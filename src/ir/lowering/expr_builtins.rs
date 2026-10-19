@@ -210,9 +210,17 @@ impl Lowerer {
                 let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest = self.fresh_value();
                 let libc_sig = self.func_meta.sigs.get(libc_name.as_str());
-                let variadic = libc_sig.is_some_and(|s| s.is_variadic);
+                // Without a visible declaration (e.g. __builtin_printf with no
+                // <stdio.h>), fall back to the known printf-family signatures.
+                let known_fixed = match libc_name.as_str() {
+                    "printf" | "scanf" => Some(1),
+                    "fprintf" | "sprintf" | "fscanf" | "sscanf" | "dprintf" => Some(2),
+                    "snprintf" => Some(3),
+                    _ => None,
+                };
+                let variadic = libc_sig.map_or(known_fixed.is_some(), |s| s.is_variadic);
                 let n_fixed = if variadic {
-                    libc_sig.map(|s| s.param_types.len()).unwrap_or(arg_vals.len())
+                    libc_sig.map(|s| s.param_types.len()).or(known_fixed).unwrap_or(arg_vals.len())
                 } else { arg_vals.len() };
                 let return_type = Self::builtin_return_type(name)
                     .or_else(|| libc_sig.map(|s| s.return_type))
@@ -505,10 +513,17 @@ impl Lowerer {
         // Only the non-v* printf-family _chk builtins are truly variadic (they take ...).
         // The v* variants (vsprintf_chk, etc.) take a va_list argument instead, which is
         // a regular pointer parameter, not variadic.
-        let is_variadic = matches!(name,
-            "__builtin___sprintf_chk" | "__builtin___snprintf_chk"
-            | "__builtin___printf_chk" | "__builtin___fprintf_chk"
-        );
+        // Number of named parameters of the variadic runtime functions; the
+        // rest are unnamed (this matters on ABIs like Apple arm64 that pass
+        // unnamed args differently).
+        let variadic_fixed_args = match name {
+            "__builtin___printf_chk" => Some(2),   // (flag, fmt, ...)
+            "__builtin___fprintf_chk" => Some(3),  // (stream, flag, fmt, ...)
+            "__builtin___sprintf_chk" => Some(4),  // (s, flag, slen, fmt, ...)
+            "__builtin___snprintf_chk" => Some(5), // (s, maxlen, flag, slen, fmt, ...)
+            _ => None,
+        };
+        let is_variadic = variadic_fixed_args.is_some();
 
         // Lower all arguments in order
         let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -517,7 +532,7 @@ impl Lowerer {
         let dest = self.fresh_value();
         let return_type = Self::builtin_return_type(name)
             .unwrap_or(crate::common::types::target_int_ir_type());
-        let n_fixed = arg_vals.len(); // All explicitly passed args are "fixed" from our perspective
+        let n_fixed = variadic_fixed_args.unwrap_or(arg_vals.len()).min(arg_vals.len());
         let struct_arg_sizes = vec![None; arg_vals.len()];
         self.emit(Instruction::Call {
             func: libc_chk_name.to_string(),

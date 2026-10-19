@@ -35,6 +35,29 @@ source. The target architecture is selected by the binary name at runtime:
 | `ccc-riscv` | RISC-V 64 |
 | `ccc-i686` | i686 (32-bit x86) |
 
+### macOS (Apple Silicon)
+
+On an arm64 Mac, `ccc` (and `ccc-arm`) targets `arm64-apple-darwin`. The
+AArch64 backend's output is translated to Apple assembler syntax
+(`src/backend/arm/darwin.rs`), then assembled and linked by the host's
+clang/ld64 (Xcode or the Command Line Tools must be installed). Headers come
+from the macOS SDK (`xcrun --show-sdk-path`, or `$SDKROOT`) and clang's
+resource directory. Use `-S` to see the Mach-O assembly.
+
+Apple's arm64 ABI differs from Linux AArch64 in a few ways that the codegen
+handles: unnamed variadic arguments always go on the stack, `va_list` is a
+plain `char *`, `long double` is IEEE double, and plain `char` is signed.
+Known gaps:
+
+- Stack-passed scalar arguments use 8-byte slots. Apple packs them at their
+  natural size, which matters when calling clang-compiled code with more than
+  8 integer/FP arguments where some are narrower than 8 bytes.
+- `_Float16` is accepted only so SDK headers parse; there is no half-precision
+  arithmetic.
+
+`tests/difftest/` checks ccc against clang; see its README and
+`tests/difftest/baseline/darwin-arm64.md` for current results.
+
 ## Quick Start
 
 Compile and run a simple C program:

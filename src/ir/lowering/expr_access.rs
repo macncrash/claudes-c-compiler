@@ -1098,9 +1098,8 @@ impl Lowerer {
             return self.lower_va_arg_struct(ap_expr, type_spec, &ctype);
         }
 
-        use crate::backend::Target;
-        let ap_val = if self.target == Target::Riscv64 || self.target == Target::I686 {
-            // RISC-V / i686: va_list is a pointer, need address of the variable holding it
+        let ap_val = if self.va_list_is_pointer() {
+            // RISC-V / i686 / Darwin: va_list is a pointer, need address of the variable holding it
             self.lower_address_of(ap_expr)
         } else {
             // x86-64 / AArch64: va_list is an array type, lower_expr handles
@@ -1418,10 +1417,16 @@ impl Lowerer {
     /// - x86-64/AArch64: va_list is array type, lower_expr handles both local
     ///   (array decay gives address) and parameter (loads pointer) cases.
     /// - RISC-V: va_list is void*, always need address-of the variable.
-    pub(super) fn lower_va_list_pointer(&mut self, ap_expr: &Expr) -> Operand {
+    /// Whether `va_list` is a scalar pointer (RISC-V, i686, Apple arm64) rather
+    /// than an array-typed register save-area descriptor (x86-64, AAPCS64).
+    pub(super) fn va_list_is_pointer(&self) -> bool {
         use crate::backend::Target;
-        if self.target == Target::Riscv64 || self.target == Target::I686 {
-            // RISC-V / i686: va_list is a pointer, need address of the variable
+        matches!(self.target, Target::Riscv64 | Target::I686) || self.target.is_darwin()
+    }
+
+    pub(super) fn lower_va_list_pointer(&mut self, ap_expr: &Expr) -> Operand {
+        if self.va_list_is_pointer() {
+            // RISC-V / i686 / Darwin: va_list is a pointer, need address of the variable
             self.lower_address_of(ap_expr)
         } else {
             self.lower_expr(ap_expr)

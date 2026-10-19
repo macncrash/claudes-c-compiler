@@ -192,7 +192,16 @@ impl Lowerer {
         let (mut arg_vals, mut arg_types, mut struct_arg_sizes, mut struct_arg_aligns, mut struct_arg_classes, mut struct_arg_riscv_float_classes) = self.lower_call_arguments(effective_func, args);
 
         // Detect variadic status early (needed for complex arg decomposition)
-        let call_is_variadic = if let Expr::Identifier(name, _) = stripped_func {
+        // For calls through function pointers, the pointer's C type is the
+        // authority on variadic-ness (needed on ABIs like Apple arm64 where
+        // unnamed args are passed differently from named ones).
+        let func_ptr_variadic = match stripped_func {
+            Expr::Identifier(name, _) if !self.is_func_ptr_variable(name) => None,
+            _ => self.func_ptr_variadic_fixed_params(stripped_func),
+        };
+        let call_is_variadic = if func_ptr_variadic.is_some() {
+            true
+        } else if let Expr::Identifier(name, _) = stripped_func {
             self.is_function_variadic(name)
         } else {
             false
@@ -229,7 +238,9 @@ impl Lowerer {
         };
 
         // Determine number of fixed args for variadic calls
-        let (call_variadic, num_fixed_args) = if let Expr::Identifier(name, _) = stripped_func {
+        let (call_variadic, num_fixed_args) = if let Some(n_fixed) = func_ptr_variadic {
+            (true, n_fixed.min(arg_vals.len()))
+        } else if let Expr::Identifier(name, _) = stripped_func {
             let variadic = call_is_variadic;
             let n_fixed = if variadic {
                 let variadic_sig = if self.is_func_ptr_variable(name) {
@@ -817,7 +828,7 @@ impl Lowerer {
                     func_ptr,
                     info: CallInfo {
                         dest: Some(dest), args: arg_vals, arg_types,
-                        return_type: indirect_ret_ty, is_variadic: false, num_fixed_args: n,
+                        return_type: indirect_ret_ty, is_variadic, num_fixed_args: if is_variadic { num_fixed_args } else { n },
                         struct_arg_sizes: sas, struct_arg_aligns: saa, struct_arg_classes: sac,
                         struct_arg_riscv_float_classes: sarfc,
                         is_sret: sret_size.is_some(), is_fastcall: false,
@@ -950,6 +961,28 @@ impl Lowerer {
             | "fscanf" | "dprintf" | "vprintf" | "vfprintf" | "vsprintf" | "vsnprintf"
             | "syslog" | "err" | "errx" | "warn" | "warnx" | "asprintf" | "vasprintf"
             | "open" | "fcntl" | "ioctl" | "execl" | "execlp" | "execle")
+    }
+
+    /// If `func_expr` has a variadic function (pointer) type, return the number
+    /// of named parameters.
+    fn func_ptr_variadic_fixed_params(&self, func_expr: &Expr) -> Option<usize> {
+        let mut expr = func_expr;
+        loop {
+            if let Some(mut ctype) = self.get_expr_ctype(expr) {
+                while let CType::Pointer(inner, _) = ctype {
+                    ctype = *inner;
+                }
+                return match ctype {
+                    CType::Function(ft) if ft.variadic => Some(ft.params.len()),
+                    _ => None,
+                };
+            }
+            if let Expr::Deref(inner, _) = expr {
+                expr = inner;
+            } else {
+                return None;
+            }
+        }
     }
 
     /// Extract the return CType from a function pointer expression.

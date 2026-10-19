@@ -269,7 +269,7 @@ impl Lexer {
             1
         } else if self.pos < self.input.len() && (self.input[self.pos] == b'l' || self.input[self.pos] == b'L') {
             self.pos += 1;
-            2
+            long_double_literal_kind()
         } else {
             0
         }
@@ -390,7 +390,7 @@ impl Lexer {
                 self.pos += 1;
                 is_imaginary = true;
             }
-            2
+            long_double_literal_kind()
         } else if self.pos < self.input.len() && (self.input[self.pos] == b'i' || self.input[self.pos] == b'I') {
             self.pos += 1;
             is_imaginary = true;
@@ -1185,4 +1185,10 @@ fn hex_digit_val(c: u8) -> u8 {
         b'A'..=b'F' => c - b'A' + 10,
         _ => 0,
     }
+}
+
+/// Float-literal kind for an `L` suffix: 2 (long double), or 0 (double) on
+/// Apple arm64 where `long double` is IEEE double.
+fn long_double_literal_kind() -> u8 {
+    if crate::common::types::target_is_darwin() { 0 } else { 2 }
 }

@@ -549,10 +549,14 @@ impl Lowerer {
                             matches!(d, DerivedDeclarator::Function(_, _))
                         );
                         if is_function_decl {
-                            self.asm_label_map.insert(
-                                declarator.name.clone(),
-                                asm_label.clone(),
-                            );
+                            // Darwin asm labels spell the raw Mach-O symbol, with
+                            // the `_` user-label prefix that the Mach-O translation
+                            // adds back (e.g. SDK `__asm("_" "fopen" "$DARWIN_EXTSN")`).
+                            let label = match asm_label.strip_prefix('_') {
+                                Some(rest) if self.target.is_darwin() => rest.to_string(),
+                                _ => asm_label.clone(),
+                            };
+                            self.asm_label_map.insert(declarator.name.clone(), label);
                         }
                     }
 

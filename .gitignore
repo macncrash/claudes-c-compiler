@@ -6,3 +6,6 @@ Cargo.lock
 a.out
 dump.rdb
 core
+
+# difftest external suites and reference-output cache
+/tests/difftest/suites/

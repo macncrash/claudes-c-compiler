@@ -426,7 +426,7 @@ pub trait ArchCodegen {
     /// Backends override the small `emit_call_*` hook methods instead of reimplementing this entire method.
     fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
                  func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 is_variadic: bool, _num_fixed_args: usize, struct_arg_sizes: &[Option<usize>],
+                 is_variadic: bool, num_fixed_args: usize, struct_arg_sizes: &[Option<usize>],
                  struct_arg_aligns: &[Option<usize>],
                  struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
                  struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
@@ -486,6 +486,24 @@ pub trait ArchCodegen {
         } else {
             None
         };
+
+        // Apple arm64: unnamed args of a variadic call go on the stack even when
+        // argument registers remain free.
+        if is_variadic && config.variadic_args_on_stack {
+            for cls in arg_classes.iter_mut().skip(num_fixed_args) {
+                *cls = match *cls {
+                    CallArgClass::IntReg { .. } | CallArgClass::FloatReg { .. } => CallArgClass::Stack,
+                    CallArgClass::I128RegPair { .. } => CallArgClass::I128Stack,
+                    CallArgClass::F128Reg { .. } => CallArgClass::F128Stack,
+                    CallArgClass::StructByValReg { size, .. }
+                    | CallArgClass::StructSseReg { size, .. }
+                    | CallArgClass::StructMixedIntSseReg { size, .. }
+                    | CallArgClass::StructMixedSseIntReg { size, .. }
+                    | CallArgClass::StructSplitRegStack { size, .. } => CallArgClass::StructByValStack { size },
+                    other => other,
+                };
+            }
+        }
 
         // Phase 0: Spill indirect function pointer before any stack manipulation.
         let indirect = func_ptr.is_some() && direct_name.is_none();

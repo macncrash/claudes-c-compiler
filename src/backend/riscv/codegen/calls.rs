@@ -19,6 +19,7 @@ impl RiscvCodegen {
             allow_struct_split_reg_stack: true,
             align_struct_pairs: true,
             sret_uses_dedicated_reg: false,
+            variadic_args_on_stack: false,
         }
     }
 

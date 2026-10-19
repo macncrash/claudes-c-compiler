@@ -404,9 +404,11 @@ impl Parser {
         } else if has_float {
             if has_complex { TypeSpecifier::ComplexFloat } else { TypeSpecifier::Float }
         } else if has_double {
+            // `long double` is plain IEEE double on Apple arm64.
+            let is_long = long_count > 0 && !crate::common::types::target_is_darwin();
             if has_complex {
-                if long_count > 0 { TypeSpecifier::ComplexLongDouble } else { TypeSpecifier::ComplexDouble }
-            } else if long_count > 0 {
+                if is_long { TypeSpecifier::ComplexLongDouble } else { TypeSpecifier::ComplexDouble }
+            } else if is_long {
                 TypeSpecifier::LongDouble
             } else {
                 TypeSpecifier::Double

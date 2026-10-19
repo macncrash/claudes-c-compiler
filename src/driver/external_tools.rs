@@ -111,6 +111,19 @@ impl Driver {
     /// assembling (with a warning). When disabled (default), uses the
     /// built-in assembler with built-in C preprocessor for .S files.
     pub(super) fn assemble_source_file(&self, input_file: &str, output_path: &str) -> Result<(), String> {
+        // Hand-written .s/.S on Darwin is already Apple syntax: let clang
+        // preprocess and assemble it directly.
+        if self.target.is_darwin() {
+            let mut extra: Vec<String> = Vec::new();
+            for def in &self.defines {
+                extra.push(format!("-D{}={}", def.name, def.value));
+            }
+            for path in &self.include_paths {
+                extra.push(format!("-I{}", path));
+            }
+            extra.extend(self.build_asm_extra_args());
+            return crate::backend::arm::darwin::assemble_file(input_file, output_path, &extra);
+        }
         // When gcc_assembler feature is enabled, use GCC for assembling
         #[cfg(feature = "gcc_assembler")]
         {

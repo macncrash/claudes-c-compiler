@@ -31,6 +31,11 @@ impl Driver {
             Target::Riscv64
         } else if binary_name.contains("i686") || binary_name.contains("i386") {
             Target::I686
+        } else if binary_name.contains("x86") {
+            Target::X86_64
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            // Plain `ccc` on Apple Silicon targets the host (arm64 Darwin).
+            Target::Aarch64
         } else {
             Target::X86_64
         };

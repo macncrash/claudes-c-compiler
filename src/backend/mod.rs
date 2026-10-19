@@ -130,6 +130,9 @@ impl Target {
     /// Return the GCC-style target triple for this architecture.
     /// Used by configure scripts (via -dumpmachine) to detect the target.
     pub fn triple(&self) -> &'static str {
+        if self.is_darwin() {
+            return "arm64-apple-darwin";
+        }
         match self {
             Target::X86_64 => "x86_64-linux-gnu",
             Target::I686 => "i686-linux-gnu",
@@ -216,6 +219,13 @@ impl Target {
         }
 
         paths.join(":")
+    }
+
+    /// Whether this target is arm64 macOS. Darwin output is Mach-O, so it is
+    /// assembled and linked by the host's clang/ld64 rather than the builtin
+    /// ELF assembler and linker.
+    pub fn is_darwin(&self) -> bool {
+        matches!(self, Target::Aarch64) && cfg!(target_os = "macos")
     }
 
     /// Whether this target uses 32-bit pointers (ILP32 data model).
@@ -325,7 +335,12 @@ impl Target {
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
                 let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
-                arm::codegen::peephole::peephole_optimize(raw)
+                let optimized = arm::codegen::peephole::peephole_optimize(raw);
+                if self.is_darwin() {
+                    arm::darwin::translate_to_macho(&optimized)
+                } else {
+                    optimized
+                }
             }
             Target::Riscv64 => {
                 let mut cg = riscv::RiscvCodegen::new();
@@ -345,6 +360,9 @@ impl Target {
     /// When the `gcc_assembler` Cargo feature is enabled, uses GCC for assembling
     /// (with a warning). When disabled (default), uses the built-in assembler.
     pub(crate) fn assemble_with_extra(&self, asm_text: &str, output_path: &str, extra_args: &[String]) -> Result<(), String> {
+        if self.is_darwin() {
+            return arm::darwin::assemble(asm_text, output_path, extra_args);
+        }
         // When gcc_assembler feature is enabled, use GCC for assembling
         #[cfg(feature = "gcc_assembler")]
         {
@@ -382,6 +400,9 @@ impl Target {
     /// fallback for operations the built-in linker doesn't support (e.g.,
     /// -shared, -r).
     pub(crate) fn link_with_args(&self, object_files: &[&str], output_path: &str, user_args: &[String]) -> Result<(), String> {
+        if self.is_darwin() {
+            return arm::darwin::link(object_files, output_path, user_args);
+        }
         common::link_with_args(&self.linker_config(), object_files, output_path, user_args)
     }
 }

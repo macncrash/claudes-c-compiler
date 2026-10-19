@@ -322,6 +322,7 @@ impl Driver {
         crate::common::types::set_target_long_double_is_f128(
             matches!(self.target, Target::Aarch64 | Target::Riscv64)
         );
+        crate::common::types::set_target_is_darwin(self.target.is_darwin());
 
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),
@@ -782,6 +783,10 @@ impl Driver {
             Target::I686 => preprocessor.set_target("i686"),
             Target::X86_64 => preprocessor.set_target("x86_64"),
         }
+        if self.target.is_darwin() {
+            use crate::backend::arm::darwin;
+            preprocessor.set_darwin(darwin::sdk_include_dir(), darwin::clang_include_dir());
+        }
         // Apply RISC-V ABI/arch overrides from -mabi= and -march= flags.
         // These must come after set_target() which sets defaults for RV64GC/lp64d.
         if self.target == Target::Riscv64 {
@@ -813,7 +818,8 @@ impl Driver {
         // Set PIC mode: defines __PIC__/__pic__ only when -fPIC is active.
         // This is critical for kernel code where RIP_REL_REF() checks #ifndef __pic__
         // to decide whether to use RIP-relative inline asm for early boot code.
-        preprocessor.set_pic(self.pic);
+        // Darwin code is always position-independent.
+        preprocessor.set_pic(self.pic || self.target.is_darwin());
         // Set SSE/SSE2/MMX predefined macros for x86 targets.
         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
         // Our i686 backend also uses SSE2, so we define them for i686 as well.
@@ -1100,7 +1106,7 @@ impl Driver {
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
         let opts = crate::backend::CodegenOptions {
-            pic: self.pic || self.shared_lib,
+            pic: self.pic || self.shared_lib || self.target.is_darwin(),
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,
             patchable_function_entry: self.patchable_function_entry,

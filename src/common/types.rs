@@ -15,6 +15,20 @@ thread_local! {
     /// Whether long double is IEEE binary128 (f128). True for AArch64/RISC-V,
     /// false for x86/i686 where long double is x87 80-bit.
     static TARGET_LONG_DOUBLE_IS_F128: Cell<bool> = const { Cell::new(false) };
+    /// Whether the target OS is Darwin (macOS). Selects the Apple arm64 ABI
+    /// (long double == double, char* va_list, variadic args on the stack) and
+    /// Mach-O assembly syntax.
+    static TARGET_IS_DARWIN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set whether the target OS is Darwin (Apple arm64 ABI, Mach-O output).
+pub fn set_target_is_darwin(is_darwin: bool) {
+    TARGET_IS_DARWIN.with(|c| c.set(is_darwin));
+}
+
+/// Whether the target OS is Darwin (Apple arm64 ABI, Mach-O output).
+pub fn target_is_darwin() -> bool {
+    TARGET_IS_DARWIN.with(|c| c.get())
 }
 
 /// Set the target pointer size for the current thread (4 for i686/ILP32, 8 for LP64).

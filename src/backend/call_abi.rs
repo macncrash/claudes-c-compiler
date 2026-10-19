@@ -256,6 +256,9 @@ pub struct CallAbiConfig {
     /// caller and callee agree on where each argument lives.
     /// ARM AAPCS64: true (sret pointer in x8), x86/RISC-V: false (sret in x0/a0).
     pub sret_uses_dedicated_reg: bool,
+    /// Whether variadic (unnamed) call arguments always go on the stack, in
+    /// 8-byte slots, regardless of free registers. Apple arm64: true.
+    pub variadic_args_on_stack: bool,
 }
 
 /// Result of SysV per-eightbyte struct classification.

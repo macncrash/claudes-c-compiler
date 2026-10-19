@@ -663,6 +663,99 @@ impl Preprocessor {
         }
     }
 
+    /// Switch from Linux/ELF to Darwin (arm64 macOS) predefined macros and
+    /// include paths, matching Apple clang's `-dM -E` output where it matters.
+    /// Called after `set_target("aarch64")`.
+    pub fn set_darwin(&mut self, sdk_include: Option<PathBuf>, clang_include: Option<PathBuf>) {
+        for name in [
+            "__linux__", "__linux", "linux", "__gnu_linux__",
+            "__unix__", "__unix", "unix", "__ELF__",
+            "__CHAR_UNSIGNED__", "__float128", "__SIZEOF_FLOAT128__",
+        ] {
+            self.macros.undefine(name);
+        }
+        const DARWIN_MACROS: &[(&str, &str)] = &[
+            ("__APPLE__", "1"), ("__MACH__", "1"), ("__APPLE_CC__", "6000"),
+            ("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "140000"),
+            ("__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__", "140000"),
+            ("__arm64__", "1"), ("__arm64", "1"),
+            ("__LITTLE_ENDIAN__", "1"), ("__DYNAMIC__", "1"),
+            ("__USER_LABEL_PREFIX__", "_"),
+            // int64_t is `long long` on Darwin (it is `long` on LP64 Linux).
+            ("__INT64_TYPE__", "long long int"), ("__UINT64_TYPE__", "long long unsigned int"),
+            ("__INT_LEAST64_TYPE__", "long long int"),
+            ("__UINT_LEAST64_TYPE__", "long long unsigned int"),
+            ("__INT_FAST16_TYPE__", "short"), ("__INT_FAST32_TYPE__", "int"),
+            ("__INT_FAST64_TYPE__", "long long int"),
+            ("__UINT_FAST16_TYPE__", "unsigned short"), ("__UINT_FAST32_TYPE__", "unsigned int"),
+            ("__UINT_FAST64_TYPE__", "long long unsigned int"),
+            ("__WINT_TYPE__", "int"), ("__WINT_MAX__", "2147483647"),
+            ("__WINT_MIN__", "(-2147483647-1)"),
+            // long double is IEEE double on Apple arm64.
+            ("__SIZEOF_LONG_DOUBLE__", "8"),
+            ("__LDBL_MANT_DIG__", "53"), ("__LDBL_DIG__", "15"),
+            ("__LDBL_MIN_EXP__", "(-1021)"), ("__LDBL_MIN_10_EXP__", "(-307)"),
+            ("__LDBL_MAX_EXP__", "1024"), ("__LDBL_MAX_10_EXP__", "308"),
+            ("__LDBL_MAX__", "1.7976931348623157e+308L"),
+            ("__LDBL_MIN__", "2.2250738585072014e-308L"),
+            ("__LDBL_EPSILON__", "2.2204460492503131e-16L"),
+            ("__LDBL_DENORM_MIN__", "4.9406564584124654e-324L"),
+            ("__LDBL_DECIMAL_DIG__", "17"), ("__DECIMAL_DIG__", "17"),
+            ("_Float128", "long double"), ("_Float64x", "long double"),
+        ];
+        for &(name, body) in DARWIN_MACROS {
+            self.define_simple_macro(name, body);
+        }
+        // The SDK's <math.h> declares half-precision functions unconditionally.
+        // TODO: real _Float16 support; this alias only lets the declarations parse.
+        self.define_simple_macro("_Float16", "short");
+
+        // clang's <stdatomic.h> (there is none in the SDK) is written against
+        // clang's __c11_atomic_* builtins; map them onto the GNU __atomic_* ones.
+        const C11_ATOMIC_MACROS: &[(&str, &[&str], &str)] = &[
+            ("__c11_atomic_init", &["p", "v"], "__atomic_store_n(p, v, __ATOMIC_RELAXED)"),
+            ("__c11_atomic_thread_fence", &["o"], "__atomic_thread_fence(o)"),
+            ("__c11_atomic_signal_fence", &["o"], "__atomic_signal_fence(o)"),
+            ("__c11_atomic_is_lock_free", &["sz"], "((sz) <= 8)"),
+            ("__c11_atomic_store", &["p", "v", "o"], "__atomic_store_n(p, v, o)"),
+            ("__c11_atomic_load", &["p", "o"], "__atomic_load_n(p, o)"),
+            ("__c11_atomic_exchange", &["p", "v", "o"], "__atomic_exchange_n(p, v, o)"),
+            ("__c11_atomic_compare_exchange_strong", &["p", "e", "d", "s", "f"],
+                "__atomic_compare_exchange_n(p, e, d, 0, s, f)"),
+            ("__c11_atomic_compare_exchange_weak", &["p", "e", "d", "s", "f"],
+                "__atomic_compare_exchange_n(p, e, d, 1, s, f)"),
+            ("__c11_atomic_fetch_add", &["p", "v", "o"], "__atomic_fetch_add(p, v, o)"),
+            ("__c11_atomic_fetch_sub", &["p", "v", "o"], "__atomic_fetch_sub(p, v, o)"),
+            ("__c11_atomic_fetch_and", &["p", "v", "o"], "__atomic_fetch_and(p, v, o)"),
+            ("__c11_atomic_fetch_or", &["p", "v", "o"], "__atomic_fetch_or(p, v, o)"),
+            ("__c11_atomic_fetch_xor", &["p", "v", "o"], "__atomic_fetch_xor(p, v, o)"),
+        ];
+        for &(name, params, body) in C11_ATOMIC_MACROS {
+            self.macros.define(MacroDef {
+                name: name.to_string(),
+                is_function_like: true,
+                params: params.iter().map(|s| s.to_string()).collect(),
+                is_variadic: false,
+                has_named_variadic: false,
+                body: body.to_string(),
+            });
+        }
+        // Undo the binary128 <float.h> overrides from set_target("aarch64").
+        for name in ["LDBL_MANT_DIG", "LDBL_DIG", "DECIMAL_DIG"] {
+            self.macros.undefine(name);
+        }
+
+        // Include search order mirrors clang: bundled headers, clang's resource
+        // headers (stddef.h, stdarg.h, float.h, ...), then the SDK.
+        self.system_include_paths.retain(|p| {
+            let s = p.to_string_lossy();
+            !s.starts_with("/usr/include") && !s.starts_with("/usr/lib/gcc")
+        });
+        let paths: Vec<PathBuf> = [clang_include, sdk_include].into_iter().flatten().collect();
+        let paths: Vec<&str> = paths.iter().filter_map(|p| p.to_str()).collect();
+        self.insert_arch_paths_after_bundled(&paths);
+    }
+
     /// Override long double macros from x87 80-bit extended to IEEE 754 binary128.
     /// Called by set_target() for aarch64 and riscv64 which use quad precision.
     fn override_ldbl_binary128(&mut self) {

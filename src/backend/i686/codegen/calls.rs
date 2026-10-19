@@ -23,6 +23,7 @@ impl I686Codegen {
             allow_struct_split_reg_stack: false,
             align_struct_pairs: false,
             sret_uses_dedicated_reg: false,
+            variadic_args_on_stack: false,
         }
     }
 

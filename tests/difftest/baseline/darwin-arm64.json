@@ -1,0 +1,5336 @@
+{
+ "meta": {
+  "platform": "darwin-arm64",
+  "date": "2026-10-17",
+  "ccc_rev": "6f1b99ac-dirty",
+  "ccc_flags": [
+   "-O2",
+   "-w"
+  ],
+  "ref_cc_version": "Apple clang version 16.0.0 (clang-1600.0.26.6)",
+  "ref_flags": [
+   "-arch",
+   "arm64",
+   "-O0",
+   "-w"
+  ]
+ },
+ "results": {
+  "c-testsuite/00001": {
+   "status": "pass"
+  },
+  "c-testsuite/00002": {
+   "status": "pass"
+  },
+  "c-testsuite/00003": {
+   "status": "pass"
+  },
+  "c-testsuite/00004": {
+   "status": "pass"
+  },
+  "c-testsuite/00005": {
+   "status": "pass"
+  },
+  "c-testsuite/00006": {
+   "status": "pass"
+  },
+  "c-testsuite/00007": {
+   "status": "pass"
+  },
+  "c-testsuite/00008": {
+   "status": "pass"
+  },
+  "c-testsuite/00009": {
+   "status": "pass"
+  },
+  "c-testsuite/00010": {
+   "status": "pass"
+  },
+  "c-testsuite/00011": {
+   "status": "pass"
+  },
+  "c-testsuite/00012": {
+   "status": "pass"
+  },
+  "c-testsuite/00013": {
+   "status": "pass"
+  },
+  "c-testsuite/00014": {
+   "status": "pass"
+  },
+  "c-testsuite/00015": {
+   "status": "pass"
+  },
+  "c-testsuite/00016": {
+   "status": "pass"
+  },
+  "c-testsuite/00017": {
+   "status": "pass"
+  },
+  "c-testsuite/00018": {
+   "status": "pass"
+  },
+  "c-testsuite/00019": {
+   "status": "pass"
+  },
+  "c-testsuite/00020": {
+   "status": "pass"
+  },
+  "c-testsuite/00021": {
+   "status": "pass"
+  },
+  "c-testsuite/00022": {
+   "status": "pass"
+  },
+  "c-testsuite/00023": {
+   "status": "pass"
+  },
+  "c-testsuite/00024": {
+   "status": "pass"
+  },
+  "c-testsuite/00025": {
+   "status": "pass"
+  },
+  "c-testsuite/00026": {
+   "status": "pass"
+  },
+  "c-testsuite/00027": {
+   "status": "pass"
+  },
+  "c-testsuite/00028": {
+   "status": "pass"
+  },
+  "c-testsuite/00029": {
+   "status": "pass"
+  },
+  "c-testsuite/00030": {
+   "status": "pass"
+  },
+  "c-testsuite/00031": {
+   "status": "pass"
+  },
+  "c-testsuite/00032": {
+   "status": "pass"
+  },
+  "c-testsuite/00033": {
+   "status": "pass"
+  },
+  "c-testsuite/00034": {
+   "status": "pass"
+  },
+  "c-testsuite/00035": {
+   "status": "pass"
+  },
+  "c-testsuite/00036": {
+   "status": "pass"
+  },
+  "c-testsuite/00037": {
+   "status": "pass"
+  },
+  "c-testsuite/00038": {
+   "status": "pass"
+  },
+  "c-testsuite/00039": {
+   "status": "pass"
+  },
+  "c-testsuite/00040": {
+   "status": "pass"
+  },
+  "c-testsuite/00041": {
+   "status": "pass"
+  },
+  "c-testsuite/00042": {
+   "status": "pass"
+  },
+  "c-testsuite/00043": {
+   "status": "pass"
+  },
+  "c-testsuite/00044": {
+   "status": "pass"
+  },
+  "c-testsuite/00045": {
+   "status": "pass"
+  },
+  "c-testsuite/00046": {
+   "status": "pass"
+  },
+  "c-testsuite/00047": {
+   "status": "pass"
+  },
+  "c-testsuite/00048": {
+   "status": "pass"
+  },
+  "c-testsuite/00049": {
+   "status": "pass"
+  },
+  "c-testsuite/00050": {
+   "status": "pass"
+  },
+  "c-testsuite/00051": {
+   "status": "pass"
+  },
+  "c-testsuite/00052": {
+   "status": "pass"
+  },
+  "c-testsuite/00053": {
+   "status": "pass"
+  },
+  "c-testsuite/00054": {
+   "status": "pass"
+  },
+  "c-testsuite/00055": {
+   "status": "pass"
+  },
+  "c-testsuite/00056": {
+   "status": "pass"
+  },
+  "c-testsuite/00057": {
+   "status": "pass"
+  },
+  "c-testsuite/00058": {
+   "status": "pass"
+  },
+  "c-testsuite/00059": {
+   "status": "pass"
+  },
+  "c-testsuite/00060": {
+   "status": "pass"
+  },
+  "c-testsuite/00061": {
+   "status": "pass"
+  },
+  "c-testsuite/00062": {
+   "status": "pass"
+  },
+  "c-testsuite/00063": {
+   "status": "pass"
+  },
+  "c-testsuite/00064": {
+   "status": "pass"
+  },
+  "c-testsuite/00065": {
+   "status": "pass"
+  },
+  "c-testsuite/00066": {
+   "status": "pass"
+  },
+  "c-testsuite/00067": {
+   "status": "pass"
+  },
+  "c-testsuite/00068": {
+   "status": "pass"
+  },
+  "c-testsuite/00069": {
+   "status": "pass"
+  },
+  "c-testsuite/00070": {
+   "status": "pass"
+  },
+  "c-testsuite/00071": {
+   "status": "pass"
+  },
+  "c-testsuite/00072": {
+   "status": "pass"
+  },
+  "c-testsuite/00073": {
+   "status": "pass"
+  },
+  "c-testsuite/00074": {
+   "status": "pass"
+  },
+  "c-testsuite/00075": {
+   "status": "pass"
+  },
+  "c-testsuite/00076": {
+   "status": "pass"
+  },
+  "c-testsuite/00077": {
+   "status": "pass"
+  },
+  "c-testsuite/00078": {
+   "status": "pass"
+  },
+  "c-testsuite/00079": {
+   "status": "pass"
+  },
+  "c-testsuite/00080": {
+   "status": "pass"
+  },
+  "c-testsuite/00081": {
+   "status": "pass"
+  },
+  "c-testsuite/00082": {
+   "status": "pass"
+  },
+  "c-testsuite/00083": {
+   "status": "pass"
+  },
+  "c-testsuite/00084": {
+   "status": "pass"
+  },
+  "c-testsuite/00085": {
+   "status": "pass"
+  },
+  "c-testsuite/00086": {
+   "status": "pass"
+  },
+  "c-testsuite/00087": {
+   "status": "pass"
+  },
+  "c-testsuite/00088": {
+   "status": "pass"
+  },
+  "c-testsuite/00089": {
+   "status": "pass"
+  },
+  "c-testsuite/00090": {
+   "status": "pass"
+  },
+  "c-testsuite/00091": {
+   "status": "pass"
+  },
+  "c-testsuite/00092": {
+   "status": "pass"
+  },
+  "c-testsuite/00093": {
+   "status": "pass"
+  },
+  "c-testsuite/00094": {
+   "status": "pass"
+  },
+  "c-testsuite/00095": {
+   "status": "pass"
+  },
+  "c-testsuite/00096": {
+   "status": "pass"
+  },
+  "c-testsuite/00097": {
+   "status": "pass"
+  },
+  "c-testsuite/00098": {
+   "status": "pass"
+  },
+  "c-testsuite/00099": {
+   "status": "pass"
+  },
+  "c-testsuite/00100": {
+   "status": "pass"
+  },
+  "c-testsuite/00101": {
+   "status": "pass"
+  },
+  "c-testsuite/00102": {
+   "status": "pass"
+  },
+  "c-testsuite/00103": {
+   "status": "pass"
+  },
+  "c-testsuite/00104": {
+   "status": "pass"
+  },
+  "c-testsuite/00105": {
+   "status": "pass"
+  },
+  "c-testsuite/00106": {
+   "status": "pass"
+  },
+  "c-testsuite/00107": {
+   "status": "pass"
+  },
+  "c-testsuite/00108": {
+   "status": "pass"
+  },
+  "c-testsuite/00109": {
+   "status": "pass"
+  },
+  "c-testsuite/00110": {
+   "status": "pass"
+  },
+  "c-testsuite/00111": {
+   "status": "pass"
+  },
+  "c-testsuite/00112": {
+   "status": "pass"
+  },
+  "c-testsuite/00113": {
+   "status": "pass"
+  },
+  "c-testsuite/00114": {
+   "status": "pass"
+  },
+  "c-testsuite/00115": {
+   "status": "pass"
+  },
+  "c-testsuite/00116": {
+   "status": "pass"
+  },
+  "c-testsuite/00117": {
+   "status": "pass"
+  },
+  "c-testsuite/00118": {
+   "status": "pass"
+  },
+  "c-testsuite/00119": {
+   "status": "pass"
+  },
+  "c-testsuite/00120": {
+   "status": "pass"
+  },
+  "c-testsuite/00121": {
+   "status": "pass"
+  },
+  "c-testsuite/00122": {
+   "status": "pass"
+  },
+  "c-testsuite/00123": {
+   "status": "pass"
+  },
+  "c-testsuite/00124": {
+   "status": "pass"
+  },
+  "c-testsuite/00125": {
+   "status": "pass"
+  },
+  "c-testsuite/00126": {
+   "status": "pass"
+  },
+  "c-testsuite/00127": {
+   "status": "pass"
+  },
+  "c-testsuite/00128": {
+   "status": "pass"
+  },
+  "c-testsuite/00129": {
+   "status": "pass"
+  },
+  "c-testsuite/00130": {
+   "status": "pass"
+  },
+  "c-testsuite/00131": {
+   "status": "pass"
+  },
+  "c-testsuite/00132": {
+   "status": "pass"
+  },
+  "c-testsuite/00133": {
+   "status": "pass"
+  },
+  "c-testsuite/00134": {
+   "status": "pass"
+  },
+  "c-testsuite/00135": {
+   "status": "pass"
+  },
+  "c-testsuite/00136": {
+   "status": "pass"
+  },
+  "c-testsuite/00137": {
+   "status": "pass"
+  },
+  "c-testsuite/00138": {
+   "status": "pass"
+  },
+  "c-testsuite/00139": {
+   "status": "pass"
+  },
+  "c-testsuite/00140": {
+   "status": "pass"
+  },
+  "c-testsuite/00141": {
+   "status": "pass"
+  },
+  "c-testsuite/00142": {
+   "status": "pass"
+  },
+  "c-testsuite/00143": {
+   "status": "pass"
+  },
+  "c-testsuite/00144": {
+   "status": "pass"
+  },
+  "c-testsuite/00145": {
+   "status": "pass"
+  },
+  "c-testsuite/00146": {
+   "status": "pass"
+  },
+  "c-testsuite/00147": {
+   "status": "pass"
+  },
+  "c-testsuite/00148": {
+   "status": "pass"
+  },
+  "c-testsuite/00149": {
+   "status": "pass"
+  },
+  "c-testsuite/00150": {
+   "status": "pass"
+  },
+  "c-testsuite/00151": {
+   "status": "pass"
+  },
+  "c-testsuite/00152": {
+   "status": "pass"
+  },
+  "c-testsuite/00153": {
+   "status": "pass"
+  },
+  "c-testsuite/00154": {
+   "status": "pass"
+  },
+  "c-testsuite/00155": {
+   "status": "pass"
+  },
+  "c-testsuite/00156": {
+   "status": "pass"
+  },
+  "c-testsuite/00157": {
+   "status": "pass"
+  },
+  "c-testsuite/00158": {
+   "status": "pass"
+  },
+  "c-testsuite/00159": {
+   "status": "pass"
+  },
+  "c-testsuite/00160": {
+   "status": "pass"
+  },
+  "c-testsuite/00161": {
+   "status": "pass"
+  },
+  "c-testsuite/00162": {
+   "status": "pass"
+  },
+  "c-testsuite/00163": {
+   "status": "pass"
+  },
+  "c-testsuite/00164": {
+   "status": "pass"
+  },
+  "c-testsuite/00165": {
+   "status": "pass"
+  },
+  "c-testsuite/00166": {
+   "status": "pass"
+  },
+  "c-testsuite/00167": {
+   "status": "pass"
+  },
+  "c-testsuite/00168": {
+   "status": "pass"
+  },
+  "c-testsuite/00169": {
+   "status": "pass"
+  },
+  "c-testsuite/00170": {
+   "status": "pass"
+  },
+  "c-testsuite/00171": {
+   "status": "pass"
+  },
+  "c-testsuite/00172": {
+   "status": "pass"
+  },
+  "c-testsuite/00173": {
+   "status": "pass"
+  },
+  "c-testsuite/00174": {
+   "status": "pass"
+  },
+  "c-testsuite/00175": {
+   "status": "pass"
+  },
+  "c-testsuite/00176": {
+   "status": "pass"
+  },
+  "c-testsuite/00177": {
+   "status": "pass"
+  },
+  "c-testsuite/00178": {
+   "status": "pass"
+  },
+  "c-testsuite/00179": {
+   "status": "pass"
+  },
+  "c-testsuite/00180": {
+   "status": "pass"
+  },
+  "c-testsuite/00181": {
+   "status": "pass"
+  },
+  "c-testsuite/00182": {
+   "status": "pass"
+  },
+  "c-testsuite/00183": {
+   "status": "pass"
+  },
+  "c-testsuite/00184": {
+   "status": "pass"
+  },
+  "c-testsuite/00185": {
+   "status": "pass"
+  },
+  "c-testsuite/00186": {
+   "status": "pass"
+  },
+  "c-testsuite/00187": {
+   "status": "pass"
+  },
+  "c-testsuite/00188": {
+   "status": "pass"
+  },
+  "c-testsuite/00189": {
+   "status": "pass"
+  },
+  "c-testsuite/00190": {
+   "status": "pass"
+  },
+  "c-testsuite/00191": {
+   "status": "pass"
+  },
+  "c-testsuite/00192": {
+   "status": "pass"
+  },
+  "c-testsuite/00193": {
+   "status": "pass"
+  },
+  "c-testsuite/00194": {
+   "status": "pass"
+  },
+  "c-testsuite/00195": {
+   "status": "pass"
+  },
+  "c-testsuite/00196": {
+   "status": "pass"
+  },
+  "c-testsuite/00197": {
+   "status": "pass"
+  },
+  "c-testsuite/00198": {
+   "status": "pass"
+  },
+  "c-testsuite/00199": {
+   "status": "pass"
+  },
+  "c-testsuite/00200": {
+   "status": "pass"
+  },
+  "c-testsuite/00201": {
+   "status": "pass"
+  },
+  "c-testsuite/00202": {
+   "status": "pass"
+  },
+  "c-testsuite/00203": {
+   "status": "pass"
+  },
+  "c-testsuite/00204": {
+   "status": "pass"
+  },
+  "c-testsuite/00205": {
+   "status": "pass"
+  },
+  "c-testsuite/00206": {
+   "status": "pass"
+  },
+  "c-testsuite/00207": {
+   "status": "pass"
+  },
+  "c-testsuite/00208": {
+   "status": "pass"
+  },
+  "c-testsuite/00209": {
+   "status": "pass"
+  },
+  "c-testsuite/00210": {
+   "status": "pass"
+  },
+  "c-testsuite/00211": {
+   "status": "pass"
+  },
+  "c-testsuite/00212": {
+   "status": "pass"
+  },
+  "c-testsuite/00213": {
+   "status": "pass"
+  },
+  "c-testsuite/00214": {
+   "status": "pass"
+  },
+  "c-testsuite/00215": {
+   "status": "pass"
+  },
+  "c-testsuite/00216": {
+   "status": "pass"
+  },
+  "c-testsuite/00217": {
+   "status": "pass"
+  },
+  "c-testsuite/00218": {
+   "status": "pass"
+  },
+  "c-testsuite/00219": {
+   "status": "pass"
+  },
+  "c-testsuite/00220": {
+   "status": "pass"
+  },
+  "cases/abi_args": {
+   "status": "wrong_output",
+   "detail": "line 3: expected 'small_stack 120936', got 'small_stack 936'"
+  },
+  "cases/abi_variadic": {
+   "status": "pass"
+  },
+  "cases/atomics": {
+   "status": "pass"
+  },
+  "cases/attributes": {
+   "status": "pass"
+  },
+  "cases/control_flow": {
+   "status": "pass"
+  },
+  "cases/exit_code": {
+   "status": "pass"
+  },
+  "cases/floats": {
+   "status": "pass"
+  },
+  "cases/globals_data": {
+   "status": "pass"
+  },
+  "cases/integers": {
+   "status": "pass"
+  },
+  "cases/libc_interop": {
+   "status": "pass"
+  },
+  "cases/strings_wide": {
+   "status": "pass"
+  },
+  "cases/structs_unions": {
+   "status": "pass"
+  },
+  "cases/thread_local": {
+   "status": "pass"
+  },
+  "cases/types_sizes": {
+   "status": "pass"
+  },
+  "gcc-torture/20000112-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000113-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000121-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000205-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000217-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000223-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000224-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000225-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000227-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000313-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000314-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000314-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000314-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20000402-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000403-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000412-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000412-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000412-3": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20000412-3.c:14:10: error: call to undeclared function 'f'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/20000412-4": {
+   "status": "pass"
+  },
+  "gcc-torture/20000412-5": {
+   "status": "pass"
+  },
+  "gcc-torture/20000412-6": {
+   "status": "pass"
+  },
+  "gcc-torture/20000419-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000422-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000503-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000511-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000519-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000519-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000523-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000528-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000603-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000605-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000605-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000605-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20000622-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000703-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000706-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000706-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000706-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20000706-4": {
+   "status": "pass"
+  },
+  "gcc-torture/20000706-5": {
+   "status": "pass"
+  },
+  "gcc-torture/20000707-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000715-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000715-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000717-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000717-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000717-3": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20000717-3.c:5:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/20000717-4": {
+   "status": "pass"
+  },
+  "gcc-torture/20000717-5": {
+   "status": "pass"
+  },
+  "gcc-torture/20000722-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000726-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000731-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000731-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000801-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000801-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000801-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20000801-4": {
+   "status": "pass"
+  },
+  "gcc-torture/20000808-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000815-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000818-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000819-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000910-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000910-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20000914-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20000917-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001009-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001009-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20001011-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001013-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001017-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001017-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20001024-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001026-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001027-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001031-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001108-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001111-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20001111-1.c:40:3: error: use of unknown builtin '__builtin_exit' [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/20001112-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001121-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/20001124-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001130-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001130-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20001203-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001203-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20001221-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001228-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20001229-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010106-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010114-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010116-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010118-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010119-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010123-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010129-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010206-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010221-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010222-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010224-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010325-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010329-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010403-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010409-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010422-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010518-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010518-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20010520-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010604-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010605-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20010605-1.c:6:5: error: function definition is not allowed here"
+  },
+  "gcc-torture/20010605-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20010605-2.c:18:3: error: call to undeclared library function 'exit' with type 'void (int) __attribute__((noreturn))'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/20010711-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010717-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010723-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010904-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010904-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20010910-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010915-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010924-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20010925-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011008-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20011019-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011024-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011109-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011109-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20011113-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011114-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011115-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011121-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011126-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011126-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20011128-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011217-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011219-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20011223-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020103-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020107-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/20020108-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020118-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020127-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020129-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020201-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020206-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020206-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20020213-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020215-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020216-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020219-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020225-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020225-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20020226-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020227-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020307-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020320-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020321-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020328-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020402-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020402-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20020402-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20020406-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020411-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020413-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020418-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020423-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020503-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020506-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020508-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020508-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20020508-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20020510-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020611-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020614-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020615-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020619-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020716-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020720-1": {
+   "status": "link_error",
+   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/20020805-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020810-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020819-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20020819-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/20020904-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020911-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020916-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20020920-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021010-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021010-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20021011-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021015-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021111-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021118-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021118-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20021118-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20021119-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021120-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021120-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20021120-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20021127-1": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/20021204-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20021219-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030105-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030109-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030117-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030120-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030120-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20030128-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030203-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030209-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030218-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030221-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030224-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20030307-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030313-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030316-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030330-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030401-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030403-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030404-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030408-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030501-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20030501-1.c:11:7: error: function definition is not allowed here"
+  },
+  "gcc-torture/20030606-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030613-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030626-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030626-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20030714-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030715-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030717-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030718-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030821-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030828-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030828-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20030903-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030909-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030910-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030913-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030914-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030914-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20030916-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030920-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20030928-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031003-1": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/20031010-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031011-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031012-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031020-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031201-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031204-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031211-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031211-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20031211-2.c:13:3: error: call to undeclared function 'foo'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/20031214-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031215-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20031216-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040208-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040218-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040307-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040309-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040311-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040313-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040319-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040331-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040409-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040409-1w": {
+   "status": "pass"
+  },
+  "gcc-torture/20040409-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20040409-2w": {
+   "status": "pass"
+  },
+  "gcc-torture/20040409-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20040409-3w": {
+   "status": "pass"
+  },
+  "gcc-torture/20040411-1": {
+   "status": "crash",
+   "detail": "signal 6"
+  },
+  "gcc-torture/20040423-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20040423-1.c:8:9: error: fields must have a constant size: 'variable length array in structure' extension will never be supported"
+  },
+  "gcc-torture/20040520-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20040520-1.c:7:9: error: function definition is not allowed here"
+  },
+  "gcc-torture/20040625-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040704-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040706-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040707-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040805-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040820-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040823-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040831-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20040917-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041011-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041019-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20041019-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/20041112-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041113-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041114-1": {
+   "status": "link_error",
+   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/20041124-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041126-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041201-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041210-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041212-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041213-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20041218-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20041218-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20041218-2.c:5:19: error: fields must have a constant size: 'variable length array in structure' extension will never be supported"
+  },
+  "gcc-torture/20050104-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050106-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050107-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050111-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050119-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050119-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20050121-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050124-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050125-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050131-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050203-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050215-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050218-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050224-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050316-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20050316-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20050410-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050502-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050502-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20050604-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050607-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050613-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050713-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050826-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20050826-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20050929-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20051021-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20051104-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20051110-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20051110-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20051113-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20051215-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060102-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060110-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060110-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20060127-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060412-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060420-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060905-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060910-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060929-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060930-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20060930-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20061031-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20061101-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20070201-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20070212-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20070212-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20070212-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20070424-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20070517-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20070614-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20070623-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20070724-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071011-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071018-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071029-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071030-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071108-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071120-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071202-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071205-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071211-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071213-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071216-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20071219-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080117-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080122-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080222-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080408-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080424-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080502-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080506-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080506-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20080519-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080522-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080529-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080604-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080719-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20080813-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20081103-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20081112-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20081218-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20090113-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20090113-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20090113-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20090207-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20090219-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20090219-1.c:13:5: error: function definition is not allowed here"
+  },
+  "gcc-torture/20090527-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20090623-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20090711-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20090814-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20091229-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20100209-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20100316-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20100416-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20100430-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20100708-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20100805-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20100827-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20101011-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20101013-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20101025-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20110418-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20111208-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20111212-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20111227-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20120105-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20120111-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20120207-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20120427-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20120427-1.c:9:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/20120427-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/20120427-2.c:9:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/20120615-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20120808-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20120817-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20121108-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20131127-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20140212-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20140212-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20140326-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20140425-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20140622-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20140828-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20141022-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20141107-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20141125-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20150611-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20170111-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20170401-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20170401-2": {
+   "status": "pass"
+  },
+  "gcc-torture/20170419-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20171008-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20180112-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20180131-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20180226-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20180921-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20190228-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20191023-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20221006-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20230509-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20230510-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20230630-1": {
+   "status": "pass"
+  },
+  "gcc-torture/20230630-2": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/20230630-3": {
+   "status": "pass"
+  },
+  "gcc-torture/20230630-4": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/20230802-1": {
+   "status": "pass"
+  },
+  "gcc-torture/900409-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920202-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920409-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920409-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920410-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920411-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920411-1.c:17:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920428-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920428-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920429-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920429-1.c:4:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920501-2": {
+   "status": "pass"
+  },
+  "gcc-torture/920501-6": {
+   "status": "pass"
+  },
+  "gcc-torture/920501-8": {
+   "status": "pass"
+  },
+  "gcc-torture/920501-9": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920501-9.c:11:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920506-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920520-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920520-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920603-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920603-1.c:2:3: error: parameter 'got' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920604-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920618-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920625-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920710-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920721-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920721-3": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920721-3.c:2:15: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920726-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920728-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920728-1.c:4:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920730-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920730-1.c:4:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920731-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920731-1.c:2:3: error: parameter 'x' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920810-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920812-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920812-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920829-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920908-1": {
+   "status": "pass"
+  },
+  "gcc-torture/920908-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920908-2.c:20:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920909-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/920909-1.c:2:3: error: parameter 'a' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/920922-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921006-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921007-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921013-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/921013-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/921016-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921019-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921019-2": {
+   "status": "pass"
+  },
+  "gcc-torture/921029-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921104-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921110-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/921110-1.c:8:3: error: call to undeclared library function 'exit' with type 'void (int) __attribute__((noreturn))'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/921112-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921113-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921117-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921123-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/921123-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/921123-2": {
+   "status": "pass"
+  },
+  "gcc-torture/921124-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/921124-1.c:3:3: error: parameter 'x' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/921202-2": {
+   "status": "pass"
+  },
+  "gcc-torture/921204-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921207-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/921207-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/921208-1": {
+   "status": "pass"
+  },
+  "gcc-torture/921218-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/921218-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/921218-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/921218-2.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930106-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930106-1.c:15:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930111-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930111-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930123-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930126-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930208-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930208-1.c:8:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930406-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930408-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930429-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930429-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930429-2.c:4:4: error: parameter 'b' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930513-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930513-1.c:7:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930513-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930513-2.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930518-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930518-1.c:5:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930526-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/930527-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930527-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930529-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930603-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930603-1.c:9:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930603-2": {
+   "status": "pass"
+  },
+  "gcc-torture/930603-3": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930603-3.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930608-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930614-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930614-2": {
+   "status": "pass"
+  },
+  "gcc-torture/930621-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930621-1.c:11:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930622-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930622-1.c:5:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930622-2": {
+   "status": "pass"
+  },
+  "gcc-torture/930628-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930630-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930630-1.c:11:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930702-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930702-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930713-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930713-1.c:16:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930718-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930718-1.c:22:3: error: call to undeclared library function 'abort' with type 'void (void) __attribute__((noreturn))'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/930719-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930719-1.c:4:14: error: parameter 'com' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930725-1": {
+   "status": "pass"
+  },
+  "gcc-torture/930818-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930818-1.c:5:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930916-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930916-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930921-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930921-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930929-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930929-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930930-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/930930-1.c:10:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/930930-2": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-1": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-10": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-11": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-12": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-13": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-14": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-2": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-3": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-4": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-5": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-6": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-7": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-8": {
+   "status": "pass"
+  },
+  "gcc-torture/931004-9": {
+   "status": "pass"
+  },
+  "gcc-torture/931005-1": {
+   "status": "pass"
+  },
+  "gcc-torture/931009-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931009-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/931012-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931012-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/931017-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931017-1.c:5:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/931018-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931018-1.c:6:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/931031-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931031-1.c:28:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/931102-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931102-1.c:10:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/931102-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931102-2.c:12:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/931110-1": {
+   "status": "pass"
+  },
+  "gcc-torture/931110-2": {
+   "status": "pass"
+  },
+  "gcc-torture/931208-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931208-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/931228-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/931228-1.c:2:4: error: parameter 'x' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/940115-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/940115-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/940122-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/940122-1.c:6:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/941014-1": {
+   "status": "pass"
+  },
+  "gcc-torture/941014-2": {
+   "status": "pass"
+  },
+  "gcc-torture/941015-1": {
+   "status": "pass"
+  },
+  "gcc-torture/941021-1": {
+   "status": "pass"
+  },
+  "gcc-torture/941025-1": {
+   "status": "pass"
+  },
+  "gcc-torture/941031-1": {
+   "status": "pass"
+  },
+  "gcc-torture/941101-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/941101-1.c:2:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/941110-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/941110-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/950221-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950322-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/950322-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/950426-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/950426-1.c:10:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/950426-2": {
+   "status": "pass"
+  },
+  "gcc-torture/950503-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950511-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950512-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/950512-1.c:4:5: error: parameter 'x' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/950605-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/950605-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/950607-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950607-2": {
+   "status": "pass"
+  },
+  "gcc-torture/950612-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950621-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/950621-1.c:10:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/950628-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950704-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950706-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950710-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950714-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950809-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950906-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950915-1": {
+   "status": "pass"
+  },
+  "gcc-torture/950929-1": {
+   "status": "pass"
+  },
+  "gcc-torture/951003-1": {
+   "status": "pass"
+  },
+  "gcc-torture/951115-1": {
+   "status": "pass"
+  },
+  "gcc-torture/951204-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960116-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960117-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960209-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960215-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960218-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/960218-1.c:5:4: error: parameter 'x' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/960219-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960301-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960302-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960311-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960311-2": {
+   "status": "pass"
+  },
+  "gcc-torture/960311-3": {
+   "status": "pass"
+  },
+  "gcc-torture/960312-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960317-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960321-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960326-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960327-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960402-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/960402-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/960405-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960416-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960419-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960419-2": {
+   "status": "pass"
+  },
+  "gcc-torture/960512-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960513-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960521-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960608-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960801-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960802-1": {
+   "status": "pass"
+  },
+  "gcc-torture/960830-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/960830-1.c:20:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/960909-1": {
+   "status": "pass"
+  },
+  "gcc-torture/961004-1": {
+   "status": "pass"
+  },
+  "gcc-torture/961017-1": {
+   "status": "pass"
+  },
+  "gcc-torture/961017-2": {
+   "status": "pass"
+  },
+  "gcc-torture/961026-1": {
+   "status": "pass"
+  },
+  "gcc-torture/961112-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/961112-1.c:3:4: error: parameter 'x' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/961122-1": {
+   "status": "pass"
+  },
+  "gcc-torture/961122-2": {
+   "status": "pass"
+  },
+  "gcc-torture/961125-1": {
+   "status": "pass"
+  },
+  "gcc-torture/961206-1": {
+   "status": "pass"
+  },
+  "gcc-torture/961213-1": {
+   "status": "pass"
+  },
+  "gcc-torture/961223-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/970214-1": {
+   "status": "pass"
+  },
+  "gcc-torture/970214-2": {
+   "status": "compile_error",
+   "detail": "tests/difftest/suites/gcc-torture/970214-2.c:7:11: error: expected ')' before character constant"
+  },
+  "gcc-torture/970217-1": {
+   "status": "pass"
+  },
+  "gcc-torture/970923-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980205": {
+   "status": "pass"
+  },
+  "gcc-torture/980223": {
+   "status": "pass"
+  },
+  "gcc-torture/980424-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980505-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980505-2": {
+   "status": "pass"
+  },
+  "gcc-torture/980506-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980506-2": {
+   "status": "pass"
+  },
+  "gcc-torture/980506-3": {
+   "status": "pass"
+  },
+  "gcc-torture/980526-2": {
+   "status": "pass"
+  },
+  "gcc-torture/980526-3": {
+   "status": "pass"
+  },
+  "gcc-torture/980602-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980602-2": {
+   "status": "pass"
+  },
+  "gcc-torture/980604-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980605-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980608-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/980612-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980617-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980618-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980701-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980707-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980709-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980716-1": {
+   "status": "pass"
+  },
+  "gcc-torture/980929-1": {
+   "status": "pass"
+  },
+  "gcc-torture/981001-1": {
+   "status": "pass"
+  },
+  "gcc-torture/981019-1": {
+   "status": "pass"
+  },
+  "gcc-torture/981130-1": {
+   "status": "pass"
+  },
+  "gcc-torture/981206-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990106-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/990106-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/990106-2": {
+   "status": "pass"
+  },
+  "gcc-torture/990117-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990127-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990127-2": {
+   "status": "pass"
+  },
+  "gcc-torture/990128-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990130-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990211-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990222-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990324-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990326-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990404-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990513-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990524-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990525-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990525-2": {
+   "status": "pass"
+  },
+  "gcc-torture/990527-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990531-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990604-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990628-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990804-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990811-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990826-0": {
+   "status": "pass"
+  },
+  "gcc-torture/990827-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990829-1": {
+   "status": "pass"
+  },
+  "gcc-torture/990923-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991014-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/991014-1.c:12:13: error: array is too large (4611686018427387648 elements)"
+  },
+  "gcc-torture/991016-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991019-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991023-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991030-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991112-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991118-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991201-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991202-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991202-2": {
+   "status": "pass"
+  },
+  "gcc-torture/991202-3": {
+   "status": "pass"
+  },
+  "gcc-torture/991216-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991216-2": {
+   "status": "pass"
+  },
+  "gcc-torture/991216-4": {
+   "status": "pass"
+  },
+  "gcc-torture/991221-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991227-1": {
+   "status": "pass"
+  },
+  "gcc-torture/991228-1": {
+   "status": "pass"
+  },
+  "gcc-torture/alias-1": {
+   "status": "pass"
+  },
+  "gcc-torture/alias-4": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/alias-4.c:3:30: error: aliases are not supported on darwin"
+  },
+  "gcc-torture/alias-access-path-1": {
+   "status": "pass"
+  },
+  "gcc-torture/alias-access-path-2": {
+   "status": "pass"
+  },
+  "gcc-torture/align-1": {
+   "status": "pass"
+  },
+  "gcc-torture/align-2": {
+   "status": "pass"
+  },
+  "gcc-torture/anon-1": {
+   "status": "pass"
+  },
+  "gcc-torture/arith-1": {
+   "status": "pass"
+  },
+  "gcc-torture/arith-rand": {
+   "status": "pass"
+  },
+  "gcc-torture/arith-rand-ll": {
+   "status": "pass"
+  },
+  "gcc-torture/ashldi-1": {
+   "status": "pass"
+  },
+  "gcc-torture/ashrdi-1": {
+   "status": "pass"
+  },
+  "gcc-torture/bcp-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/bf-layout-1": {
+   "status": "pass"
+  },
+  "gcc-torture/bf-pack-1": {
+   "status": "pass"
+  },
+  "gcc-torture/bf-sign-1": {
+   "status": "pass"
+  },
+  "gcc-torture/bf-sign-2": {
+   "status": "pass"
+  },
+  "gcc-torture/bf64-1": {
+   "status": "pass"
+  },
+  "gcc-torture/bitfld-1": {
+   "status": "pass"
+  },
+  "gcc-torture/bitfld-10": {
+   "status": "pass"
+  },
+  "gcc-torture/bitfld-2": {
+   "status": "pass"
+  },
+  "gcc-torture/bitfld-3": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/bitfld-5": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/bitfld-8": {
+   "status": "pass"
+  },
+  "gcc-torture/bitfld-9": {
+   "status": "pass"
+  },
+  "gcc-torture/bitfld-signed1-1": {
+   "status": "pass"
+  },
+  "gcc-torture/bitops-1": {
+   "status": "pass"
+  },
+  "gcc-torture/bswap-1": {
+   "status": "pass"
+  },
+  "gcc-torture/builtin-bitops-1": {
+   "status": "pass"
+  },
+  "gcc-torture/builtin-constant": {
+   "status": "crash",
+   "detail": "signal 6"
+  },
+  "gcc-torture/builtin-prefetch-1": {
+   "status": "pass"
+  },
+  "gcc-torture/builtin-prefetch-2": {
+   "status": "pass"
+  },
+  "gcc-torture/builtin-prefetch-3": {
+   "status": "pass"
+  },
+  "gcc-torture/builtin-prefetch-4": {
+   "status": "pass"
+  },
+  "gcc-torture/builtin-prefetch-5": {
+   "status": "pass"
+  },
+  "gcc-torture/builtin-prefetch-6": {
+   "status": "pass"
+  },
+  "gcc-torture/builtin-types-compatible-p": {
+   "status": "crash",
+   "detail": "signal 6"
+  },
+  "gcc-torture/cbrt": {
+   "status": "pass"
+  },
+  "gcc-torture/cmpdi-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/cmpdi-1.c:6:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/cmpsf-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/cmpsf-1.c:8:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/cmpsi-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/cmpsi-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/compare-1": {
+   "status": "pass"
+  },
+  "gcc-torture/compare-2": {
+   "status": "pass"
+  },
+  "gcc-torture/compare-3": {
+   "status": "link_error",
+   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/complex-1": {
+   "status": "pass"
+  },
+  "gcc-torture/complex-2": {
+   "status": "pass"
+  },
+  "gcc-torture/complex-3": {
+   "status": "pass"
+  },
+  "gcc-torture/complex-4": {
+   "status": "pass"
+  },
+  "gcc-torture/complex-5": {
+   "status": "pass"
+  },
+  "gcc-torture/complex-7": {
+   "status": "pass"
+  },
+  "gcc-torture/compndlit-1": {
+   "status": "pass"
+  },
+  "gcc-torture/const-addr-expr-1": {
+   "status": "pass"
+  },
+  "gcc-torture/conversion": {
+   "status": "pass"
+  },
+  "gcc-torture/cvt-1": {
+   "status": "pass"
+  },
+  "gcc-torture/dbra-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/dbra-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/divcmp-1": {
+   "status": "pass"
+  },
+  "gcc-torture/divcmp-2": {
+   "status": "pass"
+  },
+  "gcc-torture/divcmp-3": {
+   "status": "pass"
+  },
+  "gcc-torture/divcmp-4": {
+   "status": "pass"
+  },
+  "gcc-torture/divcmp-5": {
+   "status": "pass"
+  },
+  "gcc-torture/divconst-1": {
+   "status": "pass"
+  },
+  "gcc-torture/divconst-2": {
+   "status": "pass"
+  },
+  "gcc-torture/divconst-3": {
+   "status": "pass"
+  },
+  "gcc-torture/divmod-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/divmod-1.c:3:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/doloop-1": {
+   "status": "pass"
+  },
+  "gcc-torture/doloop-2": {
+   "status": "pass"
+  },
+  "gcc-torture/enum-1": {
+   "status": "pass"
+  },
+  "gcc-torture/enum-2": {
+   "status": "pass"
+  },
+  "gcc-torture/enum-3": {
+   "status": "pass"
+  },
+  "gcc-torture/extzvsi": {
+   "status": "pass"
+  },
+  "gcc-torture/ffs-1": {
+   "status": "pass"
+  },
+  "gcc-torture/ffs-2": {
+   "status": "pass"
+  },
+  "gcc-torture/float-floor": {
+   "status": "pass"
+  },
+  "gcc-torture/floatunsisf-1": {
+   "status": "pass"
+  },
+  "gcc-torture/func-ptr-1": {
+   "status": "pass"
+  },
+  "gcc-torture/ifcvt-onecmpl-abs-1": {
+   "status": "pass"
+  },
+  "gcc-torture/inst-check": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/inst-check.c:5:3: error: parameter 'm' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/int-compare": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/int-compare.c:5:8: error: parameter 'b' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/ipa-sra-1": {
+   "status": "pass"
+  },
+  "gcc-torture/longlong": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-1": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-10": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-11": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-12": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-13": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-14": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-15": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/loop-2.c:5:4: error: parameter 'b' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/loop-2b": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-2c": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/loop-2d": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/loop-2d.c:5:4: error: parameter 'b' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/loop-2e": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-3": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/loop-3.c:7:4: error: parameter 'i' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/loop-3b": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/loop-3b.c:7:4: error: parameter 'i' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/loop-3c": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/loop-3c.c:7:4: error: parameter 'm' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/loop-4": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-4b": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-5": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-6": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-7": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-8": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-9": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-ivopts-1": {
+   "status": "pass"
+  },
+  "gcc-torture/loop-ivopts-2": {
+   "status": "pass"
+  },
+  "gcc-torture/lshrdi-1": {
+   "status": "pass"
+  },
+  "gcc-torture/lto-tbaa-1": {
+   "status": "pass"
+  },
+  "gcc-torture/mayalias-1": {
+   "status": "pass"
+  },
+  "gcc-torture/mayalias-2": {
+   "status": "pass"
+  },
+  "gcc-torture/mayalias-3": {
+   "status": "pass"
+  },
+  "gcc-torture/medce-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/memchr-1": {
+   "status": "pass"
+  },
+  "gcc-torture/memcpy-1": {
+   "status": "pass"
+  },
+  "gcc-torture/memcpy-2": {
+   "status": "pass"
+  },
+  "gcc-torture/memcpy-bi": {
+   "status": "pass"
+  },
+  "gcc-torture/memset-1": {
+   "status": "pass"
+  },
+  "gcc-torture/memset-2": {
+   "status": "pass"
+  },
+  "gcc-torture/memset-3": {
+   "status": "pass"
+  },
+  "gcc-torture/memset-4": {
+   "status": "pass"
+  },
+  "gcc-torture/minmaxcmp-1": {
+   "status": "pass"
+  },
+  "gcc-torture/mod-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/mod-1.c:3:7: error: parameter 'y' was not declared, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/mul-sext": {
+   "status": "pass"
+  },
+  "gcc-torture/multdi-1": {
+   "status": "pass"
+  },
+  "gcc-torture/multi-ix": {
+   "status": "pass"
+  },
+  "gcc-torture/nest-align-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/nest-align-1.c:26:5: error: function definition is not allowed here"
+  },
+  "gcc-torture/nest-stdar-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/nest-stdar-1.c:10:5: error: function definition is not allowed here"
+  },
+  "gcc-torture/nestfunc-4": {
+   "status": "pass"
+  },
+  "gcc-torture/nestfunc-7": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/nestfunc-7.c:16:5: error: function definition is not allowed here"
+  },
+  "gcc-torture/p18298": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/packed-1": {
+   "status": "pass"
+  },
+  "gcc-torture/packed-2": {
+   "status": "pass"
+  },
+  "gcc-torture/packed-aligned": {
+   "status": "pass"
+  },
+  "gcc-torture/pending-4": {
+   "status": "pass"
+  },
+  "gcc-torture/postmod-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr100453": {
+   "status": "pass"
+  },
+  "gcc-torture/pr101335": {
+   "status": "pass"
+  },
+  "gcc-torture/pr102134": {
+   "status": "pass"
+  },
+  "gcc-torture/pr103052": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr103052.c:5:2: error: use of unknown builtin '__builtin_exit' [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/pr103209": {
+   "status": "pass"
+  },
+  "gcc-torture/pr103255": {
+   "status": "pass"
+  },
+  "gcc-torture/pr103376": {
+   "status": "pass"
+  },
+  "gcc-torture/pr103405": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr103405.c:25:3: error: function definition is not allowed here"
+  },
+  "gcc-torture/pr10352-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr104196": {
+   "status": "pass"
+  },
+  "gcc-torture/pr104604": {
+   "status": "pass"
+  },
+  "gcc-torture/pr104814": {
+   "status": "pass"
+  },
+  "gcc-torture/pr104839": {
+   "status": "pass"
+  },
+  "gcc-torture/pr105613": {
+   "status": "crash",
+   "detail": "signal 11"
+  },
+  "gcc-torture/pr105777": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr105777.c:3:10: fatal error: '../../gcc.dg/tree-ssa/pr105777.c' file not found"
+  },
+  "gcc-torture/pr105984": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr105984.c:8:8: error: use of unknown builtin '__builtin_mul_overflow_p' [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/pr106032": {
+   "status": "pass"
+  },
+  "gcc-torture/pr106523": {
+   "status": "pass"
+  },
+  "gcc-torture/pr107131": {
+   "status": "pass"
+  },
+  "gcc-torture/pr107879": {
+   "status": "pass"
+  },
+  "gcc-torture/pr107881-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr108064": {
+   "status": "pass"
+  },
+  "gcc-torture/pr108292": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr108292.c:12:33: error: address of vector element requested"
+  },
+  "gcc-torture/pr108498-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr108789": {
+   "status": "pass"
+  },
+  "gcc-torture/pr109040": {
+   "status": "crash",
+   "detail": "signal 11"
+  },
+  "gcc-torture/pr109778": {
+   "status": "pass"
+  },
+  "gcc-torture/pr109925": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110115": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110165-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110166-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110252-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110252-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110252-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110252-4": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110666-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110817-1": {
+   "status": "crash",
+   "detail": "signal 11"
+  },
+  "gcc-torture/pr110817-2": {
+   "status": "crash",
+   "detail": "signal 11"
+  },
+  "gcc-torture/pr110817-3": {
+   "status": "crash",
+   "detail": "signal 11"
+  },
+  "gcc-torture/pr110914": {
+   "status": "pass"
+  },
+  "gcc-torture/pr110954-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111151": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111331-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111331-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111331-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111408": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111422": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111431-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111469-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr111863-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr112758": {
+   "status": "pass"
+  },
+  "gcc-torture/pr113010": {
+   "status": "pass"
+  },
+  "gcc-torture/pr113787": {
+   "status": "pass"
+  },
+  "gcc-torture/pr114207": {
+   "status": "pass"
+  },
+  "gcc-torture/pr114396": {
+   "status": "pass"
+  },
+  "gcc-torture/pr114552": {
+   "status": "pass"
+  },
+  "gcc-torture/pr114965": {
+   "status": "pass"
+  },
+  "gcc-torture/pr115033": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr115033.c:34:3: error: use of unknown builtin '__builtin_exit' [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/pr15262": {
+   "status": "pass"
+  },
+  "gcc-torture/pr15262-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr15262-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr15296": {
+   "status": "pass"
+  },
+  "gcc-torture/pr16790-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr17078-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr17133": {
+   "status": "pass"
+  },
+  "gcc-torture/pr17252": {
+   "status": "pass"
+  },
+  "gcc-torture/pr19005": {
+   "status": "pass"
+  },
+  "gcc-torture/pr19449": {
+   "status": "pass"
+  },
+  "gcc-torture/pr19515": {
+   "status": "pass"
+  },
+  "gcc-torture/pr19606": {
+   "status": "pass"
+  },
+  "gcc-torture/pr19687": {
+   "status": "pass"
+  },
+  "gcc-torture/pr20100-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr20187-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr20466-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr20527-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr20601-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr20621-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr21173": {
+   "status": "pass"
+  },
+  "gcc-torture/pr21331": {
+   "status": "pass"
+  },
+  "gcc-torture/pr21964-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22061-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22061-3": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr22061-3.c:7:28: error: function definition is not allowed here"
+  },
+  "gcc-torture/pr22098-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22098-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22098-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22141-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22141-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22348": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22429": {
+   "status": "pass"
+  },
+  "gcc-torture/pr22630": {
+   "status": "pass"
+  },
+  "gcc-torture/pr23324": {
+   "status": "pass"
+  },
+  "gcc-torture/pr23604": {
+   "status": "pass"
+  },
+  "gcc-torture/pr23941": {
+   "status": "pass"
+  },
+  "gcc-torture/pr24141": {
+   "status": "pass"
+  },
+  "gcc-torture/pr24142": {
+   "status": "pass"
+  },
+  "gcc-torture/pr24716": {
+   "status": "pass"
+  },
+  "gcc-torture/pr24851": {
+   "status": "pass"
+  },
+  "gcc-torture/pr25125": {
+   "status": "pass"
+  },
+  "gcc-torture/pr25737": {
+   "status": "pass"
+  },
+  "gcc-torture/pr27073": {
+   "status": "pass"
+  },
+  "gcc-torture/pr27260": {
+   "status": "pass"
+  },
+  "gcc-torture/pr27285": {
+   "status": "pass"
+  },
+  "gcc-torture/pr27364": {
+   "status": "pass"
+  },
+  "gcc-torture/pr27671-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr28289": {
+   "status": "pass"
+  },
+  "gcc-torture/pr28403": {
+   "status": "pass"
+  },
+  "gcc-torture/pr28651": {
+   "status": "pass"
+  },
+  "gcc-torture/pr28778": {
+   "status": "pass"
+  },
+  "gcc-torture/pr28865": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr28865.c:3:20: error: initialization of flexible array member is not allowed"
+  },
+  "gcc-torture/pr28982a": {
+   "status": "pass"
+  },
+  "gcc-torture/pr28982b": {
+   "status": "pass"
+  },
+  "gcc-torture/pr29006": {
+   "status": "pass"
+  },
+  "gcc-torture/pr29156": {
+   "status": "pass"
+  },
+  "gcc-torture/pr29695-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr29695-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr29797-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr29798": {
+   "status": "pass"
+  },
+  "gcc-torture/pr30185": {
+   "status": "pass"
+  },
+  "gcc-torture/pr30314": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr30314.c:3:10: fatal error: '../../gcc.dg/tree-ssa/pr30314.c' file not found"
+  },
+  "gcc-torture/pr30778": {
+   "status": "pass"
+  },
+  "gcc-torture/pr31072": {
+   "status": "pass"
+  },
+  "gcc-torture/pr31136": {
+   "status": "pass"
+  },
+  "gcc-torture/pr31169": {
+   "status": "pass"
+  },
+  "gcc-torture/pr31448-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr31605": {
+   "status": "pass"
+  },
+  "gcc-torture/pr32244-1": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/pr32500": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33142": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33382": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33631": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33669": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33779-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33779-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33870": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33870-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr33992": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34070-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34070-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34099": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34099-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34130": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34154": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34176": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34415": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34768-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34768-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr34971": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/pr34982": {
+   "status": "pass"
+  },
+  "gcc-torture/pr35163": {
+   "status": "pass"
+  },
+  "gcc-torture/pr35231": {
+   "status": "pass"
+  },
+  "gcc-torture/pr35390": {
+   "status": "pass"
+  },
+  "gcc-torture/pr35472": {
+   "status": "pass"
+  },
+  "gcc-torture/pr35800": {
+   "status": "pass"
+  },
+  "gcc-torture/pr36034-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr36034-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr36038": {
+   "status": "pass"
+  },
+  "gcc-torture/pr36077": {
+   "status": "pass"
+  },
+  "gcc-torture/pr36339": {
+   "status": "pass"
+  },
+  "gcc-torture/pr36343": {
+   "status": "pass"
+  },
+  "gcc-torture/pr36691": {
+   "status": "pass"
+  },
+  "gcc-torture/pr36765": {
+   "status": "pass"
+  },
+  "gcc-torture/pr37102": {
+   "status": "pass"
+  },
+  "gcc-torture/pr37125": {
+   "status": "pass"
+  },
+  "gcc-torture/pr37780": {
+   "status": "pass"
+  },
+  "gcc-torture/pr37882": {
+   "status": "pass"
+  },
+  "gcc-torture/pr37924": {
+   "status": "pass"
+  },
+  "gcc-torture/pr37931": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38048-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38048-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38051": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38212": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38236": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38422": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38533": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38819": {
+   "status": "pass"
+  },
+  "gcc-torture/pr38969": {
+   "status": "pass"
+  },
+  "gcc-torture/pr39100": {
+   "status": "pass"
+  },
+  "gcc-torture/pr39120": {
+   "status": "pass"
+  },
+  "gcc-torture/pr39228": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr39228.c:9:10: error: use of unknown builtin '__builtin_isinff' [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/pr39233": {
+   "status": "pass"
+  },
+  "gcc-torture/pr39240": {
+   "status": "pass"
+  },
+  "gcc-torture/pr39339": {
+   "status": "pass"
+  },
+  "gcc-torture/pr39501": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40022": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40057": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40386": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40404": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40493": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40579": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40657": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40668": {
+   "status": "pass"
+  },
+  "gcc-torture/pr40747": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41239": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41317": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41395-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41395-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41463": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41750": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41917": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41919": {
+   "status": "pass"
+  },
+  "gcc-torture/pr41935": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr41935.c:9:23: error: fields must have a constant size: 'variable length array in structure' extension will never be supported"
+  },
+  "gcc-torture/pr42006": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42142": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42154": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42231": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42248": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42269-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42512": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42544": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42570": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42614": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42691": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42721": {
+   "status": "pass"
+  },
+  "gcc-torture/pr42833": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43008": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43236": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43269": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43385": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43438": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43560": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43629": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43784": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43835": {
+   "status": "pass"
+  },
+  "gcc-torture/pr43987": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44164": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44202-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44468": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44555": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44575": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44683": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44828": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44852": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44858": {
+   "status": "pass"
+  },
+  "gcc-torture/pr44942": {
+   "status": "pass"
+  },
+  "gcc-torture/pr45034": {
+   "status": "pass"
+  },
+  "gcc-torture/pr45070": {
+   "status": "pass"
+  },
+  "gcc-torture/pr45695": {
+   "status": "pass"
+  },
+  "gcc-torture/pr46019": {
+   "status": "pass"
+  },
+  "gcc-torture/pr46309": {
+   "status": "pass"
+  },
+  "gcc-torture/pr46316": {
+   "status": "pass"
+  },
+  "gcc-torture/pr46909-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr46909-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr47148": {
+   "status": "pass"
+  },
+  "gcc-torture/pr47155": {
+   "status": "pass"
+  },
+  "gcc-torture/pr47299": {
+   "status": "pass"
+  },
+  "gcc-torture/pr47337": {
+   "status": "pass"
+  },
+  "gcc-torture/pr47538": {
+   "status": "pass"
+  },
+  "gcc-torture/pr47925": {
+   "status": "pass"
+  },
+  "gcc-torture/pr48197": {
+   "status": "pass"
+  },
+  "gcc-torture/pr48571-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr48717": {
+   "status": "pass"
+  },
+  "gcc-torture/pr48809": {
+   "status": "pass"
+  },
+  "gcc-torture/pr48814-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr48814-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr48973-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr48973-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49039": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49073": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49123": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49161": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49186": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49218": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49279": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49281": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49390": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49419": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49644": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49712": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49768": {
+   "status": "pass"
+  },
+  "gcc-torture/pr49886": {
+   "status": "pass"
+  },
+  "gcc-torture/pr50865": {
+   "status": "pass"
+  },
+  "gcc-torture/pr51023": {
+   "status": "pass"
+  },
+  "gcc-torture/pr51323": {
+   "status": "pass"
+  },
+  "gcc-torture/pr51466": {
+   "status": "pass"
+  },
+  "gcc-torture/pr51877": {
+   "status": "pass"
+  },
+  "gcc-torture/pr51933": {
+   "status": "pass"
+  },
+  "gcc-torture/pr52129": {
+   "status": "pass"
+  },
+  "gcc-torture/pr52209": {
+   "status": "pass"
+  },
+  "gcc-torture/pr52286": {
+   "status": "pass"
+  },
+  "gcc-torture/pr52760": {
+   "status": "pass"
+  },
+  "gcc-torture/pr53084": {
+   "status": "pass"
+  },
+  "gcc-torture/pr53160": {
+   "status": "pass"
+  },
+  "gcc-torture/pr53465": {
+   "status": "pass"
+  },
+  "gcc-torture/pr53645": {
+   "status": "pass"
+  },
+  "gcc-torture/pr53645-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr53688": {
+   "status": "pass"
+  },
+  "gcc-torture/pr54471": {
+   "status": "pass"
+  },
+  "gcc-torture/pr54937": {
+   "status": "pass"
+  },
+  "gcc-torture/pr54985": {
+   "status": "pass"
+  },
+  "gcc-torture/pr55137": {
+   "status": "pass"
+  },
+  "gcc-torture/pr55750": {
+   "status": "pass"
+  },
+  "gcc-torture/pr55875": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr55875.c:4:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/pr56051": {
+   "status": "pass"
+  },
+  "gcc-torture/pr56205": {
+   "status": "pass"
+  },
+  "gcc-torture/pr56250": {
+   "status": "pass"
+  },
+  "gcc-torture/pr56837": {
+   "status": "pass"
+  },
+  "gcc-torture/pr56866": {
+   "status": "pass"
+  },
+  "gcc-torture/pr56899": {
+   "status": "pass"
+  },
+  "gcc-torture/pr56962": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57130": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57131": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57144": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57281": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57321": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57344-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57344-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57344-4": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57568": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57829": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57860": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57861": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57875": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57876": {
+   "status": "pass"
+  },
+  "gcc-torture/pr57877": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58209": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58277-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58277-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58364": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58365": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58385": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58387": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58419": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58431": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58564": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58574": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58640": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58640-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58662": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58726": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58831": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58943": {
+   "status": "pass"
+  },
+  "gcc-torture/pr58984": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59014": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59014-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59101": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59221": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59229": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59358": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59387": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59388": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59413": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59643": {
+   "status": "pass"
+  },
+  "gcc-torture/pr59747": {
+   "status": "pass"
+  },
+  "gcc-torture/pr60017": {
+   "status": "pass"
+  },
+  "gcc-torture/pr60062": {
+   "status": "pass"
+  },
+  "gcc-torture/pr60072": {
+   "status": "pass"
+  },
+  "gcc-torture/pr60454": {
+   "status": "pass"
+  },
+  "gcc-torture/pr60960": {
+   "status": "pass"
+  },
+  "gcc-torture/pr61306-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr61306-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr61306-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr61375": {
+   "status": "pass"
+  },
+  "gcc-torture/pr61517": {
+   "status": "pass"
+  },
+  "gcc-torture/pr61673": {
+   "status": "pass"
+  },
+  "gcc-torture/pr61682": {
+   "status": "pass"
+  },
+  "gcc-torture/pr61725": {
+   "status": "pass"
+  },
+  "gcc-torture/pr62151": {
+   "status": "pass"
+  },
+  "gcc-torture/pr63209": {
+   "status": "pass"
+  },
+  "gcc-torture/pr63302": {
+   "status": "pass"
+  },
+  "gcc-torture/pr63641": {
+   "status": "pass"
+  },
+  "gcc-torture/pr63659": {
+   "status": "pass"
+  },
+  "gcc-torture/pr63843": {
+   "status": "pass"
+  },
+  "gcc-torture/pr64006": {
+   "status": "pass"
+  },
+  "gcc-torture/pr64255": {
+   "status": "pass"
+  },
+  "gcc-torture/pr64260": {
+   "status": "pass"
+  },
+  "gcc-torture/pr64682": {
+   "status": "pass"
+  },
+  "gcc-torture/pr64718": {
+   "status": "pass"
+  },
+  "gcc-torture/pr64756": {
+   "status": "pass"
+  },
+  "gcc-torture/pr64957": {
+   "status": "pass"
+  },
+  "gcc-torture/pr64979": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65053-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65053-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65170": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65215-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65215-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65215-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65215-4": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65215-5": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65216": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65369": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65401": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65418-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65418-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65427": {
+   "status": "crash",
+   "detail": "signal 6"
+  },
+  "gcc-torture/pr65648": {
+   "status": "pass"
+  },
+  "gcc-torture/pr65956": {
+   "status": "pass"
+  },
+  "gcc-torture/pr66187": {
+   "status": "pass"
+  },
+  "gcc-torture/pr66233": {
+   "status": "pass"
+  },
+  "gcc-torture/pr66757": {
+   "status": "pass"
+  },
+  "gcc-torture/pr66940": {
+   "status": "pass"
+  },
+  "gcc-torture/pr67037": {
+   "status": "pass"
+  },
+  "gcc-torture/pr67226": {
+   "status": "pass"
+  },
+  "gcc-torture/pr67714": {
+   "status": "pass"
+  },
+  "gcc-torture/pr67929_1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68143_1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68185": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68249": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68250": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68321": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68328": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68376-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68376-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68381": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68390": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68506": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68532": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68624": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68841": {
+   "status": "pass"
+  },
+  "gcc-torture/pr68911": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69097-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69097-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69320-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69320-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69320-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69320-4": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69403": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69447": {
+   "status": "pass"
+  },
+  "gcc-torture/pr69691": {
+   "status": "pass"
+  },
+  "gcc-torture/pr70005": {
+   "status": "pass"
+  },
+  "gcc-torture/pr70127": {
+   "status": "pass"
+  },
+  "gcc-torture/pr70222-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr70222-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr70429": {
+   "status": "pass"
+  },
+  "gcc-torture/pr70566": {
+   "status": "pass"
+  },
+  "gcc-torture/pr70586": {
+   "status": "pass"
+  },
+  "gcc-torture/pr70903": {
+   "status": "pass"
+  },
+  "gcc-torture/pr71083": {
+   "status": "pass"
+  },
+  "gcc-torture/pr71335": {
+   "status": "pass"
+  },
+  "gcc-torture/pr71550": {
+   "status": "pass"
+  },
+  "gcc-torture/pr71554": {
+   "status": "pass"
+  },
+  "gcc-torture/pr71626-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr71626-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr71631": {
+   "status": "pass"
+  },
+  "gcc-torture/pr71700": {
+   "status": "pass"
+  },
+  "gcc-torture/pr77718": {
+   "status": "pass"
+  },
+  "gcc-torture/pr77766": {
+   "status": "pass"
+  },
+  "gcc-torture/pr77767": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78378": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78436": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78438": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78477": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78559": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78586": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78617": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78675": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78720": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78726": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78791": {
+   "status": "pass"
+  },
+  "gcc-torture/pr78856": {
+   "status": "pass"
+  },
+  "gcc-torture/pr79043": {
+   "status": "pass"
+  },
+  "gcc-torture/pr79121": {
+   "status": "pass"
+  },
+  "gcc-torture/pr79286": {
+   "status": "pass"
+  },
+  "gcc-torture/pr79354": {
+   "status": "pass"
+  },
+  "gcc-torture/pr79388": {
+   "status": "pass"
+  },
+  "gcc-torture/pr79450": {
+   "status": "pass"
+  },
+  "gcc-torture/pr79737-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr79737-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr80153": {
+   "status": "pass"
+  },
+  "gcc-torture/pr80421": {
+   "status": "pass"
+  },
+  "gcc-torture/pr80501": {
+   "status": "pass"
+  },
+  "gcc-torture/pr81281": {
+   "status": "pass"
+  },
+  "gcc-torture/pr81423": {
+   "status": "pass"
+  },
+  "gcc-torture/pr81503": {
+   "status": "pass"
+  },
+  "gcc-torture/pr81555": {
+   "status": "pass"
+  },
+  "gcc-torture/pr81556": {
+   "status": "pass"
+  },
+  "gcc-torture/pr81588": {
+   "status": "pass"
+  },
+  "gcc-torture/pr81913": {
+   "status": "pass"
+  },
+  "gcc-torture/pr82192": {
+   "status": "pass"
+  },
+  "gcc-torture/pr82387": {
+   "status": "pass"
+  },
+  "gcc-torture/pr82388": {
+   "status": "pass"
+  },
+  "gcc-torture/pr82524": {
+   "status": "pass"
+  },
+  "gcc-torture/pr82954": {
+   "status": "pass"
+  },
+  "gcc-torture/pr83269": {
+   "status": "pass"
+  },
+  "gcc-torture/pr83298": {
+   "status": "pass"
+  },
+  "gcc-torture/pr83362": {
+   "status": "pass"
+  },
+  "gcc-torture/pr83383": {
+   "status": "pass"
+  },
+  "gcc-torture/pr83477": {
+   "status": "pass"
+  },
+  "gcc-torture/pr84169": {
+   "status": "pass"
+  },
+  "gcc-torture/pr84339": {
+   "status": "pass"
+  },
+  "gcc-torture/pr84478": {
+   "status": "pass"
+  },
+  "gcc-torture/pr84524": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85095": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85156": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85169": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85529-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85529-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85582-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85582-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85582-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr85756": {
+   "status": "pass"
+  },
+  "gcc-torture/pr86231": {
+   "status": "pass"
+  },
+  "gcc-torture/pr86492": {
+   "status": "pass"
+  },
+  "gcc-torture/pr86659-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr86659-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr86714": {
+   "status": "pass"
+  },
+  "gcc-torture/pr86844": {
+   "status": "pass"
+  },
+  "gcc-torture/pr87053": {
+   "status": "pass"
+  },
+  "gcc-torture/pr87290": {
+   "status": "pass"
+  },
+  "gcc-torture/pr87623": {
+   "status": "pass"
+  },
+  "gcc-torture/pr88693": {
+   "status": "pass"
+  },
+  "gcc-torture/pr88714": {
+   "status": "pass"
+  },
+  "gcc-torture/pr88739": {
+   "status": "pass"
+  },
+  "gcc-torture/pr88904": {
+   "status": "pass"
+  },
+  "gcc-torture/pr89369": {
+   "status": "pass"
+  },
+  "gcc-torture/pr89434": {
+   "status": "pass"
+  },
+  "gcc-torture/pr89634": {
+   "status": "pass"
+  },
+  "gcc-torture/pr89826": {
+   "status": "pass"
+  },
+  "gcc-torture/pr90025": {
+   "status": "pass"
+  },
+  "gcc-torture/pr90311": {
+   "status": "pass"
+  },
+  "gcc-torture/pr90348": {
+   "status": "pass"
+  },
+  "gcc-torture/pr90949": {
+   "status": "pass"
+  },
+  "gcc-torture/pr91137": {
+   "status": "pass"
+  },
+  "gcc-torture/pr91450-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr91450-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr91597": {
+   "status": "pass"
+  },
+  "gcc-torture/pr91632": {
+   "status": "pass"
+  },
+  "gcc-torture/pr91635": {
+   "status": "pass"
+  },
+  "gcc-torture/pr92140": {
+   "status": "pass"
+  },
+  "gcc-torture/pr92618": {
+   "status": "pass"
+  },
+  "gcc-torture/pr92904": {
+   "status": "ref_fail",
+   "detail": "signal 6"
+  },
+  "gcc-torture/pr93249": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93402": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93434": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93494": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93582": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93744-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93744-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93744-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93908": {
+   "status": "pass"
+  },
+  "gcc-torture/pr93945": {
+   "status": "pass"
+  },
+  "gcc-torture/pr94130": {
+   "status": "pass"
+  },
+  "gcc-torture/pr94134": {
+   "status": "pass"
+  },
+  "gcc-torture/pr94412": {
+   "status": "crash",
+   "detail": "signal 11"
+  },
+  "gcc-torture/pr94524-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr94524-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr94567": {
+   "status": "pass"
+  },
+  "gcc-torture/pr94591": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr94591.c:9:8: error: use of unknown builtin '__builtin_shuffle' [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/pr94724": {
+   "status": "pass"
+  },
+  "gcc-torture/pr94734": {
+   "status": "pass"
+  },
+  "gcc-torture/pr94809": {
+   "status": "pass"
+  },
+  "gcc-torture/pr95731": {
+   "status": "pass"
+  },
+  "gcc-torture/pr96549": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97073": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97325": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97386-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97386-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97404": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97421-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97421-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97421-3": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97695": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97836": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97888-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr97888-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr98304-2": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/pr98304-2.c:3:10: fatal error: '../../gcc.dg/pr98304-1.c' file not found"
+  },
+  "gcc-torture/pr98474": {
+   "status": "pass"
+  },
+  "gcc-torture/pr98681": {
+   "status": "pass"
+  },
+  "gcc-torture/pr98727": {
+   "status": "pass"
+  },
+  "gcc-torture/pr98736": {
+   "status": "pass"
+  },
+  "gcc-torture/pr98853-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pr98853-2": {
+   "status": "pass"
+  },
+  "gcc-torture/pr99079": {
+   "status": "pass"
+  },
+  "gcc-torture/pr99751": {
+   "status": "pass"
+  },
+  "gcc-torture/pta-field-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pta-field-2": {
+   "status": "pass"
+  },
+  "gcc-torture/ptr-arith-1": {
+   "status": "pass"
+  },
+  "gcc-torture/pure-1": {
+   "status": "link_error",
+   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/pushpop_macro": {
+   "status": "pass"
+  },
+  "gcc-torture/regstack-1": {
+   "status": "pass"
+  },
+  "gcc-torture/restrict-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/return-addr": {
+   "status": "wrong_output",
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16d0af08f 0x16d0af08f 0x16d0af08f 0x16d0af08f'"
+  },
+  "gcc-torture/scal-to-vec1": {
+   "status": "pass"
+  },
+  "gcc-torture/scal-to-vec2": {
+   "status": "pass"
+  },
+  "gcc-torture/scal-to-vec3": {
+   "status": "pass"
+  },
+  "gcc-torture/scope-1": {
+   "status": "pass"
+  },
+  "gcc-torture/shiftopt-1": {
+   "status": "link_error",
+   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/signed1bitfield-1": {
+   "status": "pass"
+  },
+  "gcc-torture/simd-1": {
+   "status": "crash",
+   "detail": "signal 11"
+  },
+  "gcc-torture/simd-2": {
+   "status": "crash",
+   "detail": "signal 11"
+  },
+  "gcc-torture/simd-5": {
+   "status": "pass"
+  },
+  "gcc-torture/simd-6": {
+   "status": "pass"
+  },
+  "gcc-torture/ssad-run": {
+   "status": "pass"
+  },
+  "gcc-torture/stdarg-1": {
+   "status": "pass"
+  },
+  "gcc-torture/stdarg-2": {
+   "status": "pass"
+  },
+  "gcc-torture/stdarg-3": {
+   "status": "pass"
+  },
+  "gcc-torture/stdarg-4": {
+   "status": "pass"
+  },
+  "gcc-torture/stkalign": {
+   "status": "pass"
+  },
+  "gcc-torture/strcmp-1": {
+   "status": "pass"
+  },
+  "gcc-torture/strcpy-1": {
+   "status": "pass"
+  },
+  "gcc-torture/strcpy-2": {
+   "status": "pass"
+  },
+  "gcc-torture/strct-pack-1": {
+   "status": "pass"
+  },
+  "gcc-torture/strct-pack-2": {
+   "status": "pass"
+  },
+  "gcc-torture/strct-pack-3": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/strct-pack-3.c:9:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/strct-pack-4": {
+   "status": "pass"
+  },
+  "gcc-torture/strct-stdarg-1": {
+   "status": "pass"
+  },
+  "gcc-torture/strct-varg-1": {
+   "status": "pass"
+  },
+  "gcc-torture/string-opt-17": {
+   "status": "pass"
+  },
+  "gcc-torture/string-opt-18": {
+   "status": "link_error",
+   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/string-opt-5": {
+   "status": "pass"
+  },
+  "gcc-torture/strlen-1": {
+   "status": "pass"
+  },
+  "gcc-torture/strlen-2": {
+   "status": "pass"
+  },
+  "gcc-torture/strlen-3": {
+   "status": "pass"
+  },
+  "gcc-torture/strlen-4": {
+   "status": "pass"
+  },
+  "gcc-torture/strlen-5": {
+   "status": "pass"
+  },
+  "gcc-torture/strlen-6": {
+   "status": "pass"
+  },
+  "gcc-torture/strlen-7": {
+   "status": "pass"
+  },
+  "gcc-torture/strncmp-1": {
+   "status": "pass"
+  },
+  "gcc-torture/struct-aliasing-1": {
+   "status": "pass"
+  },
+  "gcc-torture/struct-cpy-1": {
+   "status": "pass"
+  },
+  "gcc-torture/struct-ini-1": {
+   "status": "pass"
+  },
+  "gcc-torture/struct-ini-2": {
+   "status": "pass"
+  },
+  "gcc-torture/struct-ini-3": {
+   "status": "pass"
+  },
+  "gcc-torture/struct-ini-4": {
+   "status": "pass"
+  },
+  "gcc-torture/struct-ret-1": {
+   "status": "pass"
+  },
+  "gcc-torture/struct-ret-2": {
+   "status": "pass"
+  },
+  "gcc-torture/switch-1": {
+   "status": "pass"
+  },
+  "gcc-torture/tstdi-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/tstdi-1.c:6:1: error: type specifier missing, defaults to 'int'; ISO C99 and later do not support implicit int [-Wimplicit-int]"
+  },
+  "gcc-torture/unroll-1": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/usad-run": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-1": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-10": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-11": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-12": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-13": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-14": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-15": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-16": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-17": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-18": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-19": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-2": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-20": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-21": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-22": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-23": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-24": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-26": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-4": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-5": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-6": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-7": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/va-arg-8": {
+   "status": "ref_fail",
+   "detail": "link: Undefined symbols for architecture arm64:"
+  },
+  "gcc-torture/va-arg-9": {
+   "status": "pass"
+  },
+  "gcc-torture/va-arg-pack-1": {
+   "status": "ref_fail",
+   "detail": "compile: tests/difftest/suites/gcc-torture/va-arg-pack-1.c:125:33: error: use of unknown builtin '__builtin_va_arg_pack' [-Wimplicit-function-declaration]"
+  },
+  "gcc-torture/va-arg-trap-1": {
+   "status": "pass"
+  },
+  "gcc-torture/vrp-1": {
+   "status": "pass"
+  },
+  "gcc-torture/vrp-2": {
+   "status": "pass"
+  },
+  "gcc-torture/vrp-3": {
+   "status": "pass"
+  },
+  "gcc-torture/vrp-4": {
+   "status": "pass"
+  },
+  "gcc-torture/vrp-7": {
+   "status": "pass"
+  },
+  "gcc-torture/wchar_t-1": {
+   "status": "pass"
+  },
+  "gcc-torture/widechar-1": {
+   "status": "pass"
+  },
+  "gcc-torture/widechar-2": {
+   "status": "pass"
+  },
+  "gcc-torture/widechar-3": {
+   "status": "pass"
+  },
+  "gcc-torture/zero-struct-1": {
+   "status": "pass"
+  },
+  "gcc-torture/zero-struct-2": {
+   "status": "pass"
+  },
+  "gcc-torture/zerolen-1": {
+   "status": "pass"
+  }
+ }
+}

@@ -1,26 +1,31 @@
 //! ArmCodegen: variadic function operations (va_arg, va_start, va_copy).
 
 use crate::ir::reexports::Value;
-use crate::common::types::IrType;
+use crate::common::types::{IrType, target_is_darwin};
 use super::emit::{ArmCodegen, callee_saved_name};
+
+// On Apple arm64, va_list is a plain `char *` into the caller's stack argument
+// area: every unnamed argument occupies one or more 8-byte slots, so va_start /
+// va_arg / va_copy reduce to pointer bumps. `va_list_ptr` is the address of
+// the `char *` variable.
 
 impl ArmCodegen {
     pub(super) fn emit_va_arg_impl(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
         let is_fp = result_ty.is_float();
         let is_f128 = result_ty.is_long_double();
 
-        if self.state.is_alloca(va_list_ptr.0) {
-            if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
-                self.emit_add_fp_offset("x1", slot.0);
-            }
-        } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
-            let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov x1, {}", reg_name));
-        } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
-            self.emit_load_from_sp("x1", slot.0, "ldr");
-        }
+        self.load_va_list_ptr(va_list_ptr, "x1");
 
-        if is_f128 {
+        if target_is_darwin() {
+            self.state.emit("    ldr x3, [x1]");
+            if result_ty == IrType::F32 {
+                self.state.emit("    ldr w0, [x3]");
+            } else {
+                self.state.emit("    ldr x0, [x3]");
+            }
+            self.state.emit("    add x3, x3, #8");
+            self.state.emit("    str x3, [x1]");
+        } else if is_f128 {
             let label_id = self.state.next_label_id();
             let label_stack = format!(".Lva_stack_{}", label_id);
             let label_done = format!(".Lva_done_{}", label_id);
@@ -107,16 +112,7 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_va_start_impl(&mut self, va_list_ptr: &Value) {
-        if self.state.is_alloca(va_list_ptr.0) {
-            if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
-                self.emit_add_fp_offset("x0", slot.0);
-            }
-        } else if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
-            let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
-        } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
-            self.emit_load_from_sp("x0", slot.0, "ldr");
-        }
+        self.load_va_list_ptr(va_list_ptr, "x0");
 
         let stack_offset = self.current_frame_size + self.va_named_stack_bytes as i64;
         if stack_offset <= 4095 {
@@ -126,6 +122,9 @@ impl ArmCodegen {
             self.state.emit("    add x1, x29, x1");
         }
         self.state.emit("    str x1, [x0]");
+        if target_is_darwin() {
+            return;
+        }
 
         let gr_top_offset = self.va_gp_save_offset + 64;
         self.emit_add_sp_offset("x1", gr_top_offset);
@@ -173,6 +172,11 @@ impl ArmCodegen {
         } else if let Some(dest_slot) = self.state.get_slot(dest_ptr.0) {
             self.emit_load_from_sp("x0", dest_slot.0, "ldr");
         }
+        if target_is_darwin() {
+            self.state.emit("    ldr x2, [x1]");
+            self.state.emit("    str x2, [x0]");
+            return;
+        }
         self.state.emit("    ldp x2, x3, [x1]");
         self.state.emit("    stp x2, x3, [x0]");
         self.state.emit("    ldp x2, x3, [x1, #16]");
@@ -208,6 +212,12 @@ impl ArmCodegen {
 
         // Load dest_ptr into x4 (scratch register)
         self.load_dest_ptr(dest_ptr, "x4");
+
+        // Apple arm64: unnamed args are always on the stack.
+        if target_is_darwin() {
+            self.state.emit("    ldr x5, [x1]");
+            self.state.emit_fmt(format_args!("    b {}", label_stack));
+        }
 
         // Check if enough GP register slots remain for the entire struct.
         // __gr_offs is a negative i32 at [va_list + 24].
@@ -256,12 +266,13 @@ impl ArmCodegen {
 
         // ==== Stack path ====
         self.state.emit_fmt(format_args!("{}:", label_stack));
-        // When falling through to stack, we must also set __gr_offs to 0
-        // to indicate no more GP registers available (per AAPCS64).
-        self.state.emit("    str wzr, [x1, #24]");
-
-        // Read from __stack
-        self.state.emit("    ldr x5, [x1]");          // x5 = __stack (source addr)
+        if !target_is_darwin() {
+            // When falling through to stack, we must also set __gr_offs to 0
+            // to indicate no more GP registers available (per AAPCS64).
+            self.state.emit("    str wzr, [x1, #24]");
+            // Read from __stack
+            self.state.emit("    ldr x5, [x1]");          // x5 = __stack (source addr)
+        }
 
         // Align __stack to 8 bytes (structs on stack are 8-byte aligned per AAPCS64)
         self.state.emit("    add x5, x5, #7");

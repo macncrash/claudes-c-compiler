@@ -130,6 +130,10 @@ impl Lowerer {
                 // RISC-V: va_list = void * (8 bytes, passed by value)
                 CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
             }
+            Target::Aarch64 if self.target.is_darwin() => {
+                // Apple arm64: va_list = char * (walks 8-byte stack slots)
+                CType::Pointer(Box::new(CType::Char), AddressSpace::Default)
+            }
             Target::Aarch64 => {
                 // AArch64: va_list is a 32-byte struct, represented as char[32]
                 CType::Array(Box::new(CType::Char), Some(32))
