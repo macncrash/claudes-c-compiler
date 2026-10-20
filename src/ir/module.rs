@@ -285,7 +285,6 @@ impl Default for IrModule {
 }
 
 impl IrFunction {
-    #[cfg(test)]
     pub fn new(name: String, return_type: IrType, params: Vec<IrParam>, is_variadic: bool) -> Self {
         Self {
             name,

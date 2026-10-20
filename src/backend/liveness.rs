@@ -52,6 +52,22 @@ pub struct LivenessResult {
     /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
     /// Used by the register allocator to weight uses inside loops more heavily.
     pub block_loop_depth: Vec<u32>,
+    /// For values whose liveness has holes, the sorted, disjoint pieces of
+    /// their interval in which they are actually live (one per run of blocks
+    /// they are live in). A value missing here is live over its whole
+    /// interval. The register allocator lets other values use a register in
+    /// the holes, and a call in a hole does not count as one the value spans.
+    pub segments: FxHashMap<u32, Vec<(u32, u32)>>,
+}
+
+impl LivenessResult {
+    /// The pieces of `iv` in which its value is live (see `segments`).
+    pub fn segments_of(&self, iv: &LiveInterval) -> Vec<(u32, u32)> {
+        match self.segments.get(&iv.value_id) {
+            Some(segs) => segs.clone(),
+            None => vec![(iv.start, iv.end)],
+        }
+    }
 }
 
 // ── Compact bitset for dataflow ──────────────────────────────────────────────
@@ -157,7 +173,10 @@ struct ProgramPointState {
 pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult {
+            intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(),
+            block_loop_depth: Vec::new(), segments: FxHashMap::default(),
+        };
     }
 
     let alloca_set = collect_alloca_set(func);
@@ -165,7 +184,10 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 
     let num_values = value_ids.len();
     if num_values == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult {
+            intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(),
+            block_loop_depth: Vec::new(), segments: FxHashMap::default(),
+        };
     }
 
     // Phase 1: Assign program points and build gen/kill sets.
@@ -206,12 +228,117 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     // Phase 5: Build and sort intervals.
     let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
 
+    // Phase 6: Live segments. setjmp functions keep whole intervals, since a
+    // longjmp can return to any point after the setjmp.
+    let segments = if ps.setjmp_block_indices.is_empty() {
+        build_live_segments(func, &value_ids, &ps, &live_in, &live_out, &alloca_set, &id_to_dense)
+    } else {
+        FxHashMap::default()
+    };
+
     LivenessResult {
         intervals,
         call_points: ps.call_points,
         reg_args_call_points: ps.reg_args_call_points,
         block_loop_depth,
+        segments,
     }
+}
+
+/// Phase 6: Split each value's interval into the blocks it is live in.
+///
+/// In a block where the value is live-in, its piece starts at the block start,
+/// otherwise at its first def or use there. Where it is live-out, the piece
+/// ends at the block end, otherwise at the earlier of the block end and the
+/// end of its interval (which covers the use points that the GEP and F128
+/// extensions add without a visible operand). Adjacent pieces are merged, and
+/// only values left with more than one piece are returned.
+fn build_live_segments(
+    func: &IrFunction,
+    value_ids: &[u32],
+    ps: &ProgramPointState,
+    live_in: &[BitSet],
+    live_out: &[BitSet],
+    alloca_set: &FxHashSet<u32>,
+    id_to_dense: &FxHashMap<u32, usize>,
+) -> FxHashMap<u32, Vec<(u32, u32)>> {
+    let num_values = value_ids.len();
+    let mut segs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); num_values];
+    let mut first_seen: Vec<u32> = vec![u32::MAX; num_values];
+    let mut touched: Vec<usize> = Vec::new();
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let block_start = ps.block_start_points[bi];
+        let block_end = ps.block_end_points[bi];
+        let mut note = |vid: u32, point: u32, first_seen: &mut [u32], touched: &mut Vec<usize>| {
+            if alloca_set.contains(&vid) {
+                return;
+            }
+            if let Some(&dense) = id_to_dense.get(&vid) {
+                if first_seen[dense] == u32::MAX {
+                    first_seen[dense] = point;
+                    touched.push(dense);
+                }
+            }
+        };
+        for (i, inst) in block.instructions.iter().enumerate() {
+            let point = block_start + i as u32;
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    note(v.0, point, &mut first_seen, &mut touched);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| note(v.0, point, &mut first_seen, &mut touched));
+            if let Instruction::InlineAsm { outputs, .. } = inst {
+                for (_, out_val, _) in outputs {
+                    note(out_val.0, point, &mut first_seen, &mut touched);
+                }
+            }
+            if let Some(dest) = inst.dest() {
+                note(dest.0, point, &mut first_seen, &mut touched);
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                note(v.0, block_end, &mut first_seen, &mut touched);
+            }
+        });
+
+        let mut add = |dense: usize, lo: u32| {
+            let iv_start = ps.def_points[dense];
+            if iv_start == u32::MAX {
+                return;
+            }
+            let last = ps.last_use_points[dense];
+            let iv_end = if last == u32::MAX { iv_start } else { last.max(iv_start) };
+            let lo = lo.max(iv_start);
+            let hi = if live_out[bi].contains(dense) { block_end } else { block_end.min(iv_end) };
+            if hi < lo {
+                return;
+            }
+            let list = &mut segs[dense];
+            match list.last_mut() {
+                Some(prev) if prev.1 + 1 >= lo => prev.1 = prev.1.max(hi),
+                _ => list.push((lo, hi)),
+            }
+        };
+        live_in[bi].for_each_set_bit(|dense| add(dense, block_start));
+        for &dense in &touched {
+            if !live_in[bi].contains(dense) {
+                add(dense, first_seen[dense]);
+            }
+            first_seen[dense] = u32::MAX;
+        }
+        touched.clear();
+    }
+
+    let mut result = FxHashMap::default();
+    for (dense, list) in segs.into_iter().enumerate() {
+        if list.len() > 1 {
+            result.insert(value_ids[dense], list);
+        }
+    }
+    result
 }
 
 /// Collect alloca values (not register-allocatable).
@@ -1238,5 +1365,126 @@ mod tests {
         // Call points should only contain the calls, not the empty barrier
         assert!(result.call_points.is_empty(),
             "Empty inline asm barriers should NOT be call points");
+    }
+
+    fn call(dest: u32) -> Instruction {
+        Instruction::Call {
+            func: "f".to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: Some(Value(dest)),
+                args: vec![],
+                arg_types: vec![],
+                return_type: IrType::I64,
+                is_variadic: false,
+                num_fixed_args: 0,
+                struct_arg_sizes: vec![],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: Vec::new(),
+                struct_arg_riscv_float_classes: Vec::new(),
+                is_sret: false,
+                is_fastcall: false,
+                ret_eightbyte_classes: Vec::new(),
+            },
+        }
+    }
+
+    fn copy(dest: u32, val: i64) -> Instruction {
+        Instruction::Copy { dest: Value(dest), src: Operand::Const(IrConst::I64(val)) }
+    }
+
+    /// A value whose only use is in a block laid out after a call it never
+    /// reaches has an interval that covers the call, but its live segments
+    /// skip the block with the call.
+    #[test]
+    fn test_segments_skip_block_not_reached() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        // .L0: v0 = 5; v1 = 1; condbr v1, .L2, .L1
+        // .L1: v2 = call f(); ret v2
+        // .L2: ret v0
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![copy(0, 5), copy(1, 1)],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(1)), true_label: BlockId(2), false_label: BlockId(1),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![call(2)],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+
+        let result = compute_live_intervals(&func);
+        let call_point = result.call_points[0];
+        let iv = result.intervals.iter().find(|iv| iv.value_id == 0).unwrap();
+        assert!(iv.start < call_point && call_point < iv.end);
+        let segs = result.segments_of(iv);
+        assert_eq!(segs.len(), 2, "{:?}", segs);
+        assert!(segs.iter().all(|&(lo, hi)| call_point < lo || call_point > hi), "{:?}", segs);
+        // v1 lives inside .L0 only: a single piece, no entry in the map.
+        assert!(!result.segments.contains_key(&1));
+    }
+
+    /// A value defined in two predecessors (a lowered phi) is live from each
+    /// definition to the join, and not in a sibling block that holds a call.
+    #[test]
+    fn test_segments_lowered_phi() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        // .L0: v1 = 1; condbr v1, .L1, .L3
+        // .L1: v0 = 2; br .L2
+        // .L3: v2 = call f(); br .L4
+        // .L4: v0 = 3; br .L2
+        // .L2: ret v0
+        // v0 is defined in .L1 and .L4 and used in .L2; it is dead in .L3.
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![copy(1, 1)],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(1)), true_label: BlockId(1), false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![copy(0, 2)],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![call(2)],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![copy(0, 3)],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+
+        let result = compute_live_intervals(&func);
+        let call_point = result.call_points[0];
+        let iv = result.intervals.iter().find(|iv| iv.value_id == 0).unwrap();
+        let segs = result.segments_of(iv);
+        // .L1 [2,3], then .L4 and .L2 merged [6,8].
+        assert_eq!(segs, vec![(2, 3), (6, 8)]);
+        assert!(segs.iter().all(|&(lo, hi)| call_point < lo || call_point > hi));
     }
 }

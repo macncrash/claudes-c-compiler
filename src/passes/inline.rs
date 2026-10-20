@@ -11,7 +11,7 @@
 
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, GlobalInit, IrFunction, IrModule, Instruction, Operand,
-    Terminator, Value, IrConst, IrBinOp,
+    Terminator, Value, IrConst, IrBinOp, IrParam,
 };
 use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::types::{IrType, AddressSpace};
@@ -87,6 +87,18 @@ const MAX_SMALL_INLINE_INSTRUCTIONS: usize = 20;
 
 /// Maximum blocks for a callee to be considered "small" (see above).
 const MAX_SMALL_INLINE_BLOCKS: usize = 3;
+
+/// A call site that passes constants is treated as small when the callee,
+/// specialized on those constants and cleaned up by the post-inline passes,
+/// shrinks to at most this many instructions (and MAX_SMALL_INLINE_BLOCKS
+/// blocks). Callee sizes are otherwise measured before mem2reg and folding, so
+/// a helper like `ray_att(DIR, sq, occ)` that indexes a table by its constant
+/// argument looks several times larger than the code it actually becomes.
+const MAX_SPECIALIZED_INLINE_INSTRUCTIONS: usize = 20;
+
+/// Upper bound on the small callees inlined into a specialized copy while
+/// measuring it.
+const MAX_SPECIALIZED_NESTED_INLINES: usize = 8;
 
 /// Maximum instructions for a `static` (non-`inline`) function to be eligible
 /// for inlining. GCC at -O2 inlines small static functions even without the
@@ -211,6 +223,7 @@ fn select_inline_site(
     caller_is_recursive: bool,
     budget_remaining: usize,
     always_inline_budget_remaining: usize,
+    spec_cache: &mut HashMap<String, Option<(usize, usize)>>,
 ) -> Option<(InlineCallSite, usize, bool)> {
     // First pass: look for tiny/small callees anywhere in the function.
     // These are always inlined regardless of caller size because:
@@ -253,7 +266,13 @@ fn select_inline_site(
         if caller_is_recursive && !is_tiny && !callee_data.is_always_inline {
             continue;
         }
-        if is_tiny || (is_small && (!budget_exhausted || callee_data.is_always_inline)) || is_static_inline_eligible {
+        let specialized_small = !is_tiny && !is_small && !is_static_inline_eligible
+            && !budget_exhausted
+            && specialized_size_cached(spec_cache, callee_map, &site.callee_name, &site.const_args)
+                .is_some_and(|(insts, blocks)| insts <= MAX_SPECIALIZED_INLINE_INSTRUCTIONS
+                    && blocks <= MAX_SMALL_INLINE_BLOCKS);
+        if is_tiny || (is_small && (!budget_exhausted || callee_data.is_always_inline)) || is_static_inline_eligible
+            || specialized_small {
             let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
             return Some((site.clone(), callee_inst_count, use_relaxed));
         }
@@ -326,6 +345,7 @@ pub fn run(module: &mut IrModule) -> usize {
     // Build a snapshot of eligible callees (we can't borrow module mutably while reading callees).
     // We clone the callee function bodies since we need them while mutating callers.
     let callee_map = build_callee_map(module);
+    let mut spec_cache: HashMap<String, Option<(usize, usize)>> = HashMap::new();
 
     if callee_map.is_empty() {
         return 0;
@@ -412,6 +432,7 @@ pub fn run(module: &mut IrModule) -> usize {
                 caller_is_recursive,
                 budget_remaining,
                 always_inline_budget_remaining,
+                &mut spec_cache,
             );
             let (site, callee_inst_count, _use_relaxed) = match found_site {
                 Some(s) => s,
@@ -925,6 +946,9 @@ struct CalleeData {
     /// same to match GCC behavior and enable critical optimizations (e.g.,
     /// constant propagation of shift amounts in ror32 used by blake2s).
     is_static_inline: bool,
+    /// The callee's parameters, for building a specialized copy when sizing
+    /// call sites that pass constants (see `specialized_size`).
+    params: Vec<IrParam>,
 }
 
 /// A call site that is eligible for inlining.
@@ -940,6 +964,156 @@ struct InlineCallSite {
     dest: Option<Value>,
     /// Arguments passed to the call
     args: Vec<Operand>,
+    /// For each argument, the constant it is known to be in the caller.
+    const_args: Vec<Option<ConstArg>>,
+}
+
+/// A call argument that is constant in the caller: the constant, plus the cast
+/// applied to it when the argument is defined by `cast <from>-><to> <const>`
+/// (how the lowering passes integer literals to narrower parameters).
+#[derive(Clone, Copy, Debug)]
+struct ConstArg {
+    value: IrConst,
+    cast: Option<(IrType, IrType)>,
+}
+
+/// Map each Value in `func` defined as a constant (directly, through copies,
+/// or by a cast of a constant) to that constant.
+fn constant_values(func: &IrFunction) -> HashMap<u32, ConstArg> {
+    let mut consts: HashMap<u32, ConstArg> = HashMap::new();
+    let mut copies: Vec<(u32, u32)> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Copy { dest, src: Operand::Const(c) } => {
+                    consts.insert(dest.0, ConstArg { value: *c, cast: None });
+                }
+                Instruction::Copy { dest, src: Operand::Value(v) } => copies.push((dest.0, v.0)),
+                Instruction::Cast { dest, src: Operand::Const(c), from_ty, to_ty } => {
+                    consts.insert(dest.0, ConstArg { value: *c, cast: Some((*from_ty, *to_ty)) });
+                }
+                _ => {}
+            }
+        }
+    }
+    // Resolve copy chains; each round extends them by one link.
+    for _ in 0..MAX_TRACE_CHAIN_LENGTH {
+        let mut grew = false;
+        for &(dest, src) in &copies {
+            if !consts.contains_key(&dest) {
+                if let Some(c) = consts.get(&src).copied() {
+                    consts.insert(dest, c);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    consts
+}
+
+/// `specialized_size`, memoized by callee and argument constants.
+fn specialized_size_cached(
+    cache: &mut HashMap<String, Option<(usize, usize)>>,
+    callee_map: &HashMap<String, CalleeData>,
+    callee_name: &str,
+    const_args: &[Option<ConstArg>],
+) -> Option<(usize, usize)> {
+    if const_args.iter().all(|a| a.is_none()) {
+        return None;
+    }
+    let mut key = callee_name.to_string();
+    for arg in const_args {
+        match arg {
+            Some(c) => key.push_str(&format!("|{:?}", c)),
+            None => key.push_str("|_"),
+        }
+    }
+    *cache.entry(key.clone()).or_insert_with(|| {
+        let size = specialized_size(callee_map, callee_name, const_args);
+        if std::env::var("CCC_INLINE_DEBUG").is_ok() {
+            eprintln!("[INLINE] specialized size of {}: {:?}", key, size);
+        }
+        size
+    })
+}
+
+/// Size of `callee` once the constant arguments of a call site are folded
+/// into it: `(instructions, blocks)` after mem2reg and the same cleanup passes
+/// that follow inlining, not counting the allocas and ParamRefs that inlining
+/// removes. The callee's own
+/// calls to tiny and small functions are inlined first, as the main loop would
+/// do after inlining it. Returns None when no scalar argument is a constant.
+fn specialized_size(
+    callee_map: &HashMap<String, CalleeData>,
+    callee_name: &str,
+    const_args: &[Option<ConstArg>],
+) -> Option<(usize, usize)> {
+    let callee = &callee_map[callee_name];
+    let mut func = IrFunction::new(callee_name.to_string(), callee.return_type, callee.params.clone(), false);
+    func.is_static = true;
+    func.next_value_id = callee.next_value_id;
+    func.blocks = callee.blocks.clone();
+    let mut specialized = false;
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            if let Instruction::ParamRef { dest, param_idx, .. } = *inst {
+                let is_struct = callee.param_struct_sizes.get(param_idx).copied().flatten().is_some();
+                if let (false, Some(Some(arg))) = (is_struct, const_args.get(param_idx)) {
+                    *inst = match arg.cast {
+                        Some((from_ty, to_ty)) => Instruction::Cast {
+                            dest, src: Operand::Const(arg.value), from_ty, to_ty,
+                        },
+                        None => Instruction::Copy { dest, src: Operand::Const(arg.value) },
+                    };
+                    specialized = true;
+                }
+            }
+        }
+    }
+    if !specialized {
+        return None;
+    }
+    // Block IDs only need to be unique within the scratch copy.
+    let mut max_block_id = callee.max_block_id;
+    for _ in 0..MAX_SPECIALIZED_NESTED_INLINES {
+        let sites = find_inline_call_sites(&func, callee_map, &[], false);
+        let small_site = sites.into_iter().find(|site| {
+            let data = &callee_map[&site.callee_name];
+            let insts: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+            site.callee_name != callee_name
+                && insts <= MAX_SMALL_INLINE_INSTRUCTIONS
+                && data.blocks.len() <= MAX_SMALL_INLINE_BLOCKS
+        });
+        match small_site {
+            Some(site) if inline_call_site(&mut func, &site, &callee_map[&site.callee_name], &mut max_block_id) => {}
+            _ => break,
+        }
+    }
+    let mut scratch = IrModule::new();
+    scratch.functions.push(func);
+    crate::ir::mem2reg::promote_allocas_with_params(&mut scratch);
+    let func = &mut scratch.functions[0];
+    for _ in 0..4 {
+        let changes = super::constant_fold::fold_function(func)
+            + super::copy_prop::propagate_copies(func)
+            + super::simplify::simplify_function(func)
+            + super::cfg_simplify::run_function(func)
+            + super::dce::eliminate_dead_code(func);
+        if changes == 0 {
+            break;
+        }
+    }
+    if std::env::var("CCC_INLINE_DUMP_SPECIALIZED").is_ok() {
+        dump_function_ir(func, "specialized for size estimate");
+    }
+    let insts = func.blocks.iter()
+        .flat_map(|b| &b.instructions)
+        .filter(|inst| !matches!(inst, Instruction::Alloca { .. } | Instruction::ParamRef { .. }))
+        .count();
+    Some((insts, func.blocks.len()))
 }
 
 /// Check if a GlobalInit contains references to local labels (`.LBBxx`).
@@ -1132,6 +1306,7 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             is_always_inline,
             exceeds_normal_limits: exceeds_normal,
             is_static_inline: func.is_static && func.is_inline,
+            params: func.params.clone(),
         });
     }
 
@@ -1171,10 +1346,21 @@ fn find_inline_call_sites(
                             callee_name: callee_name.clone(),
                             dest: info.dest,
                             args: info.args.clone(),
+                            const_args: Vec::new(),
                         });
                     }
                 }
             }
+        }
+    }
+
+    if !sites.is_empty() {
+        let consts = constant_values(func);
+        for site in &mut sites {
+            site.const_args = site.args.iter().map(|arg| match arg {
+                Operand::Const(c) => Some(ConstArg { value: *c, cast: None }),
+                Operand::Value(v) => consts.get(&v.0).copied(),
+            }).collect();
         }
     }
 

@@ -383,7 +383,7 @@ fn resolve_numeric_data_values(
 #[cfg(test)]
 mod tests {
     use super::parser::{parse_asm, AsmStatement};
-    use super::encoder::{encode_instruction, EncodeResult};
+    use super::encoder::{encode_instruction, EncodeResult, RelocType};
 
     /// Instruction forms the AArch64 codegen and peephole optimizer emit
     /// (logical immediates, register-offset loads/stores, csel, memcpy
@@ -440,6 +440,38 @@ mod tests {
             };
             match encode_instruction(&mnemonic, &operands, &raw_operands) {
                 Ok(EncodeResult::Word(w)) => assert_eq!(w, expected, "{}: got {:#010x}", text, w),
+                other => panic!("{}: unexpected encoding {:?}", text, other.map(|_| ())),
+            }
+        }
+    }
+
+    /// Global addresses with a constant offset folded into the relocation
+    /// addend (peephole `fold_offset_into_global_addr`). Words match LLVM's
+    /// unrelocated encodings.
+    #[test]
+    fn test_global_addr_offset_relocations() {
+        let cases = [
+            ("adrp x14, rays+512", 0x9000000eu32, true),
+            ("add x14, x14, :lo12:rays+512", 0x910001ce, false),
+        ];
+        for (text, expected, is_adrp) in cases {
+            let stmts = parse_asm(text).unwrap_or_else(|e| panic!("{}: {}", text, e));
+            let Some(AsmStatement::Instruction { mnemonic, operands, raw_operands }) =
+                stmts.into_iter().find(|s| matches!(s, AsmStatement::Instruction { .. }))
+            else {
+                panic!("{}: not parsed as an instruction", text)
+            };
+            match encode_instruction(&mnemonic, &operands, &raw_operands) {
+                Ok(EncodeResult::WordWithReloc { word, reloc }) => {
+                    assert_eq!(word, expected, "{}: got {:#010x}", text, word);
+                    assert_eq!(reloc.symbol, "rays", "{}", text);
+                    assert_eq!(reloc.addend, 512, "{}", text);
+                    if is_adrp {
+                        assert!(matches!(reloc.reloc_type, RelocType::AdrpPage21), "{}", text);
+                    } else {
+                        assert!(matches!(reloc.reloc_type, RelocType::AddAbsLo12), "{}", text);
+                    }
+                }
                 other => panic!("{}: unexpected encoding {:?}", text, other.map(|_| ())),
             }
         }

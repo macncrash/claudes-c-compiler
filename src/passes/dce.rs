@@ -114,7 +114,7 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     // from side-effecting instructions and terminators; the rest is dead.
     let mut live = vec![false; max_id + 1];
     let mut stack: Vec<u32> = Vec::new();
-    let mut mark = |id: u32, live: &mut Vec<bool>, stack: &mut Vec<u32>| {
+    let mark = |id: u32, live: &mut Vec<bool>, stack: &mut Vec<u32>| {
         let idx = id as usize;
         if idx < live.len() && !live[idx] {
             live[idx] = true;

@@ -456,6 +456,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_low_half_only_extends(&lines, &mut kinds, n);
             changed2 |= fold_shift_into_operand(&mut lines, &mut kinds, n);
             changed2 |= fold_index_into_mem(&mut lines, &mut kinds, n);
+            changed2 |= fold_offset_into_global_addr(&mut lines, &mut kinds, n);
             changed2 |= fuse_cset_into_csel(&mut lines, &mut kinds, n);
             changed2 |= forward_copy_propagation(&mut lines, &mut kinds, n);
             changed2 |= retarget_results(&mut lines, &mut kinds, n);
@@ -1661,6 +1662,66 @@ fn fold_shift_into_operand(lines: &mut [String], kinds: &mut [LineKind], n: usiz
     changed
 }
 
+/// `adrp xT, sym; add xT, xT, :lo12:sym; add xD, xT, #K` (T dead afterwards
+/// unless it is D) becomes `adrp xD, sym+K; add xD, xD, :lo12:sym+K`: the
+/// constant offset of a GEP from a global goes into the relocation addend.
+fn fold_offset_into_global_addr(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    // Rewrites here only remove writes of dead registers, so liveness computed
+    // up front stays a safe over-approximation.
+    let live = live_out_all(lines, kinds, n);
+    let next = |kinds: &[LineKind], mut j: usize| {
+        j += 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        j
+    };
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some(("adrp", ops)) = split_insn(&lines[i]) else { continue };
+        let (t_name, sym) = first_and_rest(ops);
+        let (t_name, sym) = (t_name.to_string(), sym.trim().to_string());
+        let Some(t) = gpr_operand(&t_name) else { continue };
+        let plain_symbol = !sym.is_empty() && regs_in(&sym) == 0
+            && sym.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$'));
+        if !t_name.starts_with('x') || !plain_symbol {
+            continue;
+        }
+        let j = next(kinds, i);
+        let k = next(kinds, j);
+        if k >= n {
+            continue;
+        }
+        let lo12 = format!(":lo12:{}", sym);
+        let Some(("add", add_ops)) = split_insn(&lines[j]) else { continue };
+        let p: Vec<&str> = add_ops.split(',').map(str::trim).collect();
+        if p.len() != 3 || p[0] != t_name || p[1] != t_name || p[2] != lo12 {
+            continue;
+        }
+        let Some(("add", off_ops)) = split_insn(&lines[k]) else { continue };
+        let q: Vec<&str> = off_ops.split(',').map(str::trim).collect();
+        if q.len() != 3 || q[1] != t_name || !q[0].starts_with('x') {
+            continue;
+        }
+        let Some(d) = gpr_operand(q[0]) else { continue };
+        let Some(offset) = q[2].strip_prefix('#').and_then(|v| v.parse::<u32>().ok()) else { continue };
+        if offset == 0 || offset > 4095 || (d != t && live[k] & (1 << t) != 0) {
+            continue;
+        }
+        let dst = q[0].to_string();
+        lines[i] = format!("    adrp {}, {}+{}", dst, sym, offset);
+        lines[j] = format!("    add {}, {}, :lo12:{}+{}", dst, dst, sym, offset);
+        kinds[i] = classify_line(&lines[i]);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[k] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
 /// `add xA, xB, xI[, lsl #k]` immediately followed by a load/store through
 /// `[xA]` (A dead afterwards, k the access size's log2 or 0) becomes the
 /// register-offset form `[xB, xI, lsl #k]`.
@@ -2342,6 +2403,58 @@ mod tests {
         // The address is used again afterwards.
         let input = ".type f, %function\nf:\n    add x15, x4, x3\n    ldr x10, [x15]\n    str x10, [x15, #8]\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("add x15, x4, x3"));
+    }
+
+    #[test]
+    fn test_offset_folded_into_global_addr() {
+        let input = ".type f, %function
+f:
+    adrp x0, rays
+    add x0, x0, :lo12:rays
+    add x14, x0, #512
+    ldr x12, [x14, x10]
+    mov x0, x12
+    ret
+.size f, .-f
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("adrp x14, rays+512
+    add x14, x14, :lo12:rays+512"), "{}", result);
+        assert!(!result.contains("add x14, x0"), "{}", result);
+        // Not when the base address is used again, through a GOT entry, or
+        // for a symbol named like a register.
+        let input = ".type f, %function
+f:
+    adrp x0, rays
+    add x0, x0, :lo12:rays
+    add x14, x0, #512
+    ldr x12, [x14, x10]
+    ldr x13, [x0]
+    add x0, x12, x13
+    ret
+.size f, .-f
+";
+        assert!(peephole_optimize(input.to_string()).contains("add x14, x0, #512"));
+        let input = ".type f, %function
+f:
+    adrp x0, :got:rays
+    ldr x0, [x0, :got_lo12:rays]
+    add x14, x0, #512
+    ldr x0, [x14]
+    ret
+.size f, .-f
+";
+        assert!(peephole_optimize(input.to_string()).contains("add x14, x0, #512"));
+        let input = ".type f, %function
+f:
+    adrp x0, x1
+    add x0, x0, :lo12:x1
+    add x14, x0, #512
+    ldr x0, [x14]
+    ret
+.size f, .-f
+";
+        assert!(peephole_optimize(input.to_string()).contains("add x14, x0, #512"));
     }
 
     #[test]

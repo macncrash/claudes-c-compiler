@@ -232,18 +232,21 @@ pub fn allocate_registers(
     let caller = &config.caller_saved_regs;
     let mut callee_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); callee.len()];
     let mut caller_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); caller.len()];
-    let fits = |busy: &[(u32, u32)], iv: &LiveInterval| busy.iter().all(|&(s, e)| iv.end < s || iv.start > e);
+    let fits = |busy: &[(u32, u32)], segs: &[(u32, u32)]| {
+        segs.iter().all(|&(lo, hi)| busy.iter().all(|&(s, e)| hi < s || lo > e))
+    };
     // Prefer a callee-saved register that is already saved by the prologue.
-    let pick_callee = |busy: &[Vec<(u32, u32)>], iv: &LiveInterval| {
-        let free = || (0..callee.len()).filter(|&i| fits(&busy[i], iv));
+    let pick_callee = |busy: &[Vec<(u32, u32)>], segs: &[(u32, u32)]| {
+        let free = || (0..callee.len()).filter(|&i| fits(&busy[i], segs));
         free().find(|&i| !busy[i].is_empty()).or_else(|| free().next())
     };
     let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
 
     // Phase 1: Callee-saved registers for call-spanning values.
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(true)) {
-        if let Some(i) = pick_callee(&callee_busy, interval) {
-            callee_busy[i].push((interval.start, interval.end));
+        let segs = liveness.segments_of(interval);
+        if let Some(i) = pick_callee(&callee_busy, &segs) {
+            callee_busy[i].extend_from_slice(&segs);
             assignments.insert(interval.value_id, callee[i]);
         }
     }
@@ -254,11 +257,12 @@ pub fn allocate_registers(
     // not fit in the caller-saved pool (e.g. high-priority values in call-free
     // loops).
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(false)) {
-        if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], interval)) {
-            caller_busy[i].push((interval.start, interval.end));
+        let segs = liveness.segments_of(interval);
+        if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], &segs)) {
+            caller_busy[i].extend_from_slice(&segs);
             assignments.insert(interval.value_id, caller[i]);
-        } else if let Some(i) = pick_callee(&callee_busy, interval) {
-            callee_busy[i].push((interval.start, interval.end));
+        } else if let Some(i) = pick_callee(&callee_busy, &segs) {
+            callee_busy[i].extend_from_slice(&segs);
             assignments.insert(interval.value_id, callee[i]);
         }
     }
@@ -274,7 +278,7 @@ pub fn allocate_registers(
                 let reg = assignments.get(&iv.value_id).map_or("-".to_string(), |r| format!("r{}", r.0));
                 eprintln!("  v{:<5} [{:>4}, {:>4}] weight {:>6} spans_call {:5} {}", iv.value_id, iv.start, iv.end,
                     use_count.get(&iv.value_id).copied().unwrap_or(0),
-                    spans_clobbering_call(iv, call_points, boundary_ok), reg);
+                    spans_clobbering_call(&liveness, iv, call_points, boundary_ok), reg);
             }
         }
     }
@@ -306,7 +310,7 @@ fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMa
             gep_base.insert(dest.0, base.0);
         }
     }
-    let mut add = |use_count: &mut FxHashMap<u32, u64>, v: u32, weight: u64| {
+    let add = |use_count: &mut FxHashMap<u32, u64>, v: u32, weight: u64| {
         *use_count.entry(v).or_insert(0) += weight;
         // Follow folded GEP chains a few levels.
         let mut cur = v;
@@ -520,10 +524,12 @@ pub fn allocate_fp_registers(
     let caller = &config.caller_saved_regs;
     let mut callee_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); callee.len()];
     let mut caller_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); caller.len()];
-    let fits = |busy: &[(u32, u32)], iv: &LiveInterval| busy.iter().all(|&(s, e)| iv.end < s || iv.start > e);
+    let fits = |busy: &[(u32, u32)], segs: &[(u32, u32)]| {
+        segs.iter().all(|&(lo, hi)| busy.iter().all(|&(s, e)| hi < s || lo > e))
+    };
     // Prefer a callee-saved register that is already saved by the prologue.
-    let pick_callee = |busy: &[Vec<(u32, u32)>], iv: &LiveInterval| {
-        let free = || (0..callee.len()).filter(|&i| fits(&busy[i], iv));
+    let pick_callee = |busy: &[Vec<(u32, u32)>], segs: &[(u32, u32)]| {
+        let free = || (0..callee.len()).filter(|&i| fits(&busy[i], segs));
         free().find(|&i| !busy[i].is_empty()).or_else(|| free().next())
     };
 
@@ -532,17 +538,19 @@ pub fn allocate_fp_registers(
     // Phase 3: leftover callee-saved registers for the remaining values.
     let no_gpr = FxHashMap::default();
     for iv in build_sorted_candidates(liveness, &eligible, &no_gpr, &clobber_points, &[], &use_count, Some(true)) {
-        if let Some(i) = pick_callee(&callee_busy, iv) {
-            callee_busy[i].push((iv.start, iv.end));
+        let segs = liveness.segments_of(iv);
+        if let Some(i) = pick_callee(&callee_busy, &segs) {
+            callee_busy[i].extend_from_slice(&segs);
             result.assignments.insert(iv.value_id, (callee[i], width[&iv.value_id]));
         }
     }
     for iv in build_sorted_candidates(liveness, &eligible, &no_gpr, &clobber_points, &[], &use_count, Some(false)) {
-        if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], iv)) {
-            caller_busy[i].push((iv.start, iv.end));
+        let segs = liveness.segments_of(iv);
+        if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], &segs)) {
+            caller_busy[i].extend_from_slice(&segs);
             result.assignments.insert(iv.value_id, (caller[i], width[&iv.value_id]));
-        } else if let Some(i) = pick_callee(&callee_busy, iv) {
-            callee_busy[i].push((iv.start, iv.end));
+        } else if let Some(i) = pick_callee(&callee_busy, &segs) {
+            callee_busy[i].extend_from_slice(&segs);
             result.assignments.insert(iv.value_id, (callee[i], width[&iv.value_id]));
         }
     }
@@ -714,23 +722,16 @@ fn remove_ineligible_operands(func: &IrFunction, eligible: &mut FxHashSet<u32>, 
     }
 }
 
-/// Check whether a live interval spans any function call point.
-/// Uses binary search since call_points is sorted by program point.
-fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
-    let start_idx = call_points.partition_point(|&cp| cp < iv.start);
-    start_idx < call_points.len() && call_points[start_idx] <= iv.end
-}
-
-/// Like `spans_any_call`, but a call in `boundary_ok` (sorted) does not
-/// count when it is exactly the interval's start or end.
-fn spans_clobbering_call(iv: &LiveInterval, call_points: &[u32], boundary_ok: &[u32]) -> bool {
-    if boundary_ok.is_empty() {
-        return spans_any_call(iv, call_points);
-    }
-    let start_idx = call_points.partition_point(|&cp| cp < iv.start);
-    call_points[start_idx..].iter()
-        .take_while(|&&cp| cp <= iv.end)
-        .any(|&cp| !((cp == iv.start || cp == iv.end) && boundary_ok.binary_search(&cp).is_ok()))
+/// Check whether a value is live at any call point (sorted), looking only at
+/// the segments in which it is live. A call in `boundary_ok` (sorted) does
+/// not count when it is exactly the interval's start or end.
+fn spans_clobbering_call(liveness: &LivenessResult, iv: &LiveInterval, call_points: &[u32], boundary_ok: &[u32]) -> bool {
+    liveness.segments_of(iv).iter().any(|&(lo, hi)| {
+        let start_idx = call_points.partition_point(|&cp| cp < lo);
+        call_points[start_idx..].iter()
+            .take_while(|&&cp| cp <= hi)
+            .any(|&cp| !((cp == iv.start || cp == iv.end) && boundary_ok.binary_search(&cp).is_ok()))
+    })
 }
 
 /// Build a sorted list of allocation candidates from live intervals.
@@ -756,8 +757,8 @@ fn build_sorted_candidates<'a>(
         .filter(|iv| !already_assigned.contains_key(&iv.value_id))
         .filter(|iv| iv.end > iv.start)
         .filter(|iv| match spans_call {
-            Some(true) => spans_clobbering_call(iv, call_points, boundary_ok),
-            Some(false) => !spans_clobbering_call(iv, call_points, boundary_ok),
+            Some(true) => spans_clobbering_call(liveness, iv, call_points, boundary_ok),
+            Some(false) => !spans_clobbering_call(liveness, iv, call_points, boundary_ok),
             None => true,
         })
         .collect();

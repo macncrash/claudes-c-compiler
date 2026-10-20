@@ -34,8 +34,8 @@ make bench           # builds ./ocean-clang too, runs both with no window or GPU
 `--bench N` simulates N frames and prints timing plus a checksum of the vertex
 data. The two builds should print the same heights and checksum.
 
-At the time of writing, the ccc build takes 1.75 ms per frame with all threads
-and 13.2 ms on one thread; clang -O2 takes 0.64 ms and 4.3 ms. Before ccc's
+At the time of writing, the ccc build takes about 1.4 ms per frame with all
+threads and 10 ms on one thread; clang -O2 takes 0.64 ms and 4.3 ms. Before ccc's
 AArch64 backend kept floats in FP registers (d8-d15, v16-v31), those were
 9.3 ms and 79.6 ms. The remaining gap is mostly integer address arithmetic
 and clang's vectorization.
