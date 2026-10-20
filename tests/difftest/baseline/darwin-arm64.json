@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-10-20",
-  "ccc_rev": "a304ea33",
+  "ccc_rev": "d42e8bf7",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -1260,8 +1260,7 @@
    "status": "pass"
   },
   "gcc-torture/20020720-1": {
-   "status": "link_error",
-   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+   "status": "pass"
   },
   "gcc-torture/20020805-1": {
    "status": "pass"
@@ -3054,8 +3053,7 @@
    "status": "pass"
   },
   "gcc-torture/compare-3": {
-   "status": "link_error",
-   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+   "status": "pass"
   },
   "gcc-torture/complex-1": {
    "status": "pass"
@@ -5056,8 +5054,7 @@
    "status": "pass"
   },
   "gcc-torture/pure-1": {
-   "status": "link_error",
-   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+   "status": "pass"
   },
   "gcc-torture/pushpop_macro": {
    "status": "pass"
@@ -5071,7 +5068,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16ae86d7f 0x16ae86d7f 0x16ae86d7f 0x16ae86d7f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16af9ad7f 0x16af9ad7f 0x16af9ad7f 0x16af9ad7f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
@@ -5086,8 +5083,7 @@
    "status": "pass"
   },
   "gcc-torture/shiftopt-1": {
-   "status": "link_error",
-   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+   "status": "pass"
   },
   "gcc-torture/signed1bitfield-1": {
    "status": "pass"
@@ -5154,8 +5150,7 @@
    "status": "pass"
   },
   "gcc-torture/string-opt-18": {
-   "status": "link_error",
-   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+   "status": "pass"
   },
   "gcc-torture/string-opt-5": {
    "status": "pass"
