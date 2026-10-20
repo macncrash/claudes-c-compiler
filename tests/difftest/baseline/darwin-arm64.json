@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-10-20",
-  "ccc_rev": "d42e8bf7",
+  "ccc_rev": "f86c5934",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -719,6 +719,9 @@
    "status": "pass"
   },
   "cases/libc_interop": {
+   "status": "pass"
+  },
+  "cases/pp_literal_prefix_params": {
    "status": "pass"
   },
   "cases/strings_wide": {
@@ -2692,8 +2695,7 @@
    "status": "pass"
   },
   "gcc-torture/970214-2": {
-   "status": "compile_error",
-   "detail": "tests/difftest/suites/gcc-torture/970214-2.c:7:11: error: expected ')' before character constant"
+   "status": "pass"
   },
   "gcc-torture/970217-1": {
    "status": "pass"
@@ -5068,7 +5070,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16af9ad7f 0x16af9ad7f 0x16af9ad7f 0x16af9ad7f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16eedad7f 0x16eedad7f 0x16eedad7f 0x16eedad7f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
