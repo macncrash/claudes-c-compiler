@@ -1723,7 +1723,7 @@ fn remap_terminator(term: &Terminator, vo: u32, bo: u32) -> Terminator {
 }
 
 /// Debug: dump function IR in a readable text format.
-fn dump_function_ir(func: &IrFunction, context: &str) {
+pub(crate) fn dump_function_ir(func: &IrFunction, context: &str) {
     eprintln!("=== IR DUMP {} ===", context);
     eprintln!("function {} (next_value_id={})", func.name, func.next_value_id);
     for (bi, block) in func.blocks.iter().enumerate() {

@@ -209,6 +209,7 @@ and comparing stdout and the exit code against the expected files.
 | `CCC_DISABLE_PASSES` | Disable specific optimization passes (comma-separated, or `all`) |
 | `CCC_KEEP_ASM` | Preserve intermediate `.s` files next to output |
 | `CCC_ASM_DEBUG` | Dump preprocessed assembly to `/tmp/asm_debug_<name>.s` |
+| `CCC_DUMP_IR` | Print a function's IR to stderr just before codegen (a function name, or `all`) |
 
 ## Project Organization
 

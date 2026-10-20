@@ -1096,6 +1096,12 @@ impl Driver {
         eliminate_phis(&mut module);
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 
+        if let Ok(name) = std::env::var("CCC_DUMP_IR") {
+            for func in module.functions.iter().filter(|f| name == "all" || f.name == name) {
+                crate::passes::inline::dump_function_ir(func, "before codegen");
+            }
+        }
+
         // Note: we intentionally do NOT run copy_prop after phi elimination.
         // The IR is no longer in SSA form at this point - Copy instructions from
         // phi elimination represent moves at specific program points. Propagating

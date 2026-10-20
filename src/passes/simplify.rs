@@ -95,10 +95,15 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     // Track values known to be boolean (0 or 1). This includes Cmp results
     // and bitwise And/Or/Xor of boolean values.
     let mut is_boolean = vec![false; max_id + 1];
+    // Values whose producer leaves them in canonical form for their type.
+    let mut canonical_ty: Vec<Option<IrType>> = vec![None; max_id + 1];
 
     // Collect definitions - first pass: mark Cmp results as boolean
     for block in &func.blocks {
         for inst in &block.instructions {
+            if let (Some(dest), Some(ty)) = (inst.dest(), canonical_result_type(inst)) {
+                set_def(&mut canonical_ty, dest.0, ty);
+            }
             match inst {
                 Instruction::Cast { dest, src, from_ty, to_ty } => {
                     set_def(&mut cast_defs, dest.0, CastDef {
@@ -157,13 +162,35 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
-            if let Some(simplified) = try_simplify(inst, &cast_defs, &gep_defs, &cmp_defs, &binop_defs, &neg_defs, &is_boolean) {
+            if let Some(simplified) = try_simplify(inst, &cast_defs, &gep_defs, &cmp_defs, &binop_defs, &neg_defs, &is_boolean, &canonical_ty) {
                 *inst = simplified;
                 total += 1;
             }
         }
     }
     total
+}
+
+/// The integer type a value is guaranteed to hold in canonical form (extended
+/// to register width the way every backend represents that type), judging by
+/// its producer alone.
+///
+/// Call results and parameters are excluded: the ABI leaves the upper bits of
+/// narrow integers unspecified. Unary ops and 8/16-bit arithmetic are excluded
+/// because backends may compute them at full register width without
+/// re-extending (e.g. AArch64 `neg x0, x0` of a U32). Same-size casts are
+/// excluded because they can be no-ops (AArch64 emits nothing for U32->I32);
+/// integer widening and narrowing always extend to the target type.
+fn canonical_result_type(inst: &Instruction) -> Option<IrType> {
+    let ty = match inst {
+        Instruction::Load { ty, .. } => *ty,
+        Instruction::Cast { from_ty, to_ty, .. }
+            if from_ty.is_integer() && from_ty.size() != to_ty.size() => *to_ty,
+        Instruction::Cmp { .. } => IrType::I8, // 0 or 1
+        Instruction::BinOp { ty, .. } if ty.size() >= 4 => *ty,
+        _ => return None,
+    };
+    (ty.is_integer() && !matches!(ty, IrType::I128 | IrType::U128)).then_some(ty)
 }
 
 /// Store a definition in a flat Vec, bounds-checked.
@@ -236,6 +263,7 @@ fn try_simplify(
     binop_defs: &[Option<BinOpDef>],
     neg_defs: &[Option<NegDef>],
     is_boolean: &[bool],
+    canonical_ty: &[Option<IrType>],
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
@@ -243,6 +271,7 @@ fn try_simplify(
         }
         Instruction::Cast { dest, src, from_ty, to_ty } => {
             simplify_cast(*dest, src, *from_ty, *to_ty, cast_defs)
+                .or_else(|| simplify_noop_cast(*dest, src, *from_ty, *to_ty, canonical_ty))
         }
         Instruction::GetElementPtr { dest, base, offset, ty } => {
             simplify_gep(*dest, *base, offset, *ty, gep_defs)
@@ -373,6 +402,29 @@ fn simplify_cast(
         }
     }
 
+    None
+}
+
+/// Replace casts that cannot change a value's bits with a Copy:
+/// - I64 <-> U64: the same 64 bits on every backend.
+/// - Narrowing a value whose producer already made it the target type in
+///   canonical form, e.g. `cast I64->I32` of an I32 BinOp result (the IR
+///   often types such operands as I64 after promotions and inlining).
+fn simplify_noop_cast(
+    dest: Value,
+    src: &Operand,
+    from_ty: IrType,
+    to_ty: IrType,
+    canonical_ty: &[Option<IrType>],
+) -> Option<Instruction> {
+    if matches!((from_ty, to_ty), (IrType::I64, IrType::U64) | (IrType::U64, IrType::I64)) {
+        return Some(Instruction::Copy { dest, src: *src });
+    }
+    let Operand::Value(v) = src else { return None };
+    let src_ty = canonical_ty.get(v.0 as usize).copied().flatten()?;
+    if src_ty == to_ty && from_ty.is_integer() && to_ty.is_integer() && from_ty.size() >= to_ty.size() {
+        return Some(Instruction::Copy { dest, src: *src });
+    }
     None
 }
 
@@ -1642,7 +1694,7 @@ mod tests {
 
     /// Shorthand: try_simplify with empty def maps (no chain optimization context).
     fn simplify_default(inst: &Instruction) -> Option<Instruction> {
-        try_simplify(inst, &[], &[], &[], &[], &[], &[])
+        try_simplify(inst, &[], &[], &[], &[], &[], &[], &[])
     }
 
     /// Create a BinOp instruction with standard test values.
@@ -1824,6 +1876,52 @@ mod tests {
         }
     }
 
+    // === No-op cast tests ===
+
+    fn cast_inst(from_ty: IrType, to_ty: IrType) -> Instruction {
+        Instruction::Cast { dest: Value(2), src: Operand::Value(Value(1)), from_ty, to_ty }
+    }
+
+    #[test]
+    fn test_i64_u64_cast_is_copy() {
+        for (from, to) in [(IrType::I64, IrType::U64), (IrType::U64, IrType::I64)] {
+            let result = simplify_default(&cast_inst(from, to));
+            assert!(matches!(result, Some(Instruction::Copy { src: Operand::Value(Value(1)), .. })));
+        }
+    }
+
+    #[test]
+    fn test_narrow_of_canonical_value_is_copy() {
+        // v1 is an I32 BinOp result; cast I64->I32 of it changes nothing.
+        let canonical = [None, Some(IrType::I32)];
+        let result = try_simplify(&cast_inst(IrType::I64, IrType::I32), &[], &[], &[], &[], &[], &[], &canonical);
+        assert!(matches!(result, Some(Instruction::Copy { .. })));
+    }
+
+    #[test]
+    fn test_narrow_of_unknown_value_kept() {
+        // Without a canonical producer (e.g. a call result), the cast must stay.
+        let result = try_simplify(&cast_inst(IrType::I64, IrType::I32), &[], &[], &[], &[], &[], &[], &[None, None]);
+        assert!(result.is_none());
+        // Same for a value canonical as a different type.
+        let canonical = [None, Some(IrType::U32)];
+        let result = try_simplify(&cast_inst(IrType::I64, IrType::I32), &[], &[], &[], &[], &[], &[], &canonical);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_canonical_result_types() {
+        let v = |n| Value(n);
+        let same_size = Instruction::Cast { dest: v(2), src: Operand::Value(v(1)), from_ty: IrType::U32, to_ty: IrType::I32 };
+        assert_eq!(canonical_result_type(&same_size), None);
+        let narrow = Instruction::Cast { dest: v(2), src: Operand::Value(v(1)), from_ty: IrType::I64, to_ty: IrType::I32 };
+        assert_eq!(canonical_result_type(&narrow), Some(IrType::I32));
+        let add8 = Instruction::BinOp { dest: v(2), op: IrBinOp::Add, lhs: Operand::Value(v(1)), rhs: Operand::Value(v(1)), ty: IrType::I8 };
+        assert_eq!(canonical_result_type(&add8), None);
+        let param = Instruction::ParamRef { dest: v(2), param_idx: 0, ty: IrType::I32 };
+        assert_eq!(canonical_result_type(&param), None);
+    }
+
     // === Cast tests ===
 
     #[test]
@@ -1853,7 +1951,7 @@ mod tests {
             from_ty: IrType::I64,
             to_ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &defs, &[], &[], &[], &[], &[]).unwrap();
+        let result = try_simplify(&inst, &defs, &[], &[], &[], &[], &[], &[]).unwrap();
         assert_copy_value(&result, 0);
     }
 
@@ -1923,7 +2021,7 @@ mod tests {
             offset: Operand::Const(IrConst::I64(4)),
             ty: IrType::Ptr,
         };
-        let result = try_simplify(&inst, &[], &gep_defs, &[], &[], &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &gep_defs, &[], &[], &[], &[], &[]).unwrap();
         match result {
             Instruction::GetElementPtr { base, offset: Operand::Const(IrConst::I64(12)), .. } => {
                 assert_eq!(base.0, 0, "Should use original base");
@@ -1946,7 +2044,7 @@ mod tests {
             offset: Operand::Const(IrConst::I64(-4)),
             ty: IrType::Ptr,
         };
-        let result = try_simplify(&inst, &[], &gep_defs, &[], &[], &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &gep_defs, &[], &[], &[], &[], &[]).unwrap();
         assert_copy_value(&result, 0);
     }
 
@@ -2254,7 +2352,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans).unwrap();
+        let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans, &[]).unwrap();
         assert_copy_value(&result, 1);
     }
 
@@ -2277,7 +2375,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans).unwrap();
+        let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans, &[]).unwrap();
         match result {
             Instruction::Cmp { op: IrCmpOp::Sge, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
                 assert_eq!(a.0, 10);
@@ -2306,7 +2404,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(1)),
             ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans).unwrap();
+        let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans, &[]).unwrap();
         assert_copy_value(&result, 1);
     }
 
@@ -2329,7 +2427,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(1)),
             ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans).unwrap();
+        let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans, &[]).unwrap();
         match result {
             Instruction::Cmp { op: IrCmpOp::Eq, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
                 assert_eq!(a.0, 10);
@@ -2351,7 +2449,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &[], &[], &booleans).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &[], &[], &booleans, &[]).unwrap();
         assert_copy_value(&result, 3);
     }
 
@@ -2519,7 +2617,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(20)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(30)), .. } => {
                 assert_eq!(v.0, 0);
@@ -2545,7 +2643,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(-5)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         assert_copy_value(&result, 0);
     }
 
@@ -2566,7 +2664,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(20)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Sub, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(30)), .. } => {
                 assert_eq!(v.0, 0);
@@ -2592,7 +2690,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(0x0F)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::And, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(0x0F)), .. } => {
                 assert_eq!(v.0, 0);
@@ -2618,7 +2716,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(0xFF)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         assert_copy_value(&result, 0);
     }
 
@@ -2639,7 +2737,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(3)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(5)), .. } => {
                 assert_eq!(v.0, 0);
@@ -2665,7 +2763,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(20)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         assert_copy_const_i32(&result, 0);
     }
 
@@ -2724,7 +2822,7 @@ mod tests {
             rhs: Operand::Const(IrConst::I32(5)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(15)), .. } => {
                 assert_eq!(v.0, 0, "Should use original non-const operand");
@@ -2759,7 +2857,7 @@ mod tests {
             rhs: Operand::Value(Value(1)),
             ty: IrType::I64,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[], &[]).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I64(15)), .. } => {
                 assert_eq!(v.0, 0);
@@ -2782,7 +2880,7 @@ mod tests {
             rhs: Operand::Value(Value(2)),
             ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).unwrap();
+        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[], &[]).unwrap();
         match result {
             Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
                 assert_eq!(a.0, 0, "lhs should be original lhs");
@@ -2804,7 +2902,7 @@ mod tests {
             rhs: Operand::Value(Value(2)),
             ty: IrType::F64,
         };
-        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]);
+        let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[], &[]);
         assert!(result.is_none());
     }
 
