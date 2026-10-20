@@ -241,6 +241,9 @@ def run_test(test, args, ref_cache, ref_cc_version):
 
 
 def first_line(text):
+    # Report paths relative to the repo, so baselines don't record the
+    # checkout location (and with it the user's home directory).
+    text = text.replace(REPO + os.sep, "")
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("WARNING"):
