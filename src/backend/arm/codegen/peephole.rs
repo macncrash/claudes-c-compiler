@@ -442,28 +442,36 @@ pub fn peephole_optimize(asm: String) -> String {
     global_dead_store_elimination(&lines, &mut kinds, n);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
+    // CCC_PEEPHOLE_SKIP=name,name skips the listed passes (for bisecting).
+    let skip = std::env::var("CCC_PEEPHOLE_SKIP").unwrap_or_default();
+    let skip: Vec<&str> = skip.split(',').filter(|s| !s.is_empty()).collect();
+    macro_rules! pass {
+        ($name:ident($($arg:expr),*)) => {
+            !skip.contains(&stringify!($name)) && $name($($arg),*)
+        };
+    }
     {
         let mut changed2 = true;
         let mut rounds2 = 0;
         while changed2 && rounds2 < 4 {
             changed2 = false;
-            changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
-            changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
-            changed2 |= eliminate_self_moves(&mut kinds, n);
-            changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
-            changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
-            changed2 |= propagate_w_copies(&mut lines, &mut kinds, n);
-            changed2 |= eliminate_low_half_only_extends(&lines, &mut kinds, n);
-            changed2 |= fold_shift_into_operand(&mut lines, &mut kinds, n);
-            changed2 |= fold_index_into_mem(&mut lines, &mut kinds, n);
-            changed2 |= fold_offset_into_global_addr(&mut lines, &mut kinds, n);
-            changed2 |= fuse_cset_into_csel(&mut lines, &mut kinds, n);
-            changed2 |= forward_copy_propagation(&mut lines, &mut kinds, n);
-            changed2 |= retarget_results(&mut lines, &mut kinds, n);
-            changed2 |= eliminate_dead_writes(&lines, &mut kinds, n);
-            changed2 |= eliminate_dead_writes_global(&lines, &mut kinds, n);
-            changed2 |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
-            changed2 |= eliminate_unreferenced_labels(&lines, &mut kinds, n);
+            changed2 |= pass!(eliminate_adjacent_store_load(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_redundant_branches(&lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_self_moves(&mut kinds, n));
+            changed2 |= pass!(eliminate_move_chains(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_redundant_sxtw(&mut lines, &mut kinds, n));
+            changed2 |= pass!(propagate_w_copies(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_low_half_only_extends(&lines, &mut kinds, n));
+            changed2 |= pass!(fold_shift_into_operand(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_index_into_mem(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_offset_into_global_addr(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_cset_into_csel(&mut lines, &mut kinds, n));
+            changed2 |= pass!(forward_copy_propagation(&mut lines, &mut kinds, n));
+            changed2 |= pass!(retarget_results(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_dead_writes(&lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_dead_writes_global(&lines, &mut kinds, n));
+            changed2 |= pass!(fuse_branch_over_branch(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_unreferenced_labels(&lines, &mut kinds, n));
             rounds2 += 1;
         }
     }

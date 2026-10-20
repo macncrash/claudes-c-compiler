@@ -627,6 +627,14 @@ impl Driver {
                 "-rdynamic" => {
                     self.linker_ordered_items.push("-rdynamic".to_string());
                 }
+                // -rpath DIR (accepted by clang, e.g. in SQLite's Makefile):
+                // a run-time search path for the linker.
+                "-rpath" => {
+                    i += 1;
+                    if i < args.len() {
+                        self.linker_ordered_items.push(format!("-Wl,-rpath,{}", args[i]));
+                    }
+                }
                 "-pipe" | "-Xa" | "-Xc" | "-Xt" => {}
                 "-pthread" => {
                     self.pthread = true;

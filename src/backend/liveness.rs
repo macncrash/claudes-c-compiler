@@ -46,8 +46,9 @@ pub struct LivenessResult {
     /// Used by the register allocator to identify values that cross call boundaries.
     pub call_points: Vec<u32>,
     /// The subset of `call_points` that are calls passing only scalar
-    /// arguments in registers (see `is_reg_args_only_call`).
-    pub reg_args_call_points: Vec<u32>,
+    /// arguments in registers (see `is_reg_args_only_call`), each with the
+    /// value the call defines, if any.
+    pub reg_args_call_points: Vec<(u32, Option<u32>)>,
     /// Loop nesting depth for each block (block_index -> depth).
     /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
     /// Used by the register allocator to weight uses inside loops more heavily.
@@ -157,7 +158,7 @@ struct ProgramPointState {
     block_id_to_idx: FxHashMap<u32, usize>,
     setjmp_block_indices: Vec<usize>,
     call_points: Vec<u32>,
-    reg_args_call_points: Vec<u32>,
+    reg_args_call_points: Vec<(u32, Option<u32>)>,
     num_points: u32,
 }
 
@@ -416,7 +417,7 @@ fn assign_program_points(
     let mut block_id_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
     let mut setjmp_block_indices: Vec<usize> = Vec::new();
     let mut call_points: Vec<u32> = Vec::new();
-    let mut reg_args_call_points: Vec<u32> = Vec::new();
+    let mut reg_args_call_points: Vec<(u32, Option<u32>)> = Vec::new();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         block_id_to_idx.insert(block.label.0, block_idx);
@@ -446,7 +447,7 @@ fn assign_program_points(
                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                     call_points.push(point);
                     if is_reg_args_only_call(info) && !is_returns_twice_call(inst) {
-                        reg_args_call_points.push(point);
+                        reg_args_call_points.push((point, info.dest.map(|d| d.0)));
                     }
                 }
                 Instruction::InlineAsm { outputs, inputs, .. } => {

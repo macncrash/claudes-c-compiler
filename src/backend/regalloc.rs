@@ -218,7 +218,7 @@ pub fn allocate_registers(
     remove_ineligible_operands(func, &mut eligible, config);
 
     let call_points = &liveness.call_points;
-    let boundary_ok: &[u32] = if config.caller_saved_at_call_boundaries {
+    let boundary_ok: &[(u32, Option<u32>)] = if config.caller_saved_at_call_boundaries {
         &liveness.reg_args_call_points
     } else {
         &[]
@@ -723,14 +723,21 @@ fn remove_ineligible_operands(func: &IrFunction, eligible: &mut FxHashSet<u32>, 
 }
 
 /// Check whether a value is live at any call point (sorted), looking only at
-/// the segments in which it is live. A call in `boundary_ok` (sorted) does
-/// not count when it is exactly the interval's start or end.
-fn spans_clobbering_call(liveness: &LivenessResult, iv: &LiveInterval, call_points: &[u32], boundary_ok: &[u32]) -> bool {
+/// the segments in which it is live. A call in `boundary_ok` (sorted by point)
+/// does not count when it defines the value, or when it is the value's last
+/// use: the value then needs no register while the callee runs. (An interval
+/// can also start at a call that it is live into, when the call opens a block;
+/// that call does count.)
+fn spans_clobbering_call(liveness: &LivenessResult, iv: &LiveInterval, call_points: &[u32], boundary_ok: &[(u32, Option<u32>)]) -> bool {
+    let at_boundary = |cp: u32| match boundary_ok.binary_search_by_key(&cp, |&(p, _)| p) {
+        Ok(i) => cp == iv.end || (cp == iv.start && boundary_ok[i].1 == Some(iv.value_id)),
+        Err(_) => false,
+    };
     liveness.segments_of(iv).iter().any(|&(lo, hi)| {
         let start_idx = call_points.partition_point(|&cp| cp < lo);
         call_points[start_idx..].iter()
             .take_while(|&&cp| cp <= hi)
-            .any(|&cp| !((cp == iv.start || cp == iv.end) && boundary_ok.binary_search(&cp).is_ok()))
+            .any(|&cp| !at_boundary(cp))
     })
 }
 
@@ -748,7 +755,7 @@ fn build_sorted_candidates<'a>(
     eligible: &FxHashSet<u32>,
     already_assigned: &FxHashMap<u32, PhysReg>,
     call_points: &[u32],
-    boundary_ok: &[u32],
+    boundary_ok: &[(u32, Option<u32>)],
     use_count: &FxHashMap<u32, u64>,
     spans_call: Option<bool>,
 ) -> Vec<&'a LiveInterval> {
@@ -777,3 +784,50 @@ fn build_sorted_candidates<'a>(
     candidates
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn liveness(intervals: Vec<LiveInterval>, call: u32, dest: Option<u32>) -> LivenessResult {
+        LivenessResult {
+            intervals,
+            call_points: vec![call],
+            reg_args_call_points: vec![(call, dest)],
+            block_loop_depth: Vec::new(),
+            segments: FxHashMap::default(),
+        }
+    }
+
+    /// A call at the start or end of an interval only lets the value stay in
+    /// a caller-saved register when the call defines it or is its last use.
+    /// An interval that starts at a call because the value is live into the
+    /// block the call opens is live across that call.
+    #[test]
+    fn test_call_boundary_exemptions() {
+        let result = LiveInterval { start: 10, end: 20, value_id: 1 };
+        let arg = LiveInterval { start: 2, end: 10, value_id: 2 };
+        let live_in = LiveInterval { start: 10, end: 30, value_id: 3 };
+        let across = LiveInterval { start: 5, end: 15, value_id: 4 };
+        let lv = liveness(vec![result, arg, live_in, across], 10, Some(1));
+        let ok = lv.reg_args_call_points.clone();
+        assert!(!spans_clobbering_call(&lv, &result, &lv.call_points, &ok));
+        assert!(!spans_clobbering_call(&lv, &arg, &lv.call_points, &ok));
+        assert!(spans_clobbering_call(&lv, &live_in, &lv.call_points, &ok));
+        assert!(spans_clobbering_call(&lv, &across, &lv.call_points, &ok));
+        // Without the exemption list every one of them spans the call.
+        assert!(spans_clobbering_call(&lv, &result, &lv.call_points, &[]));
+        assert!(spans_clobbering_call(&lv, &arg, &lv.call_points, &[]));
+    }
+
+    /// A call that falls in a hole between a value's live segments is not
+    /// one the value spans.
+    #[test]
+    fn test_call_in_segment_hole() {
+        let iv = LiveInterval { start: 2, end: 30, value_id: 7 };
+        let mut lv = liveness(vec![iv], 15, None);
+        assert!(spans_clobbering_call(&lv, &iv, &lv.call_points.clone(), &[]));
+        lv.segments.insert(7, vec![(2, 8), (20, 30)]);
+        assert!(!spans_clobbering_call(&lv, &iv, &lv.call_points.clone(), &[]));
+    }
+}
