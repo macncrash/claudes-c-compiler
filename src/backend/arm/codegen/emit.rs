@@ -31,26 +31,54 @@ pub(super) const ARM_CALLEE_SAVED: [PhysReg; 9] = [
     PhysReg(25), PhysReg(26), PhysReg(27), PhysReg(28),
 ];
 
-/// Caller-saved registers available for register allocation: x13, x14.
+/// Caller-saved registers available for register allocation: x10-x15.
 ///
 /// These are a subset of the AAPCS64 "corruptible" registers (x9-x15).
-/// We exclude x9 (primary address register), x10 (memcpy source, secondary
-/// scratch), x11 (memcpy loop counter), x12 (memcpy byte transfer), x15
-/// (F128 large-offset scratch), and x16/x17/x18 (IP0/IP1/platform-reserved).
+/// We exclude x9 (primary address register) and x16/x17/x18
+/// (IP0/IP1/platform-reserved).
 ///
-/// x13 and x14 have NO hardcoded scratch uses in the codegen. They only
-/// appear in ARM_TMP_REGS (call argument staging) and ARM_GP_SCRATCH
-/// (inline assembly scratch pool). Since caller-saved allocation only assigns
-/// values whose live ranges do NOT span any call, the call staging use is safe.
-/// Functions with inline assembly have the caller-saved pool disabled entirely.
-pub(super) const ARM_CALLER_SAVED: [PhysReg; 2] = [
-    PhysReg(13), PhysReg(14),
+/// Outside call sequences, x10-x12 are written only by the inline memcpy loop
+/// (Memcpy is a liveness call point) and x15 only by F128 code (functions with
+/// F128 ops get no caller-saved pool). All six also appear in ARM_TMP_REGS
+/// (call argument staging) and ARM_GP_SCRATCH (inline assembly scratch pool).
+/// Since caller-saved allocation only assigns values whose live ranges do NOT
+/// span any call, the call staging use is safe. Functions with inline
+/// assembly have the caller-saved pool disabled entirely.
+pub(super) const ARM_CALLER_SAVED: [PhysReg; 6] = [
+    PhysReg(10), PhysReg(11), PhysReg(12), PhysReg(13), PhysReg(14), PhysReg(15),
 ];
+
+/// Callee-saved FP registers available for allocation: d8-d15 (AAPCS64
+/// preserves their low 64 bits, which is all a scalar float needs).
+pub(super) const ARM_FP_CALLEE_SAVED: [PhysReg; 8] = [
+    PhysReg(8), PhysReg(9), PhysReg(10), PhysReg(11),
+    PhysReg(12), PhysReg(13), PhysReg(14), PhysReg(15),
+];
+
+/// Caller-saved FP registers available for allocation: v16-v31.
+///
+/// The codegen uses only v0-v7 as FP scratch. v16 and up appear only as
+/// inline asm scratch, and functions with inline asm skip FP allocation.
+pub(super) const ARM_FP_CALLER_SAVED: [PhysReg; 16] = [
+    PhysReg(16), PhysReg(17), PhysReg(18), PhysReg(19),
+    PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23),
+    PhysReg(24), PhysReg(25), PhysReg(26), PhysReg(27),
+    PhysReg(28), PhysReg(29), PhysReg(30), PhysReg(31),
+];
+
+/// Offset added to FP register numbers when FP assignments are merged with
+/// GPR assignments for stack layout, so the two never compare equal.
+pub(super) const ARM_FP_REG_ID_BASE: u8 = 64;
+
+/// Name of an allocated FP register at a value's width: `s8` or `d8`.
+pub(super) fn fp_reg_name(reg: PhysReg, is_f32: bool) -> String {
+    format!("{}{}", if is_f32 { 's' } else { 'd' }, reg.0)
+}
 
 pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         // Caller-saved registers
-        13 => "x13", 14 => "x14",
+        10 => "x10", 11 => "x11", 12 => "x12", 13 => "x13", 14 => "x14", 15 => "x15",
         // Callee-saved registers
         19 => "x19", 20 => "x20", 21 => "x21", 22 => "x22", 23 => "x23", 24 => "x24",
         25 => "x25", 26 => "x26", 27 => "x27", 28 => "x28",
@@ -61,7 +89,7 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
 pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
         // Caller-saved registers
-        13 => "w13", 14 => "w14",
+        10 => "w10", 11 => "w11", 12 => "w12", 13 => "w13", 14 => "w14", 15 => "w15",
         // Callee-saved registers
         19 => "w19", 20 => "w20", 21 => "w21", 22 => "w22", 23 => "w23", 24 => "w24",
         25 => "w25", 26 => "w26", 27 => "w27", 28 => "w28",
@@ -162,6 +190,13 @@ pub struct ArmCodegen {
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved registers are stored.
     pub(super) callee_save_offset: i64,
+    /// FP register allocator: value ID -> (FP register, value is F32).
+    /// Kept apart from `reg_assignments`, whose users all expect GPRs.
+    pub(super) fp_reg_assignments: FxHashMap<u32, (PhysReg, bool)>,
+    /// Which callee-saved FP registers (d8-d15) are used (for save/restore).
+    pub(super) used_fp_callee_saved: Vec<PhysReg>,
+    /// SP offset where callee-saved FP registers are stored.
+    pub(super) fp_callee_save_offset: i64,
     /// For large stack frames: reserved for future x19 frame base optimization.
     /// Currently always None (optimization disabled due to correctness issue).
     pub(super) frame_base_offset: Option<i64>,
@@ -187,6 +222,9 @@ impl ArmCodegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             callee_save_offset: 0,
+            fp_reg_assignments: FxHashMap::default(),
+            used_fp_callee_saved: Vec::new(),
+            fp_callee_save_offset: 0,
             frame_base_offset: None,
             general_regs_only: false,
         }
@@ -229,26 +267,45 @@ impl ArmCodegen {
         self.reg_assignments.get(&dest.0).copied()
     }
 
-    /// Load an operand into a specific callee-saved register.
-    pub(super) fn operand_to_callee_reg(&mut self, op: &Operand, reg: PhysReg) {
-        let reg_name = callee_saved_name(reg);
+    /// Name of the FP register holding an operand (`s8`/`d8`), if it has one.
+    pub(super) fn operand_fp_reg(&self, op: &Operand) -> Option<String> {
         match op {
-            Operand::Const(_) => {
-                self.operand_to_x0(op);
-                self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
-            }
-            Operand::Value(v) => {
-                if let Some(&src_reg) = self.reg_assignments.get(&v.0) {
-                    if src_reg.0 != reg.0 {
-                        let src_name = callee_saved_name(src_reg);
-                        self.state.emit_fmt(format_args!("    mov {}, {}", reg_name, src_name));
-                    }
-                } else {
-                    self.operand_to_x0(op);
-                    self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
-                }
-            }
+            Operand::Value(v) => self.fp_reg_assignments.get(&v.0).map(|&(r, f32)| fp_reg_name(r, f32)),
+            _ => None,
         }
+    }
+
+    /// Name of the FP register assigned to a destination value, if any.
+    pub(super) fn dest_fp_reg(&self, dest: &Value) -> Option<String> {
+        self.fp_reg_assignments.get(&dest.0).map(|&(r, f32)| fp_reg_name(r, f32))
+    }
+
+    /// Get a float operand into an FP register: its allocated register if it
+    /// has one, else `scratch` (an `s`/`d` register), loaded via x0.
+    pub(super) fn float_operand_to_fp_reg(&mut self, op: &Operand, ty: IrType, scratch: &str) -> String {
+        if let Some(reg) = self.operand_fp_reg(op) {
+            return reg;
+        }
+        self.operand_to_x0(op);
+        let src = if ty == IrType::F32 { "w0" } else { "x0" };
+        self.state.emit_fmt(format_args!("    fmov {}, {}", scratch, src));
+        scratch.to_string()
+    }
+
+    /// Finish a float op whose result is in FP register `result`: leave it in
+    /// the dest's FP register if allocated, else move it to x0 and store.
+    /// When the dest is allocated, the op must have written it directly.
+    pub(super) fn finish_float_result(&mut self, dest: &Value, result: &str, ty: IrType) {
+        if self.fp_reg_assignments.contains_key(&dest.0) {
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        if ty == IrType::F32 {
+            self.state.emit_fmt(format_args!("    fmov w0, {}", result));
+        } else {
+            self.state.emit_fmt(format_args!("    fmov x0, {}", result));
+        }
+        self.store_x0_to(dest);
     }
 
     /// Try to extract an immediate value suitable for ARM imm12 encoding.
@@ -270,6 +327,14 @@ impl ArmCodegen {
                     None
                 }
             }
+            _ => None,
+        }
+    }
+
+    /// If `op` is a constant shift amount valid for a `width`-bit shift, return it.
+    pub(super) fn const_as_shift_imm(op: &Operand, width: i64) -> Option<i64> {
+        match op {
+            Operand::Const(c) => c.to_i64().filter(|v| (0..width).contains(v)),
             _ => None,
         }
     }
@@ -485,6 +550,24 @@ impl ArmCodegen {
             let r = callee_saved_name(used_regs[i]);
             let offset = base + (i as i64) * 8;
             self.emit_load_from_sp(r, offset, "ldr");
+        }
+        self.emit_save_restore_fp_callee_saved(false);
+    }
+
+    /// Save (prologue) or restore (epilogue) the callee-saved FP registers
+    /// the FP allocator used, in pairs where possible.
+    pub(super) fn emit_save_restore_fp_callee_saved(&mut self, save: bool) {
+        let regs: Vec<String> = self.used_fp_callee_saved.iter().map(|&r| fp_reg_name(r, false)).collect();
+        let base = self.fp_callee_save_offset;
+        for (pair_idx, pair) in regs.chunks(2).enumerate() {
+            let offset = base + (pair_idx as i64) * 16;
+            match (pair, save) {
+                ([r1, r2], true) => self.emit_stp_to_sp(r1, r2, offset),
+                ([r1, r2], false) => self.emit_ldp_from_sp(r1, r2, offset),
+                ([r], true) => self.emit_store_to_sp(r, offset, "str"),
+                ([r], false) => self.emit_load_from_sp(r, offset, "ldr"),
+                _ => unreachable!(),
+            }
         }
     }
 
@@ -1035,6 +1118,12 @@ impl ArmCodegen {
                     self.state.reg_cache.set_acc(v.0, false);
                     return;
                 }
+                if let Some(&(reg, is_f32)) = self.fp_reg_assignments.get(&v.0) {
+                    let acc = if is_f32 { "w0" } else { "x0" };
+                    self.state.emit_fmt(format_args!("    fmov {}, {}", acc, fp_reg_name(reg, is_f32)));
+                    self.state.reg_cache.set_acc(v.0, false);
+                    return;
+                }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     if is_alloca {
                         self.emit_alloca_addr("x0", v.0, slot.0);
@@ -1059,6 +1148,9 @@ impl ArmCodegen {
             // Value has a callee-saved register: store only to register, skip stack.
             let reg_name = callee_saved_name(reg);
             self.state.emit_fmt(format_args!("    mov {}, x0", reg_name));
+        } else if let Some(&(reg, is_f32)) = self.fp_reg_assignments.get(&dest.0) {
+            let acc = if is_f32 { "w0" } else { "x0" };
+            self.state.emit_fmt(format_args!("    fmov {}, {}", fp_reg_name(reg, is_f32), acc));
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             self.emit_store_to_sp("x0", slot.0, "str");
         }
@@ -1733,6 +1825,37 @@ impl ArchCodegen for ArmCodegen {
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
         self.reg_assignments.get(&val_id).copied()
+    }
+
+    fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        if let Some(d) = self.dest_fp_reg(dest) {
+            if let Some(s) = self.operand_fp_reg(src) {
+                // Both widths come from the same Copy chain, so they match.
+                if d != s {
+                    self.state.emit_fmt(format_args!("    fmov {}, {}", d, s));
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+
+        match (self.dest_reg(dest), self.operand_reg(src)) {
+            (Some(d), Some(s)) => {
+                if d.0 != s.0 {
+                    self.emit_reg_to_reg_move(s, d);
+                }
+                self.state.reg_cache.invalidate_acc();
+            }
+            (Some(d), None) => {
+                self.operand_to_x0(src);
+                self.emit_acc_to_phys_reg(d);
+                self.state.reg_cache.invalidate_acc();
+            }
+            _ => {
+                self.operand_to_x0(src);
+                self.store_x0_to(dest);
+            }
+        }
     }
 
     fn emit_reg_to_reg_move(&mut self, src: PhysReg, dest: PhysReg) {

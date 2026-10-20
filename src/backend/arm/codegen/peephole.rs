@@ -450,6 +450,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
+            changed2 |= forward_copy_propagation(&mut lines, &mut kinds, n);
+            changed2 |= retarget_results(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_dead_writes(&lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
@@ -798,10 +801,11 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
             continue;
         }
 
-        // Try to replace references to dst with src in line j
+        // Try to replace references to dst with src in line j. Skip lines with
+        // relocations or literals, whose symbol names may look like registers.
         let old_line = &lines[j];
         let dst_name = xreg_name(dst);
-        if !old_line.contains(dst_name) {
+        if !old_line.contains(dst_name) || old_line.contains(':') || old_line.contains('@') || old_line.contains('=') {
             continue;
         }
 
@@ -833,10 +837,236 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
     changed
 }
 
+// ── Straight-line dataflow passes ────────────────────────────────────────────
+//
+// The accumulator codegen computes most results in x0 and then copies them,
+// and stages operands through x1/x2. These passes clean that up within
+// straight-line code. They only reason about instructions on explicit
+// allowlists, whose register reads and writes are all explicit operands; any
+// other line (label, branch, call, ret, unknown instruction, raw `.inst`)
+// ends the scan with every register treated as live.
+
+/// How a line uses general-purpose registers.
+#[derive(Clone, Copy, PartialEq)]
+enum Access {
+    /// Writes only its first operand (when that is a GPR) and reads the rest.
+    Write { deletable: bool },
+    /// Reads all its operands and writes no GPR.
+    ReadOnly,
+    /// Assembler directive that cannot touch registers (`.loc`, `.cfi_*`).
+    Transparent,
+    /// Anything else: control flow, calls, or unknown semantics.
+    Barrier,
+}
+
+fn split_insn(line: &str) -> Option<(&str, &str)> {
+    let t = line.trim();
+    match t.find(char::is_whitespace) {
+        Some(p) => Some((&t[..p], t[p..].trim())),
+        None => Some((t, "")),
+    }
+}
+
+fn classify_access(line: &str, kind: LineKind) -> Access {
+    if matches!(kind, LineKind::Label | LineKind::Branch | LineKind::CondBranch
+        | LineKind::CmpBranch | LineKind::Ret | LineKind::Call)
+    {
+        return Access::Barrier;
+    }
+    let Some((mnemonic, ops)) = split_insn(line) else { return Access::Barrier };
+    if mnemonic.starts_with('.') {
+        return if mnemonic == ".loc" || mnemonic.starts_with(".cfi_") {
+            Access::Transparent
+        } else {
+            Access::Barrier
+        };
+    }
+    // Relocations and literals carry symbol names that could look like registers.
+    let has_symbol = ops.contains(':') || ops.contains('@') || ops.contains('=');
+    match mnemonic {
+        "mov" | "movz" | "movn" | "add" | "sub" | "and" | "orr" | "eor" | "bic" | "orn"
+        | "eon" | "lsl" | "lsr" | "asr" | "ror" | "mul" | "madd" | "msub" | "smull"
+        | "umull" | "smulh" | "umulh" | "sdiv" | "udiv" | "neg" | "mvn" | "sxtw" | "sxth"
+        | "sxtb" | "uxtb" | "uxth" | "cset" | "csetm" | "csel" | "csinc" | "csinv"
+        | "csneg" | "cinc" | "clz" | "rbit" | "rev" | "rev16" | "rev32" | "ubfx" | "sbfx"
+        | "ubfiz" | "sbfiz" | "fmov" | "fcvtzs" | "fcvtzu" if !has_symbol => {
+            Access::Write { deletable: true }
+        }
+        // Loads write their destination; never delete them (volatile/MMIO).
+        // Pre/post-index forms also write the base register.
+        "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldur" | "ldurb" | "ldurh"
+        | "ldursb" | "ldursh" | "ldursw"
+            if !has_symbol && !ops.contains("]!") && !ops.contains("],") =>
+        {
+            Access::Write { deletable: false }
+        }
+        "str" | "strb" | "strh" | "stur" | "sturb" | "sturh" | "cmp" | "cmn" | "tst"
+        | "fcmp" | "fcmpe" | "fadd" | "fsub" | "fmul" | "fdiv" | "fneg" | "fabs" | "fsqrt"
+        | "fmadd" | "fmsub" | "fnmadd" | "fnmsub" | "fmin" | "fmax" | "fminnm" | "fmaxnm"
+        | "fcsel" | "fcvt" | "scvtf" | "ucvtf"
+            if !has_symbol && !ops.contains("]!") && !ops.contains("],") =>
+        {
+            Access::ReadOnly
+        }
+        _ => Access::Barrier,
+    }
+}
+
+/// GPR number of an `xN`/`wN` operand (0-28; not fp, lr, sp, or zr).
+fn gpr_operand(op: &str) -> Option<u8> {
+    let op = op.trim();
+    let num = op.strip_prefix('x').or_else(|| op.strip_prefix('w'))?;
+    let n: u8 = num.parse().ok()?;
+    (n <= 28 && num.len() <= 2 && !num.starts_with('+')).then_some(n)
+}
+
+/// Whether `text` names register `n` as `xN` or `wN`.
+fn mentions_reg(text: &str, n: u8) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| gpr_operand(tok) == Some(n))
+}
+
+/// Split operands into (first operand, everything after the first comma).
+fn first_and_rest(ops: &str) -> (&str, &str) {
+    match ops.find(',') {
+        Some(p) => (ops[..p].trim(), &ops[p + 1..]),
+        None => (ops.trim(), ""),
+    }
+}
+
+/// Whether register `r` is overwritten before being read, scanning forward
+/// from line `start` through straight-line code.
+fn reg_dead_after(lines: &[String], kinds: &[LineKind], start: usize, n: usize, r: u8) -> bool {
+    for k in start..n {
+        if kinds[k] == LineKind::Nop {
+            continue;
+        }
+        let (_, ops) = split_insn(&lines[k]).unwrap_or(("", ""));
+        match classify_access(&lines[k], kinds[k]) {
+            Access::Transparent => {}
+            Access::Barrier => return false,
+            Access::ReadOnly => {
+                if mentions_reg(ops, r) {
+                    return false;
+                }
+            }
+            Access::Write { .. } => {
+                let (dest, srcs) = first_and_rest(ops);
+                if mentions_reg(srcs, r) {
+                    return false;
+                }
+                if gpr_operand(dest) == Some(r) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// After `mov xA, xB`, rewrite later reads of A to read B, until A or B is
+/// written. This lets the mov itself become dead.
+fn forward_copy_propagation(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let LineKind::Move { dst: a, src: b, is_32bit: false } = kinds[i] else { continue };
+        if a > 28 || b > 28 || a == b {
+            continue;
+        }
+        let (a_x, b_x) = (xreg_name(a), xreg_name(b));
+        let (a_w, b_w) = (wreg_name(a), wreg_name(b));
+        for k in i + 1..n {
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            let access = classify_access(&lines[k], kinds[k]);
+            let (prefix, ops) = match access {
+                Access::Transparent => continue,
+                Access::Barrier => break,
+                _ => {
+                    let line = lines[k].trim_start();
+                    let p = line.find(char::is_whitespace).unwrap_or(line.len());
+                    (line[..p].to_string(), line[p..].trim().to_string())
+                }
+            };
+            let (dest, srcs) = match access {
+                Access::Write { .. } => {
+                    let (d, s) = first_and_rest(&ops);
+                    (Some(d.to_string()), s.to_string())
+                }
+                _ => (None, ops.clone()),
+            };
+            let new_srcs = replace_whole_word(&replace_whole_word(&srcs, a_x, b_x), a_w, b_w);
+            if new_srcs != srcs {
+                lines[k] = match &dest {
+                    Some(d) => format!("    {} {},{}", prefix, d, new_srcs),
+                    None => format!("    {} {}", prefix, new_srcs),
+                };
+                kinds[k] = classify_line(&lines[k]);
+                changed = true;
+            }
+            if let Some(d) = dest {
+                if matches!(gpr_operand(&d), Some(r) if r == a || r == b) {
+                    break;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// `op xS, ...` then `mov xR, xS` with S dead afterwards: compute into R.
+fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop || !matches!(classify_access(&lines[i], kinds[i]), Access::Write { .. }) {
+            continue;
+        }
+        let Some((mnemonic, ops)) = split_insn(&lines[i]) else { continue };
+        let (dest, srcs) = first_and_rest(ops);
+        let Some(s) = gpr_operand(dest) else { continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let LineKind::Move { dst: r, src, is_32bit: false } = kinds[j] else { continue };
+        if src != s || r > 28 || r == s || !reg_dead_after(lines, kinds, j + 1, n, s) {
+            continue;
+        }
+        let new_dest = if dest.starts_with('w') { wreg_name(r) } else { xreg_name(r) };
+        lines[i] = format!("    {} {},{}", mnemonic, new_dest, srcs);
+        kinds[i] = classify_line(&lines[i]);
+        kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// Delete register writes that are overwritten before any read.
+fn eliminate_dead_writes(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        if classify_access(&lines[i], kinds[i]) != (Access::Write { deletable: true }) {
+            continue;
+        }
+        let (_, ops) = split_insn(&lines[i]).unwrap_or(("", ""));
+        let Some(r) = gpr_operand(first_and_rest(ops).0) else { continue };
+        if reg_dead_after(lines, kinds, i + 1, n, r) {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
 // Shared peephole string utilities -- see backend/peephole_common.rs
-use crate::backend::peephole_common::replace_source_reg_in_instruction;
-#[cfg(test)]
-use crate::backend::peephole_common::replace_whole_word;
+use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace_whole_word};
 
 // ── Global dead store elimination ────────────────────────────────────────────
 //
@@ -1219,5 +1449,75 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         // Store must be preserved because address of stack slot is taken
         assert!(result.contains("str w0, [sp, #16]"));
+    }
+
+    #[test]
+    fn test_retarget_result_into_dest_reg() {
+        let input = "    add x0, x21, x13\n    mov x22, x0\n    mov x0, #1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x22, x21, x13"), "{}", result);
+        assert!(!result.contains("mov x22, x0"), "{}", result);
+    }
+
+    #[test]
+    fn test_retarget_keeps_live_scratch() {
+        // x0 is read after the copy, so the add must still write x0.
+        let input = "    add x0, x21, x13\n    mov x22, x0\n    str x0, [x9]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x0, x21, x13"), "{}", result);
+    }
+
+    #[test]
+    fn test_dead_write_removed() {
+        let input = "    mov x0, x21\n    mov x0, #5\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x0, x21"), "{}", result);
+    }
+
+    #[test]
+    fn test_dead_write_kept_before_call() {
+        // bl reads x0-x7 implicitly.
+        let input = "    mov x0, x21\n    bl foo\n    mov x0, #5\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x0, x21"), "{}", result);
+    }
+
+    #[test]
+    fn test_dead_load_not_removed() {
+        // The load may be volatile or MMIO.
+        let input = "    ldr x0, [x9]\n    mov x0, #5\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr x0, [x9]"), "{}", result);
+    }
+
+    #[test]
+    fn test_dead_write_kept_before_unknown_instruction() {
+        // svc reads x8 (and x0-x5) implicitly.
+        let input = "    mov x8, #64\n    svc #0\n    mov x8, #1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x8, #64"), "{}", result);
+    }
+
+    #[test]
+    fn test_forward_copy_propagation() {
+        let input = "    mov x1, x22\n    add x0, x1, x13\n    str x1, [x9]\n    mov x1, #0\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x0, x22, x13"), "{}", result);
+        assert!(result.contains("str x22, [x9]"), "{}", result);
+    }
+
+    #[test]
+    fn test_copy_propagation_stops_at_redefinition() {
+        let input = "    mov x1, x22\n    mov x22, #7\n    add x0, x1, x13\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("add x0, x1, x13"), "{}", result);
+    }
+
+    #[test]
+    fn test_copy_propagation_skips_symbols() {
+        // A symbol named like a register must not be rewritten.
+        let input = "    mov x1, x22\n    add x0, x0, :lo12:x1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains(":lo12:x1"), "{}", result);
     }
 }

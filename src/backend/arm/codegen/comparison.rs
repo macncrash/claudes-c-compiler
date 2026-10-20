@@ -6,17 +6,16 @@ use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code};
 
 impl ArmCodegen {
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        self.operand_to_x0(lhs);
-        self.state.emit("    mov x1, x0");
-        self.operand_to_x0(rhs);
-        if ty == IrType::F32 {
-            self.state.emit("    fmov s0, w1");
-            self.state.emit("    fmov s1, w0");
-            self.state.emit("    fcmp s0, s1");
+        if self.operand_fp_reg(lhs).is_some() || self.operand_fp_reg(rhs).is_some() {
+            let (s0, s1) = if ty == IrType::F32 { ("s0", "s1") } else { ("d0", "d1") };
+            let a = self.float_operand_to_fp_reg(lhs, ty, s0);
+            let b = self.float_operand_to_fp_reg(rhs, ty, s1);
+            self.state.emit_fmt(format_args!("    fcmp {}, {}", a, b));
         } else {
-            self.state.emit("    fmov d0, x1");
-            self.state.emit("    fmov d1, x0");
-            self.state.emit("    fcmp d0, d1");
+            self.operand_to_x0(lhs);
+            self.state.emit("    mov x1, x0");
+            self.operand_to_x0(rhs);
+            self.emit_float_cmp_x1_x0(ty);
         }
         let cond = match op {
             IrCmpOp::Eq => "eq",
@@ -28,6 +27,19 @@ impl ArmCodegen {
         };
         self.state.emit_fmt(format_args!("    cset x0, {}", cond));
         self.store_x0_to(dest);
+    }
+
+    /// Compare float bit patterns lhs (x1) and rhs (x0).
+    fn emit_float_cmp_x1_x0(&mut self, ty: IrType) {
+        if ty == IrType::F32 {
+            self.state.emit("    fmov s0, w1");
+            self.state.emit("    fmov s1, w0");
+            self.state.emit("    fcmp s0, s1");
+        } else {
+            self.state.emit("    fmov d0, x1");
+            self.state.emit("    fmov d1, x0");
+            self.state.emit("    fcmp d0, d1");
+        }
     }
 
     pub(super) fn emit_f128_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) {

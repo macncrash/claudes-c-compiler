@@ -937,7 +937,7 @@ fn terminator_targets(term: &Terminator) -> Vec<u32> {
 /// Return true if the instruction is a call to setjmp, _setjmp, sigsetjmp, or __sigsetjmp.
 /// These functions "return twice": once normally (returning 0) and again when longjmp is called.
 /// Values live at the call point must have their intervals extended to prevent stack slot reuse.
-fn is_returns_twice_call(inst: &Instruction) -> bool {
+pub(super) fn is_returns_twice_call(inst: &Instruction) -> bool {
     if let Instruction::Call { func, .. } = inst {
         matches!(func.as_str(), "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp")
     } else {

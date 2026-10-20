@@ -114,20 +114,7 @@ pub fn allocate_registers(
     // priority for register allocation over values in straight-line code,
     // which is critical for performance in compute-heavy loops like zlib's
     // deflate_slow, longest_match, and slide_hash.
-    let mut use_count: FxHashMap<u32, u64> = FxHashMap::default();
-
-    // Precompute per-block loop weight: 10^depth, capped to avoid overflow.
-    let block_loop_weight: Vec<u64> = liveness.block_loop_depth.iter()
-        .map(|&d| {
-            match d {
-                0 => 1,
-                1 => 10,
-                2 => 100,
-                3 => 1000,
-                _ => 10_000, // cap at 10K for very deep nesting
-            }
-        })
-        .collect();
+    let use_count = weighted_use_counts(func, &liveness);
 
     // Collect values whose types don't fit in a single GPR.
     let non_gpr_values = collect_non_gpr_values(func, is_32bit);
@@ -144,14 +131,7 @@ pub fn allocate_registers(
     // standard accumulator path (e.g., store_rax_to on x86, store_t0_to on RISC-V).
     let mut eligible: FxHashSet<u32> = FxHashSet::default();
 
-    for (block_idx, block) in func.blocks.iter().enumerate() {
-        // Get the loop weight for this block (default 1 if no loop info available).
-        let weight: u64 = if block_idx < block_loop_weight.len() {
-            block_loop_weight[block_idx]
-        } else {
-            1
-        };
-
+    for block in &func.blocks {
         for inst in &block.instructions {
             // Values eligible for register allocation: those stored via the
             // standard accumulator path (store_rax_to on x86, store_t0_to on RISC-V).
@@ -224,19 +204,7 @@ pub fn allocate_registers(
                 }
                 _ => {}
             }
-
-            // Count uses of operands, weighted by loop depth of the containing block.
-            for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    *use_count.entry(v.0).or_insert(0) += weight;
-                }
-            });
         }
-        for_each_operand_in_terminator(&block.terminator, |op| {
-            if let Operand::Value(v) = op {
-                *use_count.entry(v.0).or_insert(0) += weight;
-            }
-        });
     }
 
     // Exclude values used as pointers in instructions whose codegen paths use
@@ -321,6 +289,242 @@ pub fn allocate_registers(
         used_regs,
         liveness: Some(liveness),
     }
+}
+
+/// Count uses per value, weighted by loop depth: a use inside a loop at depth D
+/// contributes 10^D (capped at 10K), so inner-loop values get priority.
+fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMap<u32, u64> {
+    let mut use_count: FxHashMap<u32, u64> = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let weight: u64 = match liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0) {
+            0 => 1,
+            1 => 10,
+            2 => 100,
+            3 => 1000,
+            _ => 10_000, // cap at 10K for very deep nesting
+        };
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *use_count.entry(v.0).or_insert(0) += weight;
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *use_count.entry(v.0).or_insert(0) += weight;
+            }
+        });
+    }
+    use_count
+}
+
+/// Configuration for floating-point register allocation.
+pub struct FpRegAllocConfig {
+    /// FP registers preserved across calls (AArch64: d8-d15).
+    pub callee_saved_regs: Vec<PhysReg>,
+    /// FP registers clobbered by calls (AArch64: v16-v31). Assigned only to
+    /// values whose live ranges cross no call or helper-calling instruction.
+    pub caller_saved_regs: Vec<PhysReg>,
+}
+
+/// Result of floating-point register allocation.
+pub struct FpRegAllocResult {
+    /// Map from value ID -> (FP register, value is F32 rather than F64).
+    pub assignments: FxHashMap<u32, (PhysReg, bool)>,
+    /// Callee-saved FP registers actually used (for prologue/epilogue save/restore).
+    pub used_callee_saved: Vec<PhysReg>,
+}
+
+/// Allocate FP registers to F32/F64 values, using the same linear scan as
+/// `allocate_registers`.
+///
+/// The backend moves floats through the integer accumulator as bit patterns,
+/// and several codegen paths (call arguments, intrinsics, inline asm) read a
+/// value's stack slot directly. So a value is eligible only if it is defined
+/// and used exclusively by instructions whose codegen goes through the
+/// backend's register-aware load/store-result helpers.
+pub fn allocate_fp_registers(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    config: &FpRegAllocConfig,
+) -> FpRegAllocResult {
+    let mut result = FpRegAllocResult {
+        assignments: FxHashMap::default(),
+        used_callee_saved: Vec::new(),
+    };
+    let has_barrier = func.blocks.iter().flat_map(|b| &b.instructions).any(|inst| {
+        matches!(inst, Instruction::InlineAsm { .. }) || super::liveness::is_returns_twice_call(inst)
+    });
+    if has_barrier || (config.callee_saved_regs.is_empty() && config.caller_saved_regs.is_empty()) {
+        return result;
+    }
+
+    let is_fp = |ty: &IrType| matches!(ty, IrType::F32 | IrType::F64);
+    let is_wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128 | IrType::F128);
+
+    // Float width of each candidate value, and values that cannot be candidates.
+    let mut width: FxHashMap<u32, bool> = FxHashMap::default();
+    let mut bad: FxHashSet<u32> = FxHashSet::default();
+    fn set_width(width: &mut FxHashMap<u32, bool>, bad: &mut FxHashSet<u32>, id: u32, is_f32: bool) {
+        if *width.entry(id).or_insert(is_f32) != is_f32 {
+            bad.insert(id);
+        }
+    }
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let float_def = match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. }
+                | Instruction::Select { dest, ty, .. } if is_fp(ty) => Some((*dest, *ty)),
+                Instruction::Cast { dest, from_ty, to_ty, .. }
+                    if is_fp(to_ty) && !is_wide(from_ty) => Some((*dest, *to_ty)),
+                _ => None,
+            };
+            match (float_def, inst) {
+                (Some((dest, ty)), _) => set_width(&mut width, &mut bad, dest.0, ty == IrType::F32),
+                (None, Instruction::Copy { dest, src: Operand::Const(c) }) => match c {
+                    IrConst::F32(_) => set_width(&mut width, &mut bad, dest.0, true),
+                    IrConst::F64(_) => set_width(&mut width, &mut bad, dest.0, false),
+                    _ => { bad.insert(dest.0); }
+                },
+                (None, Instruction::Copy { .. }) => {} // resolved below
+                (None, _) => {
+                    if let Some(dest) = inst.dest() {
+                        bad.insert(dest.0);
+                    }
+                }
+            }
+
+            // Only these instructions read their operands through the
+            // register-aware helpers on every codegen path.
+            let safe_use = match inst {
+                Instruction::BinOp { ty, .. }
+                | Instruction::UnaryOp { ty, .. }
+                | Instruction::Cmp { ty, .. } => is_fp(ty),
+                Instruction::Cast { from_ty, to_ty, .. } => is_fp(from_ty) && !is_wide(to_ty),
+                Instruction::Store { ty, .. } | Instruction::Select { ty, .. } => !is_wide(ty),
+                Instruction::Copy { .. } => true,
+                _ => false,
+            };
+            if !safe_use {
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        bad.insert(v.0);
+                    }
+                });
+                super::liveness::for_each_value_use_in_instruction(inst, |v| {
+                    bad.insert(v.0);
+                });
+            }
+        }
+        let returns_fp = matches!(block.terminator, crate::ir::reexports::Terminator::Return(_))
+            && is_fp(&func.return_type);
+        if !returns_fp {
+            for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    bad.insert(v.0);
+                }
+            });
+        }
+    }
+
+    // Copies take the width of their source (phi elimination produces chains
+    // and values with several defining Copies). A Copy from a value of unknown
+    // width (e.g. a float parameter) makes its dest ineligible.
+    for taint_unknown in [false, true] {
+        loop {
+            let mut changed = false;
+            for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+                if let Instruction::Copy { dest, src: Operand::Value(v) } = inst {
+                    if bad.contains(&v.0) {
+                        changed |= bad.insert(dest.0);
+                    } else if let Some(&is_f32) = width.get(&v.0) {
+                        match width.get(&dest.0) {
+                            None => { width.insert(dest.0, is_f32); changed = true; }
+                            Some(&w) if w != is_f32 => { changed |= bad.insert(dest.0); }
+                            _ => {}
+                        }
+                    } else if taint_unknown {
+                        changed |= bad.insert(dest.0);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    let eligible: FxHashSet<u32> = width.keys().copied().filter(|id| !bad.contains(id)).collect();
+    if eligible.is_empty() {
+        return result;
+    }
+
+    // Caller-saved FP registers are also clobbered by instructions that the
+    // backend lowers to helper calls (F128 soft-float, intrinsics).
+    let mut clobber_points = liveness.call_points.clone();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let calls_helper = match inst {
+                Instruction::Intrinsic { .. } => true,
+                Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
+                | Instruction::Cmp { ty, .. } | Instruction::Load { ty, .. }
+                | Instruction::Store { ty, .. } => *ty == IrType::F128,
+                Instruction::Cast { from_ty, to_ty, .. } => *from_ty == IrType::F128 || *to_ty == IrType::F128,
+                _ => false,
+            };
+            if calls_helper {
+                clobber_points.push(point);
+            }
+            point += 1;
+        }
+        point += 1; // terminator
+    }
+    clobber_points.sort_unstable();
+    clobber_points.dedup();
+
+    // Candidates are assigned in priority order, not program order, so each
+    // register keeps all its intervals and a candidate may fill any gap.
+    // Intervals are inclusive, so a value used by the instruction that defines
+    // another never shares its register.
+    let use_count = weighted_use_counts(func, liveness);
+    let callee = &config.callee_saved_regs;
+    let caller = &config.caller_saved_regs;
+    let mut callee_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); callee.len()];
+    let mut caller_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); caller.len()];
+    let fits = |busy: &[(u32, u32)], iv: &LiveInterval| busy.iter().all(|&(s, e)| iv.end < s || iv.start > e);
+    // Prefer a callee-saved register that is already saved by the prologue.
+    let pick_callee = |busy: &[Vec<(u32, u32)>], iv: &LiveInterval| {
+        let free = || (0..callee.len()).filter(|&i| fits(&busy[i], iv));
+        free().find(|&i| !busy[i].is_empty()).or_else(|| free().next())
+    };
+
+    // Phase 1: callee-saved registers for values that live across clobbers.
+    // Phase 2: caller-saved registers for values that cross no clobber.
+    // Phase 3: leftover callee-saved registers for the remaining values.
+    let no_gpr = FxHashMap::default();
+    for iv in build_sorted_candidates(liveness, &eligible, &no_gpr, &clobber_points, &use_count, Some(true)) {
+        if let Some(i) = pick_callee(&callee_busy, iv) {
+            callee_busy[i].push((iv.start, iv.end));
+            result.assignments.insert(iv.value_id, (callee[i], width[&iv.value_id]));
+        }
+    }
+    for iv in build_sorted_candidates(liveness, &eligible, &no_gpr, &clobber_points, &use_count, Some(false)) {
+        if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], iv)) {
+            caller_busy[i].push((iv.start, iv.end));
+            result.assignments.insert(iv.value_id, (caller[i], width[&iv.value_id]));
+        } else if let Some(i) = pick_callee(&callee_busy, iv) {
+            callee_busy[i].push((iv.start, iv.end));
+            result.assignments.insert(iv.value_id, (callee[i], width[&iv.value_id]));
+        }
+    }
+
+    result.used_callee_saved = (0..callee.len()).filter(|&i| !callee_busy[i].is_empty()).map(|i| callee[i]).collect();
+    result.used_callee_saved.sort_by_key(|r| r.0);
+    result
 }
 
 /// Collect values whose types don't fit in a single GPR (floats, i128, and

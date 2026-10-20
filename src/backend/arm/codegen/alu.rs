@@ -2,7 +2,7 @@
 
 use crate::ir::reexports::{IrBinOp, Operand, Value};
 use crate::common::types::IrType;
-use super::emit::{ArmCodegen, callee_saved_name, callee_saved_name_32, arm_alu_mnemonic};
+use super::emit::{ArmCodegen, callee_saved_name, arm_alu_mnemonic};
 
 impl ArmCodegen {
     pub(super) fn emit_float_neg_impl(&mut self, ty: IrType) {
@@ -95,60 +95,70 @@ impl ArmCodegen {
             }
         }
 
-        // Register-direct path
-        if let Some(dest_phys) = self.dest_reg(dest) {
-            let dest_name = callee_saved_name(dest_phys);
-            let dest_name_32 = callee_saved_name_32(dest_phys);
-
-            let is_simple_alu = matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And
-                | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul);
-            if is_simple_alu {
-                let mnemonic = arm_alu_mnemonic(op);
-
-                if matches!(op, IrBinOp::Add | IrBinOp::Sub) {
-                    if let Some(imm) = Self::const_as_imm12(rhs) {
-                        self.operand_to_callee_reg(lhs, dest_phys);
-                        if use_32bit {
-                            self.state.emit_fmt(format_args!("    {} {}, {}, #{}", mnemonic, dest_name_32, dest_name_32, imm));
-                            if !is_unsigned { self.state.emit_fmt(format_args!("    sxtw {}, {}", dest_name, dest_name_32)); }
-                        } else {
-                            self.state.emit_fmt(format_args!("    {} {}, {}, #{}", mnemonic, dest_name, dest_name, imm));
-                        }
-                        self.state.reg_cache.invalidate_acc();
-                        return;
-                    }
-                }
-
-                let rhs_phys = self.operand_reg(rhs);
-                let rhs_conflicts = rhs_phys.is_some_and(|r| r.0 == dest_phys.0);
-                let rhs_reg: String = if rhs_conflicts {
-                    self.operand_to_x0(rhs);
-                    self.operand_to_callee_reg(lhs, dest_phys);
-                    "x0".to_string()
-                } else {
-                    self.operand_to_callee_reg(lhs, dest_phys);
-                    if let Some(rhs_phys) = rhs_phys {
-                        callee_saved_name(rhs_phys).to_string()
+        // Three-address path for ALU ops and shifts: read operands from their
+        // registers (loading the rest into x1/x0), use an immediate rhs when it
+        // encodes, and write the dest's register directly.
+        let is_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
+        if is_shift || matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::And
+            | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul)
+        {
+            let width = if use_32bit { 32 } else { 64 };
+            let rhs_imm = if is_shift {
+                Self::const_as_shift_imm(rhs, width)
+            } else if matches!(op, IrBinOp::Add | IrBinOp::Sub) {
+                Self::const_as_imm12(rhs)
+            } else {
+                None
+            };
+            let lhs_reg = self.operand_reg(lhs).map(callee_saved_name);
+            let rhs_reg = self.operand_reg(rhs).map(callee_saved_name);
+            let rhs_needs_load = rhs_imm.is_none() && rhs_reg.is_none();
+            let a = match lhs_reg {
+                Some(r) => r,
+                None => {
+                    self.operand_to_x0(lhs);
+                    if rhs_needs_load {
+                        self.state.emit("    mov x1, x0");
+                        "x1"
                     } else {
-                        self.operand_to_x0(rhs);
-                        "x0".to_string()
+                        "x0"
                     }
-                };
-                let rhs_32: String = if rhs_reg == "x0" { "w0".to_string() }
-                    else { rhs_reg.replace('x', "w") };
-
-                if use_32bit {
-                    self.state.emit_fmt(format_args!("    {} {}, {}, {}", mnemonic, dest_name_32, dest_name_32, rhs_32));
-                    if !is_unsigned { self.state.emit_fmt(format_args!("    sxtw {}, {}", dest_name, dest_name_32)); }
-                } else {
-                    self.state.emit_fmt(format_args!("    {} {}, {}, {}", mnemonic, dest_name, dest_name, rhs_reg));
                 }
-                self.state.reg_cache.invalidate_acc();
-                return;
+            };
+            let b = match (rhs_imm, rhs_reg) {
+                (Some(imm), _) => format!("#{}", imm),
+                (None, Some(r)) => r.to_string(),
+                (None, None) => {
+                    self.operand_to_x0(rhs);
+                    "x0".to_string()
+                }
+            };
+            let d = self.dest_reg(dest).map_or("x0", callee_saved_name);
+            let mnemonic = match op {
+                IrBinOp::Shl => "lsl",
+                IrBinOp::AShr => "asr",
+                IrBinOp::LShr => "lsr",
+                _ => arm_alu_mnemonic(op),
+            };
+            if use_32bit {
+                let w = |r: &str| if r.starts_with('x') { r.replacen('x', "w", 1) } else { r.to_string() };
+                self.state.emit_fmt(format_args!("    {} {}, {}, {}", mnemonic, w(d), w(a), w(&b)));
+                // Keep signed 32-bit results in canonical sign-extended form.
+                if !is_unsigned {
+                    self.state.emit_fmt(format_args!("    sxtw {}, {}", d, w(d)));
+                }
+            } else {
+                self.state.emit_fmt(format_args!("    {} {}, {}, {}", mnemonic, d, a, b));
             }
+            if d == "x0" {
+                self.store_x0_to(dest);
+            } else {
+                self.state.reg_cache.invalidate_acc();
+            }
+            return;
         }
 
-        // Fallback: accumulator path
+        // Division and remainder: accumulator path
         self.operand_to_x0(lhs);
         self.state.emit("    mov x1, x0");
         self.operand_to_x0(rhs);
@@ -156,18 +166,6 @@ impl ArmCodegen {
 
         if use_32bit {
             match op {
-                IrBinOp::Add => {
-                    self.state.emit("    add w0, w1, w2");
-                    if !is_unsigned { self.state.emit("    sxtw x0, w0"); }
-                }
-                IrBinOp::Sub => {
-                    self.state.emit("    sub w0, w1, w2");
-                    if !is_unsigned { self.state.emit("    sxtw x0, w0"); }
-                }
-                IrBinOp::Mul => {
-                    self.state.emit("    mul w0, w1, w2");
-                    if !is_unsigned { self.state.emit("    sxtw x0, w0"); }
-                }
                 IrBinOp::SDiv => {
                     self.state.emit("    sdiv w0, w1, w2");
                     self.state.emit("    sxtw x0, w0");
@@ -182,24 +180,10 @@ impl ArmCodegen {
                     self.state.emit("    udiv w3, w1, w2");
                     self.state.emit("    msub w0, w3, w2, w1");
                 }
-                IrBinOp::And => self.state.emit("    and w0, w1, w2"),
-                IrBinOp::Or => self.state.emit("    orr w0, w1, w2"),
-                IrBinOp::Xor => self.state.emit("    eor w0, w1, w2"),
-                IrBinOp::Shl => {
-                    self.state.emit("    lsl w0, w1, w2");
-                    if !is_unsigned { self.state.emit("    sxtw x0, w0"); }
-                }
-                IrBinOp::AShr => {
-                    self.state.emit("    asr w0, w1, w2");
-                    if !is_unsigned { self.state.emit("    sxtw x0, w0"); }
-                }
-                IrBinOp::LShr => self.state.emit("    lsr w0, w1, w2"),
+                _ => unreachable!("handled by the three-address path"),
             }
         } else {
             match op {
-                IrBinOp::Add => self.state.emit("    add x0, x1, x2"),
-                IrBinOp::Sub => self.state.emit("    sub x0, x1, x2"),
-                IrBinOp::Mul => self.state.emit("    mul x0, x1, x2"),
                 IrBinOp::SDiv => self.state.emit("    sdiv x0, x1, x2"),
                 IrBinOp::UDiv => self.state.emit("    udiv x0, x1, x2"),
                 IrBinOp::SRem => {
@@ -210,12 +194,7 @@ impl ArmCodegen {
                     self.state.emit("    udiv x3, x1, x2");
                     self.state.emit("    msub x0, x3, x2, x1");
                 }
-                IrBinOp::And => self.state.emit("    and x0, x1, x2"),
-                IrBinOp::Or => self.state.emit("    orr x0, x1, x2"),
-                IrBinOp::Xor => self.state.emit("    eor x0, x1, x2"),
-                IrBinOp::Shl => self.state.emit("    lsl x0, x1, x2"),
-                IrBinOp::AShr => self.state.emit("    asr x0, x1, x2"),
-                IrBinOp::LShr => self.state.emit("    lsr x0, x1, x2"),
+                _ => unreachable!("handled by the three-address path"),
             }
         }
 

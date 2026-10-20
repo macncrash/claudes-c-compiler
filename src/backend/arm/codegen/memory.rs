@@ -13,6 +13,9 @@ impl ArmCodegen {
             crate::backend::f128_softfloat::f128_emit_store(self, val, ptr);
             return;
         }
+        if self.try_emit_fp_reg_access(val, ptr, 0, ty, "str") {
+            return;
+        }
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
 
@@ -21,12 +24,54 @@ impl ArmCodegen {
             crate::backend::f128_softfloat::f128_emit_load(self, dest, ptr);
             return;
         }
+        if self.try_emit_fp_reg_access(&Operand::Value(*dest), ptr, 0, ty, "ldr") {
+            return;
+        }
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
+    }
+
+    /// Load into or store from a value's allocated FP register directly
+    /// (`ldr s8, [...]` / `str s8, [...]`), leaving x0 untouched. Returns false,
+    /// emitting nothing, unless `value` has an FP register of type `ty`.
+    fn try_emit_fp_reg_access(&mut self, value: &Operand, base: &Value, offset: i64, ty: IrType, instr: &str) -> bool {
+        let Some(reg) = self.operand_fp_reg(value) else { return false };
+        let reg_is_f32 = reg.starts_with('s');
+        if !matches!((ty, reg_is_f32), (IrType::F32, true) | (IrType::F64, false)) {
+            return false;
+        }
+        let Some(addr) = self.state.resolve_slot_addr(base.0) else { return false };
+        match addr {
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr_impl(slot, id);
+                if offset != 0 {
+                    self.emit_add_offset_to_addr_reg_impl(offset);
+                }
+                self.state.emit_fmt(format_args!("    {} {}, [x9]", instr, reg));
+            }
+            SlotAddr::Direct(slot) => {
+                if instr == "str" {
+                    self.emit_store_to_sp(&reg, slot.0 + offset, instr);
+                } else {
+                    self.emit_load_from_sp(&reg, slot.0 + offset, instr);
+                }
+            }
+            SlotAddr::Indirect(slot) => {
+                self.emit_load_ptr_from_slot_impl(slot, base.0);
+                if offset != 0 {
+                    self.emit_add_offset_to_addr_reg_impl(offset);
+                }
+                self.state.emit_fmt(format_args!("    {} {}, [x9]", instr, reg));
+            }
+        }
+        true
     }
 
     pub(super) fn emit_store_with_const_offset_impl(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_store_with_offset(self, val, base, offset);
+            return;
+        }
+        if self.try_emit_fp_reg_access(val, base, offset, ty, "str") {
             return;
         }
         self.operand_to_x0(val);
@@ -62,6 +107,9 @@ impl ArmCodegen {
     pub(super) fn emit_load_with_const_offset_impl(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_load_with_offset(self, dest, base, offset);
+            return;
+        }
+        if self.try_emit_fp_reg_access(&Operand::Value(*dest), base, offset, ty, "ldr") {
             return;
         }
         let addr = self.state.resolve_slot_addr(base.0);
@@ -236,17 +284,40 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_acc();
     }
 
+    /// Copy `size` bytes from [x10] to [x9] in 16-byte ldp/stp chunks, then an
+    /// 8/4/2/1-byte tail. Uses only GPRs (safe under -mgeneral-regs-only);
+    /// x11-x13 are free because Memcpy is a liveness call point.
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
-        let label_id = self.state.next_label_id();
-        let loop_label = format!(".Lmemcpy_loop_{}", label_id);
-        let done_label = format!(".Lmemcpy_done_{}", label_id);
-        self.load_large_imm("x11", size as i64);
-        self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state.emit_fmt(format_args!("    cbz x11, {}", done_label));
-        self.state.emit("    ldrb w12, [x10], #1");
-        self.state.emit("    strb w12, [x9], #1");
-        self.state.emit("    sub x11, x11, #1");
-        self.state.emit_fmt(format_args!("    b {}", loop_label));
-        self.state.emit_fmt(format_args!("{}:", done_label));
+        const MAX_UNROLLED_CHUNKS: usize = 16; // stp offsets reach 504
+        let chunks = size / 16;
+        let mut offset = 0usize;
+        if chunks > MAX_UNROLLED_CHUNKS {
+            let label_id = self.state.next_label_id();
+            let loop_label = format!(".Lmemcpy_loop_{}", label_id);
+            self.load_large_imm("x11", chunks as i64);
+            self.state.emit_fmt(format_args!("{}:", loop_label));
+            self.state.emit("    ldp x12, x13, [x10], #16");
+            self.state.emit("    stp x12, x13, [x9], #16");
+            self.state.emit("    subs x11, x11, #1");
+            self.state.emit_fmt(format_args!("    b.ne {}", loop_label));
+        } else {
+            for _ in 0..chunks {
+                self.state.emit_fmt(format_args!("    ldp x12, x13, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    stp x12, x13, [x9, #{}]", offset));
+                offset += 16;
+            }
+        }
+        let mut tail = size % 16;
+        for (width, reg, load, store) in [
+            (8, "x12", "ldr", "str"), (4, "w12", "ldr", "str"),
+            (2, "w12", "ldrh", "strh"), (1, "w12", "ldrb", "strb"),
+        ] {
+            if tail >= width {
+                self.state.emit_fmt(format_args!("    {} {}, [x10, #{}]", load, reg, offset));
+                self.state.emit_fmt(format_args!("    {} {}, [x9, #{}]", store, reg, offset));
+                offset += width;
+                tail -= width;
+            }
+        }
     }
 }

@@ -6,6 +6,7 @@ use crate::backend::generation::{calculate_stack_space_common, find_param_alloca
 use crate::backend::call_abi::{ParamClass, classify_params};
 use super::emit::{
     ArmCodegen, callee_saved_name, ARM_CALLEE_SAVED, ARM_CALLER_SAVED, ARM_ARG_REGS,
+    ARM_FP_CALLEE_SAVED, ARM_FP_CALLER_SAVED, ARM_FP_REG_ID_BASE,
 };
 
 impl ArmCodegen {
@@ -48,11 +49,33 @@ impl ArmCodegen {
             caller_saved_regs.clear();
         }
 
-        let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
+        let (mut reg_assigned, mut cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
         );
+
+        // FP registers for F32/F64 values. Skipped for variadic functions
+        // (like the GPR pools) and under -mgeneral-regs-only.
+        self.fp_reg_assignments.clear();
+        self.used_fp_callee_saved.clear();
+        if !func.is_variadic && !self.general_regs_only {
+            let liveness = cached_liveness.take()
+                .unwrap_or_else(|| crate::backend::liveness::compute_live_intervals(func));
+            let config = crate::backend::regalloc::FpRegAllocConfig {
+                callee_saved_regs: ARM_FP_CALLEE_SAVED.to_vec(),
+                caller_saved_regs: ARM_FP_CALLER_SAVED.to_vec(),
+            };
+            let fp = crate::backend::regalloc::allocate_fp_registers(func, &liveness, &config);
+            cached_liveness = Some(liveness);
+            // Stack layout must treat these like register-allocated values:
+            // no stack slot, and never coalesced with another value's slot.
+            for (&id, &(reg, _)) in &fp.assignments {
+                reg_assigned.insert(id, PhysReg(ARM_FP_REG_ID_BASE + reg.0));
+            }
+            self.fp_reg_assignments = fp.assignments;
+            self.used_fp_callee_saved = fp.used_callee_saved;
+        }
 
         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
@@ -102,6 +125,13 @@ impl ArmCodegen {
             space += save_count * 8;
         }
 
+        let fp_save_count = self.used_fp_callee_saved.len() as i64;
+        if fp_save_count > 0 {
+            space = (space + 7) & !7;
+            self.fp_callee_save_offset = space;
+            space += (fp_save_count + 1) / 2 * 16;
+        }
+
         space
     }
 
@@ -135,6 +165,7 @@ impl ArmCodegen {
             let offset = base + (i as i64) * 8;
             self.emit_store_to_sp(r, offset, "str");
         }
+        self.emit_save_restore_fp_callee_saved(true);
     }
 
     // ---- emit_epilogue ----
