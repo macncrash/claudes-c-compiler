@@ -171,6 +171,7 @@ impl RiscvCodegen {
             };
 
             match class {
+                ParamClass::StructHfaReg { .. } => unreachable!("HFA params are AArch64-only"),
                 ParamClass::IntReg { reg_idx } => {
                     // GP register param - extend sub-64-bit values to full
                     // 64 bits and store with sd so the entire 8-byte slot is

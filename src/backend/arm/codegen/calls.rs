@@ -20,6 +20,7 @@ impl ArmCodegen {
             sret_uses_dedicated_reg: true,
             variadic_args_on_stack: crate::common::types::target_is_darwin(),
             pack_stack_scalars: crate::common::types::target_is_darwin(),
+            use_hfa_classification: true,
         }
     }
 

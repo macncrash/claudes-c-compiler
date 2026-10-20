@@ -153,7 +153,8 @@ impl Lowerer {
         // Check if function returns a large struct via sret
         if let Some(sig) = self.func_meta.sigs.get(&func.name) {
             if let Some(sret_size) = sig.sret_size {
-                params.push(IrParam { ty: IrType::Ptr, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None });
+                // An HFA return's class rides on the sret pointer (see FuncSig::ret_hfa).
+                params.push(IrParam { ty: IrType::Ptr, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: sig.ret_hfa });
                 uses_sret = true;
                 let _ = sret_size; // used for alloca sizing in allocate_function_params
             }
@@ -220,7 +221,7 @@ impl Lowerer {
                     if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
                         let ctx = &*self.types.borrow_struct_layouts();
                         let classes = layout.classify_sysv_eightbytes(ctx);
-                        let rv_class = layout.classify_riscv_float_fields(ctx);
+                        let rv_class = self.fp_struct_class(&layout, ctx);
                         (Some(layout.align), classes, rv_class)
                     } else {
                         (None, Vec::new(), None)

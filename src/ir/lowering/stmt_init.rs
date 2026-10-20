@@ -218,6 +218,7 @@ impl Lowerer {
         // Detect struct/complex/vector returns that need special ABI handling
         let mut sret_size = None;
         let mut two_reg_ret_size = None;
+        let mut ret_hfa = None;
         if ptr_count == 0 {
             let ret_ct = self.type_spec_to_ctype(ret_type_spec);
             if ret_ct.is_struct_or_union() {
@@ -225,6 +226,11 @@ impl Lowerer {
                 let (s, t) = Self::classify_struct_return(size);
                 sret_size = s;
                 two_reg_ret_size = t;
+                ret_hfa = self.hfa_class_of(&ret_ct);
+                if ret_hfa.is_some() {
+                    sret_size = Some(size);
+                    two_reg_ret_size = None;
+                }
             }
             // Vector types use the same by-value return convention as structs
             if ret_ct.is_vector() {
@@ -314,7 +320,7 @@ impl Lowerer {
         let param_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> = params.iter().enumerate().map(|(i, p)| {
             if param_struct_sizes.get(i).copied().flatten().is_some() {
                 if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
-                    layout.classify_riscv_float_fields(&*self.types.borrow_struct_layouts())
+                    self.fp_struct_class(&layout, &*self.types.borrow_struct_layouts())
                 } else {
                     None
                 }
@@ -334,6 +340,7 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes: ret_eightbyte_classes.clone(),
+                ret_hfa,
                 param_struct_sizes,
                 param_struct_classes,
                 param_riscv_float_classes,
@@ -349,6 +356,7 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes,
+                ret_hfa,
                 param_struct_sizes: Vec::new(),
                 param_struct_classes: Vec::new(),
                 param_riscv_float_classes: Vec::new(),

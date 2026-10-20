@@ -25,6 +25,7 @@ impl I686Codegen {
             sret_uses_dedicated_reg: false,
             variadic_args_on_stack: false,
             pack_stack_scalars: false,
+            use_hfa_classification: false,
         }
     }
 

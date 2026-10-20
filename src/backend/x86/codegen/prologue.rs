@@ -270,6 +270,7 @@ impl X86Codegen {
             };
 
             match class {
+                ParamClass::StructHfaReg { .. } => unreachable!("HFA params are AArch64-only"),
                 ParamClass::IntReg { reg_idx } => {
                     // Always store the full 64-bit register to ensure the entire 8-byte
                     // slot is initialized. Using a typed store (e.g., movl for I32) would

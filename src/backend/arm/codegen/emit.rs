@@ -183,6 +183,10 @@ pub struct ArmCodegen {
     /// Total bytes of named (non-variadic) params passed on the stack.
     /// This includes all stack-passed scalars, F128, I128, and structs with alignment.
     pub(super) va_named_stack_bytes: usize,
+    /// For a function returning an HFA (lowered as sret): (member count,
+    /// is_double) and the frame offset of the buffer the sret pointer (x8)
+    /// is pointed at, from which the return loads s0-s3/d0-d3.
+    pub(super) hfa_ret: Option<(usize, bool, i64)>,
     /// Scratch register index for inline asm GP register allocation
     pub(super) asm_scratch_idx: usize,
     /// Scratch register index for inline asm FP register allocation
@@ -223,6 +227,7 @@ impl ArmCodegen {
             va_named_gp_count: 0,
             va_named_fp_count: 0,
             va_named_stack_bytes: 0,
+            hfa_ret: None,
             asm_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),
@@ -1593,17 +1598,28 @@ impl ArmCodegen {
     }
 
     /// Phase 3c: Load struct-by-value register args. Loads pointer into x17,
-    /// then reads struct data from [x17] into arg regs.
+    /// then reads struct data from [x17] into arg regs (GP regs, or s/d regs
+    /// for an HFA).
     pub(super) fn emit_call_struct_byval_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass],
                                         slot_adjust: i64, needs_adjusted_load: bool) {
         for (i, arg) in args.iter().enumerate() {
-            if let CallArgClass::StructByValReg { base_reg_idx, size } = arg_classes[i] {
-                let regs_needed = if size <= 8 { 1 } else { 2 };
-                self.emit_load_arg_to_reg(arg, "x17", slot_adjust, 0, needs_adjusted_load);
-                self.state.emit_fmt(format_args!("    ldr {}, [x17]", ARM_ARG_REGS[base_reg_idx]));
-                if regs_needed > 1 {
-                    self.state.emit_fmt(format_args!("    ldr {}, [x17, #8]", ARM_ARG_REGS[base_reg_idx + 1]));
+            match arg_classes[i] {
+                CallArgClass::StructByValReg { base_reg_idx, size } => {
+                    let regs_needed = if size <= 8 { 1 } else { 2 };
+                    self.emit_load_arg_to_reg(arg, "x17", slot_adjust, 0, needs_adjusted_load);
+                    self.state.emit_fmt(format_args!("    ldr {}, [x17]", ARM_ARG_REGS[base_reg_idx]));
+                    if regs_needed > 1 {
+                        self.state.emit_fmt(format_args!("    ldr {}, [x17, #8]", ARM_ARG_REGS[base_reg_idx + 1]));
+                    }
                 }
+                CallArgClass::StructHfaReg { first_fp_idx, count, is_double, .. } => {
+                    self.emit_load_arg_to_reg(arg, "x17", slot_adjust, 0, needs_adjusted_load);
+                    let (prefix, elem_size) = if is_double { ('d', 8) } else { ('s', 4) };
+                    for k in 0..count {
+                        self.state.emit_fmt(format_args!("    ldr {}{}, [x17, #{}]", prefix, first_fp_idx + k, k * elem_size));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1728,6 +1744,17 @@ impl ArmCodegen {
             self.emit_store_to_sp("x9", slot.0 + 128, "str");
         }
 
+        // HFA params: copy each member from the saved Q area into the slot.
+        for (i, _) in func.params.iter().enumerate() {
+            let ParamClass::StructHfaReg { first_fp_idx, count, is_double, .. } = param_classes[i] else { continue };
+            let Some((slot, _, _)) = self.resolve_param_slot(func, i) else { continue };
+            let (reg, elem_size) = if is_double { ("d0", 8) } else { ("s0", 4) };
+            for k in 0..count {
+                self.state.emit_fmt(format_args!("    ldr {}, [sp, #{}]", reg, (first_fp_idx + k) * 16));
+                self.emit_store_to_sp(reg, slot.0 + 128 + (k * elem_size) as i64, "str");
+            }
+        }
+
         // Process F128 FP reg params: store full 16-byte f128, then f64 approx.
         for (i, _) in func.params.iter().enumerate() {
             let reg_idx = match param_classes[i] {
@@ -1769,6 +1796,15 @@ impl ArmCodegen {
                 self.state.emit_fmt(format_args!("    fmov x9, d{}", reg_idx));
             }
             self.emit_store_to_sp("x9", slot.0, "str");
+        }
+        // HFA params: store each member register into the struct's slot.
+        for (i, _) in func.params.iter().enumerate() {
+            let ParamClass::StructHfaReg { first_fp_idx, count, is_double, .. } = param_classes[i] else { continue };
+            let Some((slot, _, _)) = self.resolve_param_slot(func, i) else { continue };
+            let (prefix, elem_size) = if is_double { ('d', 8) } else { ('s', 4) };
+            for k in 0..count {
+                self.emit_store_to_sp(&format!("{}{}", prefix, first_fp_idx + k), slot.0 + (k * elem_size) as i64, "str");
+            }
         }
     }
 
@@ -1995,6 +2031,14 @@ impl ArchCodegen for ArmCodegen {
         let slot_adjust = if self.state.has_dyn_alloca { 0 } else { total_sp_adjust };
         let needs_adjusted = total_sp_adjust > 0;
         self.emit_load_arg_to_reg(sret_operand, "x8", slot_adjust, 0, needs_adjusted);
+    }
+    fn emit_call_store_hfa_return(&mut self, sret_operand: &Operand, count: usize, is_double: bool) {
+        // Runs after the call's stack cleanup, so slots need no adjustment.
+        self.emit_load_arg_to_reg(sret_operand, "x17", 0, 0, false);
+        let (prefix, elem_size) = if is_double { ('d', 8) } else { ('s', 4) };
+        for k in 0..count {
+            self.state.emit_fmt(format_args!("    str {}{}, [x17, #{}]", prefix, k, k * elem_size));
+        }
     }
 
     // ---- Inline asm / intrinsics (kept inline - has extra logic) ----

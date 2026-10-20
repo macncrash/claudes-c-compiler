@@ -120,9 +120,11 @@ impl ArmCodegen {
                     continue;
                 }
                 named_gp += class.gp_reg_count();
-                if matches!(class, crate::backend::call_abi::ParamClass::FloatReg { .. }
-                    | crate::backend::call_abi::ParamClass::F128FpReg { .. }) {
-                    named_fp += 1;
+                match class {
+                    crate::backend::call_abi::ParamClass::FloatReg { .. }
+                    | crate::backend::call_abi::ParamClass::F128FpReg { .. } => named_fp += 1,
+                    crate::backend::call_abi::ParamClass::StructHfaReg { count, .. } => named_fp += count,
+                    _ => {}
                 }
             }
             self.va_named_gp_count = named_gp.min(8);
@@ -130,6 +132,19 @@ impl ArmCodegen {
             // Unnamed args start at the next 8-byte slot after the named ones
             // (which Apple arm64 packs, so their end need not be a slot boundary).
             self.va_named_stack_bytes = classification.total_stack_bytes.next_multiple_of(8);
+        }
+
+        // HFA return: the caller passes no sret pointer, so reserve the buffer
+        // here (up to four doubles); the param stores point x8 at it.
+        self.hfa_ret = None;
+        if func.uses_sret {
+            if let Some(crate::common::types::RiscvFloatClass::Hfa { count, is_double }) =
+                func.params.first().and_then(|p| p.riscv_float_class)
+            {
+                space = (space + 15) & !15;
+                self.hfa_ret = Some((count, is_double, space));
+                space += 32;
+            }
         }
 
         let save_count = self.used_callee_saved.len() as i64;
@@ -283,6 +298,11 @@ impl ArmCodegen {
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
         if func.is_variadic {
             self.emit_save_variadic_regs();
+        }
+        // HFA return: point the sret pointer (read from x8 below) at the
+        // frame buffer the return loads from.
+        if let Some((_, _, buf_offset)) = self.hfa_ret {
+            self.emit_add_sp_offset("x8", buf_offset);
         }
 
         let config = self.call_abi_config_impl();

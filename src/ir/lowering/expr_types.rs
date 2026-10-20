@@ -214,6 +214,23 @@ impl Lowerer {
     /// union, or vector and return its size. Returns None if not an aggregate return or if
     /// the type cannot be determined.
     pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
+        let ret_ct = self.get_call_return_ctype(func)?;
+        if ret_ct.is_struct_or_union() || ret_ct.is_vector() {
+            // Use resolve_ctype_size to look up struct layouts properly;
+            // CType::size() returns 0 for Struct/Union since they only
+            // store a key, not the actual layout.
+            return Some(self.resolve_ctype_size(&ret_ct));
+        }
+        None
+    }
+
+    /// For indirect calls, the HFA class of the returned struct (AArch64).
+    pub(super) fn get_call_return_hfa(&self, func: &Expr) -> Option<crate::common::types::RiscvFloatClass> {
+        self.hfa_class_of(&self.get_call_return_ctype(func)?)
+    }
+
+    /// For indirect calls, the return type from the function pointer's CType.
+    fn get_call_return_ctype(&self, func: &Expr) -> Option<CType> {
         // For indirect calls, extract the return type from the function pointer's CType.
         // Strip Deref layers since dereferencing function pointers is a no-op in C.
         let func_ctype = match func {
@@ -235,22 +252,8 @@ impl Lowerer {
             _ => self.get_expr_ctype(func),
         };
 
-        if let Some(ref ctype) = func_ctype {
-            // Navigate through CType to find the return type
-            let ret_ctype = ctype.func_ptr_return_type(false);
-            if let Some(ret_ct) = ret_ctype {
-                if ret_ct.is_struct_or_union() {
-                    // Use resolve_ctype_size to look up struct layouts properly;
-                    // CType::size() returns 0 for Struct/Union since they only
-                    // store a key, not the actual layout.
-                    return Some(self.resolve_ctype_size(&ret_ct));
-                }
-                if ret_ct.is_vector() {
-                    return Some(self.resolve_ctype_size(&ret_ct));
-                }
-            }
-        }
-        None
+        // Navigate through CType to find the return type
+        func_ctype?.func_ptr_return_type(false)
     }
 
     /// Check if a builtin name is a polymorphic atomic builtin whose return type

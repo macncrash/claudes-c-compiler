@@ -35,6 +35,9 @@ pub enum CallArgClass {
     /// Passed in 1-2 XMM registers instead of GP registers.
     /// `lo_fp_idx` is the FP register for the first eightbyte, `hi_fp_idx` for the second (if size > 8).
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
+    /// AArch64 HFA: `count` float or double members in consecutive FP
+    /// registers starting at `first_fp_idx`.
+    StructHfaReg { first_fp_idx: usize, count: usize, is_double: bool, size: usize },
     /// Small struct where first eightbyte is INTEGER and second is SSE (mixed).
     StructMixedIntSseReg { int_reg_idx: usize, fp_reg_idx: usize, size: usize },
     /// Small struct where first eightbyte is SSE and second is INTEGER (mixed).
@@ -122,6 +125,9 @@ pub enum ParamClass {
     StructByValReg { base_reg_idx: usize, size: usize },
     /// Small struct where all eightbytes are SSE class -> 1-2 XMM registers.
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
+    /// AArch64 HFA: `count` float or double members in consecutive FP
+    /// registers starting at `first_fp_idx`.
+    StructHfaReg { first_fp_idx: usize, count: usize, is_double: bool },
     /// Small struct: first eightbyte INTEGER, second SSE.
     /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
     #[allow(dead_code)] // size field not yet read by any backend
@@ -277,6 +283,10 @@ pub struct CallAbiConfig {
     /// size, aligned to it (a `char` then a `short` sit at offsets 0 and 2),
     /// instead of an 8-byte slot each. Apple arm64: true.
     pub pack_stack_scalars: bool,
+    /// Whether homogeneous floating-point aggregates (`RiscvFloatClass::Hfa`)
+    /// go in consecutive FP registers, at any size up to four members, and
+    /// entirely on the stack when too few FP registers remain. AArch64: true.
+    pub use_hfa_classification: bool,
 }
 
 /// Result of SysV per-eightbyte struct classification.
@@ -377,6 +387,7 @@ enum CoreArgClass {
     F128Stack,
     StructByValReg { base_reg_idx: usize, size: usize },
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
+    StructHfaReg { first_fp_idx: usize, count: usize, is_double: bool, size: usize },
     StructMixedIntSseReg { int_reg_idx: usize, fp_reg_idx: usize, size: usize },
     StructMixedSseIntReg { fp_reg_idx: usize, int_reg_idx: usize, size: usize },
     StructByValStack { size: usize },
@@ -424,7 +435,20 @@ fn classify_args_core(
 
             let eb_classes = info.eightbyte_classes;
 
-            if size <= 16 && config.use_sysv_struct_classification && !eb_classes.is_empty() {
+            if let (true, Some(crate::common::types::RiscvFloatClass::Hfa { count, is_double })) =
+                (config.use_hfa_classification, info.riscv_float_class)
+            {
+                // AAPCS64 C.2/C.3: an HFA takes `count` consecutive FP registers,
+                // or if too few remain, goes wholly on the stack and no later
+                // argument may use an FP register.
+                if float_idx + count <= config.max_float_regs {
+                    result.push(CoreArgClass::StructHfaReg { first_fp_idx: float_idx, count, is_double, size });
+                    float_idx += count;
+                } else {
+                    result.push(CoreArgClass::StructByValStack { size });
+                    float_idx = config.max_float_regs;
+                }
+            } else if size <= 16 && config.use_sysv_struct_classification && !eb_classes.is_empty() {
                 // SysV AMD64 ABI: classify per-eightbyte and assign to GP or SSE registers
                 let (cls, gp_used, fp_used) = classify_sysv_struct(eb_classes, int_idx, float_idx, config);
                 match cls {
@@ -489,6 +513,8 @@ fn classify_args_core(
                                 classified = true;
                             }
                         }
+                        // Handled above when use_hfa_classification is set.
+                        RiscvFloatClass::Hfa { .. } => {}
                     }
                 }
                 if !classified {
@@ -625,6 +651,7 @@ pub fn classify_call_args(
         CoreArgClass::F128Stack => CallArgClass::F128Stack,
         CoreArgClass::StructByValReg { base_reg_idx, size } => CallArgClass::StructByValReg { base_reg_idx, size },
         CoreArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size } => CallArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size },
+        CoreArgClass::StructHfaReg { first_fp_idx, count, is_double, size } => CallArgClass::StructHfaReg { first_fp_idx, count, is_double, size },
         CoreArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size } => CallArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size },
         CoreArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size } => CallArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size },
         CoreArgClass::StructByValStack { size } => CallArgClass::StructByValStack { size },
@@ -739,6 +766,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             CoreArgClass::I128RegPair { base_reg_idx } => ParamClass::I128RegPair { base_reg_idx },
             CoreArgClass::StructByValReg { base_reg_idx, size } => ParamClass::StructByValReg { base_reg_idx, size },
             CoreArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size } => ParamClass::StructSseReg { lo_fp_idx, hi_fp_idx, size },
+            CoreArgClass::StructHfaReg { first_fp_idx, count, is_double, .. } => ParamClass::StructHfaReg { first_fp_idx, count, is_double },
             CoreArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size } => ParamClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size },
             CoreArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size } => ParamClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size },
             CoreArgClass::F128FpReg { reg_idx } => ParamClass::F128FpReg { reg_idx },

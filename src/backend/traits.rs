@@ -499,7 +499,8 @@ pub trait ArchCodegen {
                     | CallArgClass::StructSseReg { size, .. }
                     | CallArgClass::StructMixedIntSseReg { size, .. }
                     | CallArgClass::StructMixedSseIntReg { size, .. }
-                    | CallArgClass::StructSplitRegStack { size, .. } => CallArgClass::StructByValStack { size },
+                    | CallArgClass::StructSplitRegStack { size, .. }
+                    | CallArgClass::StructHfaReg { size, .. } => CallArgClass::StructByValStack { size },
                     other => other,
                 };
             }
@@ -556,6 +557,14 @@ pub trait ArchCodegen {
         let callee_pops = self.callee_pops_bytes_for_sret(is_sret);
         let effective_stack_cleanup = stack_arg_space.saturating_sub(callee_pops);
         self.emit_call_cleanup(effective_stack_cleanup, f128_temp_space, indirect);
+
+        // Phase 5.5: AArch64 HFA return, lowered as sret: the callee left the
+        // struct in s0-s3/d0-d3, so store it into the sret buffer.
+        if let (true, Some(Some(crate::common::types::RiscvFloatClass::Hfa { count, is_double }))) =
+            (is_sret && config.use_hfa_classification, struct_arg_riscv_float_classes.first())
+        {
+            self.emit_call_store_hfa_return(&args[0], *count, *is_double);
+        }
 
         // Phase 6: Store return value.
         if let Some(dest) = dest {
@@ -615,6 +624,12 @@ pub trait ArchCodegen {
     /// On i386 SysV, functions returning via sret do `ret $4` to pop the hidden
     /// pointer. All other architectures and non-sret calls return 0.
     fn callee_pops_bytes_for_sret(&self, _is_sret: bool) -> usize { 0 }
+
+    /// Store an HFA returned in FP registers into the call's sret buffer
+    /// (`sret_operand`). Required when `CallAbiConfig::use_hfa_classification`.
+    fn emit_call_store_hfa_return(&mut self, _sret_operand: &Operand, _count: usize, _is_double: bool) {
+        unreachable!("HFA returns need a backend with use_hfa_classification");
+    }
 
     /// Stash the SysV eightbyte classification for the call's return struct.
     /// x86-64 overrides this to store the classes for use in emit_call_store_result.

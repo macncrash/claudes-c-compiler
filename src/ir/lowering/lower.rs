@@ -279,6 +279,34 @@ impl Lowerer {
         self.target == Target::Riscv64
     }
 
+    /// The FP-register classification of a struct passed or returned by value:
+    /// an HFA on AArch64, a RISC-V LP64D float struct elsewhere (ignored by
+    /// backends that don't set `use_riscv_float_struct_classification`).
+    pub(super) fn fp_struct_class(
+        &self,
+        layout: &crate::common::types::StructLayout,
+        ctx: &dyn crate::common::types::StructLayoutProvider,
+    ) -> Option<crate::common::types::RiscvFloatClass> {
+        if self.target == Target::Aarch64 {
+            layout.classify_hfa(ctx)
+        } else {
+            layout.classify_riscv_float_fields(ctx)
+        }
+    }
+
+    /// AArch64: the HFA class of a struct type, if it is one. Returned HFAs
+    /// come back in s0-s3/d0-d3, which lowering models as sret.
+    pub(super) fn hfa_class_of(&self, ret_ct: &CType) -> Option<crate::common::types::RiscvFloatClass> {
+        use crate::common::types::StructLayoutProvider;
+        if self.target != Target::Aarch64 {
+            return None;
+        }
+        let CType::Struct(key) = ret_ct else { return None };
+        let layouts = self.types.borrow_struct_layouts();
+        let layout = layouts.get_struct_layout(key)?;
+        layout.classify_hfa(&*layouts)
+    }
+
     /// Returns true if the target decomposes _Complex long double into 2 F128 scalar
     /// components for function argument/parameter passing.
     /// On ARM64 (AAPCS64): _Complex long double is an HFA passed in Q0/Q1 registers,
@@ -862,12 +890,18 @@ impl Lowerer {
         // Detect struct/complex/vector returns that need special ABI handling.
         let mut sret_size = None;
         let mut two_reg_ret_size = None;
+        let mut ret_hfa = None;
         if ptr_count == 0 {
             if full_ret_ctype.is_struct_or_union() {
                 let size = self.sizeof_type(ret_type_spec);
                 let (s, t) = Self::classify_struct_return(size);
                 sret_size = s;
                 two_reg_ret_size = t;
+                ret_hfa = self.hfa_class_of(&full_ret_ctype);
+                if ret_hfa.is_some() {
+                    sret_size = Some(size);
+                    two_reg_ret_size = None;
+                }
             }
             // Vector types use the same by-value return convention as structs:
             // small vectors (<=8 bytes) are packed into a register, larger ones use sret.
@@ -1000,7 +1034,7 @@ impl Lowerer {
         let param_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> = params.iter().enumerate().map(|(i, p)| {
             if param_struct_sizes.get(i).copied().flatten().is_some() {
                 if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
-                    layout.classify_riscv_float_fields(&*self.types.borrow_struct_layouts())
+                    self.fp_struct_class(&layout, &*self.types.borrow_struct_layouts())
                 } else {
                     None
                 }
@@ -1020,6 +1054,7 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes: ret_eightbyte_classes.clone(),
+                ret_hfa,
                 param_struct_sizes,
                 param_struct_classes,
                 param_riscv_float_classes,
@@ -1035,6 +1070,7 @@ impl Lowerer {
                 sret_size,
                 two_reg_ret_size,
                 ret_eightbyte_classes,
+                ret_hfa,
                 param_struct_sizes: Vec::new(),
                 param_struct_classes: Vec::new(),
                 param_riscv_float_classes: Vec::new(),

@@ -252,6 +252,10 @@ pub(super) struct FuncSig {
     /// Used to determine which eightbytes go in GP vs SSE registers on return.
     /// Empty if not applicable (non-struct return, sret, or non-x86-64).
     pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    /// AArch64: the HFA class of a returned struct. Such a return is lowered
+    /// as sret, and the backend moves the buffer to and from s0-s3/d0-d3; the
+    /// class rides on the sret pointer's `riscv_float_class` in the IR.
+    pub ret_hfa: Option<crate::common::types::RiscvFloatClass>,
     /// Per-parameter struct sizes for by-value struct passing ABI.
     /// Each entry is Some(size) if that parameter is a struct/union, None otherwise.
     pub param_struct_sizes: Vec<Option<usize>>,
@@ -277,6 +281,7 @@ impl FuncSig {
             sret_size: None,
             two_reg_ret_size: None,
             ret_eightbyte_classes: Vec::new(),
+            ret_hfa: None,
             param_struct_sizes: Vec::new(),
             param_struct_classes: Vec::new(),
             param_riscv_float_classes: Vec::new(),

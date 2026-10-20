@@ -173,6 +173,11 @@ pub enum RiscvFloatClass {
         int_size: usize,
         float_offset: usize,
     },
+    /// AArch64 homogeneous floating-point aggregate: 1-4 members, all float
+    /// or all double (arrays and nested structs flattened). Passed in
+    /// consecutive s/d registers and returned in s0-s3/d0-d3. Produced only
+    /// for AArch64 targets, by `classify_hfa`.
+    Hfa { count: usize, is_double: bool },
 }
 
 /// Address space for pointer types (GCC named address space extension).
@@ -901,7 +906,7 @@ impl StructLayout {
         // Flatten all scalar fields (recursing into nested structs/arrays)
         let mut float_fields: Vec<(usize, usize)> = Vec::new(); // (offset, size_bytes: 4=float, 8=double)
         let mut int_fields: Vec<(usize, usize)> = Vec::new(); // (offset, size_bytes)
-        if !Self::collect_riscv_fields(&self.fields, 0, &mut float_fields, &mut int_fields, ctx) {
+        if !Self::collect_riscv_fields(&self.fields, 0, &mut float_fields, &mut int_fields, 2, ctx) {
             return None;
         }
 
@@ -947,6 +952,29 @@ impl StructLayout {
         }
     }
 
+    /// AAPCS64 homogeneous floating-point aggregate classification: a struct
+    /// whose flattened members are 1-4 values of one float type (all float or
+    /// all double) and nothing else. Returns `RiscvFloatClass::Hfa`.
+    pub fn classify_hfa(&self, ctx: &dyn StructLayoutProvider) -> Option<RiscvFloatClass> {
+        if self.is_union || self.size == 0 {
+            return None;
+        }
+        let mut float_fields: Vec<(usize, usize)> = Vec::new();
+        let mut int_fields: Vec<(usize, usize)> = Vec::new();
+        if !Self::collect_riscv_fields(&self.fields, 0, &mut float_fields, &mut int_fields, 4, ctx) {
+            return None;
+        }
+        let count = float_fields.len();
+        if !int_fields.is_empty() || !(1..=4).contains(&count) {
+            return None;
+        }
+        let elem_size = float_fields[0].1;
+        if float_fields.iter().any(|&(_, size)| size != elem_size) || self.size != count * elem_size {
+            return None;
+        }
+        Some(RiscvFloatClass::Hfa { count, is_double: elem_size == 8 })
+    }
+
     /// Recursively collect scalar float and int fields from a struct.
     /// Returns false if the struct contains unsupported field types (e.g., bitfields,
     /// empty arrays, complex types) that prevent FP classification.
@@ -955,6 +983,7 @@ impl StructLayout {
         base_offset: usize,
         float_fields: &mut Vec<(usize, usize)>,
         int_fields: &mut Vec<(usize, usize)>,
+        max_fields: usize,
         ctx: &dyn StructLayoutProvider,
     ) -> bool {
         for field in fields {
@@ -981,7 +1010,7 @@ impl StructLayout {
                             // Unions break FP classification
                             return false;
                         }
-                        if !Self::collect_riscv_fields(&layout.fields, offset, float_fields, int_fields, ctx) {
+                        if !Self::collect_riscv_fields(&layout.fields, offset, float_fields, int_fields, max_fields, ctx) {
                             return false;
                         }
                     } else {
@@ -1004,7 +1033,7 @@ impl StructLayout {
                                     if layout.is_union {
                                         return false;
                                     }
-                                    if !Self::collect_riscv_fields(&layout.fields, elem_offset, float_fields, int_fields, ctx) {
+                                    if !Self::collect_riscv_fields(&layout.fields, elem_offset, float_fields, int_fields, max_fields, ctx) {
                                         return false;
                                     }
                                 } else {
@@ -1031,8 +1060,8 @@ impl StructLayout {
                 }
             }
 
-            // If we already have more than 2 fields total, can't classify as FP
-            if float_fields.len() + int_fields.len() > 2 {
+            // Too many fields to classify (2 for RISC-V, 4 for an HFA)
+            if float_fields.len() + int_fields.len() > max_fields {
                 return false;
             }
             // If we have more than 1 int field, can't classify as FP

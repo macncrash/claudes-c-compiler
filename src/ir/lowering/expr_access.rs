@@ -1141,7 +1141,9 @@ impl Lowerer {
         // On ARM64 and RISC-V, structs > 16 bytes are passed by reference:
         // a pointer to the struct is placed in the va_list. Read the pointer
         // and return it directly (the pointer IS the struct address).
-        let large_struct_by_ref = matches!(self.target, Target::Aarch64 | Target::Riscv64);
+        // An AArch64 HFA is passed by value at any size (AAPCS64 B.3 excludes it).
+        let large_struct_by_ref = matches!(self.target, Target::Aarch64 | Target::Riscv64)
+            && self.hfa_class_of(ctype).is_none();
         if large_struct_by_ref && struct_size > 16 {
             let ap_val = self.lower_va_list_pointer(ap_expr);
             let va_list_ptr = self.operand_to_value(ap_val);

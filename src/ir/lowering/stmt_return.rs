@@ -91,8 +91,10 @@ impl Lowerer {
             }
         }
         // On i686, the i386 SysV ABI uses sret for ALL struct sizes (threshold 0).
-        // On 64-bit targets, structs > 16 bytes use sret.
-        let sret_threshold = if crate::common::types::target_is_32bit() { 0 } else { 16 };
+        // On 64-bit targets, structs > 16 bytes use sret, and so does any AArch64
+        // HFA (see FuncSig::ret_hfa).
+        let hfa_ret = self.func_meta.sigs.get(self.func().name.as_str()).is_some_and(|s| s.ret_hfa.is_some());
+        let sret_threshold = if crate::common::types::target_is_32bit() || hfa_ret { 0 } else { 16 };
         if struct_size > sret_threshold {
             let src_addr = self.get_struct_base_addr(e);
             let sret_ptr = self.fresh_value();

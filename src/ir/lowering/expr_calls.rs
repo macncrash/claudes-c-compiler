@@ -154,18 +154,22 @@ impl Lowerer {
         }
 
         // Determine sret/two-reg return convention
-        let (sret_size, two_reg_size, call_ret_classes) = if let Expr::Identifier(name, _) = stripped_func {
+        let indirect_ret = |this: &Self| match this.get_call_return_struct_size(effective_func) {
+            Some(size) => match this.get_call_return_hfa(effective_func) {
+                Some(hfa) => (Some(size), None, Vec::new(), Some(hfa)),
+                None => {
+                    let (s, t) = Self::classify_struct_return(size);
+                    (s, t, Vec::new(), None)
+                }
+            },
+            None => (None, None, Vec::new(), None),
+        };
+        let (sret_size, two_reg_size, call_ret_classes, ret_hfa) = if let Expr::Identifier(name, _) = stripped_func {
             if self.is_func_ptr_variable(name) {
                 // Indirect call through function pointer variable
                 // TODO: compute ret_eightbyte_classes from the function pointer's
                 // return type to support mixed SSE/INTEGER struct returns via fptrs
-                match self.get_call_return_struct_size(effective_func) {
-                    Some(size) => {
-                        let (s, t) = Self::classify_struct_return(size);
-                        (s, t, Vec::new())
-                    }
-                    None => (None, None, Vec::new()),
-                }
+                indirect_ret(self)
             } else {
                 // Direct function call - look up by function name
                 let sig = self.func_meta.sigs.get(name.as_str());
@@ -173,19 +177,14 @@ impl Lowerer {
                     sig.and_then(|s| s.sret_size),
                     sig.and_then(|s| s.two_reg_ret_size),
                     sig.map(|s| s.ret_eightbyte_classes.clone()).unwrap_or_default(),
+                    sig.and_then(|s| s.ret_hfa),
                 )
             }
         } else {
             // Non-identifier function expression (e.g., array[i]())
             // TODO: compute ret_eightbyte_classes from expression return type
             // to support mixed SSE/INTEGER struct returns via indirect calls
-            match self.get_call_return_struct_size(effective_func) {
-                Some(size) => {
-                    let (s, t) = Self::classify_struct_return(size);
-                    (s, t, Vec::new())
-                }
-                None => (None, None, Vec::new()),
-            }
+            indirect_ret(self)
         };
 
         // Lower arguments with implicit casts
@@ -231,7 +230,8 @@ impl Lowerer {
             struct_arg_sizes.insert(0, None); // sret pointer is not a struct arg
             struct_arg_aligns.insert(0, None);
             struct_arg_classes.insert(0, Vec::new()); // sret pointer has no eightbyte classes
-            struct_arg_riscv_float_classes.insert(0, None); // sret pointer has no riscv float class
+            // The sret pointer carries the HFA class of an HFA return (FuncSig::ret_hfa).
+            struct_arg_riscv_float_classes.insert(0, ret_hfa);
             Some(alloca)
         } else {
             None
@@ -706,6 +706,19 @@ impl Lowerer {
             }).collect()
         } else {
             args.iter().map(|_a| None).collect()
+        };
+        // AArch64: an HFA goes in FP registers whether or not the callee has a
+        // known signature (function pointers) or the arg is variadic, so
+        // classify struct args the signature doesn't cover by their own type.
+        let struct_arg_riscv_float_classes = if self.target == crate::backend::Target::Aarch64 {
+            struct_arg_riscv_float_classes.into_iter().zip(args).enumerate().map(|(i, (class, a))| {
+                if class.is_some() || struct_arg_sizes.get(i).copied().flatten().is_none() {
+                    return class;
+                }
+                self.get_expr_ctype(a).and_then(|ct| self.hfa_class_of(&ct))
+            }).collect()
+        } else {
+            struct_arg_riscv_float_classes
         };
 
         (arg_vals, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes)
