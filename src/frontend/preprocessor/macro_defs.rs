@@ -1070,6 +1070,15 @@ impl MacroTable {
                     continue;
                 }
 
+                // Likewise an encoding prefix (the "L" in L'1') is part of the
+                // string/char literal token, not a parameter reference.
+                if i < len && (bytes[i] == b'"' || bytes[i] == b'\'')
+                    && matches!(ident, "u8" | "u" | "U" | "L")
+                {
+                    result.push_str(ident);
+                    continue;
+                }
+
                 if ident == "__VA_ARGS__" && is_variadic {
                     let va_args = self.get_va_args(params, args);
                     let next = if i < len { Some(bytes[i]) } else { None };
