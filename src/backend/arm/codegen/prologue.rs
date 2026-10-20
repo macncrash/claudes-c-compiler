@@ -107,7 +107,8 @@ impl ArmCodegen {
             }
 
             let config = self.call_abi_config_impl();
-            let param_classes = crate::backend::call_abi::classify_params(func, &config);
+            let classification = crate::backend::call_abi::classify_params_full(func, &config);
+            let param_classes = classification.classes;
             let mut named_gp = 0usize;
             let mut named_fp = 0usize;
             for (i, class) in param_classes.iter().enumerate() {
@@ -126,7 +127,9 @@ impl ArmCodegen {
             }
             self.va_named_gp_count = named_gp.min(8);
             self.va_named_fp_count = named_fp.min(8);
-            self.va_named_stack_bytes = crate::backend::call_abi::named_params_stack_bytes(&param_classes);
+            // Unnamed args start at the next 8-byte slot after the named ones
+            // (which Apple arm64 packs, so their end need not be a slot boundary).
+            self.va_named_stack_bytes = classification.total_stack_bytes.next_multiple_of(8);
         }
 
         let save_count = self.used_callee_saved.len() as i64;

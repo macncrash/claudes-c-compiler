@@ -505,6 +505,16 @@ pub trait ArchCodegen {
             }
         }
 
+        // Apple arm64: named scalars on the stack are packed at their own size.
+        if config.pack_stack_scalars {
+            let named = if is_variadic { num_fixed_args } else { arg_classes.len() };
+            for (cls, ty) in arg_classes.iter_mut().zip(arg_types).take(named) {
+                if matches!(cls, CallArgClass::Stack) {
+                    *cls = CallArgClass::StackPacked { size: ty.size().max(1) };
+                }
+            }
+        }
+
         // Phase 0: Spill indirect function pointer before any stack manipulation.
         let indirect = func_ptr.is_some() && direct_name.is_none();
         if indirect {

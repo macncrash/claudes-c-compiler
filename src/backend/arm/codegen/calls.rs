@@ -19,6 +19,7 @@ impl ArmCodegen {
             align_struct_pairs: false,
             sret_uses_dedicated_reg: true,
             variadic_args_on_stack: crate::common::types::target_is_darwin(),
+            pack_stack_scalars: crate::common::types::target_is_darwin(),
         }
     }
 
@@ -41,9 +42,8 @@ impl ArmCodegen {
             for (arg_idx, arg) in args.iter().enumerate() {
                 if !arg_classes[arg_idx].is_stack() { continue; }
                 let cls = arg_classes[arg_idx];
-                if matches!(cls, CallArgClass::F128Stack | CallArgClass::I128Stack) {
-                    stack_offset = (stack_offset + 15) & !15;
-                }
+                let align = cls.stack_align() as i64;
+                stack_offset = (stack_offset + align - 1) / align * align;
                 match cls {
                     CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
                         let n_dwords = size.div_ceil(8);
@@ -177,7 +177,7 @@ impl ArmCodegen {
                         }
                         stack_offset += 16;
                     }
-                    CallArgClass::Stack => {
+                    CallArgClass::Stack | CallArgClass::StackPacked { .. } => {
                         match arg {
                             Operand::Value(v) => {
                                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -196,8 +196,14 @@ impl ArmCodegen {
                             }
                             Operand::Const(_) => { self.operand_to_x0(arg); }
                         }
-                        self.emit_store_to_raw_sp("x0", stack_offset, "str");
-                        stack_offset += 8;
+                        let (reg, instr) = match cls.stack_bytes() {
+                            1 => ("w0", "strb"),
+                            2 => ("w0", "strh"),
+                            4 => ("w0", "str"),
+                            _ => ("x0", "str"),
+                        };
+                        self.emit_store_to_raw_sp(reg, stack_offset, instr);
+                        stack_offset += cls.stack_bytes() as i64;
                     }
                     _ => {}
                 }

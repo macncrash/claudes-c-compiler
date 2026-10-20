@@ -48,6 +48,9 @@ pub enum CallArgClass {
     LargeStructStack { size: usize },
     /// Argument overflows to the stack (normal 8-byte).
     Stack,
+    /// Scalar argument packed on the stack at its own size and alignment
+    /// (Apple arm64 named arguments; see `CallAbiConfig::pack_stack_scalars`).
+    StackPacked { size: usize },
     /// F128 argument overflows to the stack (16-byte aligned).
     F128Stack,
     /// I128 argument overflows to the stack (16-byte aligned).
@@ -60,10 +63,20 @@ pub enum CallArgClass {
 impl CallArgClass {
     /// Returns true if this argument is passed on the stack (any kind).
     pub fn is_stack(&self) -> bool {
-        matches!(self, CallArgClass::Stack | CallArgClass::F128Stack |
-                 CallArgClass::I128Stack | CallArgClass::StructByValStack { .. } |
+        matches!(self, CallArgClass::Stack | CallArgClass::StackPacked { .. } |
+                 CallArgClass::F128Stack | CallArgClass::I128Stack |
+                 CallArgClass::StructByValStack { .. } |
                  CallArgClass::LargeStructStack { .. } |
                  CallArgClass::StructSplitRegStack { .. })
+    }
+
+    /// Alignment of this argument's offset in the stack argument area.
+    pub fn stack_align(&self) -> usize {
+        match self {
+            CallArgClass::F128Stack | CallArgClass::I128Stack => 16,
+            CallArgClass::StackPacked { size } => *size,
+            _ => crate::common::types::target_ptr_size(),
+        }
     }
 
     /// Returns the stack space consumed by this argument (0 if register).
@@ -82,6 +95,7 @@ impl CallArgClass {
                 (stack_part + align_mask) & !align_mask
             }
             CallArgClass::Stack => slot_size,
+            CallArgClass::StackPacked { size } => *size,
             _ => 0,
         }
     }
@@ -259,6 +273,10 @@ pub struct CallAbiConfig {
     /// Whether variadic (unnamed) call arguments always go on the stack, in
     /// 8-byte slots, regardless of free registers. Apple arm64: true.
     pub variadic_args_on_stack: bool,
+    /// Whether named scalar arguments passed on the stack take only their own
+    /// size, aligned to it (a `char` then a `short` sit at offsets 0 and 2),
+    /// instead of an 8-byte slot each. Apple arm64: true.
+    pub pack_stack_scalars: bool,
 }
 
 /// Result of SysV per-eightbyte struct classification.
@@ -707,6 +725,14 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
 
     for (i, c) in core.classes.iter().enumerate() {
         let param_ty = func.params.get(i).map(|p| p.ty);
+        if config.pack_stack_scalars && matches!(c,
+            CoreArgClass::StructByValStack { .. } | CoreArgClass::LargeStructStack { .. }
+            | CoreArgClass::StructSplitRegStack { .. } | CoreArgClass::LargeStructByRefStack { .. })
+        {
+            // Only scalars are packed; other stack args start on a slot boundary.
+            // (F128Stack and I128Stack align to 16 themselves.)
+            stack_offset = (stack_offset + slot_align_mask) & !slot_align_mask;
+        }
         let pc = match *c {
             CoreArgClass::IntReg { reg_idx } => ParamClass::IntReg { reg_idx },
             CoreArgClass::FloatReg { reg_idx } => ParamClass::FloatReg { reg_idx },
@@ -766,6 +792,13 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 let off = stack_offset;
                 stack_offset += slot_size as i64; // pointer on stack
                 ParamClass::LargeStructByRefStack { offset: off, size }
+            }
+            CoreArgClass::Stack if config.pack_stack_scalars => {
+                let size = param_ty.map(|t| t.size() as i64).unwrap_or(slot_size as i64).max(1);
+                stack_offset = (stack_offset + size - 1) / size * size;
+                let off = stack_offset;
+                stack_offset += size;
+                ParamClass::StackScalar { offset: off }
             }
             CoreArgClass::Stack => {
                 let off = stack_offset;
@@ -832,9 +865,7 @@ pub fn compute_stack_arg_space(arg_classes: &[CallArgClass]) -> usize {
     let mut total: usize = 0;
     for cls in arg_classes {
         if !cls.is_stack() { continue; }
-        if matches!(cls, CallArgClass::F128Stack | CallArgClass::I128Stack) {
-            total = (total + 15) & !15;
-        }
+        total = total.next_multiple_of(cls.stack_align());
         total += cls.stack_bytes();
     }
     (total + 15) & !15
