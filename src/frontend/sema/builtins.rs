@@ -20,6 +20,8 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
 
     // Memory functions
     m.insert("__builtin_memcpy", BuiltinInfo::simple("memcpy"));
+    m.insert("__builtin_mempcpy", BuiltinInfo::intrinsic(BuiltinIntrinsic::Mempcpy));
+    m.insert("mempcpy", BuiltinInfo::intrinsic(BuiltinIntrinsic::Mempcpy));
     m.insert("__builtin_memmove", BuiltinInfo::simple("memmove"));
     m.insert("__builtin_memset", BuiltinInfo::simple("memset"));
     m.insert("__builtin_memcmp", BuiltinInfo::simple("memcmp"));
@@ -623,6 +625,9 @@ pub enum BuiltinIntrinsic {
     VaArgPack,
     /// __builtin_thread_pointer(): returns the thread pointer (TLS base address)
     ThreadPointer,
+    /// mempcpy(d, s, n): memcpy(d, s, n) returning d + n. Expanded inline, as
+    /// GCC and clang do, since some C libraries (Apple's) don't provide it.
+    Mempcpy,
 }
 
 impl BuiltinInfo {

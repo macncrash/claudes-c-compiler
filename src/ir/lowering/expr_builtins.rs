@@ -419,6 +419,7 @@ impl Lowerer {
             BuiltinIntrinsic::FortifyChk => {
                 self.lower_fortify_chk(name, args)
             }
+            BuiltinIntrinsic::Mempcpy => self.lower_mempcpy(args),
             // TODO: __builtin_va_arg_pack / __builtin_va_arg_pack_len are stubbed
             // to return 0. Proper implementation requires forwarding the caller's
             // variadic args during inlining. Since _FORTIFY_SOURCE is disabled,
@@ -553,6 +554,38 @@ impl Lowerer {
             },
         });
         Some(Operand::Value(dest))
+    }
+
+    /// Lower mempcpy(d, s, n) as memcpy(d, s, n) followed by d + n.
+    fn lower_mempcpy(&mut self, args: &[Expr]) -> Option<Operand> {
+        let [d, s, n] = args else { return None };
+        let size_ty = crate::common::types::target_int_ir_type();
+        let dest = self.lower_expr(d);
+        let dest = self.operand_to_value(dest);
+        let src = self.lower_expr(s);
+        let len = self.lower_expr_with_type(n, size_ty);
+        let ignored = self.fresh_value();
+        self.emit(Instruction::Call {
+            func: "memcpy".to_string(),
+            info: CallInfo {
+                dest: Some(ignored),
+                args: vec![Operand::Value(dest), src, len],
+                arg_types: vec![IrType::Ptr, IrType::Ptr, size_ty],
+                return_type: IrType::Ptr,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None; 3],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: Vec::new(),
+                struct_arg_riscv_float_classes: Vec::new(),
+                is_sret: false,
+                is_fastcall: false,
+                ret_eightbyte_classes: Vec::new(),
+            },
+        });
+        let end = self.fresh_value();
+        self.emit(Instruction::GetElementPtr { dest: end, base: dest, offset: len, ty: IrType::I8 });
+        Some(Operand::Value(end))
     }
 
     /// Lower __builtin_is{greater,less,unordered,...} float comparison builtins.

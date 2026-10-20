@@ -67,6 +67,11 @@ struct StoreFwdKey {
     ty: IrType,
 }
 
+/// A forwardable store: (stored operand, load generation, local generation,
+/// whether the address is local-only). Valid while the load generation is
+/// current, or for a local-only address while the local generation is.
+type StoreFwdEntry = (Operand, u32, u32, bool);
+
 /// Mutable state for the GVN pass, threaded through the dominator-tree DFS.
 ///
 /// Groups the value numbering tables, expression maps, and rollback logs that
@@ -89,18 +94,25 @@ struct GvnState {
     /// clobbering instruction is encountered, bump this counter; cached
     /// load entries with older generations are considered stale.
     load_generation: u32,
+    /// Like `load_generation`, but not bumped by calls: a call cannot write a
+    /// local whose address never escapes (`local_only`), so a store to one
+    /// stays forwardable across calls while this generation is current.
+    local_generation: u32,
+    /// Addresses of non-escaping locals: allocas, and GEPs into them, used
+    /// only as load/store addresses or GEP bases (see `find_local_only_addresses`).
+    local_only: FxHashSet<u32>,
     /// Store-to-load forwarding map: (pointer VN, type) -> (stored operand, generation).
     /// When a Store writes a value to a pointer, we record it here. A subsequent
     /// Load from the same pointer (same VN) with matching type and generation can
     /// be replaced with a Copy of the stored value, eliminating the load entirely.
     /// Uses the same generation counter as load CSE for O(1) invalidation.
-    store_fwd_map: FxHashMap<StoreFwdKey, (Operand, u32)>,
+    store_fwd_map: FxHashMap<StoreFwdKey, StoreFwdEntry>,
     /// Rollback log for `expr_to_value`: (key, previous_value).
     rollback_log: Vec<(ExprKey, Option<Value>)>,
     /// Rollback log for `load_expr_to_value`: (key, previous_entry).
     load_rollback_log: Vec<(ExprKey, Option<(Value, u32)>)>,
     /// Rollback log for `store_fwd_map`: (key, previous_entry).
-    store_fwd_rollback_log: Vec<(StoreFwdKey, Option<(Operand, u32)>)>,
+    store_fwd_rollback_log: Vec<(StoreFwdKey, Option<StoreFwdEntry>)>,
     /// Rollback log for `value_numbers`: (index, previous_vn).
     vn_log: Vec<(usize, u32)>,
     /// Total instructions eliminated across all blocks.
@@ -115,13 +127,15 @@ struct GvnState {
 
 impl GvnState {
     /// Create a new GVN state sized for `max_value_id` values.
-    fn new(max_value_id: usize, escaped_param_allocas: FxHashSet<u32>) -> Self {
+    fn new(max_value_id: usize, escaped_param_allocas: FxHashSet<u32>, local_only: FxHashSet<u32>) -> Self {
         Self {
             value_numbers: vec![u32::MAX; max_value_id + 1],
             next_vn: 0,
             expr_to_value: FxHashMap::default(),
             load_expr_to_value: FxHashMap::default(),
             load_generation: 0,
+            local_generation: 0,
+            local_only,
             store_fwd_map: FxHashMap::default(),
             rollback_log: Vec::new(),
             load_rollback_log: Vec::new(),
@@ -253,6 +267,7 @@ impl GvnState {
             store_fwd_rollback_start: self.store_fwd_rollback_log.len(),
             vn_log_start: self.vn_log.len(),
             saved_load_generation: self.load_generation,
+            saved_local_generation: self.local_generation,
         }
     }
 
@@ -301,6 +316,7 @@ impl GvnState {
 
         // Rollback: restore load_generation
         self.load_generation = checkpoint.saved_load_generation;
+        self.local_generation = checkpoint.saved_local_generation;
     }
 }
 
@@ -312,6 +328,7 @@ struct ScopeCheckpoint {
     store_fwd_rollback_start: usize,
     vn_log_start: usize,
     saved_load_generation: u32,
+    saved_local_generation: u32,
 }
 
 /// Find param allocas whose address has escaped (used in non-Load/Store contexts).
@@ -372,6 +389,56 @@ fn find_escaped_param_allocas(func: &IrFunction) -> FxHashSet<u32> {
     escaped
 }
 
+/// Find addresses of locals whose address never escapes: non-volatile allocas,
+/// and GEPs into them, where every address derived from the alloca is used
+/// only as a Load/Store address or a GEP base. No call can write such a
+/// local (a pointer to it is never passed on or stored anywhere).
+fn find_local_only_addresses(func: &IrFunction) -> FxHashSet<u32> {
+    let insts = || func.blocks.iter().flat_map(|b| &b.instructions);
+    // Each candidate address -> the alloca it derives from.
+    let mut root: FxHashMap<u32, u32> = FxHashMap::default();
+    for inst in insts() {
+        if let Instruction::Alloca { dest, volatile: false, .. } = inst {
+            root.insert(dest.0, dest.0);
+        }
+    }
+    if root.is_empty() {
+        return FxHashSet::default();
+    }
+    loop {
+        let mut changed = false;
+        for inst in insts() {
+            if let Instruction::GetElementPtr { dest, base, .. } = inst {
+                if let Some(&r) = root.get(&base.0) {
+                    if root.insert(dest.0, r).is_none() {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut escaped: FxHashSet<u32> = FxHashSet::default();
+    for inst in insts() {
+        let mut escape = |v: u32| {
+            if let Some(&r) = root.get(&v) {
+                escaped.insert(r);
+            }
+        };
+        match inst {
+            Instruction::Load { .. } => {}
+            Instruction::Store { val: Operand::Value(v), .. } => escape(v.0),
+            Instruction::Store { .. } => {}
+            Instruction::GetElementPtr { offset: Operand::Value(v), .. } => escape(v.0),
+            Instruction::GetElementPtr { .. } => {}
+            _ => inst.for_each_used_value(escape),
+        }
+    }
+    root.into_iter().filter(|(_, r)| !escaped.contains(r)).map(|(v, _)| v).collect()
+}
+
 /// Run dominator-based GVN on a single function.
 pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     let num_blocks = func.blocks.len();
@@ -383,7 +450,7 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
 
     // Fast path for single-block functions: skip CFG/dominator computation.
     if num_blocks == 1 {
-        let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+        let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
         return process_block(0, func, &mut state);
     }
 
@@ -404,11 +471,11 @@ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAn
 
     // Fast path for single-block functions.
     if num_blocks == 1 {
-        let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+        let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
         return process_block(0, func, &mut state);
     }
 
-    let mut state = GvnState::new(func.max_value_id() as usize, escaped);
+    let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
 
     // DFS over the dominator tree
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
@@ -438,6 +505,7 @@ fn gvn_dfs(
     // generations are ignored during lookup.
     if block_idx != 0 && preds.len(block_idx) > 1 {
         state.load_generation += 1;
+        state.local_generation += 1;
     }
 
     // Process instructions in this block
@@ -519,6 +587,9 @@ fn process_block(
         // all keys.
         if clobbers_memory(&inst) {
             state.load_generation += 1;
+            if !matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }) {
+                state.local_generation += 1;
+            }
         }
 
         // Store-to-load forwarding: record stored values for subsequent loads.
@@ -536,7 +607,9 @@ fn process_block(
                     let ptr_vn = state.operand_to_vn(&Operand::Value(*ptr));
                     let fwd_key = StoreFwdKey { ptr_vn, ty: *ty };
                     let fwd_key_for_log = fwd_key.clone();
-                    let old_val = state.store_fwd_map.insert(fwd_key, (*val, state.load_generation));
+                    let local = state.local_only.contains(&ptr.0);
+                    let entry = (*val, state.load_generation, state.local_generation, local);
+                    let old_val = state.store_fwd_map.insert(fwd_key, entry);
                     state.store_fwd_rollback_log.push((fwd_key_for_log, old_val));
                 }
             }
@@ -554,9 +627,8 @@ fn process_block(
                 if is_load {
                     if let ExprKey::Load { ptr: ref ptr_vn, ty } = expr_key {
                         let fwd_key = StoreFwdKey { ptr_vn: ptr_vn.clone(), ty };
-                        if let Some((stored_op, gen)) = state.store_fwd_map.get(&fwd_key) {
-                            if *gen == state.load_generation {
-                                let stored_op = *stored_op;
+                        if let Some(&(stored_op, gen, local_gen, local)) = state.store_fwd_map.get(&fwd_key) {
+                            if gen == state.load_generation || (local && local_gen == state.local_generation) {
                                 // Forward the stored value to the load destination.
                                 // Assign the dest a VN matching the stored value.
                                 let dest_idx = dest.0 as usize;
@@ -1639,6 +1711,70 @@ mod tests {
         let mut module = make_module(func);
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0); // No forwarding: call invalidates the store
+    }
+
+    /// alloca %0; gep %1 = %0+4; store 42 -> *%1; call foo(args); load *%1.
+    fn local_store_call_load(call_args: Vec<Operand>) -> IrFunction {
+        let n = call_args.len();
+        make_func(vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca { dest: Value(0), ty: IrType::Ptr, size: 16, align: 0, volatile: false },
+                Instruction::GetElementPtr {
+                    dest: Value(1), base: Value(0), offset: Operand::Const(IrConst::I64(4)), ty: IrType::I32,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Call {
+                    func: "foo".to_string(),
+                    info: CallInfo {
+                        dest: Some(Value(2)),
+                        args: call_args,
+                        arg_types: vec![IrType::Ptr; n],
+                        return_type: IrType::Void,
+                        is_variadic: false,
+                        num_fixed_args: n,
+                        struct_arg_sizes: vec![None; n],
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: vec![],
+                        struct_arg_riscv_float_classes: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        ret_eightbyte_classes: Vec::new(),
+                    },
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }], 4)
+    }
+
+    #[test]
+    fn test_store_to_local_forwarded_across_call() {
+        // The local's address never escapes, so the call cannot modify it.
+        let mut module = make_module(local_store_call_load(vec![]));
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 1);
+        let last = &module.functions[0].blocks[0].instructions[4];
+        assert!(matches!(last, Instruction::Copy { src: Operand::Const(IrConst::I32(42)), .. }));
+    }
+
+    #[test]
+    fn test_store_to_escaped_local_not_forwarded_across_call() {
+        // Passing the local's base address to the call lets it write the local.
+        let mut module = make_module(local_store_call_load(vec![Operand::Value(Value(0))]));
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 0);
     }
 
     #[test]

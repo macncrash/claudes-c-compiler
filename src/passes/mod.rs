@@ -381,8 +381,9 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         }
 
         // Phase 3: Algebraic simplification
-        // Upstream: copy_prop (propagated values), narrow (smaller types)
-        if !dis.simplify && should_run!(3, 1, 2) {
+        // Upstream: copy_prop (propagated values), narrow (smaller types),
+        //           if_convert (selects, e.g. from && and ||), copy_prop2
+        if !dis.simplify && should_run!(3, 1, 2, 7, 8) {
             let n = timed_pass!("simplify", run_on_visited(module, &dirty, &mut changed, simplify::simplify_function));
             cur_pass_changes[3] = n;
             total_changes += n;

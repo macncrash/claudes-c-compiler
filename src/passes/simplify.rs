@@ -168,7 +168,45 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
             }
         }
     }
-    total
+    total + fold_fabs_below_zero(func, max_id)
+}
+
+/// fabs(x) is never below zero, and a NaN compares false, so `fabs(x) < c`
+/// for c <= 0 and `fabs(x) <= c` for c < 0 are always false.
+fn fold_fabs_below_zero(func: &mut IrFunction, max_id: usize) -> usize {
+    let mut is_fabs = vec![false; max_id + 1];
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Intrinsic { dest: Some(d), op: IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64, .. } = inst {
+            if let Some(slot) = is_fabs.get_mut(d.0 as usize) {
+                *slot = true;
+            }
+        }
+    }
+    let is_fabs_value = |op: &Operand| matches!(op, Operand::Value(v) if is_fabs.get(v.0 as usize).copied().unwrap_or(false));
+    let mut folded = 0;
+    for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+        let Instruction::Cmp { dest, op, lhs, rhs, ty } = inst else { continue };
+        if !ty.is_float() {
+            continue;
+        }
+        // Normalize to fabs(x) OP c.
+        let (op, c) = match (lhs, rhs) {
+            (l, Operand::Const(c)) if is_fabs_value(l) => (*op, c.to_f64()),
+            (Operand::Const(c), r) if is_fabs_value(r) => (swap_cmp_op(*op), c.to_f64()),
+            _ => continue,
+        };
+        let Some(c) = c else { continue };
+        let never = match op {
+            IrCmpOp::Slt | IrCmpOp::Ult => c <= 0.0,
+            IrCmpOp::Sle | IrCmpOp::Ule => c < 0.0,
+            _ => false,
+        };
+        if never {
+            *inst = Instruction::Copy { dest: *dest, src: Operand::Const(IrConst::I8(0)) };
+            folded += 1;
+        }
+    }
+    folded
 }
 
 /// The integer type a value is guaranteed to hold in canonical form (extended
@@ -279,10 +317,20 @@ fn try_simplify(
         Instruction::Cmp { dest, op, lhs, rhs, ty } => {
             simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, is_boolean)
         }
-        Instruction::Select { dest, cond, true_val, false_val, .. } => {
+        Instruction::Select { dest, cond, true_val, false_val, ty } => {
             // select cond, x, x => x (both arms are the same)
             if same_operand(true_val, false_val) {
                 return Some(Instruction::Copy { dest: *dest, src: *true_val });
+            }
+            // c1 && c2 as select c1, c2, 0 is always false, and c1 || c2 as
+            // select c1, 1, c2 always true, when c1 and c2 compare the same two
+            // values and contradict or cover every ordering (x == y && x != y).
+            let is_const = |op: &Operand, nonzero: bool| matches!(op, Operand::Const(c) if c.is_zero() != nonzero);
+            if is_const(false_val, false) && cmp_orderings_combined(cond, true_val, cmp_defs, |a, b| a & b) == Some(0) {
+                return Some(Instruction::Copy { dest: *dest, src: Operand::Const(IrConst::zero(*ty)) });
+            }
+            if is_const(true_val, true) && cmp_orderings_combined(cond, false_val, cmp_defs, |a, b| a | b) == Some(ALL_ORDERINGS) {
+                return Some(Instruction::Copy { dest: *dest, src: Operand::Const(IrConst::one(*ty)) });
             }
             // select Const(0), a, b => b (constant false condition)
             // select Const(nonzero), a, b => a (constant true condition)
@@ -1079,6 +1127,10 @@ fn simplify_binop(
                     src: Operand::Const(IrConst::zero(ty)),
                 });
             }
+            if op == IrBinOp::AShr && is_all_ones(lhs, ty) {
+                // -1 >> x (arithmetic) => -1: the sign bit fills every vacated bit
+                return Some(Instruction::Copy { dest, src: *lhs });
+            }
             // Reassociation: (x << C1) << C2 => x << (C1 + C2)
             // Also for >>: (x >> C1) >> C2 => x >> (C1 + C2)
             if let Some(inst) = try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs) {
@@ -1209,6 +1261,56 @@ fn same_value_operands(lhs: &Operand, rhs: &Operand) -> bool {
         (Operand::Value(a), Operand::Value(b)) => a.0 == b.0,
         _ => false,
     }
+}
+
+/// Orderings of `lhs` against `rhs` as bits: less, equal, greater.
+const ORDER_LT: u8 = 1;
+const ORDER_EQ: u8 = 2;
+const ORDER_GT: u8 = 4;
+const ALL_ORDERINGS: u8 = ORDER_LT | ORDER_EQ | ORDER_GT;
+
+/// The orderings an integer comparison accepts, and whether its ordering is
+/// signed (Some(false)), unsigned (Some(true)), or either (None, for ==/!=).
+fn cmp_orderings(op: IrCmpOp) -> (u8, Option<bool>) {
+    match op {
+        IrCmpOp::Eq => (ORDER_EQ, None),
+        IrCmpOp::Ne => (ORDER_LT | ORDER_GT, None),
+        IrCmpOp::Slt => (ORDER_LT, Some(false)),
+        IrCmpOp::Sle => (ORDER_LT | ORDER_EQ, Some(false)),
+        IrCmpOp::Sgt => (ORDER_GT, Some(false)),
+        IrCmpOp::Sge => (ORDER_EQ | ORDER_GT, Some(false)),
+        IrCmpOp::Ult => (ORDER_LT, Some(true)),
+        IrCmpOp::Ule => (ORDER_LT | ORDER_EQ, Some(true)),
+        IrCmpOp::Ugt => (ORDER_GT, Some(true)),
+        IrCmpOp::Uge => (ORDER_EQ | ORDER_GT, Some(true)),
+    }
+}
+
+/// If `a` and `b` are integer comparisons of the same two values (either
+/// order) with compatible signedness, combine the orderings each accepts.
+fn cmp_orderings_combined(a: &Operand, b: &Operand, cmp_defs: &[Option<CmpDef>], combine: impl Fn(u8, u8) -> u8) -> Option<u8> {
+    let def = |op: &Operand| match op {
+        Operand::Value(v) => cmp_defs.get(v.0 as usize).copied().flatten(),
+        _ => None,
+    };
+    let (da, db) = (def(a)?, def(b)?);
+    if !da.ty.is_integer() || !db.ty.is_integer() || da.ty != db.ty {
+        return None;
+    }
+    let (sa, fa) = cmp_orderings(da.op);
+    let (sb, fb) = cmp_orderings(db.op);
+    if matches!((fa, fb), (Some(x), Some(y)) if x != y) {
+        return None;
+    }
+    let sb = if same_value_operands(&da.lhs, &db.lhs) && same_value_operands(&da.rhs, &db.rhs) {
+        sb
+    } else if same_value_operands(&da.lhs, &db.rhs) && same_value_operands(&da.rhs, &db.lhs) {
+        // b compares the operands the other way around: mirror its orderings.
+        (sb & ORDER_EQ) | ((sb & ORDER_LT) << 2) | ((sb & ORDER_GT) >> 2)
+    } else {
+        return None;
+    };
+    Some(combine(sa, sb))
 }
 
 /// Check if two operands are identical (same value or same constant).
@@ -2331,6 +2433,36 @@ mod tests {
         };
         let result = simplify_default(&inst).unwrap();
         assert_copy_bool(&result, 0);
+    }
+
+    #[test]
+    fn test_select_contradictory_and_or() {
+        // Values 1 and 2 are comparisons of x (10) and y (11).
+        let cmp = |op, lhs: u32, rhs: u32| Some(CmpDef {
+            op, lhs: Operand::Value(Value(lhs)), rhs: Operand::Value(Value(rhs)), ty: IrType::I32,
+        });
+        let select = |t: Operand, f: Operand| Instruction::Select {
+            dest: Value(3), cond: Operand::Value(Value(1)), true_val: t, false_val: f, ty: IrType::I32,
+        };
+        let and = select(Operand::Value(Value(2)), Operand::Const(IrConst::I32(0)));
+        let or = select(Operand::Const(IrConst::I32(1)), Operand::Value(Value(2)));
+        let run = |inst: &Instruction, c1, c2| {
+            let defs = vec![None, c1, c2, None];
+            try_simplify(inst, &[], &[], &defs, &[], &[], &[], &[])
+        };
+        let is_const = |r: Option<Instruction>, v: i64| matches!(r,
+            Some(Instruction::Copy { src: Operand::Const(c), .. }) if c.to_i64() == Some(v));
+
+        // x == y && x != y, x < y && y < x: never
+        assert!(is_const(run(&and, cmp(IrCmpOp::Eq, 10, 11), cmp(IrCmpOp::Ne, 10, 11)), 0));
+        assert!(is_const(run(&and, cmp(IrCmpOp::Slt, 10, 11), cmp(IrCmpOp::Slt, 11, 10)), 0));
+        // x >= y || x < y, x <= y || y < x: always
+        assert!(is_const(run(&or, cmp(IrCmpOp::Sge, 10, 11), cmp(IrCmpOp::Slt, 10, 11)), 1));
+        assert!(is_const(run(&or, cmp(IrCmpOp::Ule, 10, 11), cmp(IrCmpOp::Ult, 11, 10)), 1));
+        // Not decidable: overlapping, mixed signedness, different operands
+        assert!(run(&and, cmp(IrCmpOp::Sle, 10, 11), cmp(IrCmpOp::Sge, 10, 11)).is_none());
+        assert!(run(&and, cmp(IrCmpOp::Slt, 10, 11), cmp(IrCmpOp::Ugt, 10, 11)).is_none());
+        assert!(run(&and, cmp(IrCmpOp::Eq, 10, 11), cmp(IrCmpOp::Ne, 10, 12)).is_none());
     }
 
     #[test]
