@@ -45,6 +45,9 @@ pub struct LivenessResult {
     /// Program points that are Call or CallIndirect instructions.
     /// Used by the register allocator to identify values that cross call boundaries.
     pub call_points: Vec<u32>,
+    /// The subset of `call_points` that are calls passing only scalar
+    /// arguments in registers (see `is_reg_args_only_call`).
+    pub reg_args_call_points: Vec<u32>,
     /// Loop nesting depth for each block (block_index -> depth).
     /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
     /// Used by the register allocator to weight uses inside loops more heavily.
@@ -138,6 +141,7 @@ struct ProgramPointState {
     block_id_to_idx: FxHashMap<u32, usize>,
     setjmp_block_indices: Vec<usize>,
     call_points: Vec<u32>,
+    reg_args_call_points: Vec<u32>,
     num_points: u32,
 }
 
@@ -153,7 +157,7 @@ struct ProgramPointState {
 pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), block_loop_depth: Vec::new() };
     }
 
     let alloca_set = collect_alloca_set(func);
@@ -161,7 +165,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 
     let num_values = value_ids.len();
     if num_values == 0 {
-        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), block_loop_depth: Vec::new() };
+        return LivenessResult { intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), block_loop_depth: Vec::new() };
     }
 
     // Phase 1: Assign program points and build gen/kill sets.
@@ -205,6 +209,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     LivenessResult {
         intervals,
         call_points: ps.call_points,
+        reg_args_call_points: ps.reg_args_call_points,
         block_loop_depth,
     }
 }
@@ -284,6 +289,7 @@ fn assign_program_points(
     let mut block_id_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
     let mut setjmp_block_indices: Vec<usize> = Vec::new();
     let mut call_points: Vec<u32> = Vec::new();
+    let mut reg_args_call_points: Vec<u32> = Vec::new();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         block_id_to_idx.insert(block.label.0, block_idx);
@@ -310,8 +316,11 @@ fn assign_program_points(
             // etc. Treating them as call points would unnecessarily force values
             // into callee-saved registers across simple barriers.
             match inst {
-                Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                     call_points.push(point);
+                    if is_reg_args_only_call(info) && !is_returns_twice_call(inst) {
+                        reg_args_call_points.push(point);
+                    }
                 }
                 Instruction::InlineAsm { outputs, inputs, .. } => {
                     // Only treat as call point if the asm has register operands
@@ -417,6 +426,7 @@ fn assign_program_points(
         block_id_to_idx,
         setjmp_block_indices,
         call_points,
+        reg_args_call_points,
         num_points: point,
     }
 }
@@ -935,6 +945,27 @@ fn terminator_targets(term: &Terminator) -> Vec<u32> {
 }
 
 /// Return true if the instruction is a call to setjmp, _setjmp, sigsetjmp, or __sigsetjmp.
+/// A call whose arguments are all scalars (integers, pointers, f32/f64) that
+/// fit in argument registers, with a scalar or void result: no struct, i128,
+/// or f128 values, no variadic or sret handling, no stack arguments. A
+/// backend may let values read only as such a call's arguments, or defined
+/// only by its result, use caller-saved registers
+/// (`RegAllocConfig::caller_saved_at_call_boundaries`).
+pub fn is_reg_args_only_call(info: &crate::ir::reexports::CallInfo) -> bool {
+    let scalar = |ty: &IrType| matches!(ty,
+        IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        | IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F32 | IrType::F64);
+    let floats = info.arg_types.iter().filter(|t| t.is_float()).count();
+    !info.is_variadic
+        && !info.is_sret
+        && info.struct_arg_sizes.iter().all(Option::is_none)
+        && info.arg_types.len() == info.args.len()
+        && info.arg_types.iter().all(scalar)
+        && floats <= 8
+        && info.args.len() - floats <= 8
+        && (info.return_type == IrType::Void || scalar(&info.return_type))
+}
+
 /// These functions "return twice": once normally (returning 0) and again when longjmp is called.
 /// Values live at the call point must have their intervals extended to prevent stack slot reuse.
 pub(super) fn is_returns_twice_call(inst: &Instruction) -> bool {

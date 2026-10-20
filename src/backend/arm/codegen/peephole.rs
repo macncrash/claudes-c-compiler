@@ -452,6 +452,10 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+            changed2 |= propagate_w_copies(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_low_half_only_extends(&lines, &mut kinds, n);
+            changed2 |= fold_shift_into_operand(&mut lines, &mut kinds, n);
+            changed2 |= fold_index_into_mem(&mut lines, &mut kinds, n);
             changed2 |= fuse_cset_into_csel(&mut lines, &mut kinds, n);
             changed2 |= forward_copy_propagation(&mut lines, &mut kinds, n);
             changed2 |= retarget_results(&mut lines, &mut kinds, n);
@@ -465,6 +469,12 @@ pub fn peephole_optimize(asm: String) -> String {
 
     // Phase 4: drop frame records that leaf functions no longer need.
     omit_leaf_frames(&lines, &mut kinds, n);
+
+    for i in 0..n {
+        if lines[i] == RET_NONE_MARKER || lines[i] == RET_X0_MARKER {
+            kinds[i] = LineKind::Nop;
+        }
+    }
 
     // Build result, filtering out Nop lines
     let mut result = String::with_capacity(asm.len());
@@ -931,7 +941,7 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
     }
     let Some((mnemonic, ops)) = split_insn(line) else { return Access::Barrier };
     if mnemonic.starts_with('.') {
-        return if mnemonic == ".loc" || mnemonic.starts_with(".cfi_") {
+        return if mnemonic == ".loc" || mnemonic.starts_with(".cfi_") || mnemonic == ".ccc_ret_regs" {
             Access::Transparent
         } else {
             Access::Barrier
@@ -939,6 +949,19 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
     }
     // Relocations and literals carry symbol names that could look like registers.
     let has_symbol = ops.contains(':') || ops.contains('@') || ops.contains('=');
+    // Address materialization (`adrp xD, sym`; `add xD, xS, :lo12:sym`) is an
+    // ordinary write when the symbol text contains nothing register-like, so
+    // no pass can misread or rewrite it.
+    let (first, rest) = first_and_rest(ops);
+    if gpr_operand(first).is_some() && !ops.contains('[') {
+        if mnemonic == "adrp" && !rest.contains(':') && regs_in(rest) == 0 {
+            return Access::Write { deletable: true };
+        }
+        let sym = last_operand(ops);
+        if mnemonic == "add" && sym.starts_with(":lo12:") && regs_in(sym) == 0 && ops.matches(',').count() == 2 {
+            return Access::Write { deletable: true };
+        }
+    }
     match mnemonic {
         "mov" | "movz" | "movn" | "add" | "sub" | "and" | "orr" | "eor" | "bic" | "orn"
         | "eon" | "lsl" | "lsr" | "asr" | "ror" | "mul" | "madd" | "msub" | "smull"
@@ -1086,6 +1109,8 @@ fn forward_copy_propagation(lines: &mut [String], kinds: &mut [LineKind], n: usi
 /// `op xS, ...` then `mov xR, xS` with S dead afterwards: compute into R.
 fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
+    // Only removes a read of a dead register; precomputed liveness stays safe.
+    let live = live_out_all(lines, kinds, n);
     for i in 0..n {
         if kinds[i] == LineKind::Nop || !matches!(classify_access(&lines[i], kinds[i]), Access::Write { .. }) {
             continue;
@@ -1101,7 +1126,7 @@ fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> b
             continue;
         }
         let LineKind::Move { dst: r, src, is_32bit: false } = kinds[j] else { continue };
-        if src != s || r > 28 || r == s || !reg_dead_after(lines, kinds, j + 1, n, s) {
+        if src != s || r > 28 || r == s || (live[j] & (1 << s) != 0 && !reg_dead_after(lines, kinds, j + 1, n, s)) {
             continue;
         }
         let new_dest = if dest.starts_with('w') { wreg_name(r) } else { xreg_name(r) };
@@ -1465,6 +1490,244 @@ fn fuse_cset_into_csel(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
     changed
 }
 
+// ── 32-bit copies and shifted operands ───────────────────────────────────────
+//
+// `sxtw xA, wB` and `mov wA, wB` leave wA equal to wB. Later 32-bit reads of
+// wA can read wB instead (making the copy dead), and `sxtw xA, wA` itself is
+// a no-op for code that only reads wA. A shift feeding a single ALU op folds
+// into the op's shifted-register operand.
+
+/// Whether `ops` (operand text) reads register `r` in its 64-bit form.
+fn reads_x_form(ops: &str, r: u8) -> bool {
+    ops.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok.starts_with('x') && gpr_operand(tok) == Some(r))
+}
+
+/// The register ids a line reads (`srcs`) and writes (`dest`), split like
+/// classify_access; None for lines that are not plain Write/ReadOnly.
+fn split_rw(line: &str, kind: LineKind) -> Option<(Option<String>, String, String)> {
+    let access = classify_access(line, kind);
+    let (mnemonic, ops) = split_insn(line)?;
+    match access {
+        Access::Write { .. } => {
+            let (d, s) = first_and_rest(ops);
+            Some((Some(d.to_string()), s.to_string(), mnemonic.to_string()))
+        }
+        Access::ReadOnly => Some((None, ops.to_string(), mnemonic.to_string())),
+        _ => None,
+    }
+}
+
+fn propagate_w_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let (a, b) = match kinds[i] {
+            LineKind::Sxtw { dst, src } => (dst, src),
+            LineKind::Move { dst, src, is_32bit: true } => (dst, src),
+            _ => continue,
+        };
+        if a > 28 || b > 28 || a == b {
+            continue;
+        }
+        let (a_w, b_w) = (wreg_name(a), wreg_name(b));
+        for k in i + 1..n {
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            if kinds[k] == LineKind::CmpBranch {
+                if let Some((m @ ("cbz" | "cbnz"), ops)) = split_insn(&lines[k]) {
+                    let (reg, target) = first_and_rest(ops);
+                    if reg == a_w {
+                        lines[k] = format!("    {} {},{}", m, b_w, target);
+                        changed = true;
+                    }
+                }
+                break;
+            }
+            if access_is_transparent(&lines[k], kinds[k]) {
+                continue;
+            }
+            let Some((dest, srcs, mnemonic)) = split_rw(&lines[k], kinds[k]) else { break };
+            // A 64-bit read of A needs A itself (and stops the propagation).
+            if reads_x_form(&srcs, a) {
+                break;
+            }
+            let new_srcs = replace_whole_word(&srcs, a_w, b_w);
+            if new_srcs != srcs {
+                lines[k] = match &dest {
+                    Some(d) => format!("    {} {},{}", mnemonic, d, new_srcs),
+                    None => format!("    {} {}", mnemonic, new_srcs),
+                };
+                kinds[k] = classify_line(&lines[k]);
+                changed = true;
+            }
+            if let Some(d) = dest {
+                if matches!(gpr_operand(&d), Some(r) if r == a || r == b) {
+                    break;
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn access_is_transparent(line: &str, kind: LineKind) -> bool {
+    classify_access(line, kind) == Access::Transparent
+}
+
+/// `sxtw xA, wA` / `mov wA, wA` where A is only read as wA until it is
+/// redefined in the same block: the upper half never matters.
+fn eliminate_low_half_only_extends(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let a = match kinds[i] {
+            LineKind::Sxtw { dst, src } if dst == src => dst,
+            LineKind::Move { dst, src, is_32bit: true } if dst == src => dst,
+            _ => continue,
+        };
+        if a > 28 {
+            continue;
+        }
+        let mut safe = false;
+        for k in i + 1..n {
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            if access_is_transparent(&lines[k], kinds[k]) {
+                continue;
+            }
+            let Some((dest, srcs, _)) = split_rw(&lines[k], kinds[k]) else { break };
+            if reads_x_form(&srcs, a) {
+                break;
+            }
+            if dest.as_deref().and_then(gpr_operand) == Some(a) {
+                safe = true;
+                break;
+            }
+        }
+        if safe {
+            kinds[i] = LineKind::Nop;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// `lsl/lsr/asr T, S, #k` immediately followed by `add|sub|orr|and|eor D, X, T`
+/// (T dead afterwards, same width) becomes `op D, X, S, <shift> #k`.
+fn fold_shift_into_operand(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    // Rewrites here only remove reads of dead registers, so liveness computed
+    // up front stays a safe over-approximation.
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        let Some((shift @ ("lsl" | "lsr" | "asr"), ops)) = split_insn(&lines[i]) else { continue };
+        let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
+        if parts.len() != 3 || !parts[2].starts_with('#') {
+            continue;
+        }
+        let (t_name, s_name, amount) = (parts[0], parts[1], parts[2]);
+        let (Some(t), Some(_)) = (gpr_operand(t_name), gpr_operand(s_name)) else { continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((op @ ("add" | "sub" | "orr" | "and" | "eor"), op_ops)) = split_insn(&lines[j]) else { continue };
+        let p: Vec<&str> = op_ops.split(',').map(str::trim).collect();
+        if p.len() != 3 || p.iter().any(|r| gpr_operand(r).is_none() || r.starts_with('x') != t_name.starts_with('x')) {
+            continue;
+        }
+        // The shifted operand must be the second source; swap for commutative ops.
+        let x = if p[2] == t_name && p[1] != t_name {
+            p[1]
+        } else if p[1] == t_name && p[2] != t_name && op != "sub" {
+            p[2]
+        } else {
+            continue;
+        };
+        let d = gpr_operand(p[0]).unwrap_or(255);
+        if d != t && live[j] & (1 << t) != 0 {
+            continue;
+        }
+        let new_line = format!("    {} {}, {}, {}, {} {}", op, p[0], x, s_name, shift, amount);
+        lines[j] = new_line;
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `add xA, xB, xI[, lsl #k]` immediately followed by a load/store through
+/// `[xA]` (A dead afterwards, k the access size's log2 or 0) becomes the
+/// register-offset form `[xB, xI, lsl #k]`.
+fn fold_index_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        let Some(("add", ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let shift = match p.len() {
+            3 => 0,
+            4 => match p[3].strip_prefix("lsl #").and_then(|k| k.parse::<u32>().ok()) {
+                Some(k) => k,
+                None => continue,
+            },
+            _ => continue,
+        };
+        if !p[..3].iter().all(|r| r.starts_with('x') && gpr_operand(r).is_some()) {
+            continue;
+        }
+        let a = gpr_operand(p[0]).unwrap_or(255);
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((m, mops)) = split_insn(&lines[j]) else { continue };
+        let (reg, addr) = first_and_rest(mops);
+        if addr.trim() != format!("[{}]", p[0]) {
+            continue;
+        }
+        let is_load = m.starts_with("ld");
+        let size = match (m, reg.chars().next()) {
+            ("ldrb" | "ldrsb" | "strb", _) => 1,
+            ("ldrh" | "ldrsh" | "strh", _) => 2,
+            ("ldrsw", _) => 4,
+            ("ldr" | "str", Some('x' | 'd')) => 8,
+            ("ldr" | "str", Some('w' | 's')) => 4,
+            ("ldr" | "str", Some('q')) => 16,
+            _ => continue,
+        };
+        if shift != 0 && 1u32 << shift != size {
+            continue;
+        }
+        let value_reg = gpr_operand(reg);
+        // A store must not store A itself; A must be dead unless a load overwrites it.
+        if !is_load && value_reg == Some(a) {
+            continue;
+        }
+        if !(is_load && value_reg == Some(a)) && live[j] & (1 << a) != 0 {
+            continue;
+        }
+        let mem = if shift == 0 {
+            format!("[{}, {}]", p[1], p[2])
+        } else {
+            format!("[{}, {}, lsl #{}]", p[1], p[2], shift)
+        };
+        lines[j] = format!("    {} {}, {}", m, reg, mem);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
 // ── Function-wide dead register write elimination ────────────────────────────
 //
 // `eliminate_dead_writes` only sees straight-line code. This pass computes
@@ -1476,6 +1739,12 @@ fn fuse_cset_into_csel(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
 // registers; calls read the argument registers; indirect branches, branches
 // to labels outside the function, and anything after them make every
 // register live. Functions that call setjmp-like routines are skipped.
+
+/// Emitted by the prologue when x0/x1 do not carry the return value (void
+/// or FP results): neither is live at `ret`. Always removed from the output.
+pub(super) const RET_NONE_MARKER: &str = "    .ccc_ret_regs 0";
+/// Emitted by the prologue when only x0 carries the return value.
+pub(super) const RET_X0_MARKER: &str = "    .ccc_ret_regs 1";
 
 /// Bitmask over x0-x28.
 type RegSet = u32;
@@ -1599,30 +1868,22 @@ fn is_function_start(line: &str) -> bool {
 
 fn eliminate_dead_writes_global(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
-    let mut i = 0;
-    while i < n {
-        if !is_function_start(&lines[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i + 1;
-        let mut end = start;
-        while end < n && !lines[end].trim().starts_with(".size ") && !is_function_start(&lines[end]) {
-            end += 1;
-        }
+    for (start, end) in function_ranges(lines, n) {
         changed |= dead_writes_in_function(lines, kinds, start, end);
-        i = end;
     }
     changed
 }
 
-fn dead_writes_in_function(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
+/// GPRs live after each line of the function `start..end`, and each line's
+/// deletable destination. None for functions the model does not cover
+/// (setjmp-like calls).
+fn function_liveness(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> Option<(Vec<RegSet>, Vec<Option<u8>>)> {
     let body = start..end;
     if body.clone().any(|k| {
         kinds[k] == LineKind::Call
             && ["setjmp", "vfork", "getcontext", "savectx"].iter().any(|s| lines[k].contains(s))
     }) {
-        return false;
+        return None;
     }
     // Label name -> line index (local to this function).
     let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
@@ -1634,39 +1895,86 @@ fn dead_writes_in_function(lines: &[String], kinds: &mut [LineKind], start: usiz
         }
     }
     let label_index = |name: &str| labels.get(name).copied();
+    let ret_mask: RegSet = if body.clone().any(|k| lines[k] == RET_NONE_MARKER) {
+        !0b11
+    } else if body.clone().any(|k| lines[k] == RET_X0_MARKER) {
+        !0b10
+    } else {
+        !0
+    };
 
-    let mut changed = false;
-    loop {
-        let infos: Vec<LineInfo> = body.clone().map(|k| line_info(&lines[k], kinds[k], &label_index)).collect();
-        let len = infos.len();
-        let succ_live = |live_in: &[RegSet], idx: usize| -> RegSet {
-            let next = if idx + 1 < len { live_in[idx + 1] } else { ALL_REGS };
-            match infos[idx].flow {
-                Flow::Next => next,
-                Flow::Exit => 0,
-                Flow::Jump { target, falls_through } => {
-                    let t = target.map_or(ALL_REGS, |t| live_in[t - start]);
-                    if falls_through { t | next } else { t }
-                }
-            }
-        };
-        let mut live_in: Vec<RegSet> = vec![0; len];
-        let mut iterate = true;
-        while iterate {
-            iterate = false;
-            for idx in (0..len).rev() {
-                let out = succ_live(&live_in, idx);
-                let new_in = (out & !infos[idx].defs) | infos[idx].uses;
-                if new_in != live_in[idx] {
-                    live_in[idx] = new_in;
-                    iterate = true;
-                }
+    let mut infos: Vec<LineInfo> = body.clone().map(|k| line_info(&lines[k], kinds[k], &label_index)).collect();
+    for info in infos.iter_mut().filter(|i| matches!(i.flow, Flow::Exit)) {
+        info.uses &= ret_mask;
+    }
+    let len = infos.len();
+    let succ_live = |live_in: &[RegSet], idx: usize| -> RegSet {
+        let next = if idx + 1 < len { live_in[idx + 1] } else { ALL_REGS };
+        match infos[idx].flow {
+            Flow::Next => next,
+            Flow::Exit => 0,
+            Flow::Jump { target, falls_through } => {
+                let t = target.map_or(ALL_REGS, |t| live_in[t - start]);
+                if falls_through { t | next } else { t }
             }
         }
+    };
+    let mut live_in: Vec<RegSet> = vec![0; len];
+    let mut iterate = true;
+    while iterate {
+        iterate = false;
+        for idx in (0..len).rev() {
+            let out = succ_live(&live_in, idx);
+            let new_in = (out & !infos[idx].defs) | infos[idx].uses;
+            if new_in != live_in[idx] {
+                live_in[idx] = new_in;
+                iterate = true;
+            }
+        }
+    }
+    let live_out = (0..len).map(|idx| succ_live(&live_in, idx)).collect();
+    Some((live_out, infos.iter().map(|i| i.deletable_dest).collect()))
+}
+
+/// Function boundaries: (start, end) line ranges of each function body.
+fn function_ranges(lines: &[String], n: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if !is_function_start(&lines[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < n && !lines[end].trim().starts_with(".size ") && !is_function_start(&lines[end]) {
+            end += 1;
+        }
+        ranges.push((start, end));
+        i = end;
+    }
+    ranges
+}
+
+/// GPRs live after every line (all registers outside analyzed functions).
+fn live_out_all(lines: &[String], kinds: &[LineKind], n: usize) -> Vec<RegSet> {
+    let mut live = vec![ALL_REGS; n];
+    for (start, end) in function_ranges(lines, n) {
+        if let Some((out, _)) = function_liveness(lines, kinds, start, end) {
+            live[start..end].copy_from_slice(&out);
+        }
+    }
+    live
+}
+
+fn dead_writes_in_function(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
+    let mut changed = false;
+    loop {
+        let Some((live_out, deletable)) = function_liveness(lines, kinds, start, end) else { return changed };
         let mut removed = false;
-        for idx in 0..len {
-            if let Some(d) = infos[idx].deletable_dest {
-                if succ_live(&live_in, idx) & (1 << d) == 0 {
+        for idx in 0..live_out.len() {
+            if let Some(d) = deletable[idx] {
+                if live_out[idx] & (1 << d) == 0 {
                     kinds[start + idx] = LineKind::Nop;
                     removed = true;
                 }
@@ -1943,7 +2251,7 @@ mod tests {
         // x12 is read after the sxtw, and must keep its zero-extended upper half.
         let input = "    sxtw x10, w1\n    sxtw x11, w2\n    orr w12, w10, w11\n    sxtw x13, w12\n    str x12, [x9]\n    str x13, [x9]\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("orr w12, w10, w11"), "{}", result);
+        assert!(!result.contains("orr x12"), "{}", result);
         assert!(result.contains("sxtw x13, w12"), "{}", result);
     }
 
@@ -1984,6 +2292,70 @@ mod tests {
             let result = peephole_optimize(format!("{}{}{}", frame, body, tail));
             assert!(result.contains("stp x29, x30") && result.contains("ldp x29, x30"), "{}", result);
         }
+    }
+
+    #[test]
+    fn test_w_copy_feeds_32bit_store() {
+        // Only the low half is stored: store w13 directly.
+        let input = ".type f, %function\nf:\n    sxtw x0, w13\n    mov w0, w0\n    str w0, [x14]\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("str w13, [x14]"), "{}", result);
+        // x0 itself stays live for the return value, so only the sxtw goes.
+        assert!(!result.contains("sxtw x0"), "{}", result);
+    }
+
+    #[test]
+    fn test_w_copy_stops_at_64bit_read() {
+        let input = ".type f, %function\nf:\n    sxtw x0, w13\n    str x0, [x14]\n    str w0, [x15]\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("sxtw x0, w13") && result.contains("str x0, [x14]"), "{}", result);
+    }
+
+    #[test]
+    fn test_shift_folded_into_operand() {
+        let input = ".type f, %function\nf:\n    lsl w11, w0, #6\n    orr w13, w12, w11\n    str w13, [x14]\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("orr w13, w12, w0, lsl #6"), "{}", result);
+        assert!(!result.contains("lsl w11"), "{}", result);
+        // Not when the shifted value is used again, or for sub with the shift first.
+        let input = ".type f, %function\nf:\n    lsl x11, x0, #3\n    add x13, x12, x11\n    str x13, [x14]\n    str x11, [x15]\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("lsl x11, x0, #3"));
+        let input = ".type f, %function\nf:\n    lsl x11, x0, #3\n    sub x13, x11, x12\n    str x13, [x14]\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("lsl x11, x0, #3"));
+    }
+
+    #[test]
+    fn test_index_folded_into_load_and_store() {
+        let input = ".type f, %function\nf:\n    add x15, x4, x3, lsl #3\n    ldr x10, [x15]\n    add x9, x4, x3, lsl #2\n    str w10, [x9]\n    add x9, x4, x3\n    ldrb w11, [x9]\n    mov x0, x11\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr x10, [x4, x3, lsl #3]"), "{}", result);
+        assert!(result.contains("str w10, [x4, x3, lsl #2]"), "{}", result);
+        assert!(result.contains("ldrb w0, [x4, x3]") || result.contains("ldrb w11, [x4, x3]"), "{}", result);
+        assert!(!result.contains("add x"), "{}", result);
+    }
+
+    #[test]
+    fn test_index_not_folded_with_wrong_scale_or_live_address() {
+        // lsl #3 does not match a 4-byte access.
+        let input = ".type f, %function\nf:\n    add x15, x4, x3, lsl #3\n    ldr w10, [x15]\n    mov x0, x10\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("add x15, x4, x3, lsl #3"));
+        // The address is used again afterwards.
+        let input = ".type f, %function\nf:\n    add x15, x4, x3\n    ldr x10, [x15]\n    str x10, [x15, #8]\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("add x15, x4, x3"));
+    }
+
+    #[test]
+    fn test_return_register_markers() {
+        // x1 is dead at ret when only x0 is returned; nothing is returned in GPRs for void.
+        let body = "    mov x1, x5\n    mov x0, x6\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(format!(".type f, %function\nf:\n{}\n{}", RET_X0_MARKER, body));
+        assert!(!result.contains("mov x1, x5") && result.contains("mov x0, x6"), "{}", result);
+        assert!(!result.contains("ccc_ret_regs"), "{}", result);
+        let result = peephole_optimize(format!(".type f, %function\nf:\n{}\n{}", RET_NONE_MARKER, body));
+        assert!(!result.contains("mov x1, x5") && !result.contains("mov x0, x6"), "{}", result);
+        // Without a marker both stay live.
+        let result = peephole_optimize(format!(".type f, %function\nf:\n{}", body));
+        assert!(result.contains("mov x1, x5") && result.contains("mov x0, x6"), "{}", result);
     }
 
     #[test]

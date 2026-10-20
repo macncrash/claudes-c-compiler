@@ -106,22 +106,40 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     }
 
     // Step 3: Process worklist - transitively remove dead chains.
-    while let Some((bi, ii)) = worklist.pop() {
-        let inst = &func.blocks[bi as usize].instructions[ii as usize];
-        // Decrement use-counts of this instruction's operands.
-        inst.for_each_used_value(|id| {
-            let idx = id as usize;
-            if idx < use_count.len() {
-                use_count[idx] = use_count[idx].saturating_sub(1);
-                if use_count[idx] == 0 {
-                    let (dbi, dii) = def_loc[idx];
-                    if dbi != u32::MAX && !dead[dbi as usize][dii as usize] {
-                        dead[dbi as usize][dii as usize] = true;
-                        worklist.push((dbi, dii));
-                    }
-                }
+    drain_dead_worklist(func, &mut worklist, &mut dead, &mut use_count, &def_loc);
+
+    // Step 3b: Dead cycles. Use counts cannot remove values that only feed
+    // each other (a = phi(.., b), b = phi(.., a), or through pure copies),
+    // e.g. a loop-carried value that is never read. Mark everything reachable
+    // from side-effecting instructions and terminators; the rest is dead.
+    let mut live = vec![false; max_id + 1];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut mark = |id: u32, live: &mut Vec<bool>, stack: &mut Vec<u32>| {
+        let idx = id as usize;
+        if idx < live.len() && !live[idx] {
+            live[idx] = true;
+            stack.push(id);
+        }
+    };
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if !dead[bi][ii] && has_side_effects(inst) {
+                inst.for_each_used_value(|id| mark(id, &mut live, &mut stack));
             }
-        });
+        }
+        block.terminator.for_each_used_value(|id| mark(id, &mut live, &mut stack));
+    }
+    while let Some(id) = stack.pop() {
+        let (bi, ii) = def_loc[id as usize];
+        if bi != u32::MAX {
+            func.blocks[bi as usize].instructions[ii as usize]
+                .for_each_used_value(|u| mark(u, &mut live, &mut stack));
+        }
+    }
+    for (idx, &(bi, ii)) in def_loc.iter().enumerate() {
+        if bi != u32::MAX && !live[idx] && !dead[bi as usize][ii as usize] {
+            dead[bi as usize][ii as usize] = true;
+        }
     }
 
     // Step 4: Sweep - remove all dead instructions.
@@ -167,6 +185,34 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     }
 
     total
+}
+
+/// Transitively mark dead the definitions whose last use was a dead
+/// instruction on the worklist.
+fn drain_dead_worklist(
+    func: &IrFunction,
+    worklist: &mut Vec<(u32, u32)>,
+    dead: &mut [Vec<bool>],
+    use_count: &mut [u32],
+    def_loc: &[(u32, u32)],
+) {
+    while let Some((bi, ii)) = worklist.pop() {
+        let inst = &func.blocks[bi as usize].instructions[ii as usize];
+        // Decrement use-counts of this instruction's operands.
+        inst.for_each_used_value(|id| {
+            let idx = id as usize;
+            if idx < use_count.len() {
+                use_count[idx] = use_count[idx].saturating_sub(1);
+                if use_count[idx] == 0 {
+                    let (dbi, dii) = def_loc[idx];
+                    if dbi != u32::MAX && !dead[dbi as usize][dii as usize] {
+                        dead[dbi as usize][dii as usize] = true;
+                        worklist.push((dbi, dii));
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Simple fixpoint DCE for very small functions (avoids overhead of def-map + worklist).
@@ -332,6 +378,52 @@ mod tests {
         assert_eq!(removed, 1); // The dead BinOp should be removed
         // Verify the remaining instructions
         assert_eq!(func.blocks[0].instructions.len(), 3); // alloca, store, load
+    }
+
+    /// Loop carrying a value that is never read, through a phi and a copy:
+    ///   b0: br b1
+    ///   b1: v1 = phi [0, b0], [v2, b2]; v3 = param 0; condbr v3, b2, b3
+    ///   b2: v2 = copy v1 (+ dead pair v4/v5 cycling phi to phi); br b1
+    ///   b3: ret v3
+    fn make_dead_cycle_func() -> IrFunction {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let block = |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+            label: BlockId(label), instructions, terminator, source_spans: Vec::new(),
+        };
+        func.blocks.push(block(0, vec![], Terminator::Branch(BlockId(1))));
+        func.blocks.push(block(1, vec![
+            Instruction::Phi { dest: Value(1), ty: IrType::I32, incoming: vec![
+                (Operand::Const(IrConst::I32(0)), BlockId(0)), (Operand::Value(Value(2)), BlockId(2))] },
+            Instruction::Phi { dest: Value(4), ty: IrType::I32, incoming: vec![
+                (Operand::Const(IrConst::I32(0)), BlockId(0)), (Operand::Value(Value(5)), BlockId(2))] },
+            Instruction::ParamRef { dest: Value(3), param_idx: 0, ty: IrType::I32 },
+        ], Terminator::CondBranch { cond: Operand::Value(Value(3)), true_label: BlockId(2), false_label: BlockId(3) }));
+        func.blocks.push(block(2, vec![
+            Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) },
+            Instruction::Phi { dest: Value(5), ty: IrType::I32, incoming: vec![(Operand::Value(Value(4)), BlockId(1))] },
+        ], Terminator::Branch(BlockId(1))));
+        func.blocks.push(block(3, vec![], Terminator::Return(Some(Operand::Value(Value(3))))));
+        func
+    }
+
+    #[test]
+    fn test_dead_phi_and_copy_cycles_removed() {
+        let mut func = make_dead_cycle_func();
+        let removed = eliminate_dead_code(&mut func);
+        assert_eq!(removed, 4, "v1, v2, v4, v5 form dead cycles");
+        let remaining: Vec<_> = func.blocks.iter().flat_map(|b| &b.instructions).collect();
+        assert_eq!(remaining.len(), 1);
+        assert!(matches!(remaining[0], Instruction::ParamRef { .. }));
+    }
+
+    #[test]
+    fn test_live_cycle_kept() {
+        // Same loop, but the carried value is returned: nothing is dead.
+        let mut func = make_dead_cycle_func();
+        func.blocks[3].terminator = Terminator::Return(Some(Operand::Value(Value(1))));
+        let removed = eliminate_dead_code(&mut func);
+        assert_eq!(removed, 2, "only the unrelated v4/v5 cycle is dead");
+        assert!(func.blocks[2].instructions.iter().any(|i| matches!(i, Instruction::Copy { .. })));
     }
 
     #[test]

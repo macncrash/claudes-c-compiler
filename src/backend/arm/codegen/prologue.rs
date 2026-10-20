@@ -4,6 +4,7 @@ use crate::ir::reexports::{IrFunction, Instruction, Value};
 use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{ParamClass, classify_params};
+use super::peephole;
 use super::emit::{
     ArmCodegen, callee_saved_name, callee_saved_name_32, ARM_CALLEE_SAVED, ARM_CALLER_SAVED, ARM_ARG_REGS,
     ARM_FP_CALLEE_SAVED, ARM_FP_CALLER_SAVED, ARM_FP_REG_ID_BASE,
@@ -55,6 +56,7 @@ impl ArmCodegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
+            true, // argument setup leaves x10-x15 intact (calls.rs)
         );
 
         // FP registers for F32/F64 values. Skipped for variadic functions
@@ -157,6 +159,17 @@ impl ArmCodegen {
         self.current_frame_size = frame_size;
         self.frame_base_offset = None;
         self.emit_prologue_arm(frame_size);
+        // Tells the peephole optimizer how many of x0/x1 carry the return
+        // value at `ret`; it always removes this line.
+        let ret_regs = match func.return_type {
+            IrType::Void | IrType::F32 | IrType::F64 | IrType::F128 => Some(peephole::RET_NONE_MARKER),
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+            | IrType::I64 | IrType::U64 | IrType::Ptr if !func.uses_sret => Some(peephole::RET_X0_MARKER),
+            _ => None,
+        };
+        if let Some(marker) = ret_regs {
+            self.state.emit(marker);
+        }
 
         let used_regs = self.used_callee_saved.clone();
         let base = self.callee_save_offset;

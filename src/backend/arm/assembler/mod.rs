@@ -414,6 +414,22 @@ mod tests {
             ("ldp x12, x13, [x10], #16", 0xa8c1354c),
             ("stp x12, x13, [x9], #16", 0xa881352c),
             ("subs x11, x11, #1", 0xf100056b),
+            // Shifted-register operands and register-offset addressing
+            // (peephole shift/index folding).
+            ("orr w13, w12, w0, lsl #6", 0x2a00198d),
+            ("add x14, x15, x11, lsl #2", 0x8b0b09ee),
+            ("sub x3, x4, x5, asr #7", 0xcb851c83),
+            ("eor x1, x2, x3, lsr #1", 0xca430441),
+            ("ldr x10, [x4, x15, lsl #3]", 0xf86f788a),
+            ("ldrsw x1, [x2, x3, lsl #2]", 0xb8a37841),
+            ("ldrb w1, [x2, x3]", 0x38636841),
+            ("strb w1, [x2, x3]", 0x38236841),
+            ("ldrh w5, [x6, x7, lsl #1]", 0x786778c5),
+            ("str w13, [x14, x11, lsl #2]", 0xb82b79cd),
+            ("ldr d0, [x1, x2, lsl #3]", 0xfc627820),
+            ("ldr s1, [x1, x2, lsl #2]", 0xbc627821),
+            ("str x9, [x10, x11]", 0xf82b6949),
+            ("ldrsb x3, [x4, x5]", 0x38a56883),
         ];
         for (text, expected) in cases {
             let stmts = parse_asm(text).unwrap_or_else(|e| panic!("{}: {}", text, e));

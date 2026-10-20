@@ -3,7 +3,7 @@
 use crate::ir::reexports::{IrConst, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
-use super::emit::{ArmCodegen, callee_saved_name};
+use super::emit::{ArmCodegen, callee_saved_name, ARM_ARG_REGS};
 
 impl ArmCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
@@ -211,6 +211,25 @@ impl ArmCodegen {
                           _struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) {
         let slot_adjust = if self.state.has_dyn_alloca { 0 } else { total_sp_adjust };
         let needs_adjusted_load = total_sp_adjust > 0;
+
+        // Scalar register args only: no source can live in x0-x7 (functions
+        // with calls never allocate them), so load each GP arg straight into
+        // its register, after the FP args (which use x0 as scratch) and in
+        // descending order (constants go through x0). Unlike staging through
+        // x9-x16, this leaves the caller-saved pool intact, which
+        // liveness::is_reg_args_only_call relies on.
+        if arg_classes.iter().all(|c| matches!(c, CallArgClass::IntReg { .. } | CallArgClass::FloatReg { .. })) {
+            self.emit_call_fp_reg_args(args, arg_classes, arg_types, slot_adjust, needs_adjusted_load);
+            let gp_args: Vec<usize> = (0..args.len())
+                .filter(|&i| matches!(arg_classes[i], CallArgClass::IntReg { .. }))
+                .collect();
+            for (reg_idx, &i) in gp_args.iter().enumerate().rev() {
+                if reg_idx < 8 {
+                    self.emit_load_arg_to_reg(&args[i], ARM_ARG_REGS[reg_idx], slot_adjust, 0, needs_adjusted_load);
+                }
+            }
+            return;
+        }
 
         self.emit_call_gp_to_temps(args, arg_classes, slot_adjust, needs_adjusted_load);
         self.emit_call_fp_reg_args(args, arg_classes, arg_types, slot_adjust, needs_adjusted_load);

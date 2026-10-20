@@ -69,6 +69,7 @@ impl I686Codegen {
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
+            false,
         );
 
         // In PIC mode, %ebx must be saved/restored as a callee-saved register.

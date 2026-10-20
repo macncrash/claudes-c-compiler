@@ -64,6 +64,12 @@ pub struct RegAllocConfig {
     /// Only enable this when the backend's asm emitter checks reg_assignments
     /// before falling back to stack access. Currently only RISC-V does this.
     pub allow_inline_asm_regalloc: bool,
+    /// Whether a value may use a caller-saved register when a register-args-
+    /// only call (`liveness::is_reg_args_only_call`) is only where its live
+    /// range starts (it is the call's result) or ends (it is only read as an
+    /// argument). Requires a backend whose argument setup and result copy
+    /// leave the caller-saved pool untouched (AArch64).
+    pub caller_saved_at_call_boundaries: bool,
 }
 
 /// Run the linear scan register allocator on a function.
@@ -212,6 +218,11 @@ pub fn allocate_registers(
     remove_ineligible_operands(func, &mut eligible, config);
 
     let call_points = &liveness.call_points;
+    let boundary_ok: &[u32] = if config.caller_saved_at_call_boundaries {
+        &liveness.reg_args_call_points
+    } else {
+        &[]
+    };
 
     // Candidates are assigned in priority order, not program order, so each
     // register keeps all its intervals and a candidate may fill any gap.
@@ -230,7 +241,7 @@ pub fn allocate_registers(
     let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
 
     // Phase 1: Callee-saved registers for call-spanning values.
-    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, &use_count, Some(true)) {
+    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(true)) {
         if let Some(i) = pick_callee(&callee_busy, interval) {
             callee_busy[i].push((interval.start, interval.end));
             assignments.insert(interval.value_id, callee[i]);
@@ -242,13 +253,29 @@ pub fn allocate_registers(
     // Phase 3: Callee-saved spillover for non-call-spanning values that did
     // not fit in the caller-saved pool (e.g. high-priority values in call-free
     // loops).
-    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, &use_count, Some(false)) {
+    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(false)) {
         if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], interval)) {
             caller_busy[i].push((interval.start, interval.end));
             assignments.insert(interval.value_id, caller[i]);
         } else if let Some(i) = pick_callee(&callee_busy, interval) {
             callee_busy[i].push((interval.start, interval.end));
             assignments.insert(interval.value_id, callee[i]);
+        }
+    }
+
+    // CCC_DUMP_REGALLOC=<function|all>: each candidate's interval, weight,
+    // and register (or "-" for a stack slot).
+    if let Ok(want) = std::env::var("CCC_DUMP_REGALLOC") {
+        if want == "all" || want == func.name {
+            eprintln!("=== regalloc {} (calls at {:?})", func.name, call_points);
+            let mut ivs: Vec<&LiveInterval> = liveness.intervals.iter().filter(|iv| eligible.contains(&iv.value_id)).collect();
+            ivs.sort_by_key(|iv| std::cmp::Reverse(use_count.get(&iv.value_id).copied().unwrap_or(0)));
+            for iv in ivs {
+                let reg = assignments.get(&iv.value_id).map_or("-".to_string(), |r| format!("r{}", r.0));
+                eprintln!("  v{:<5} [{:>4}, {:>4}] weight {:>6} spans_call {:5} {}", iv.value_id, iv.start, iv.end,
+                    use_count.get(&iv.value_id).copied().unwrap_or(0),
+                    spans_clobbering_call(iv, call_points, boundary_ok), reg);
+            }
         }
     }
 
@@ -267,8 +294,32 @@ pub fn allocate_registers(
 
 /// Count uses per value, weighted by loop depth: a use inside a loop at depth D
 /// contributes 10^D (capped at 10K), so inner-loop values get priority.
+///
+/// A use of a constant-offset GEP also counts as a use of its base: codegen
+/// folds such GEPs into the loads and stores that use them (`[base, #off]`),
+/// so those accesses read the base register directly.
 fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMap<u32, u64> {
     let mut use_count: FxHashMap<u32, u64> = FxHashMap::default();
+    let mut gep_base: FxHashMap<u32, u32> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(_), .. } = inst {
+            gep_base.insert(dest.0, base.0);
+        }
+    }
+    let mut add = |use_count: &mut FxHashMap<u32, u64>, v: u32, weight: u64| {
+        *use_count.entry(v).or_insert(0) += weight;
+        // Follow folded GEP chains a few levels.
+        let mut cur = v;
+        for _ in 0..4 {
+            match gep_base.get(&cur) {
+                Some(&b) if b != cur => {
+                    *use_count.entry(b).or_insert(0) += weight;
+                    cur = b;
+                }
+                _ => break,
+            }
+        }
+    };
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let weight: u64 = match liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0) {
             0 => 1,
@@ -280,13 +331,13 @@ fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMa
         for inst in &block.instructions {
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
-                    *use_count.entry(v.0).or_insert(0) += weight;
+                    add(&mut use_count, v.0, weight);
                 }
             });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
-                *use_count.entry(v.0).or_insert(0) += weight;
+                add(&mut use_count, v.0, weight);
             }
         });
     }
@@ -480,13 +531,13 @@ pub fn allocate_fp_registers(
     // Phase 2: caller-saved registers for values that cross no clobber.
     // Phase 3: leftover callee-saved registers for the remaining values.
     let no_gpr = FxHashMap::default();
-    for iv in build_sorted_candidates(liveness, &eligible, &no_gpr, &clobber_points, &use_count, Some(true)) {
+    for iv in build_sorted_candidates(liveness, &eligible, &no_gpr, &clobber_points, &[], &use_count, Some(true)) {
         if let Some(i) = pick_callee(&callee_busy, iv) {
             callee_busy[i].push((iv.start, iv.end));
             result.assignments.insert(iv.value_id, (callee[i], width[&iv.value_id]));
         }
     }
-    for iv in build_sorted_candidates(liveness, &eligible, &no_gpr, &clobber_points, &use_count, Some(false)) {
+    for iv in build_sorted_candidates(liveness, &eligible, &no_gpr, &clobber_points, &[], &use_count, Some(false)) {
         if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], iv)) {
             caller_busy[i].push((iv.start, iv.end));
             result.assignments.insert(iv.value_id, (caller[i], width[&iv.value_id]));
@@ -670,6 +721,18 @@ fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
     start_idx < call_points.len() && call_points[start_idx] <= iv.end
 }
 
+/// Like `spans_any_call`, but a call in `boundary_ok` (sorted) does not
+/// count when it is exactly the interval's start or end.
+fn spans_clobbering_call(iv: &LiveInterval, call_points: &[u32], boundary_ok: &[u32]) -> bool {
+    if boundary_ok.is_empty() {
+        return spans_any_call(iv, call_points);
+    }
+    let start_idx = call_points.partition_point(|&cp| cp < iv.start);
+    call_points[start_idx..].iter()
+        .take_while(|&&cp| cp <= iv.end)
+        .any(|&cp| !((cp == iv.start || cp == iv.end) && boundary_ok.binary_search(&cp).is_ok()))
+}
+
 /// Build a sorted list of allocation candidates from live intervals.
 ///
 /// Filters by eligibility, minimum span length, and call-spanning behavior:
@@ -684,6 +747,7 @@ fn build_sorted_candidates<'a>(
     eligible: &FxHashSet<u32>,
     already_assigned: &FxHashMap<u32, PhysReg>,
     call_points: &[u32],
+    boundary_ok: &[u32],
     use_count: &FxHashMap<u32, u64>,
     spans_call: Option<bool>,
 ) -> Vec<&'a LiveInterval> {
@@ -692,8 +756,8 @@ fn build_sorted_candidates<'a>(
         .filter(|iv| !already_assigned.contains_key(&iv.value_id))
         .filter(|iv| iv.end > iv.start)
         .filter(|iv| match spans_call {
-            Some(true) => spans_any_call(iv, call_points),
-            Some(false) => !spans_any_call(iv, call_points),
+            Some(true) => spans_clobbering_call(iv, call_points, boundary_ok),
+            Some(false) => !spans_clobbering_call(iv, call_points, boundary_ok),
             None => true,
         })
         .collect();
