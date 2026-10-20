@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-10-20",
-  "ccc_rev": "f86c5934",
+  "ccc_rev": "0a345012",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -734,6 +734,9 @@
    "status": "pass"
   },
   "cases/thread_local": {
+   "status": "pass"
+  },
+  "cases/types_long_double_enum": {
    "status": "pass"
   },
   "cases/types_sizes": {
@@ -1587,7 +1590,7 @@
   },
   "gcc-torture/20041114-1": {
    "status": "link_error",
-   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
+   "detail": "ccc: error: linker failed (clang): clang: error: couldn't create cache file '/var/folders/4x/8v702dbd30l6xjkp3lgrx23h0000gp/T/xcrun_db-ftq9EvPK' (errno=Operation not permitted)"
   },
   "gcc-torture/20041124-1": {
    "status": "pass"
@@ -3030,8 +3033,7 @@
    "status": "pass"
   },
   "gcc-torture/builtin-types-compatible-p": {
-   "status": "crash",
-   "detail": "signal 6"
+   "status": "pass"
   },
   "gcc-torture/cbrt": {
    "status": "pass"
@@ -5070,7 +5072,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16eedad7f 0x16eedad7f 0x16eedad7f 0x16eedad7f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b732d7f 0x16b732d7f 0x16b732d7f 0x16b732d7f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
