@@ -355,6 +355,30 @@ impl ArmCodegen {
         self.state.emit_fmt(format_args!("    and x0, x0, #{}", -(align as i64)));
     }
 
+    /// Memcpy with the destination address in x9 and the source in x10.
+    /// emit_alloca_aligned_addr computes into x9, so an over-aligned source
+    /// goes through x0 instead to keep the destination intact.
+    pub(super) fn emit_memcpy_arm(&mut self, dest: &Value, src: &Value, size: usize) {
+        if let Some(addr) = self.state.resolve_slot_addr(dest.0) {
+            match addr {
+                SlotAddr::OverAligned(slot, id) => self.emit_alloca_aligned_addr_impl(slot, id),
+                SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr_impl(slot, true, dest.0),
+                SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr_impl(slot, false, dest.0),
+            }
+        }
+        if let Some(addr) = self.state.resolve_slot_addr(src.0) {
+            match addr {
+                SlotAddr::OverAligned(slot, id) => {
+                    self.emit_alloca_aligned_addr_to_acc_impl(slot, id);
+                    self.state.emit("    mov x10, x0");
+                }
+                SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr_impl(slot, true, src.0),
+                SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr_impl(slot, false, src.0),
+            }
+        }
+        self.emit_memcpy_impl_impl(size);
+    }
+
     pub(super) fn emit_memcpy_load_dest_addr_impl(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) {
         if is_alloca {
             self.emit_alloca_addr("x9", val_id, slot.0);

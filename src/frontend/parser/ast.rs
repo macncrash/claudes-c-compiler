@@ -729,7 +729,8 @@ pub enum Expr {
     LabelAddr(String, Span),
     /// GCC extension: __builtin_types_compatible_p(type1, type2)
     /// Compile-time constant: 1 if the two types are compatible, 0 otherwise.
-    BuiltinTypesCompatibleP(TypeSpecifier, TypeSpecifier, Span),
+    /// The flags say whether each type's base type was written `const`.
+    BuiltinTypesCompatibleP(TypeSpecifier, TypeSpecifier, [bool; 2], Span),
 }
 
 /// A _Generic association: either a type-expression pair, or a default expression.
@@ -833,7 +834,7 @@ impl Expr {
             | Expr::GnuAlignofExpr(_, s) | Expr::Comma(_, _, s)
             | Expr::AddressOf(_, s) | Expr::Deref(_, s)
             | Expr::GenericSelection(_, _, s) | Expr::LabelAddr(_, s)
-            | Expr::BuiltinTypesCompatibleP(_, _, s) => *s,
+            | Expr::BuiltinTypesCompatibleP(_, _, _, s) => *s,
         }
     }
 }

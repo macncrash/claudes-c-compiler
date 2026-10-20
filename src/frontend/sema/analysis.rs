@@ -1513,7 +1513,7 @@ impl SemanticAnalyzer {
             // Label address (&&label) - just a compile-time address
             Expr::LabelAddr(_, _) => {}
             // __builtin_types_compatible_p(type1, type2) - compile-time constant
-            Expr::BuiltinTypesCompatibleP(_, _, _) => {}
+            Expr::BuiltinTypesCompatibleP(..) => {}
         }
 
         // After analyzing sub-expressions, infer this expression's CType using

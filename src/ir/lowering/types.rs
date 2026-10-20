@@ -11,7 +11,7 @@ use crate::frontend::parser::ast::{
     StructFieldDecl,
     TypeSpecifier,
 };
-use crate::common::types::{IrType, StructField, StructLayout, RcLayout, CType};
+use crate::common::types::{IrType, StructField, StructLayout, RcLayout, CType, builtin_types_compatible, has_pointer_level};
 use super::lower::Lowerer;
 
 impl Lowerer {
@@ -132,40 +132,14 @@ impl Lowerer {
     /// Returns 1 if the unqualified types are compatible (same type after resolving
     /// typedefs and typeof), 0 otherwise. Follows GCC semantics: ignores top-level
     /// qualifiers, resolves typedefs, but considers signed/unsigned as distinct.
-    pub(super) fn eval_types_compatible(&self, type1: &TypeSpecifier, type2: &TypeSpecifier) -> i32 {
+    /// `base_const` says whether each type's base type was written `const`,
+    /// which matters when it sits under a pointer (`const char *`).
+    pub(super) fn eval_types_compatible(&self, type1: &TypeSpecifier, type2: &TypeSpecifier, base_const: [bool; 2]) -> i32 {
         let ctype1 = self.type_spec_to_ctype(type1);
         let ctype2 = self.type_spec_to_ctype(type2);
-        // Strip top-level qualifiers (CType doesn't carry qualifiers, so this is already done).
-        // Compare the resolved CTypes. GCC considers enum types as their underlying int type,
-        // and considers long/int as distinct even if same size on the platform.
-        if Self::ctypes_compatible(&ctype1, &ctype2) { 1 } else { 0 }
-    }
-
-    /// Check if two CTypes are compatible for __builtin_types_compatible_p purposes.
-    /// This is structural equality with special handling for:
-    /// - Arrays: compatible if element types match (ignore size for unsized arrays)
-    /// - Pointers: compatible if pointee types are compatible
-    /// - Enums: treated as compatible with int
-    fn ctypes_compatible(a: &CType, b: &CType) -> bool {
-        // Normalize enum to int for compatibility purposes
-        let a_norm = match a { CType::Enum(_) => &CType::Int, other => other };
-        let b_norm = match b { CType::Enum(_) => &CType::Int, other => other };
-
-        match (a_norm, b_norm) {
-            // Pointers: pointee types must be compatible
-            (CType::Pointer(p1, _), CType::Pointer(p2, _)) => Self::ctypes_compatible(p1, p2),
-            // Arrays: element types must be compatible, sizes must match (or both unsized)
-            (CType::Array(e1, s1), CType::Array(e2, s2)) => {
-                Self::ctypes_compatible(e1, e2) && s1 == s2
-            }
-            // Structs/Unions: use derived PartialEq (compares name + fields)
-            (CType::Struct(s1), CType::Struct(s2)) => s1 == s2,
-            (CType::Union(u1), CType::Union(u2)) => u1 == u2,
-            // Function types
-            (CType::Function(f1), CType::Function(f2)) => f1 == f2,
-            // All other types (scalars, void, bool, etc.): direct enum equality
-            _ => a_norm == b_norm,
-        }
+        let compatible = builtin_types_compatible(&ctype1, &ctype2)
+            && (base_const[0] == base_const[1] || !has_pointer_level(&ctype1));
+        if compatible { 1 } else { 0 }
     }
 
     pub(super) fn type_spec_to_ir(&self, ts: &TypeSpecifier) -> IrType {

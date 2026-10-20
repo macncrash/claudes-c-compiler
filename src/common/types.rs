@@ -263,6 +263,33 @@ pub struct EnumType {
     pub is_packed: bool,
 }
 
+/// Type compatibility for `__builtin_types_compatible_p`, after top-level
+/// qualifiers are stripped (CType carries none). Two distinct enum types are
+/// incompatible, but an enum is compatible with `int`; an array of unknown
+/// size is compatible with any array of a compatible element type.
+pub fn builtin_types_compatible(a: &CType, b: &CType) -> bool {
+    match (a, b) {
+        (CType::Enum(e1), CType::Enum(e2)) => e1 == e2,
+        (CType::Enum(_), _) => builtin_types_compatible(&CType::Int, b),
+        (_, CType::Enum(_)) => builtin_types_compatible(a, &CType::Int),
+        (CType::Pointer(p1, _), CType::Pointer(p2, _)) => builtin_types_compatible(p1, p2),
+        (CType::Array(e1, s1), CType::Array(e2, s2)) => {
+            builtin_types_compatible(e1, e2) && (s1.is_none() || s2.is_none() || s1 == s2)
+        }
+        _ => a == b,
+    }
+}
+
+/// Whether a qualifier on the base type of `t` would sit under a pointer
+/// (`const char *`, `const int *[4]`) rather than at the top level.
+pub fn has_pointer_level(t: &CType) -> bool {
+    match t {
+        CType::Pointer(..) => true,
+        CType::Array(elem, _) => has_pointer_level(elem),
+        _ => false,
+    }
+}
+
 impl EnumType {
     /// Returns the size (and alignment) in bytes for this enum.
     /// Non-packed enums are always 4 bytes (int). Packed enums use the
@@ -1443,6 +1470,22 @@ impl CType {
 
     /// For a vector type, returns (element_type, num_elements).
     /// Returns None for non-vector types.
+    /// The type of a GCC vector comparison whose operands have this vector
+    /// type: a vector of signed integers of the same lane size, each lane
+    /// -1 where the comparison holds and 0 where it doesn't.
+    pub fn vector_compare_result(&self) -> Option<CType> {
+        let CType::Vector(elem, total_size) = self else { return None };
+        let lane = match elem.size() {
+            1 => CType::Char,
+            2 => CType::Short,
+            4 => CType::Int,
+            8 => CType::Long,
+            16 => CType::Int128,
+            _ => return None,
+        };
+        Some(CType::Vector(Box::new(lane), *total_size))
+    }
+
     pub fn vector_info(&self) -> Option<(&CType, usize)> {
         match self {
             CType::Vector(elem, total_size) => {

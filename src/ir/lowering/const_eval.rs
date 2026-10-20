@@ -31,6 +31,34 @@ impl Lowerer {
         self.sema_const_values.get(&expr.id()).cloned()
     }
 
+    /// Whether `sizeof(arg)` depends on a VLA dimension, so it has no
+    /// compile-time value (`typedef int c[n]; sizeof(c) * 3`).
+    fn sizeof_is_runtime(&self, arg: &SizeofArg) -> bool {
+        let Some(func) = self.func_state.as_ref() else { return false };
+        match arg {
+            SizeofArg::Expr(Expr::Identifier(name, _)) => {
+                func.locals.get(name).is_some_and(|info| info.vla_size.is_some())
+                    || func.vla_typedef_sizes.contains_key(name)
+            }
+            SizeofArg::Expr(_) => false,
+            SizeofArg::Type(ts) => {
+                if let TypeSpecifier::TypedefName(name) = ts {
+                    if func.vla_typedef_sizes.contains_key(name) {
+                        return true;
+                    }
+                }
+                let mut t = self.resolve_type_spec(ts);
+                while let TypeSpecifier::Array(elem, size) = t {
+                    if size.as_ref().is_some_and(|e| self.expr_as_array_size(e).is_none()) {
+                        return true;
+                    }
+                    t = elem;
+                }
+                false
+            }
+        }
+    }
+
     /// Check if an expression tree contains a Sizeof node at any depth.
     /// Used to avoid trusting sema's pre-computed values for expressions involving
     /// sizeof, since sema evaluates sizeof before the lowerer resolves unsized array
@@ -176,6 +204,9 @@ impl Lowerer {
                 self.eval_const_identifier(name)
             }
             Expr::Sizeof(arg, _) => {
+                if self.sizeof_is_runtime(arg) {
+                    return None;
+                }
                 let size = match arg.as_ref() {
                     SizeofArg::Type(ts) => self.sizeof_type(ts),
                     SizeofArg::Expr(e) => self.sizeof_expr(e),
@@ -229,8 +260,8 @@ impl Lowerer {
             Expr::AddressOf(inner, _) => {
                 self.eval_offsetof_pattern(inner)
             }
-            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
-                let result = self.eval_types_compatible(type1, type2);
+            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, base_const, _) => {
+                let result = self.eval_types_compatible(type1, type2, *base_const);
                 Some(IrConst::I64(result as i64))
             }
             // Handle compile-time builtin function calls in constant expressions.

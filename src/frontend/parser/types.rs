@@ -838,6 +838,24 @@ impl Parser {
         }
     }
 
+    /// Parse a type-name, also returning whether its base type was written
+    /// `const` (for `const char *`, the pointee is const). CType drops
+    /// qualifiers, so __builtin_types_compatible_p needs this separately.
+    pub(super) fn parse_type_name_with_base_const(&mut self) -> (TypeSpecifier, bool) {
+        let saved_const = self.attrs.parsing_const();
+        self.attrs.set_const(false);
+        let result = if let Some(ts) = self.parse_type_specifier() {
+            let base_const = self.attrs.parsing_const();
+            (self.parse_abstract_declarator_suffix(ts), base_const)
+        } else {
+            let span = self.peek_span();
+            self.emit_error("expected type name", span);
+            (TypeSpecifier::Int, false)
+        };
+        self.attrs.set_const(saved_const);
+        result
+    }
+
     /// Parse a type-name for __builtin_va_arg: type-specifier + abstract declarator.
     pub(super) fn parse_va_arg_type(&mut self) -> TypeSpecifier {
         if let Some(type_spec) = self.parse_type_specifier() {

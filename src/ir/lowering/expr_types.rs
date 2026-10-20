@@ -374,9 +374,18 @@ impl Lowerer {
         }
     }
 
+    /// The result type of comparing `lhs` and `rhs` when either is a vector.
+    pub(super) fn vector_compare_ctype(&self, lhs: &Expr, rhs: &Expr) -> Option<CType> {
+        [lhs, rhs].into_iter()
+            .filter_map(|e| self.get_expr_ctype(e))
+            .find_map(|ct| ct.vector_compare_result())
+    }
+
     /// Get the IR type for a binary operation expression.
     fn get_binop_type(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> IrType {
         match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                if self.vector_compare_ctype(lhs, rhs).is_some() => IrType::Ptr,
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
             | BinOp::LogicalAnd | BinOp::LogicalOr => crate::common::types::target_int_ir_type(),
             BinOp::Shl | BinOp::Shr => {
@@ -853,10 +862,13 @@ impl Lowerer {
 
     /// Get the CType of a binary operation expression.
     fn get_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
-        // Comparison and logical operators always produce int
+        // Comparison and logical operators produce int, except that comparing
+        // vectors gives a vector of lane masks.
         match op {
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-            | BinOp::LogicalAnd | BinOp::LogicalOr => {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                return Some(self.vector_compare_ctype(lhs, rhs).unwrap_or(CType::Int));
+            }
+            BinOp::LogicalAnd | BinOp::LogicalOr => {
                 return Some(CType::Int);
             }
             _ => {}

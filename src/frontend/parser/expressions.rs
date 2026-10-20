@@ -654,11 +654,11 @@ impl Parser {
                 self.advance();
                 let open = self.peek_span();
                 self.expect_context(&TokenKind::LParen, "after '__builtin_types_compatible_p'");
-                let type1 = self.parse_va_arg_type();
+                let (type1, const1) = self.parse_type_name_with_base_const();
                 self.expect_context(&TokenKind::Comma, "between '__builtin_types_compatible_p' arguments");
-                let type2 = self.parse_va_arg_type();
+                let (type2, const2) = self.parse_type_name_with_base_const();
                 self.expect_closing(&TokenKind::RParen, open);
-                Expr::BuiltinTypesCompatibleP(type1, type2, span)
+                Expr::BuiltinTypesCompatibleP(type1, type2, [const1, const2], span)
             }
             TokenKind::Typeof => {
                 let span = self.peek_span();

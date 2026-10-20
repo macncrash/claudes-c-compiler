@@ -39,7 +39,8 @@ impl Lowerer {
         // Per GCC vector extensions, if either operand is a vector, the operation
         // is element-wise. A scalar operand is splatted (broadcast) to all lanes.
         if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
-            | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr) {
+            | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr)
+            || op.is_comparison() {
             let lhs_ct = self.expr_ctype(lhs);
             if lhs_ct.is_vector() {
                 return self.lower_vector_binary_op(op, lhs, rhs, &lhs_ct);
@@ -324,6 +325,12 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     pub(super) fn lower_unary_op(&mut self, op: UnaryOp, inner: &Expr) -> Operand {
+        if matches!(op, UnaryOp::Plus | UnaryOp::Neg | UnaryOp::BitNot) {
+            let inner_ct = self.expr_ctype(inner);
+            if inner_ct.is_vector() {
+                return self.lower_vector_unary_op(op, inner, &inner_ct);
+            }
+        }
         match op {
             UnaryOp::Plus => {
                 let inner_ct = self.expr_ctype(inner);

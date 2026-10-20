@@ -1978,6 +1978,9 @@ impl ArchCodegen for ArmCodegen {
     fn emit_acc_to_secondary(&mut self) { self.state.emit("    mov x1, x0"); }
     fn emit_memcpy_store_dest_from_acc(&mut self) { }
     fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    mov x10, x9"); }
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        self.emit_memcpy_arm(dest, src, size);
+    }
     fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) {
         self.operand_to_x0(func_ptr);
         self.state.emit("    str x0, [sp, #-16]!");

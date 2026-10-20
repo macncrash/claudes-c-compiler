@@ -7,11 +7,12 @@
 //! - Bitfield helpers: resolve_bitfield_lvalue, store_bitfield, extract_bitfield
 //! - Arithmetic conversion helpers: usual_arithmetic_conversions, promote_for_op, narrow_from_op
 
-use crate::frontend::parser::ast::{BinOp, Expr};
+use crate::frontend::parser::ast::{BinOp, Expr, UnaryOp};
 use crate::ir::reexports::{
     Instruction,
     IrBinOp,
     IrConst,
+    IrUnaryOp,
     Operand,
     Value,
 };
@@ -817,10 +818,54 @@ impl Lowerer {
         Operand::Value(lhs_ptr_val)
     }
 
+    /// Lower a vector unary operation (+v, -v, ~v): element-wise, returns new alloca.
+    pub(super) fn lower_vector_unary_op(&mut self, op: UnaryOp, inner: &Expr, vec_ct: &CType) -> Operand {
+        let (elem_ct, num_elems) = match vec_ct.vector_info() {
+            Some((elem_ct, num_elems)) => (elem_ct.clone(), num_elems),
+            None => return Operand::Const(IrConst::I64(0)),
+        };
+        let src = self.lower_expr(inner);
+        if op == UnaryOp::Plus {
+            return src;
+        }
+        let src_ptr = self.operand_to_value(src);
+        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+        let elem_size = elem_ct.size();
+        let total_size = num_elems * elem_size;
+        let ir_op = if op == UnaryOp::Neg { IrUnaryOp::Neg } else { IrUnaryOp::Not };
+        let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        for i in 0..num_elems {
+            let offset = Operand::Const(IrConst::ptr_int((i * elem_size) as i64));
+            let (src_elem_ptr, dst_elem_ptr) = if i > 0 {
+                (self.emit_binop_val(IrBinOp::Add, Operand::Value(src_ptr), offset, ptr_int_ty),
+                 self.emit_binop_val(IrBinOp::Add, Operand::Value(result_alloca), offset, ptr_int_ty))
+            } else {
+                (src_ptr, result_alloca)
+            };
+            let elem = self.fresh_value();
+            self.emit(Instruction::Load { dest: elem, ptr: src_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+            let result = self.fresh_value();
+            self.emit(Instruction::UnaryOp { dest: result, op: ir_op, src: Operand::Value(elem), ty: elem_ir_ty });
+            self.emit(Instruction::Store { val: Operand::Value(result), ptr: dst_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+        }
+        Operand::Value(result_alloca)
+    }
+
     /// Lower vector binary operation (a + b, a - b, etc.): element-wise, returns new alloca.
     /// Per GCC vector extensions, if one operand is a scalar and the other is a
     /// vector, the scalar is broadcast (splatted) to all elements of the vector.
+    /// A comparison sets each lane of a same-size signed integer vector to -1
+    /// where it holds and 0 where it doesn't.
     pub(super) fn lower_vector_binary_op(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr, vec_ct: &CType) -> Operand {
+        let lane_mask_ty = if op.is_comparison() {
+            match vec_ct.vector_compare_result().as_ref().and_then(|ct| ct.vector_info().map(|(e, _)| e.clone())) {
+                Some(lane_ct) => Some(Self::vector_elem_ir_type(&lane_ct)),
+                None => return Operand::Const(IrConst::I64(0)),
+            }
+        } else {
+            None
+        };
         let (elem_ct, num_elems) = match vec_ct.vector_info() {
             Some((elem_ct, num_elems)) => (elem_ct.clone(), num_elems),
             None => return Operand::Const(IrConst::I64(0)),
@@ -832,7 +877,6 @@ impl Lowerer {
             _ => unreachable!("lower_vector_binary_op called with non-vector type: {:?}", vec_ct),
         };
         let is_unsigned = elem_ct.is_unsigned();
-        let ir_op = Self::binop_to_ir(*op, is_unsigned);
 
         // Determine if each operand is a vector or scalar.
         let lhs_is_vector = self.expr_ctype(lhs).is_vector();
@@ -901,9 +945,19 @@ impl Lowerer {
             };
 
             // Compute result
-            let result_elem = self.emit_binop_val(ir_op, lhs_elem_op, rhs_elem_op, elem_ir_ty);
+            let (result_elem, result_ty) = if let Some(mask_ty) = lane_mask_ty {
+                let cmp_op = Self::binop_to_cmp(*op, is_unsigned);
+                let bit = self.emit_cmp_val(cmp_op, lhs_elem_op, rhs_elem_op, elem_ir_ty);
+                let bit = self.emit_cast_val(Operand::Value(bit), IrType::I32, mask_ty);
+                let mask = self.fresh_value();
+                self.emit(Instruction::UnaryOp { dest: mask, op: IrUnaryOp::Neg, src: Operand::Value(bit), ty: mask_ty });
+                (mask, mask_ty)
+            } else {
+                let ir_op = Self::binop_to_ir(*op, is_unsigned);
+                (self.emit_binop_val(ir_op, lhs_elem_op, rhs_elem_op, elem_ir_ty), elem_ir_ty)
+            };
             // Store to result
-            self.emit(Instruction::Store { val: Operand::Value(result_elem), ptr: result_elem_ptr, ty: elem_ir_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val: Operand::Value(result_elem), ptr: result_elem_ptr, ty: result_ty, seg_override: AddressSpace::Default });
         }
 
         Operand::Value(result_alloca)

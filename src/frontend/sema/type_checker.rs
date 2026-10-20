@@ -339,7 +339,7 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::LabelAddr(_, _) => Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
 
             // __builtin_types_compatible_p: int
-            Expr::BuiltinTypesCompatibleP(_, _, _) => Some(CType::Int),
+            Expr::BuiltinTypesCompatibleP(..) => Some(CType::Int),
         }
     }
 
@@ -349,10 +349,16 @@ impl<'a> ExprTypeChecker<'a> {
     /// on deeply nested expression chains like `+1+1+1+...+1` (which appear in
     /// preprocessor-generated enum initializers).
     fn infer_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
-        // Comparison and logical operators always produce int
+        // Comparison and logical operators produce int, except that comparing
+        // vectors gives a vector of lane masks.
         match op {
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-            | BinOp::LogicalAnd | BinOp::LogicalOr => {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let vector = [lhs, rhs].into_iter()
+                    .filter_map(|e| self.infer_expr_ctype(e))
+                    .find_map(|ct| ct.vector_compare_result());
+                return Some(vector.unwrap_or(CType::Int));
+            }
+            BinOp::LogicalAnd | BinOp::LogicalOr => {
                 return Some(CType::Int);
             }
             _ => {}

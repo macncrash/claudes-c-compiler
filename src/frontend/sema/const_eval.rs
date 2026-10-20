@@ -18,7 +18,7 @@
 //! - Pointer arithmetic on global addresses
 //!   These remain in the lowerer since they require IR-level state.
 
-use crate::common::types::CType;
+use crate::common::types::{CType, builtin_types_compatible, has_pointer_level};
 use crate::common::types::AddressSpace;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
@@ -356,10 +356,11 @@ impl<'a> SemaConstEval<'a> {
             }
 
             // __builtin_types_compatible_p
-            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
+            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, base_const, _) => {
                 let ctype1 = self.type_spec_to_ctype(type1);
                 let ctype2 = self.type_spec_to_ctype(type2);
-                let compatible = self.ctypes_compatible(&ctype1, &ctype2);
+                let compatible = builtin_types_compatible(&ctype1, &ctype2)
+                    && (base_const[0] == base_const[1] || !has_pointer_level(&ctype1));
                 Some(IrConst::I64(compatible as i64))
             }
 
@@ -479,16 +480,6 @@ impl<'a> SemaConstEval<'a> {
                 self.types.borrow_struct_layouts().get(&**key).cloned()
             }
             _ => None,
-        }
-    }
-
-    /// Check if two CTypes are compatible (for __builtin_types_compatible_p).
-    fn ctypes_compatible(&self, t1: &CType, t2: &CType) -> bool {
-        // Strip qualifiers (CType doesn't carry them) and compare
-        match (t1, t2) {
-            (CType::Pointer(a, _), CType::Pointer(b, _)) => self.ctypes_compatible(a, b),
-            (CType::Array(a, _), CType::Array(b, _)) => self.ctypes_compatible(a, b),
-            _ => t1 == t2,
         }
     }
 
