@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-10-20",
-  "ccc_rev": "08b87d21-dirty",
+  "ccc_rev": "7fe458a9",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -1525,8 +1525,7 @@
    "status": "pass"
   },
   "gcc-torture/20040411-1": {
-   "status": "crash",
-   "detail": "signal 6"
+   "status": "pass"
   },
   "gcc-torture/20040423-1": {
    "status": "ref_fail",
@@ -3375,8 +3374,7 @@
    "status": "pass"
   },
   "gcc-torture/pr105613": {
-   "status": "crash",
-   "detail": "signal 11"
+   "status": "pass"
   },
   "gcc-torture/pr105777": {
    "status": "ref_fail",
@@ -3415,8 +3413,7 @@
    "status": "pass"
   },
   "gcc-torture/pr109040": {
-   "status": "crash",
-   "detail": "signal 11"
+   "status": "pass"
   },
   "gcc-torture/pr109778": {
    "status": "pass"
@@ -3449,16 +3446,13 @@
    "status": "pass"
   },
   "gcc-torture/pr110817-1": {
-   "status": "crash",
-   "detail": "signal 11"
+   "status": "pass"
   },
   "gcc-torture/pr110817-2": {
-   "status": "crash",
-   "detail": "signal 11"
+   "status": "pass"
   },
   "gcc-torture/pr110817-3": {
-   "status": "crash",
-   "detail": "signal 11"
+   "status": "pass"
   },
   "gcc-torture/pr110914": {
    "status": "pass"
@@ -4502,8 +4496,7 @@
    "status": "pass"
   },
   "gcc-torture/pr65427": {
-   "status": "crash",
-   "detail": "signal 6"
+   "status": "pass"
   },
   "gcc-torture/pr65648": {
    "status": "pass"
@@ -4951,8 +4944,7 @@
    "status": "pass"
   },
   "gcc-torture/pr94412": {
-   "status": "crash",
-   "detail": "signal 11"
+   "status": "pass"
   },
   "gcc-torture/pr94524-1": {
    "status": "pass"
@@ -5071,7 +5063,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16da5adaf 0x16da5adaf 0x16da5adaf 0x16da5adaf'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16d68ed7f 0x16d68ed7f 0x16d68ed7f 0x16d68ed7f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
@@ -5093,12 +5085,10 @@
    "status": "pass"
   },
   "gcc-torture/simd-1": {
-   "status": "crash",
-   "detail": "signal 11"
+   "status": "pass"
   },
   "gcc-torture/simd-2": {
-   "status": "crash",
-   "detail": "signal 11"
+   "status": "pass"
   },
   "gcc-torture/simd-5": {
    "status": "pass"
