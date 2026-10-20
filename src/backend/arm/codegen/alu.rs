@@ -107,6 +107,8 @@ impl ArmCodegen {
                 Self::const_as_shift_imm(rhs, width)
             } else if matches!(op, IrBinOp::Add | IrBinOp::Sub) {
                 Self::const_as_imm12(rhs)
+            } else if matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) {
+                Self::const_as_logical_imm(rhs, use_32bit)
             } else {
                 None
             };

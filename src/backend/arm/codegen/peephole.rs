@@ -426,6 +426,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
+        changed |= eliminate_unreferenced_labels(&lines, &mut kinds, n);
         rounds += 1;
     }
 
@@ -450,12 +451,20 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_redundant_branches(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
+            changed2 |= fuse_cset_into_csel(&mut lines, &mut kinds, n);
             changed2 |= forward_copy_propagation(&mut lines, &mut kinds, n);
             changed2 |= retarget_results(&mut lines, &mut kinds, n);
             changed2 |= eliminate_dead_writes(&lines, &mut kinds, n);
+            changed2 |= eliminate_dead_writes_global(&lines, &mut kinds, n);
+            changed2 |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_unreferenced_labels(&lines, &mut kinds, n);
             rounds2 += 1;
         }
     }
+
+    // Phase 4: drop frame records that leaf functions no longer need.
+    omit_leaf_frames(&lines, &mut kinds, n);
 
     // Build result, filtering out Nop lines
     let mut result = String::with_capacity(asm.len());
@@ -532,17 +541,39 @@ fn eliminate_redundant_branches(lines: &[String], kinds: &mut [LineKind], n: usi
         if kinds[i] == LineKind::Branch {
             if let Some(target) = branch_target(&lines[i]) {
                 // Find next non-Nop line
+                // Any of the labels directly after the branch.
                 let mut j = i + 1;
-                while j < n && kinds[j] == LineKind::Nop {
+                while j < n && matches!(kinds[j], LineKind::Nop | LineKind::Label) {
+                    if kinds[j] == LineKind::Label && label_name(&lines[j]) == Some(target) {
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        break;
+                    }
                     j += 1;
                 }
-                if j < n && kinds[j] == LineKind::Label {
-                    if let Some(lbl) = label_name(&lines[j]) {
-                        if target == lbl {
-                            kinds[i] = LineKind::Nop;
-                            changed = true;
-                        }
-                    }
+            }
+        }
+    }
+    changed
+}
+
+/// Delete `.L` local labels that nothing references, so branches separated by
+/// them (e.g. a leftover `.Lskip_N:`) become adjacent for the other passes.
+fn eliminate_unreferenced_labels(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let is_sym_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$';
+    let mut referenced: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for i in 0..n {
+        if !matches!(kinds[i], LineKind::Nop | LineKind::Label) {
+            referenced.extend(lines[i].split(|c: char| !is_sym_char(c)).filter(|t| t.starts_with(".L")));
+        }
+    }
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] == LineKind::Label {
+            if let Some(name) = label_name(&lines[i]) {
+                if name.starts_with(".L") && name.chars().all(is_sym_char) && !referenced.contains(name) {
+                    kinds[i] = LineKind::Nop;
+                    changed = true;
                 }
             }
         }
@@ -689,11 +720,36 @@ fn estimate_branch_distance(lines: &[String], kinds: &[LineKind], from: usize, t
 /// Use a conservative threshold of 200,000 to leave margin.
 const COND_BRANCH_SAFE_DISTANCE: usize = 200_000;
 
+/// The inverse of a conditional branch, retargeted: `b.cc` becomes `b.!cc`,
+/// `cbz` becomes `cbnz` and vice versa. None for `tbz`/`tbnz`, whose
+/// +/-32KB range is too short to retarget safely.
+fn invert_branch(line: &str, target: &str) -> Option<String> {
+    if let Some((cc, _)) = cond_branch_parts(line) {
+        return invert_condition(cc).map(|inv| format!("    b.{} {}", inv, target));
+    }
+    let (mnemonic, ops) = split_insn(line)?;
+    let inv = match mnemonic {
+        "cbz" => "cbnz",
+        "cbnz" => "cbz",
+        _ => return None,
+    };
+    Some(format!("    {} {}, {}", inv, first_and_rest(ops).0, target))
+}
+
+/// Target label of `b.cc`, `cbz`, or `cbnz`.
+fn cond_target(line: &str) -> Option<&str> {
+    if let Some((_, t)) = cond_branch_parts(line) {
+        return Some(t);
+    }
+    let (mnemonic, ops) = split_insn(line)?;
+    matches!(mnemonic, "cbz" | "cbnz").then(|| last_operand(ops))
+}
+
 fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let mut i = 0;
     while i + 2 < n {
-        if kinds[i] == LineKind::CondBranch {
+        if matches!(kinds[i], LineKind::CondBranch | LineKind::CmpBranch) {
             // Find the next two non-Nop instructions
             let mut j = i + 1;
             while j < n && kinds[j] == LineKind::Nop {
@@ -714,8 +770,8 @@ fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usiz
 
             // Check pattern: b.cc .skip ; b .target ; .skip:
             if kinds[j] == LineKind::Branch && kinds[k] == LineKind::Label {
-                if let (Some((cc, skip_target)), Some(real_target), Some(lbl)) = (
-                    cond_branch_parts(&lines[i]),
+                if let (Some(skip_target), Some(real_target), Some(lbl)) = (
+                    cond_target(&lines[i]),
                     branch_target(&lines[j]),
                     label_name(&lines[k]),
                 ) {
@@ -727,10 +783,10 @@ fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                         let in_range = estimate_branch_distance(lines, kinds, i, real_target)
                             .is_none_or(|d| d < COND_BRANCH_SAFE_DISTANCE);
                         if in_range {
-                            if let Some(inv_cc) = invert_condition(cc) {
+                            if let Some(inverted) = invert_branch(&lines[i], real_target) {
                                 // Replace conditional branch with inverted condition to real target
-                                lines[i] = format!("    b.{} {}", inv_cc, real_target);
-                                // kinds[i] stays as CondBranch
+                                lines[i] = inverted;
+                                // kinds[i] stays as CondBranch/CmpBranch
                                 // Remove the unconditional branch
                                 kinds[j] = LineKind::Nop;
                                 // Keep the label (might be targeted by other branches)
@@ -979,6 +1035,18 @@ fn forward_copy_propagation(lines: &mut [String], kinds: &mut [LineKind], n: usi
             if kinds[k] == LineKind::Nop {
                 continue;
             }
+            // `cbz`/`cbnz` read their register operand and end the block.
+            if kinds[k] == LineKind::CmpBranch {
+                if let Some((mnemonic @ ("cbz" | "cbnz"), ops)) = split_insn(&lines[k]) {
+                    let (reg, target) = first_and_rest(ops);
+                    let new_reg = if reg == a_x { Some(b_x) } else if reg == a_w { Some(b_w) } else { None };
+                    if let Some(new_reg) = new_reg {
+                        lines[k] = format!("    {} {},{}", mnemonic, new_reg, target);
+                        changed = true;
+                    }
+                }
+                break;
+            }
             let access = classify_access(&lines[k], kinds[k]);
             let (prefix, ops) = match access {
                 Access::Transparent => continue,
@@ -1063,6 +1131,552 @@ fn eliminate_dead_writes(lines: &[String], kinds: &mut [LineKind], n: usize) -> 
         }
     }
     changed
+}
+
+// ── Redundant sign extension ─────────────────────────────────────────────────
+//
+// Codegen keeps signed 32-bit values sign-extended in their x register, and
+// an IR cast to 64 bits emits another `sxtw`. Track, through straight-line
+// code, which registers already hold the sign extension of their low 32 bits;
+// `sxtw xD, wS` of such a register is a plain copy (or nothing when D == S).
+
+/// Whether writing `line` (destination register `dest` operand text) leaves
+/// the destination equal to the sign extension of its low 32 bits.
+fn writes_sign_extended(mnemonic: &str, dest: &str, srcs: &str, sext: &[bool; 29]) -> bool {
+    let x_dest = dest.starts_with('x');
+    match mnemonic {
+        "sxtw" | "ldrsw" | "cset" | "csetm" => x_dest,
+        // Byte/halfword sign extensions into an x register, and zero
+        // extensions of at most 16 bits into either width.
+        "sxtb" | "sxth" | "ldrsb" | "ldrsh" => x_dest,
+        "uxtb" | "uxth" | "ldrb" | "ldrh" => true,
+        // A count of at most 64.
+        "clz" => true,
+        // Results below 2^31: masking with a small non-negative immediate,
+        // and 32-bit logical right shifts by at least one.
+        "and" => {
+            let imm = last_operand(srcs).strip_prefix('#').and_then(|v| v.parse::<i64>().ok());
+            imm.is_some_and(|v| (0..=i32::MAX as i64).contains(&v))
+        }
+        "lsr" if !x_dest => {
+            let imm = last_operand(srcs).strip_prefix('#').and_then(|v| v.parse::<i64>().ok());
+            imm.is_some_and(|v| (1..32).contains(&v))
+        }
+        // Selects between two sign-extended registers (or zero).
+        "csel" if x_dest => {
+            let (a, rest) = first_and_rest(srcs);
+            let b = first_and_rest(rest).0;
+            let ok = |r: &str| r == "xzr" || (r.starts_with('x') && gpr_operand(r).is_some_and(|n| sext[n as usize]));
+            ok(a) && ok(b)
+        }
+        "mov" => {
+            let src = srcs.trim();
+            if let Some(imm) = src.strip_prefix('#') {
+                let imm = imm.trim();
+                let value = match imm.strip_prefix("0x").or_else(|| imm.strip_prefix("-0x")) {
+                    Some(hex) => i64::from_str_radix(hex, 16).ok().map(|v| if imm.starts_with('-') { -v } else { v }),
+                    None => imm.parse::<i64>().ok(),
+                };
+                return match value {
+                    Some(v) if x_dest => (i32::MIN as i64..=i32::MAX as i64).contains(&v),
+                    Some(v) => (0..=i32::MAX as i64).contains(&v),
+                    None => false,
+                };
+            }
+            x_dest && gpr_operand(src).is_some_and(|s| src.starts_with('x') && sext[s as usize])
+        }
+        _ => false,
+    }
+}
+
+fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut sext = [false; 29];
+    // Register -> the immediately preceding 32-bit bitwise op that defined it.
+    let mut widenable: [Option<usize>; 29] = [None; 29];
+    let mut last_wmov: Option<(u8, u8)> = None;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let access = classify_access(&lines[i], kinds[i]);
+        if access == Access::Barrier {
+            sext = [false; 29];
+            widenable = [None; 29];
+            last_wmov = None;
+            continue;
+        }
+        let line = lines[i].clone();
+        let Some((mnemonic, ops)) = split_insn(&line) else { continue };
+        let (dest, srcs) = first_and_rest(ops);
+        // `mov wA, wB` then `sxtw xD, wA`: sign-extend wB directly.
+        if let (LineKind::Sxtw { dst, src }, Some((a, b))) = (kinds[i], last_wmov) {
+            if src == a && b <= 28 {
+                lines[i] = format!("    sxtw {}, {}", xreg_name(dst), wreg_name(b));
+                kinds[i] = classify_line(&lines[i]);
+                changed = true;
+            }
+        }
+        last_wmov = match kinds[i] {
+            LineKind::Move { dst, src, is_32bit: true } if dst != src => Some((dst, src)),
+            _ => None,
+        };
+        if let LineKind::Sxtw { dst, src } = kinds[i] {
+            // `orr wS, wA, wB` of sign-extended A and B, then `sxtw xD, wS`:
+            // the 64-bit bitwise op already gives the sign-extended result.
+            // S's own upper half changes, so S must be overwritten or dead.
+            let s_dead = dst == src || (src <= 28 && reg_dead_after(lines, kinds, i + 1, n, src));
+            if src <= 28 && !sext[src as usize] && s_dead {
+                if let Some(j) = widenable[src as usize].take() {
+                    let (m, o) = split_insn(&lines[j]).unwrap_or(("", ""));
+                    let widened = o.split(',').map(|r| r.trim().replacen('w', "x", 1)).collect::<Vec<_>>().join(", ");
+                    lines[j] = format!("    {} {}", m, widened);
+                    kinds[j] = classify_line(&lines[j]);
+                    sext[src as usize] = true;
+                }
+            }
+            if dst <= 28 && src <= 28 && sext[src as usize] {
+                if dst == src {
+                    kinds[i] = LineKind::Nop;
+                } else {
+                    lines[i] = format!("    mov {}, {}", xreg_name(dst), xreg_name(src));
+                    kinds[i] = classify_line(&lines[i]);
+                    sext[dst as usize] = true;
+                }
+                changed = true;
+                continue;
+            }
+        }
+        widenable = [None; 29];
+        if let Access::Write { .. } = access {
+            if let Some(d) = gpr_operand(dest) {
+                let new_sext = writes_sign_extended(mnemonic, dest, srcs, &sext);
+                let regs: Vec<&str> = srcs.split(',').map(str::trim).collect();
+                if matches!(mnemonic, "and" | "orr" | "eor") && dest.starts_with('w') && regs.len() == 2
+                    && regs.iter().all(|r| r.starts_with('w') && gpr_operand(r).is_some_and(|n| sext[n as usize]))
+                {
+                    widenable[d as usize] = Some(i);
+                }
+                sext[d as usize] = new_sext;
+            }
+        }
+        // Writeback addressing also updates the base register.
+        if ops.contains("]!") || ops.contains("],") {
+            sext = [false; 29];
+        }
+    }
+    changed
+}
+
+// ── Leaf frame omission ──────────────────────────────────────────────────────
+//
+// A function that calls nothing and, after the other passes, never touches
+// the stack, fp, or lr does not need its 16-byte frame record:
+//   stp x29, x30, [sp, #-16]!; mov x29, sp; ...; ldp x29, x30, [sp], #16; ret
+// Dropping it (and its CFI) leaves the default CFA of sp with the return
+// address in x30, which is what clang emits for such leaves.
+
+fn omit_leaf_frames(lines: &[String], kinds: &mut [LineKind], n: usize) {
+    let mut i = 0;
+    while i < n {
+        if !is_function_start(&lines[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < n && !lines[end].trim().starts_with(".size ") && !is_function_start(&lines[end]) {
+            end += 1;
+        }
+        omit_leaf_frame_in(lines, kinds, start, end);
+        i = end;
+    }
+}
+
+fn omit_leaf_frame_in(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) {
+    const FRAME_CFI: [&str; 4] = [
+        ".cfi_def_cfa_offset 16", ".cfi_offset x29, -16", ".cfi_offset x30, -8", ".cfi_def_cfa_register x29",
+    ];
+    let mut prologue: Vec<usize> = Vec::new();
+    let mut epilogues: Vec<usize> = Vec::new();
+    let mut saw_stp = false;
+    let mut saw_mov_fp = false;
+    for k in start..end {
+        if kinds[k] == LineKind::Nop {
+            continue;
+        }
+        let t = lines[k].trim();
+        if !saw_stp {
+            // Everything before the frame setup must be the label/directives.
+            if t == "stp x29, x30, [sp, #-16]!" {
+                saw_stp = true;
+                prologue.push(k);
+                continue;
+            }
+            if kinds[k] == LineKind::Label || t == ".cfi_startproc" || t.starts_with(".loc ") {
+                continue;
+            }
+            return;
+        }
+        if !saw_mov_fp {
+            if FRAME_CFI.contains(&t) {
+                prologue.push(k);
+                continue;
+            }
+            if t == "mov x29, sp" {
+                saw_mov_fp = true;
+                prologue.push(k);
+                continue;
+            }
+            return;
+        }
+        if t == ".cfi_def_cfa_register x29" && prologue.len() < 6 {
+            prologue.push(k);
+            continue;
+        }
+        if t == "ldp x29, x30, [sp], #16" {
+            epilogues.push(k);
+            continue;
+        }
+        if kinds[k] == LineKind::Call || (t.starts_with(".cfi_") && t != ".cfi_endproc") {
+            return;
+        }
+        let touches_frame = t.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| matches!(tok, "sp" | "wsp" | "x29" | "w29" | "x30" | "w30" | "fp" | "lr"));
+        if touches_frame {
+            return;
+        }
+    }
+    if !saw_mov_fp || epilogues.is_empty() {
+        return;
+    }
+    for k in prologue.into_iter().chain(epilogues) {
+        kinds[k] = LineKind::Nop;
+    }
+}
+
+// ── Condition reuse for selects ──────────────────────────────────────────────
+//
+// A select on a compare result is emitted as
+//   cmp ...; cset xC, cc; <setup>; cmp xC, #0; csel xD, xT, xF, ne
+// When nothing in between sets the flags or writes C, the csel can use the
+// original condition directly (`csel xD, xT, xF, cc`) and the second compare
+// goes away; the cset is left for dead-write elimination.
+
+/// Mnemonics that write the NZCV flags.
+fn sets_flags(mnemonic: &str) -> bool {
+    matches!(mnemonic, "cmp" | "cmn" | "tst" | "fcmp" | "fcmpe" | "ccmp" | "ccmn" | "fccmp"
+        | "fccmpe" | "adds" | "subs" | "ands" | "bics" | "adcs" | "sbcs" | "negs" | "ngcs")
+}
+
+/// Mnemonics that read the NZCV flags (besides `b.cc`).
+fn reads_flags(mnemonic: &str) -> bool {
+    matches!(mnemonic, "csel" | "csinc" | "csinv" | "csneg" | "cset" | "csetm" | "cinc" | "cinv"
+        | "cneg" | "fcsel" | "adc" | "adcs" | "sbc" | "sbcs" | "ngc" | "ngcs" | "ccmp" | "ccmn"
+        | "fccmp" | "fccmpe")
+}
+
+/// Whether the flags are dead after line `start - 1`: overwritten, or the
+/// block ends, before anything reads them. Codegen never keeps flags live
+/// across labels, branches, or calls.
+fn flags_dead_after(lines: &[String], kinds: &[LineKind], start: usize, n: usize) -> bool {
+    for k in start..n {
+        match kinds[k] {
+            LineKind::Nop => continue,
+            LineKind::Label | LineKind::Branch | LineKind::Ret | LineKind::Call => return true,
+            LineKind::CondBranch => return false,
+            _ => {}
+        }
+        let Some((m, _)) = split_insn(&lines[k]) else { return false };
+        if reads_flags(m) {
+            return false;
+        }
+        if sets_flags(m) {
+            return true;
+        }
+        match classify_access(&lines[k], kinds[k]) {
+            Access::Barrier if kinds[k] != LineKind::CmpBranch => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn fuse_cset_into_csel(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        // `cmp xC, #0` / `cmp wC, #0`
+        let Some(("cmp", ops)) = split_insn(&lines[i]) else { continue };
+        let (creg, imm) = first_and_rest(ops);
+        if imm.trim() != "#0" {
+            continue;
+        }
+        let Some(c) = gpr_operand(creg) else { continue };
+        // Next instruction: `csel xD, xT, xF, ne|eq`.
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some(("csel", sel_ops)) = split_insn(&lines[j]) else { continue };
+        let sel_cc = last_operand(sel_ops);
+        if sel_cc != "ne" && sel_cc != "eq" {
+            continue;
+        }
+        // Walk back to the cset that defined C, through flag-preserving code.
+        let mut k = i;
+        let mut cc = None;
+        while k > 0 {
+            k -= 1;
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            let access = classify_access(&lines[k], kinds[k]);
+            if access == Access::Transparent {
+                continue;
+            }
+            let Some((m, o)) = split_insn(&lines[k]) else { break };
+            if m == "cset" {
+                let (d, rest) = first_and_rest(o);
+                if gpr_operand(d) == Some(c) {
+                    cc = Some(rest.trim().to_string());
+                }
+                break;
+            }
+            let writes_c = matches!(access, Access::Write { .. }) && gpr_operand(first_and_rest(o).0) == Some(c);
+            if access == Access::Barrier || sets_flags(m) || writes_c {
+                break;
+            }
+        }
+        let Some(cc) = cc else { continue };
+        if !flags_dead_after(lines, kinds, j + 1, n) {
+            continue;
+        }
+        let new_cc = if sel_cc == "ne" { Some(cc.as_str()) } else { invert_condition(&cc) };
+        let Some(new_cc) = new_cc else { continue };
+        let prefix = &sel_ops[..sel_ops.len() - sel_cc.len()];
+        lines[j] = format!("    csel {}{}", prefix, new_cc);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+// ── Function-wide dead register write elimination ────────────────────────────
+//
+// `eliminate_dead_writes` only sees straight-line code. This pass computes
+// GPR liveness over each function's control-flow graph (labels and branches)
+// and deletes deletable writes whose destination is dead on every path.
+//
+// The model is conservative: any line it does not understand reads every
+// register and writes none; `ret` reads the return and callee-saved
+// registers; calls read the argument registers; indirect branches, branches
+// to labels outside the function, and anything after them make every
+// register live. Functions that call setjmp-like routines are skipped.
+
+/// Bitmask over x0-x28.
+type RegSet = u32;
+const ALL_REGS: RegSet = (1 << 29) - 1;
+/// x0-x8: integer arguments and the indirect-result register.
+const ARG_REGS: RegSet = 0x1ff;
+/// x0-x1 (return value) and x19-x28 (callee-saved).
+const RET_REGS: RegSet = 0b11 | (0x3ff << 19);
+
+/// Register set named by `text` (`xN`/`wN` tokens, N ≤ 28).
+fn regs_in(text: &str) -> RegSet {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(gpr_operand)
+        .fold(0, |s, r| s | 1 << r)
+}
+
+#[derive(Clone, Copy)]
+enum Flow {
+    /// Falls through to the next line.
+    Next,
+    /// Jumps to a label (its line index) and maybe falls through.
+    Jump { target: Option<usize>, falls_through: bool },
+    /// Leaves the function (ret).
+    Exit,
+}
+
+struct LineInfo {
+    uses: RegSet,
+    defs: RegSet,
+    flow: Flow,
+    /// Destination GPR if this line may be deleted when it is dead.
+    deletable_dest: Option<u8>,
+}
+
+fn last_operand(ops: &str) -> &str {
+    ops.rsplit(',').next().unwrap_or("").trim()
+}
+
+fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<usize>) -> LineInfo {
+    let simple = |uses, defs| LineInfo { uses, defs, flow: Flow::Next, deletable_dest: None };
+    let (mnemonic, ops) = split_insn(line).unwrap_or(("", ""));
+    match kind {
+        LineKind::Nop | LineKind::Label => return simple(0, 0),
+        LineKind::Ret => return LineInfo { uses: RET_REGS, defs: 0, flow: Flow::Exit, deletable_dest: None },
+        LineKind::Call => {
+            let uses = if mnemonic == "blr" { ARG_REGS | regs_in(ops) } else { ARG_REGS };
+            return simple(uses, 0);
+        }
+        LineKind::Branch => {
+            let target = if mnemonic == "b" { label_index(ops.trim()) } else { None };
+            // An unknown target (indirect, tail call, outside label) needs everything.
+            let uses = if target.is_some() { 0 } else { ALL_REGS };
+            return LineInfo { uses, defs: 0, flow: Flow::Jump { target, falls_through: false }, deletable_dest: None };
+        }
+        LineKind::CondBranch | LineKind::CmpBranch => {
+            let target = label_index(last_operand(ops));
+            let reg_use = if kind == LineKind::CmpBranch { regs_in(first_and_rest(ops).0) } else { 0 };
+            let uses = if target.is_some() { reg_use } else { ALL_REGS };
+            return LineInfo { uses, defs: 0, flow: Flow::Jump { target, falls_through: true }, deletable_dest: None };
+        }
+        _ => {}
+    }
+    let (dest, srcs) = first_and_rest(ops);
+    // Address materialization: `adrp xN, sym` and `add xN, xM, :lo12:sym`.
+    if mnemonic == "adrp" {
+        if let Some(d) = gpr_operand(dest) {
+            return LineInfo { uses: 0, defs: 1 << d, flow: Flow::Next, deletable_dest: Some(d) };
+        }
+    }
+    if mnemonic == "add" && last_operand(ops).starts_with(":lo12:") {
+        let base = first_and_rest(srcs).0;
+        if let (Some(d), Some(b)) = (gpr_operand(dest), gpr_operand(base)) {
+            return LineInfo { uses: 1 << b, defs: 1 << d, flow: Flow::Next, deletable_dest: Some(d) };
+        }
+    }
+    // Pair loads/stores and writeback forms (callee-saved register saves and
+    // restores, memcpy loops). The writeback base stays live; it is never
+    // treated as killed.
+    let has_symbol = ops.contains(':') || ops.contains('@') || ops.contains('=');
+    if !has_symbol {
+        if let Some(bracket) = ops.find('[') {
+            let (regs, addr) = (&ops[..bracket], &ops[bracket..]);
+            let writeback = addr.contains("]!") || addr.contains("],");
+            match mnemonic {
+                "ldp" | "ldpsw" => {
+                    let (a, rest) = first_and_rest(regs);
+                    let b = first_and_rest(rest).0;
+                    let defs = regs_in(a) | regs_in(b);
+                    return simple(regs_in(addr), defs & !regs_in(addr));
+                }
+                "stp" => return simple(regs_in(ops), 0),
+                "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" if writeback => {
+                    return simple(regs_in(addr), regs_in(dest) & !regs_in(addr));
+                }
+                "str" | "strb" | "strh" if writeback => return simple(regs_in(ops), 0),
+                _ => {}
+            }
+        }
+    }
+    match classify_access(line, kind) {
+        Access::Transparent => simple(0, 0),
+        Access::Barrier => simple(ALL_REGS, 0),
+        Access::ReadOnly => simple(regs_in(ops), 0),
+        Access::Write { deletable } => match gpr_operand(dest) {
+            Some(d) => LineInfo {
+                uses: regs_in(srcs),
+                defs: 1 << d,
+                flow: Flow::Next,
+                deletable_dest: deletable.then_some(d),
+            },
+            // Non-GPR destination (e.g. `fmov d0, x1`): only reads.
+            None => simple(regs_in(srcs), 0),
+        },
+    }
+}
+
+fn is_function_start(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with(".type ") && t.ends_with("%function")
+}
+
+fn eliminate_dead_writes_global(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        if !is_function_start(&lines[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < n && !lines[end].trim().starts_with(".size ") && !is_function_start(&lines[end]) {
+            end += 1;
+        }
+        changed |= dead_writes_in_function(lines, kinds, start, end);
+        i = end;
+    }
+    changed
+}
+
+fn dead_writes_in_function(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
+    let body = start..end;
+    if body.clone().any(|k| {
+        kinds[k] == LineKind::Call
+            && ["setjmp", "vfork", "getcontext", "savectx"].iter().any(|s| lines[k].contains(s))
+    }) {
+        return false;
+    }
+    // Label name -> line index (local to this function).
+    let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for k in body.clone() {
+        if kinds[k] == LineKind::Label {
+            if let Some(name) = label_name(&lines[k]) {
+                labels.insert(name, k);
+            }
+        }
+    }
+    let label_index = |name: &str| labels.get(name).copied();
+
+    let mut changed = false;
+    loop {
+        let infos: Vec<LineInfo> = body.clone().map(|k| line_info(&lines[k], kinds[k], &label_index)).collect();
+        let len = infos.len();
+        let succ_live = |live_in: &[RegSet], idx: usize| -> RegSet {
+            let next = if idx + 1 < len { live_in[idx + 1] } else { ALL_REGS };
+            match infos[idx].flow {
+                Flow::Next => next,
+                Flow::Exit => 0,
+                Flow::Jump { target, falls_through } => {
+                    let t = target.map_or(ALL_REGS, |t| live_in[t - start]);
+                    if falls_through { t | next } else { t }
+                }
+            }
+        };
+        let mut live_in: Vec<RegSet> = vec![0; len];
+        let mut iterate = true;
+        while iterate {
+            iterate = false;
+            for idx in (0..len).rev() {
+                let out = succ_live(&live_in, idx);
+                let new_in = (out & !infos[idx].defs) | infos[idx].uses;
+                if new_in != live_in[idx] {
+                    live_in[idx] = new_in;
+                    iterate = true;
+                }
+            }
+        }
+        let mut removed = false;
+        for idx in 0..len {
+            if let Some(d) = infos[idx].deletable_dest {
+                if succ_live(&live_in, idx) & (1 << d) == 0 {
+                    kinds[start + idx] = LineKind::Nop;
+                    removed = true;
+                }
+            }
+        }
+        if !removed {
+            return changed;
+        }
+        changed = true;
+    }
 }
 
 // Shared peephole string utilities -- see backend/peephole_common.rs
@@ -1286,10 +1900,154 @@ mod tests {
 
     #[test]
     fn test_redundant_branch() {
-        let input = "    b .LBB1\n.LBB1:\n    ret\n";
+        let input = "    cbz x0, .LBB1\n    b .LBB1\n.LBB1:\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(!result.contains("b .LBB1"));
         assert!(result.contains(".LBB1:"));
+    }
+
+    #[test]
+    fn test_repeated_sxtw_becomes_copy() {
+        let input = "    sxtw x10, w1\n    sxtw x11, w10\n    sxtw x10, w10\n    str x11, [x9]\n    str x10, [x8]\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("sxtw x11, w10"), "{}", result);
+        assert!(!result.contains("sxtw x10, w10"), "{}", result);
+        assert!(result.contains("sxtw x10, w1"), "{}", result);
+    }
+
+    #[test]
+    fn test_sxtw_kept_after_32bit_arithmetic_and_labels() {
+        let input = "    cbz x0, .LBB1\n    sxtw x10, w1\n    add w10, w10, w2\n    sxtw x10, w10\n    sxtw x12, w1\n.LBB1:\n    sxtw x13, w12\n    str x10, [x9]\n    str x13, [x9]\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("sxtw x10, w10"), "32-bit add can overflow: {}", result);
+        assert!(result.contains("sxtw x13, w12"), "state resets at labels: {}", result);
+    }
+
+    #[test]
+    fn test_sxtw_of_clz_and_csel_removed() {
+        let input = "    clz x0, x1\n    sxtw x0, w0\n    mov x1, #8\n    mov x2, #-8\n    csel x3, x1, x2, ne\n    sxtw x3, w3\n    str x0, [x9]\n    str x3, [x9]\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("sxtw"), "{}", result);
+    }
+
+    #[test]
+    fn test_bitwise_op_widened_instead_of_sxtw() {
+        let input = "    sxtw x10, w1\n    sxtw x11, w2\n    orr w12, w10, w11\n    sxtw x12, w12\n    str x12, [x9]\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("orr x12, x10, x11"), "{}", result);
+        assert!(!result.contains("sxtw x12"), "{}", result);
+    }
+
+    #[test]
+    fn test_bitwise_op_not_widened_when_source_stays_live() {
+        // x12 is read after the sxtw, and must keep its zero-extended upper half.
+        let input = "    sxtw x10, w1\n    sxtw x11, w2\n    orr w12, w10, w11\n    sxtw x13, w12\n    str x12, [x9]\n    str x13, [x9]\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("orr w12, w10, w11"), "{}", result);
+        assert!(result.contains("sxtw x13, w12"), "{}", result);
+    }
+
+    #[test]
+    fn test_cset_condition_reused_by_csel() {
+        let input = "    cmp w1, #2\n    cset x10, le\n    mov x2, #8\n    cmp x10, #0\n    csel x0, x2, x3, ne\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("csel x0, x2, x3, le"), "{}", result);
+        assert!(!result.contains("cmp x10, #0"), "{}", result);
+        // eq on the boolean is the inverted condition.
+        let input = "    cmp w1, #2\n    cset x10, le\n    cmp x10, #0\n    csel x0, x2, x3, eq\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("csel x0, x2, x3, gt"), "{}", result);
+    }
+
+    #[test]
+    fn test_cset_condition_not_reused_across_flag_writes() {
+        // Another compare between the cset and the select.
+        let input = "    cmp w1, #2\n    cset x10, le\n    cmp w1, #7\n    cset x11, eq\n    cmp x10, #0\n    csel x0, x2, x11, ne\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("cmp x10, #0"), "{}", result);
+        // A later reader of the flags from `cmp x10, #0`.
+        let input = "    cmp w1, #2\n    cset x10, le\n    cmp x10, #0\n    csel x0, x2, x3, ne\n    b.ne .LBB1\n    ret\n.LBB1:\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("cmp x10, #0"), "{}", result);
+    }
+
+    #[test]
+    fn test_leaf_frame_omitted() {
+        let frame = ".type f, %function\nf:\n.cfi_startproc\n    stp x29, x30, [sp, #-16]!\n    .cfi_def_cfa_offset 16\n    .cfi_offset x29, -16\n    .cfi_offset x30, -8\n    mov x29, sp\n    .cfi_def_cfa_register x29\n";
+        let tail = "    ldp x29, x30, [sp], #16\n    ret\n.cfi_endproc\n.size f, .-f\n";
+        let leaf = format!("{}    add x0, x0, x1\n{}", frame, tail);
+        let result = peephole_optimize(leaf);
+        assert!(!result.contains("x29") && !result.contains("cfa"), "{}", result);
+        assert!(result.contains("add x0, x0, x1") && result.contains("ret"), "{}", result);
+        // Calls and stack accesses keep the frame.
+        for body in ["    bl g\n", "    str x0, [sp, #8]\n", "    mov x0, x30\n"] {
+            let result = peephole_optimize(format!("{}{}{}", frame, body, tail));
+            assert!(result.contains("stp x29, x30") && result.contains("ldp x29, x30"), "{}", result);
+        }
+    }
+
+    #[test]
+    fn test_unreferenced_label_removed() {
+        let input = "    b .LBB1\n.LBB1:\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains(".LBB1"));
+    }
+
+    #[test]
+    fn test_cbz_over_branch_fusion() {
+        // cbz to a skip label over `b`: invert, and fall through to the true block.
+        let input = "    cbz x0, .Lskip_0\n    b .LBB2\n.Lskip_0:\n    b .LBB4\n.LBB2:\n    ret\n.LBB4:\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("cbz x0, .LBB4"), "{}", result);
+        assert!(!result.contains("b .LBB2"), "{}", result);
+    }
+
+    #[test]
+    fn test_copy_propagates_into_cbz() {
+        let input = ".type f, %function\nf:\n    mov x0, x12\n    cbz x0, .LBB1\n    mov x0, #1\n    ret\n.LBB1:\n    mov x0, #2\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("cbz x12, .LBB1"), "{}", result);
+        assert!(!result.contains("mov x0, x12"), "{}", result);
+    }
+
+    #[test]
+    fn test_global_dead_write_across_blocks() {
+        // x11 is written before a branch and overwritten on both paths.
+        let input = ".type f, %function\nf:\n    mov x11, x1\n    cbz x0, .LBB1\n    mov x11, #1\n    b .LBB2\n.LBB1:\n    mov x11, #2\n.LBB2:\n    mov x0, x11\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x11, x1"), "{}", result);
+        assert!(result.contains("mov x11, #1") && result.contains("mov x11, #2"), "{}", result);
+    }
+
+    #[test]
+    fn test_global_dead_write_kept_when_live_on_one_path() {
+        let input = ".type f, %function\nf:\n    mov x11, x1\n    cbz x0, .LBB1\n    mov x11, #1\n.LBB1:\n    mov x0, x11\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x11, x1"), "{}", result);
+    }
+
+    #[test]
+    fn test_global_dead_write_kept_for_return_and_callee_saved() {
+        // x1 (second return register) and x20 (callee-saved) are live at ret.
+        let input = ".type f, %function\nf:\n    mov x1, x2\n    mov x20, x3\n    mov x9, x4\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x1, x2") && result.contains("mov x20, x3"), "{}", result);
+        assert!(!result.contains("mov x9, x4"), "{}", result);
+    }
+
+    #[test]
+    fn test_global_dead_write_kept_before_indirect_branch_and_calls() {
+        let input = ".type f, %function\nf:\n    mov x3, x9\n    bl g\n    mov x11, x9\n    br x10\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x3, x9"), "call argument: {}", result);
+        assert!(result.contains("mov x11, x9"), "indirect branch: {}", result);
+    }
+
+    #[test]
+    fn test_global_dead_write_skips_setjmp_functions() {
+        let input = ".type f, %function\nf:\n    bl setjmp\n    mov x11, x1\n    cbz x0, .LBB1\n    mov x11, #1\n.LBB1:\n    mov x11, #2\n    mov x0, x11\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x11, x1"), "{}", result);
     }
 
     #[test]
@@ -1379,6 +2137,7 @@ mod tests {
     fn test_gsf_invalidation_at_jump_target() {
         // Mappings are invalidated at jump target labels
         let input = "\
+    cbz x0, .LBB1\n\
     str x5, [sp, #16]\n\
     b .LBB1\n\
 .LBB1:\n\

@@ -24,6 +24,8 @@ make bench           # ccc and clang builds; results must be identical
 ```
 
 `make check` and `./perft --deep` pass with ccc on arm64 macOS. At the time
-of writing, the ccc build does about 24 M nodes/s and clang -O2 about
-80 M nodes/s (ccc was at 7.7 M nodes/s before struct copies were compiled
-to 16-byte `ldp`/`stp` chunks instead of a byte loop).
+of writing, the ccc build does about 36 M nodes/s and clang -O2 about
+84 M nodes/s. Earlier milestones: 7.7 M nodes/s before struct copies were
+compiled to 16-byte `ldp`/`stp` chunks instead of a byte loop, and 24 M
+nodes/s before register-addressed loads/stores, gap-aware register
+allocation, and function-wide dead-code cleanup in the peephole optimizer.

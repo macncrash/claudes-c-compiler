@@ -669,69 +669,7 @@ pub trait ArchCodegen {
 
     /// Emit a get-element-pointer (base + offset).
     fn emit_gep(&mut self, dest: &Value, base: &Value, offset: &Operand) {
-        // Optimized path for constant offsets: avoid loading offset into acc
-        // and adding via secondary register. Instead, directly compute
-        // base_addr + constant using efficient addressing modes.
-        if let Operand::Const(c) = offset {
-            let const_offset = match c {
-                IrConst::I64(n) => Some(*n),
-                IrConst::I32(n) => Some(*n as i64),
-                IrConst::I16(n) => Some(*n as i64),
-                IrConst::I8(n) => Some(*n as i64),
-                _ => None,
-            };
-            // Backend displacement fields are signed 32-bit (x86 disp32, ARM imm9/12,
-            // RISC-V imm12).  If the offset doesn't fit in i32, sign-narrow it:
-            // unsigned type constants (e.g. U32 -1 stored as 4294967295) must be
-            // re-interpreted as signed 32-bit for pointer arithmetic.  Offsets that
-            // truly exceed i32 after narrowing fall through to the general (register)
-            // path.
-            let const_offset = const_offset.and_then(|off| {
-                if off >= i32::MIN as i64 && off <= i32::MAX as i64 {
-                    Some(off)
-                } else if off > i32::MAX as i64 && off <= u32::MAX as i64 {
-                    // U32-range: reinterpret as signed 32-bit
-                    Some(off as i32 as i64)
-                } else {
-                    None
-                }
-            });
-            if let Some(off) = const_offset {
-                if let Some(addr) = self.state_ref().resolve_slot_addr(base.0) {
-                    match addr {
-                        SlotAddr::OverAligned(slot, id) => {
-                            // Compute aligned base addr into acc, then add offset.
-                            self.emit_alloca_aligned_addr_to_acc(slot, id);
-                            self.emit_gep_add_const_to_acc(off);
-                        }
-                        SlotAddr::Direct(slot) => {
-                            // Alloca: lea (slot+offset)(%rbp), %rax — single instruction.
-                            self.emit_gep_direct_const(slot, off);
-                        }
-                        SlotAddr::Indirect(slot) => {
-                            // Pointer in slot: load ptr, then lea offset(%rax), %rax.
-                            self.emit_gep_indirect_const(slot, off, base.0);
-                        }
-                    }
-                    self.emit_store_result(dest);
-                    return;
-                }
-            }
-        }
-        // General path for non-constant offsets.
-        if let Some(addr) = self.state_ref().resolve_slot_addr(base.0) {
-            match addr {
-                SlotAddr::OverAligned(slot, id) => {
-                    self.emit_alloca_aligned_addr_to_acc(slot, id);
-                    self.emit_acc_to_secondary();
-                }
-                SlotAddr::Direct(slot) => self.emit_slot_addr_to_secondary(slot, true, base.0),
-                SlotAddr::Indirect(slot) => self.emit_slot_addr_to_secondary(slot, false, base.0),
-            }
-        }
-        self.emit_load_operand(offset);
-        self.emit_add_secondary_to_acc();
-        self.emit_store_result(dest);
+        emit_gep_default(self, dest, base, offset);
     }
 
     /// Emit optimized GEP for Direct (alloca) base + constant offset.
@@ -1470,6 +1408,73 @@ pub fn get_const_i128_shift_amount(rhs: &Operand) -> Option<u32> {
     }
 }
 
+/// Default get-element-pointer lowering (base + offset) through the
+/// accumulator and secondary registers.
+pub fn emit_gep_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, base: &Value, offset: &Operand) {
+    // Optimized path for constant offsets: avoid loading offset into acc
+    // and adding via secondary register. Instead, directly compute
+    // base_addr + constant using efficient addressing modes.
+    if let Operand::Const(c) = offset {
+        let const_offset = match c {
+            IrConst::I64(n) => Some(*n),
+            IrConst::I32(n) => Some(*n as i64),
+            IrConst::I16(n) => Some(*n as i64),
+            IrConst::I8(n) => Some(*n as i64),
+            _ => None,
+        };
+        // Backend displacement fields are signed 32-bit (x86 disp32, ARM imm9/12,
+        // RISC-V imm12).  If the offset doesn't fit in i32, sign-narrow it:
+        // unsigned type constants (e.g. U32 -1 stored as 4294967295) must be
+        // re-interpreted as signed 32-bit for pointer arithmetic.  Offsets that
+        // truly exceed i32 after narrowing fall through to the general (register)
+        // path.
+        let const_offset = const_offset.and_then(|off| {
+            if off >= i32::MIN as i64 && off <= i32::MAX as i64 {
+                Some(off)
+            } else if off > i32::MAX as i64 && off <= u32::MAX as i64 {
+                // U32-range: reinterpret as signed 32-bit
+                Some(off as i32 as i64)
+            } else {
+                None
+            }
+        });
+        if let Some(off) = const_offset {
+            if let Some(addr) = cg.state_ref().resolve_slot_addr(base.0) {
+                match addr {
+                    SlotAddr::OverAligned(slot, id) => {
+                        // Compute aligned base addr into acc, then add offset.
+                        cg.emit_alloca_aligned_addr_to_acc(slot, id);
+                        cg.emit_gep_add_const_to_acc(off);
+                    }
+                    SlotAddr::Direct(slot) => {
+                        // Alloca: lea (slot+offset)(%rbp), %rax — single instruction.
+                        cg.emit_gep_direct_const(slot, off);
+                    }
+                    SlotAddr::Indirect(slot) => {
+                        // Pointer in slot: load ptr, then lea offset(%rax), %rax.
+                        cg.emit_gep_indirect_const(slot, off, base.0);
+                    }
+                }
+                cg.emit_store_result(dest);
+                return;
+            }
+        }
+    }
+    // General path for non-constant offsets.
+    if let Some(addr) = cg.state_ref().resolve_slot_addr(base.0) {
+        match addr {
+            SlotAddr::OverAligned(slot, id) => {
+                cg.emit_alloca_aligned_addr_to_acc(slot, id);
+                cg.emit_acc_to_secondary();
+            }
+            SlotAddr::Direct(slot) => cg.emit_slot_addr_to_secondary(slot, true, base.0),
+            SlotAddr::Indirect(slot) => cg.emit_slot_addr_to_secondary(slot, false, base.0),
+        }
+    }
+    cg.emit_load_operand(offset);
+    cg.emit_add_secondary_to_acc();
+    cg.emit_store_result(dest);
+}
 /// Default store implementation: 3-way SlotAddr dispatch for i128 and typed stores.
 /// Backends that override `emit_store` should call this for types they don't handle specially.
 pub fn emit_store_default(cg: &mut (impl ArchCodegen + ?Sized), val: &Operand, ptr: &Value, ty: IrType) {

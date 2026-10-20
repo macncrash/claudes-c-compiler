@@ -5,7 +5,7 @@ use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{ParamClass, classify_params};
 use super::emit::{
-    ArmCodegen, callee_saved_name, ARM_CALLEE_SAVED, ARM_CALLER_SAVED, ARM_ARG_REGS,
+    ArmCodegen, callee_saved_name, callee_saved_name_32, ARM_CALLEE_SAVED, ARM_CALLER_SAVED, ARM_ARG_REGS,
     ARM_FP_CALLEE_SAVED, ARM_FP_CALLER_SAVED, ARM_FP_REG_ID_BASE,
 };
 
@@ -48,6 +48,8 @@ impl ArmCodegen {
         if has_f128_ops {
             caller_saved_regs.clear();
         }
+        let leaf_extra = if has_f128_ops { Vec::new() } else { Self::leaf_extra_caller_saved(func, &self.call_abi_config_impl()) };
+        caller_saved_regs.extend_from_slice(&leaf_extra);
 
         let (mut reg_assigned, mut cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, &asm_clobbered_regs,
@@ -77,12 +79,19 @@ impl ArmCodegen {
             self.used_fp_callee_saved = fp.used_callee_saved;
         }
 
+        self.prestore_regs = ARM_CALLEE_SAVED.to_vec();
+        if Self::params_can_prestore_caller_saved(func, &self.call_abi_config_impl()) {
+            // The leaf extras are never incoming argument registers either.
+            self.prestore_regs.extend_from_slice(&ARM_CALLER_SAVED);
+            self.prestore_regs.extend_from_slice(&leaf_extra);
+        }
+        let prestore_regs = self.prestore_regs.clone();
         let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let slot = (space + effective_align - 1) & !(effective_align - 1);
             let new_space = slot + ((alloc_size + 7) & !7).max(8);
             (slot, new_space)
-        }, &reg_assigned, &ARM_CALLEE_SAVED, cached_liveness, false);
+        }, &reg_assigned, &prestore_regs, cached_liveness, false);
 
         if func.is_variadic {
             space = (space + 7) & !7;
@@ -177,6 +186,84 @@ impl ArmCodegen {
 
     // ---- emit_store_params ----
 
+    /// Argument registers x3-x8 that a function can use as extra caller-saved
+    /// registers. Codegen only uses them as scratch for calls (argument
+    /// setup), division (x3), atomics, i128 arithmetic, variadics, and inline
+    /// asm, so a function with none of those may allocate the ones above its
+    /// own incoming GP arguments (and x8 unless it is the sret pointer).
+    fn leaf_extra_caller_saved(func: &IrFunction, config: &crate::backend::call_abi::CallAbiConfig) -> Vec<crate::backend::regalloc::PhysReg> {
+        use crate::ir::reexports::{Instruction, IrBinOp};
+        use crate::backend::regalloc::PhysReg;
+        if func.is_variadic {
+            return Vec::new();
+        }
+        let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128 | IrType::F128);
+        let mut has_div = false;
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                Instruction::BinOp { op, ty, .. } => {
+                    if wide(ty) {
+                        return Vec::new();
+                    }
+                    has_div |= matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem);
+                }
+                Instruction::Cast { from_ty, to_ty, .. } if wide(from_ty) || wide(to_ty) => return Vec::new(),
+                Instruction::Load { ty, .. } | Instruction::Store { ty, .. }
+                | Instruction::UnaryOp { ty, .. } | Instruction::Cmp { ty, .. } if wide(ty) => return Vec::new(),
+                Instruction::Call { .. } | Instruction::CallIndirect { .. } | Instruction::InlineAsm { .. }
+                | Instruction::Intrinsic { .. } | Instruction::AtomicLoad { .. } | Instruction::AtomicStore { .. }
+                | Instruction::AtomicRmw { .. } | Instruction::AtomicCmpxchg { .. } | Instruction::Fence { .. }
+                | Instruction::VaArg { .. } | Instruction::VaStart { .. } | Instruction::VaEnd { .. }
+                | Instruction::VaCopy { .. } | Instruction::DynAlloca { .. } => return Vec::new(),
+                _ => {}
+            }
+        }
+        // First GP register not carrying an incoming argument.
+        let mut first_free = 0usize;
+        for class in classify_params(func, config) {
+            let last = match class {
+                ParamClass::IntReg { reg_idx } | ParamClass::LargeStructByRefReg { reg_idx, .. } => reg_idx,
+                ParamClass::I128RegPair { base_reg_idx } => base_reg_idx + 1,
+                ParamClass::StructByValReg { base_reg_idx, size } => base_reg_idx + usize::from(size > 8),
+                c if c.uses_gp_reg() => return Vec::new(),
+                _ => continue,
+            };
+            first_free = first_free.max(last + 1);
+        }
+        let first = first_free.max(if has_div { 4 } else { 3 });
+        let last = if func.uses_sret { 7 } else { 8 };
+        (first..=last).map(|r| PhysReg(r as u8)).collect()
+    }
+
+    /// Whether ParamRef dests may live in caller-saved registers (x10-x15)
+    /// from function entry. Those registers are not argument registers, but
+    /// the prologue only keeps them intact, and the earlier start of the
+    /// live range only collides with nothing, when:
+    /// - every ParamRef is in the entry block, preceded only by allocas and
+    ///   other ParamRefs, and
+    /// - no param is copied with x10 (large struct by reference on the stack)
+    ///   or converted with a libcall (f128 in an FP register).
+    fn params_can_prestore_caller_saved(func: &IrFunction, config: &crate::backend::call_abi::CallAbiConfig) -> bool {
+        use crate::ir::reexports::Instruction;
+        if func.is_variadic {
+            return false;
+        }
+        let classes = classify_params(func, config);
+        if classes.iter().any(|c| matches!(c, ParamClass::F128FpReg { .. } | ParamClass::LargeStructByRefStack { .. })) {
+            return false;
+        }
+        let Some(entry) = func.blocks.first() else { return false };
+        let in_prefix = entry.instructions.iter()
+            .take_while(|i| matches!(i, Instruction::Alloca { .. } | Instruction::ParamRef { .. }))
+            .filter(|i| matches!(i, Instruction::ParamRef { .. }))
+            .count();
+        let total = func.blocks.iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i, Instruction::ParamRef { .. }))
+            .count();
+        in_prefix == total
+    }
+
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
         if func.is_variadic {
             self.emit_save_variadic_regs();
@@ -236,11 +323,10 @@ impl ArmCodegen {
 
             if let Some(paramref_dest) = paramref_dests[i] {
                 if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
-                    // Only pre-store to callee-saved registers (x20-x28).
-                    // Caller-saved registers (x13, x14) cannot be used because
-                    // they may overlap with scratch registers.
-                    let is_callee_saved = phys_reg.0 >= 20 && phys_reg.0 <= 28;
-                    if is_callee_saved {
+                    // Only pre-store to callee-saved registers, and to
+                    // caller-saved ones when params_can_prestore_caller_saved
+                    // allows it.
+                    if self.prestore_regs.contains(&phys_reg) {
                         // Safety check: if another param's dest is also assigned
                         // to this register, skip pre-store to avoid conflicts.
                         // The register allocator may assign the same register to
@@ -317,6 +403,14 @@ impl ArmCodegen {
                     let actual_idx = if reg_idx >= sret_shift { reg_idx - sret_shift } else { reg_idx };
                     Self::reg_for_type(ARM_ARG_REGS[actual_idx], ty)
                 };
+                // Copy straight into an assigned register; going through x0
+                // would clobber param 0 if it has not been read yet.
+                if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+                    let dst = if actual_reg.starts_with('w') { callee_saved_name_32(phys) } else { callee_saved_name(phys) };
+                    self.state.emit_fmt(format_args!("    mov {}, {}", dst, actual_reg));
+                    self.state.reg_cache.invalidate_all();
+                    return;
+                }
                 let dst = Self::reg_for_type("x0", ty);
                 if actual_reg != dst {
                     self.state.emit_fmt(format_args!("    mov {}, {}", dst, actual_reg));

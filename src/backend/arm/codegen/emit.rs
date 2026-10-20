@@ -77,7 +77,9 @@ pub(super) fn fp_reg_name(reg: PhysReg, is_f32: bool) -> String {
 
 pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
     match reg.0 {
-        // Caller-saved registers
+        // Caller-saved registers (x3-x8 only in leaf functions; see
+        // leaf_extra_caller_saved)
+        3 => "x3", 4 => "x4", 5 => "x5", 6 => "x6", 7 => "x7", 8 => "x8",
         10 => "x10", 11 => "x11", 12 => "x12", 13 => "x13", 14 => "x14", 15 => "x15",
         // Callee-saved registers
         19 => "x19", 20 => "x20", 21 => "x21", 22 => "x22", 23 => "x23", 24 => "x24",
@@ -89,6 +91,7 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
 pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
         // Caller-saved registers
+        3 => "w3", 4 => "w4", 5 => "w5", 6 => "w6", 7 => "w7", 8 => "w8",
         10 => "w10", 11 => "w11", 12 => "w12", 13 => "w13", 14 => "w14", 15 => "w15",
         // Callee-saved registers
         19 => "w19", 20 => "w20", 21 => "w21", 22 => "w22", 23 => "w23", 24 => "w24",
@@ -197,6 +200,9 @@ pub struct ArmCodegen {
     pub(super) used_fp_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved FP registers are stored.
     pub(super) fp_callee_save_offset: i64,
+    /// Registers a ParamRef dest may be loaded into directly from its ABI
+    /// argument register in the prologue (letting the param alloca go away).
+    pub(super) prestore_regs: Vec<PhysReg>,
     /// For large stack frames: reserved for future x19 frame base optimization.
     /// Currently always None (optimization disabled due to correctness issue).
     pub(super) frame_base_offset: Option<i64>,
@@ -225,6 +231,7 @@ impl ArmCodegen {
             fp_reg_assignments: FxHashMap::default(),
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
+            prestore_regs: Vec::new(),
             frame_base_offset: None,
             general_regs_only: false,
         }
@@ -329,6 +336,19 @@ impl ArmCodegen {
             }
             _ => None,
         }
+    }
+
+    /// If `op` is a constant encodable as a logical (bitmask) immediate for a
+    /// 32- or 64-bit and/orr/eor, return it (as the signed value to print).
+    pub(super) fn const_as_logical_imm(op: &Operand, use_32bit: bool) -> Option<i64> {
+        let Operand::Const(c) = op else { return None };
+        let v = c.to_i64()?;
+        let ok = if use_32bit {
+            super::asm_emitter::is_valid_aarch64_logical_immediate_32(v as u32)
+        } else {
+            super::asm_emitter::is_valid_aarch64_logical_immediate(v as u64)
+        };
+        ok.then_some(if use_32bit { v as i32 as i64 } else { v })
     }
 
     /// If `op` is a constant shift amount valid for a `width`-bit shift, return it.
@@ -1947,6 +1967,11 @@ impl ArchCodegen for ArmCodegen {
     // ---- Standard trait methods (kept inline - arch-specific) ----
     fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_x0(op); }
     fn emit_store_result(&mut self, dest: &Value) { self.store_x0_to(dest); }
+    fn emit_gep(&mut self, dest: &Value, base: &Value, offset: &Operand) {
+        if !self.try_emit_gpr_gep(dest, base, offset) {
+            crate::backend::traits::emit_gep_default(self, dest, base, offset);
+        }
+    }
     fn emit_save_acc(&mut self) { self.state.emit("    mov x1, x0"); }
     fn emit_add_secondary_to_acc(&mut self) { self.state.emit("    add x0, x1, x0"); }
     fn emit_gep_add_const_to_acc(&mut self, offset: i64) { if offset != 0 { self.emit_add_imm_to_acc_impl(offset); } }

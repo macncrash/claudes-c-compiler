@@ -213,76 +213,50 @@ pub fn allocate_registers(
 
     let call_points = &liveness.call_points;
 
-    // Phase 1: Callee-saved registers for call-spanning values.
-    let candidates = build_sorted_candidates(
-        &liveness, &eligible, &FxHashMap::default(), call_points, &use_count, Some(true),
-    );
-
-    let num_regs = config.available_regs.len();
-    let mut reg_free_until: Vec<u32> = vec![0; num_regs];
+    // Candidates are assigned in priority order, not program order, so each
+    // register keeps all its intervals and a candidate may fill any gap.
+    // Intervals are inclusive, so a value used by the instruction that defines
+    // another never shares its register.
+    let callee = &config.available_regs;
+    let caller = &config.caller_saved_regs;
+    let mut callee_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); callee.len()];
+    let mut caller_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); caller.len()];
+    let fits = |busy: &[(u32, u32)], iv: &LiveInterval| busy.iter().all(|&(s, e)| iv.end < s || iv.start > e);
+    // Prefer a callee-saved register that is already saved by the prologue.
+    let pick_callee = |busy: &[Vec<(u32, u32)>], iv: &LiveInterval| {
+        let free = || (0..callee.len()).filter(|&i| fits(&busy[i], iv));
+        free().find(|&i| !busy[i].is_empty()).or_else(|| free().next())
+    };
     let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
-    let mut used_regs_set: FxHashSet<u8> = FxHashSet::default();
 
-    for interval in &candidates {
-        if let Some(reg_idx) = find_best_callee_reg(&reg_free_until, interval.start, &config.available_regs, &used_regs_set) {
-            reg_free_until[reg_idx] = interval.end + 1;
-            assignments.insert(interval.value_id, config.available_regs[reg_idx]);
-            used_regs_set.insert(config.available_regs[reg_idx].0);
+    // Phase 1: Callee-saved registers for call-spanning values.
+    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, &use_count, Some(true)) {
+        if let Some(i) = pick_callee(&callee_busy, interval) {
+            callee_busy[i].push((interval.start, interval.end));
+            assignments.insert(interval.value_id, callee[i]);
         }
     }
 
-    let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
+    // Phase 2: Caller-saved registers for non-call-spanning values (no
+    // prologue/epilogue cost).
+    // Phase 3: Callee-saved spillover for non-call-spanning values that did
+    // not fit in the caller-saved pool (e.g. high-priority values in call-free
+    // loops).
+    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, &use_count, Some(false)) {
+        if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], interval)) {
+            caller_busy[i].push((interval.start, interval.end));
+            assignments.insert(interval.value_id, caller[i]);
+        } else if let Some(i) = pick_callee(&callee_busy, interval) {
+            callee_busy[i].push((interval.start, interval.end));
+            assignments.insert(interval.value_id, callee[i]);
+        }
+    }
+
+    let mut used_regs: Vec<PhysReg> = (0..callee.len())
+        .filter(|&i| !callee_busy[i].is_empty())
+        .map(|i| callee[i])
+        .collect();
     used_regs.sort_by_key(|r| r.0);
-
-    // Phase 2: Caller-saved registers for non-call-spanning values.
-    if !config.caller_saved_regs.is_empty() {
-        let caller_candidates = build_sorted_candidates(
-            &liveness, &eligible, &assignments, call_points, &use_count, Some(false),
-        );
-
-        let num_caller_regs = config.caller_saved_regs.len();
-        let mut caller_free_until: Vec<u32> = vec![0; num_caller_regs];
-
-        for interval in &caller_candidates {
-            let mut best: Option<usize> = None;
-            let mut best_free_time: u32 = u32::MAX;
-
-            for (i, &free_until) in caller_free_until.iter().enumerate() {
-                if free_until <= interval.start
-                    && (best.is_none() || free_until < best_free_time) {
-                        best = Some(i);
-                        best_free_time = free_until;
-                    }
-            }
-
-            if let Some(reg_idx) = best {
-                caller_free_until[reg_idx] = interval.end + 1;
-                assignments.insert(interval.value_id, config.caller_saved_regs[reg_idx]);
-            }
-        }
-    }
-
-    // Phase 3: Callee-saved spillover for non-call-spanning values.
-    //
-    // After Phases 1 and 2, there may be high-priority values in call-free loops
-    // that didn't get a register because the caller-saved pool overflowed. Assign
-    // remaining callee-saved registers to these overflow values.
-    {
-        let spillover_candidates = build_sorted_candidates(
-            &liveness, &eligible, &assignments, call_points, &use_count, Some(false),
-        );
-
-        for interval in &spillover_candidates {
-            if let Some(reg_idx) = find_best_callee_reg(&reg_free_until, interval.start, &config.available_regs, &used_regs_set) {
-                reg_free_until[reg_idx] = interval.end + 1;
-                assignments.insert(interval.value_id, config.available_regs[reg_idx]);
-                used_regs_set.insert(config.available_regs[reg_idx].0);
-            }
-        }
-
-        used_regs = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
-        used_regs.sort_by_key(|r| r.0);
-    }
 
     RegAllocResult {
         assignments,
@@ -738,40 +712,3 @@ fn build_sorted_candidates<'a>(
     candidates
 }
 
-/// Find the best callee-saved register for an interval, preferring registers
-/// that are already in use (to minimize prologue/epilogue save/restore cost).
-///
-/// Returns the index into `available_regs` of the chosen register, or None
-/// if no register is free at the interval's start point.
-fn find_best_callee_reg(
-    reg_free_until: &[u32],
-    interval_start: u32,
-    available_regs: &[PhysReg],
-    used_regs_set: &FxHashSet<u8>,
-) -> Option<usize> {
-    let mut best_already_used: Option<usize> = None;
-    let mut best_already_used_free_time: u32 = u32::MAX;
-    let mut best_new: Option<usize> = None;
-    let mut best_new_free_time: u32 = u32::MAX;
-
-    for (i, &free_until) in reg_free_until.iter().enumerate() {
-        if free_until <= interval_start {
-            let reg_id = available_regs[i].0;
-            if used_regs_set.contains(&reg_id) {
-                // Already saved/restored — reusing costs nothing extra.
-                if best_already_used.is_none() || free_until < best_already_used_free_time {
-                    best_already_used = Some(i);
-                    best_already_used_free_time = free_until;
-                }
-            } else {
-                // Would introduce a new callee-saved register.
-                if best_new.is_none() || free_until < best_new_free_time {
-                    best_new = Some(i);
-                    best_new_free_time = free_until;
-                }
-            }
-        }
-    }
-
-    best_already_used.or(best_new)
-}

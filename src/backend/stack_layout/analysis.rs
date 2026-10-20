@@ -98,8 +98,10 @@ pub(super) fn collect_used_values(func: &IrFunction) -> FxHashSet<u32> {
 ///
 /// A param alloca is dead when BOTH conditions hold:
 /// 1. No instruction references the alloca value (mem2reg promoted it away)
-/// 2. The corresponding ParamRef dest IS register-assigned, so emit_store_params
-///    can store the ABI arg register directly to the callee-saved register
+/// 2. The corresponding ParamRef dest IS assigned to one of `prestore_regs`
+///    (callee-saved registers, plus on AArch64 caller-saved registers that are
+///    not argument registers when the prologue keeps them intact), so
+///    emit_store_params can copy the ABI arg register directly into it
 ///
 /// Without condition 2, the param value would have nowhere to live: the alloca
 /// slot was eliminated, the ABI register may be clobbered, and no callee-saved
@@ -109,7 +111,7 @@ pub(super) fn find_dead_param_allocas(
     func: &IrFunction,
     used_values: &FxHashSet<u32>,
     reg_assigned: &FxHashMap<u32, PhysReg>,
-    callee_saved_regs: &[PhysReg],
+    prestore_regs: &[PhysReg],
 ) -> FxHashSet<u32> {
     let mut dead = FxHashSet::default();
     if func.param_alloca_values.is_empty() {
@@ -131,14 +133,14 @@ pub(super) fn find_dead_param_allocas(
     for (idx, pv) in func.param_alloca_values.iter().enumerate() {
         if !used_values.contains(&pv.0) {
             // Only eliminate the alloca if the ParamRef dest is assigned to a
-            // callee-saved register. Caller-saved registers overlap with ABI
-            // argument registers, so using them would clobber other params'
-            // values before they're saved.
+            // pre-storable register. Caller-saved registers on most targets
+            // overlap with ABI argument registers, so using them would clobber
+            // other params' values before they're saved.
             if let Some(dest_id) = paramref_dests.get(idx).copied().flatten() {
-                let is_callee_saved = reg_assigned.get(&dest_id)
-                    .map(|phys| callee_saved_regs.contains(phys))
+                let prestorable = reg_assigned.get(&dest_id)
+                    .map(|phys| prestore_regs.contains(phys))
                     .unwrap_or(false);
-                if is_callee_saved {
+                if prestorable {
                     dead.insert(pv.0);
                 }
             }

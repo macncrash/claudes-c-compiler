@@ -431,7 +431,7 @@ pub(super) fn normalize_aarch64_register(name: &str) -> String {
 
 /// Check whether a 32-bit value is a valid AArch64 32-bit logical immediate.
 /// Used for the 'L' constraint (32-bit logical operations like AND w0, w1, #imm).
-fn is_valid_aarch64_logical_immediate_32(value: u32) -> bool {
+pub(super) fn is_valid_aarch64_logical_immediate_32(value: u32) -> bool {
     if value == 0 || value == u32::MAX {
         return false;
     }
@@ -470,7 +470,7 @@ fn is_valid_aarch64_logical_immediate_32(value: u32) -> bool {
 /// element contains a contiguous (possibly rotated) run of set bits.
 ///
 /// The values 0 and all-ones (0xFFFFFFFF_FFFFFFFF) are NOT valid logical immediates.
-fn is_valid_aarch64_logical_immediate(value: u64) -> bool {
+pub(super) fn is_valid_aarch64_logical_immediate(value: u64) -> bool {
     // 0 and all-ones are never valid logical immediates
     if value == 0 || value == u64::MAX {
         return false;

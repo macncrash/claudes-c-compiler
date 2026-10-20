@@ -3,7 +3,7 @@
 use crate::ir::reexports::{Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
-use super::emit::{ArmCodegen, callee_saved_name};
+use super::emit::{ArmCodegen, callee_saved_name, callee_saved_name_32};
 
 impl ArmCodegen {
     // ---- Store/Load overrides ----
@@ -14,6 +14,9 @@ impl ArmCodegen {
             return;
         }
         if self.try_emit_fp_reg_access(val, ptr, 0, ty, "str") {
+            return;
+        }
+        if self.try_emit_gpr_store(val, ptr, 0, ty) {
             return;
         }
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
@@ -27,7 +30,112 @@ impl ArmCodegen {
         if self.try_emit_fp_reg_access(&Operand::Value(*dest), ptr, 0, ty, "ldr") {
             return;
         }
+        if self.try_emit_gpr_load(dest, ptr, 0, ty) {
+            return;
+        }
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
+    }
+
+    // ---- Register-addressed fast paths ----
+    //
+    // When a pointer lives in a GPR, address it directly (`[x12, #8]`) and
+    // load into / store from the value's own register, instead of copying the
+    // pointer to x9 and going through x0.
+
+    /// GPR holding non-alloca pointer `ptr`, if it is register-allocated.
+    pub(super) fn ptr_in_reg(&self, ptr: &Value) -> Option<&'static str> {
+        if self.state.is_alloca(ptr.0) {
+            return None;
+        }
+        self.reg_assignments.get(&ptr.0).map(|&r| callee_saved_name(r))
+    }
+
+    /// Access size of an integer or pointer load/store, or None for types
+    /// with their own paths (floats, i128).
+    fn gpr_access_size(ty: IrType) -> Option<i64> {
+        match ty {
+            IrType::I8 | IrType::U8 => Some(1),
+            IrType::I16 | IrType::U16 => Some(2),
+            IrType::I32 | IrType::U32 => Some(4),
+            IrType::I64 | IrType::U64 | IrType::Ptr => Some(8),
+            _ => None,
+        }
+    }
+
+    /// `[base, #off]` when `off` fits the scaled unsigned 12-bit immediate of
+    /// an access of `size` bytes.
+    fn scaled_mem_operand(base: &str, off: i64, size: i64) -> Option<String> {
+        if off == 0 {
+            Some(format!("[{}]", base))
+        } else if off > 0 && off % size == 0 && off / size < 4096 {
+            Some(format!("[{}, #{}]", base, off))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn try_emit_gpr_load(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) -> bool {
+        let Some(size) = Self::gpr_access_size(ty) else { return false };
+        let Some(base_reg) = self.ptr_in_reg(base) else { return false };
+        let Some(mem) = Self::scaled_mem_operand(base_reg, offset, size) else { return false };
+        let dest_reg = self.reg_assignments.get(&dest.0).copied();
+        let (xreg, wreg) = match dest_reg {
+            Some(r) => (callee_saved_name(r), callee_saved_name_32(r)),
+            None => ("x0", "w0"),
+        };
+        let (instr, reg) = Self::arm_parse_load_to_reg(self.load_instr_for_type_impl(ty), xreg, wreg);
+        self.state.emit_fmt(format_args!("    {} {}, {}", instr, reg, mem));
+        if dest_reg.is_none() {
+            self.store_x0_to(dest);
+        }
+        true
+    }
+
+    pub(super) fn try_emit_gpr_store(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) -> bool {
+        let Some(size) = Self::gpr_access_size(ty) else { return false };
+        let Some(base_reg) = self.ptr_in_reg(base) else { return false };
+        let Some(mem) = Self::scaled_mem_operand(base_reg, offset, size) else { return false };
+        let narrow = size < 8;
+        let reg = match val {
+            Operand::Value(v) if self.reg_assignments.contains_key(&v.0) => {
+                let r = self.reg_assignments[&v.0];
+                if narrow { callee_saved_name_32(r) } else { callee_saved_name(r) }
+            }
+            Operand::Const(c) if c.to_i64() == Some(0) => if narrow { "wzr" } else { "xzr" },
+            _ => {
+                self.operand_to_x0(val);
+                if narrow { "w0" } else { "x0" }
+            }
+        };
+        self.state.emit_fmt(format_args!("    {} {}, {}", Self::str_for_type(ty), reg, mem));
+        true
+    }
+
+    /// `dest = base + offset` with base in a register: one add/sub into the
+    /// destination register.
+    pub(super) fn try_emit_gpr_gep(&mut self, dest: &Value, base: &Value, offset: &Operand) -> bool {
+        let Some(base_reg) = self.ptr_in_reg(base) else { return false };
+        let rhs = match offset {
+            Operand::Const(c) => match c.to_i64() {
+                Some(n) if (0..=4095).contains(&n) => format!("#{}", n),
+                Some(n) if (-4095..0).contains(&n) => format!("#{}", n),
+                _ => return false,
+            },
+            Operand::Value(v) => match self.reg_assignments.get(&v.0) {
+                Some(&r) => callee_saved_name(r).to_string(),
+                None => return false,
+            },
+        };
+        let dest_reg = self.reg_assignments.get(&dest.0).map(|&r| callee_saved_name(r));
+        let dst = dest_reg.unwrap_or("x0");
+        match rhs.strip_prefix("#-") {
+            Some(neg) => self.state.emit_fmt(format_args!("    sub {}, {}, #{}", dst, base_reg, neg)),
+            None => self.state.emit_fmt(format_args!("    add {}, {}, {}", dst, base_reg, rhs)),
+        }
+        if dest_reg.is_none() {
+            self.store_x0_to(dest);
+        }
+        true
     }
 
     /// Load into or store from a value's allocated FP register directly
@@ -74,6 +182,9 @@ impl ArmCodegen {
         if self.try_emit_fp_reg_access(val, base, offset, ty, "str") {
             return;
         }
+        if self.try_emit_gpr_store(val, base, offset, ty) {
+            return;
+        }
         self.operand_to_x0(val);
         let addr = self.state.resolve_slot_addr(base.0);
         if let Some(addr) = addr {
@@ -110,6 +221,9 @@ impl ArmCodegen {
             return;
         }
         if self.try_emit_fp_reg_access(&Operand::Value(*dest), base, offset, ty, "ldr") {
+            return;
+        }
+        if self.try_emit_gpr_load(dest, base, offset, ty) {
             return;
         }
         let addr = self.state.resolve_slot_addr(base.0);
