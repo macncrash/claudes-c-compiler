@@ -210,6 +210,7 @@ and comparing stdout and the exit code against the expected files.
 | `CCC_KEEP_ASM` | Preserve intermediate `.s` files next to output |
 | `CCC_ASM_DEBUG` | Dump preprocessed assembly to `/tmp/asm_debug_<name>.s` |
 | `CCC_DUMP_IR` | Print a function's IR to stderr just before codegen (a function name, or `all`) |
+| `CCC_DUMP_REGALLOC` | Print each register-allocation candidate's live interval, weight, and register (a function name, or `all`) |
 
 ## Project Organization
 
