@@ -239,17 +239,18 @@ pub fn build_full_ctype_with_base(
         while i < derived.len() {
             match &derived[i] {
                 DerivedDeclarator::Pointer => {
+                    // `Pointer, FunctionPointer` is one pointer-to-function layer.
+                    // A Pointer before a plain Function wraps the type built so
+                    // far, and the Function is an outer layer: for
+                    // `double (*f(void))(int)` the parser emits
+                    // [Function(int), Pointer, Function(void)], a function
+                    // returning a pointer to `double(int)`.
                     if i + 1 < derived.len()
-                        && matches!(
-                            &derived[i + 1],
-                            DerivedDeclarator::FunctionPointer(_, _)
-                                | DerivedDeclarator::Function(_, _)
-                        )
+                        && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(_, _))
                     {
                         let (params, variadic) = match &derived[i + 1] {
-                            DerivedDeclarator::FunctionPointer(p, v)
-                            | DerivedDeclarator::Function(p, v) => (p, *v),
-                            _ => unreachable!("expected FunctionPointer/Function declarator after Pointer"),
+                            DerivedDeclarator::FunctionPointer(p, v) => (p, *v),
+                            _ => unreachable!("expected FunctionPointer declarator after Pointer"),
                         };
                         let param_types = convert_param_decls_to_ctypes(ctx, params);
                         let func_type = CType::Function(Box::new(FunctionType {

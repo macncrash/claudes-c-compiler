@@ -70,34 +70,11 @@ impl Lowerer {
             return false;
         }
 
-        // Check for direct function declarator: int f(int, int)
-        // A block-scope function declaration has the form: type name(params);
-        // The derived list starts with Function (possibly preceded by Pointer for
-        // return type indirection like `int *f(int)`).
-        // If we encounter a FunctionPointer before Function, this is a variable
-        // with a function pointer type, not a function declaration.
-        let mut ptr_count = 0;
-        let mut func_info = None;
-        let mut has_fptr_before_func = false;
-        for d in &declarator.derived {
-            match d {
-                DerivedDeclarator::Pointer => ptr_count += 1,
-                DerivedDeclarator::Function(p, v) => {
-                    func_info = Some((p.clone(), *v));
-                    break;
-                }
-                DerivedDeclarator::FunctionPointer(_, _) => {
-                    has_fptr_before_func = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        // If we found a FunctionPointer before a Function, this is a function pointer
-        // variable (e.g., int (*(*p)(int))(int)), not a function declaration.
-        if has_fptr_before_func {
-            return false;
-        }
+        // Check for a function declarator: int f(int, int), int *f(int), or
+        // double (*f(void))(int). A function declaration's outermost (last)
+        // derived declarator is a Function; a function pointer variable such
+        // as int (*(*p)(int))(int) ends in a FunctionPointer instead.
+        let (ptr_count, func_info) = Self::declared_function(&declarator.derived);
         if let Some((params, variadic)) = func_info {
             self.register_block_func_meta(&declarator.name, &decl.type_spec, ptr_count, &params, variadic);
             self.shadow_local_for_scope(&declarator.name);

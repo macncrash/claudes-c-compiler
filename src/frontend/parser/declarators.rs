@@ -275,11 +275,13 @@ impl Parser {
             return result;
         }
 
-        // Handle nested function pointer variables like `int (*(*p)(int a, int b))(int c, int d)`.
-        // The inner declarator produces [Pointer, Pointer, FunctionPointer(...)], and the
-        // outer adds Function(...). We keep inner_derived intact and convert the outer
-        // Function to Pointer + FunctionPointer, yielding:
-        //   [Pointer, Pointer, FunctionPointer([int,int]), Pointer, FunctionPointer([int,int])]
+        // Handle nested function pointer variables like `int (*(*p)(int a, int b))(int c, int d)`:
+        // p points to a function (a, b) returning a pointer to a function (c, d)
+        // returning int. The inner declarator `*(*p)(int a, int b)` produces
+        // [Pointer, Pointer, FunctionPointer([a,b])], whose leading Pointer is the
+        // `*` that makes the outer (c, d) suffix a function pointer. Derived
+        // declarators run innermost first, so that layer goes first:
+        //   [Pointer, FunctionPointer([c,d]), Pointer, FunctionPointer([a,b])]
         //
         // This does NOT match function definitions returning function pointers like
         // `int (*g(int))(int)`, where inner has Function (not FunctionPointer).
@@ -287,9 +289,8 @@ impl Parser {
         let inner_has_fptr = inner_derived.iter().any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
         if inner_starts_with_pointer && inner_has_fptr && outer_starts_with_function {
             let mut result = outer_pointers;
-            // Keep inner_derived in its existing order
-            result.extend(inner_derived);
-            // The outer Function becomes a Pointer + FunctionPointer pair
+            // The outer Function, with the inner leading Pointer, becomes a
+            // Pointer + FunctionPointer layer around the base type.
             for suffix in outer_suffixes {
                 match suffix {
                     DerivedDeclarator::Function(params, variadic) => {
@@ -299,6 +300,7 @@ impl Parser {
                     other => result.push(other),
                 }
             }
+            result.extend(inner_derived.into_iter().skip(1));
             return result;
         }
 

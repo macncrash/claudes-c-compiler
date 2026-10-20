@@ -294,6 +294,20 @@ impl Lowerer {
         }
     }
 
+    /// If a declarator declares a function, its parameters and variadic flag,
+    /// with the number of pointer layers in its return type. The parser lists
+    /// derived declarators innermost first, so the function is the last one:
+    /// `double (*f(void))(int)` is [Function(int), Pointer, Function(void)].
+    pub(super) fn declared_function(derived: &[DerivedDeclarator]) -> (usize, Option<(Vec<ParamDecl>, bool)>) {
+        match derived.split_last() {
+            Some((DerivedDeclarator::Function(p, v), inner)) => {
+                let ptr_count = inner.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer)).count();
+                (ptr_count, Some((p.clone(), *v)))
+            }
+            _ => (0, None),
+        }
+    }
+
     /// AArch64: the HFA class of a struct type, if it is one. Returned HFAs
     /// come back in s0-s3/d0-d3, which lowering models as sret.
     pub(super) fn hfa_class_of(&self, ret_ct: &CType) -> Option<crate::common::types::RiscvFloatClass> {
@@ -588,19 +602,7 @@ impl Lowerer {
                         }
                     }
 
-                    // Find the Function derived declarator and count preceding Pointer derivations
-                    let mut ptr_count = 0;
-                    let mut func_info = None;
-                    for d in &declarator.derived {
-                        match d {
-                            DerivedDeclarator::Pointer => ptr_count += 1,
-                            DerivedDeclarator::Function(p, v) => {
-                                func_info = Some((p.clone(), *v));
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
+                    let (ptr_count, func_info) = Self::declared_function(&declarator.derived);
                     if let Some((params, variadic)) = func_info {
                         self.register_function_meta(
                             &declarator.name, &decl.type_spec, ptr_count,
