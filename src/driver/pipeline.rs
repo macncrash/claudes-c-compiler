@@ -361,8 +361,7 @@ impl Driver {
                 let dep_line = format!("{}: {}\n", target, input_name);
 
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, &dep_line)
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    Self::write_text_output(&self.output_path, &dep_line)?;
                 } else {
                     print!("{}", dep_line);
                 }
@@ -393,8 +392,7 @@ impl Driver {
 
                 let output = preprocessor.dump_defines();
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, format!("{}\n", output))
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    Self::write_text_output(&self.output_path, &format!("{}\n", output))?;
                 } else {
                     println!("{}", output);
                 }
@@ -413,8 +411,7 @@ impl Driver {
                 };
 
                 if self.output_path_set {
-                    std::fs::write(&self.output_path, &output)
-                        .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                    Self::write_text_output(&self.output_path, &output)?;
                     // Write dependency file if requested (e.g., -Wp,-MMD,<depfile>).
                     // The kernel build uses this when preprocessing linker scripts
                     // (.lds.S -> .lds) and fixdep expects the .d file to exist.
@@ -477,8 +474,7 @@ impl Driver {
             };
 
             if self.output_path_set {
-                std::fs::write(&self.output_path, &output)
-                    .map_err(|e| format!("Cannot write {}: {}", self.output_path, e))?;
+                Self::write_text_output(&self.output_path, &output)?;
                 self.write_dep_file(input_file, &self.output_path);
             } else {
                 print!("{}", output);
@@ -570,8 +566,7 @@ impl Driver {
             }
             // Default path: compile with internal codegen (handles .code16gcc prepend)
             let asm = self.compile_to_assembly(input_file)?;
-            std::fs::write(&out_path, &asm)
-                .map_err(|e| format!("Cannot write {}: {}", out_path, e))?;
+            Self::write_text_output(&out_path, &asm)?;
             self.write_dep_file(input_file, &out_path);
             if self.verbose {
                 eprintln!("Assembly output: {}", out_path);
@@ -759,6 +754,20 @@ impl Driver {
         let bytes = std::fs::read(path)
             .map_err(|e| format!("Cannot read {}: {}", path, e))?;
         Ok(crate::common::encoding::bytes_to_string(bytes))
+    }
+
+    /// Write text output (preprocessed source, assembly, dependency lines) to
+    /// a file. A path of "-" means stdout, as with GCC's `-o -`.
+    fn write_text_output(path: &str, content: &str) -> Result<(), String> {
+        if path == "-" {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            out.write_all(content.as_bytes())
+                .and_then(|_| out.flush())
+                .map_err(|e| format!("Cannot write to stdout: {}", e))
+        } else {
+            std::fs::write(path, content).map_err(|e| format!("Cannot write {}: {}", path, e))
+        }
     }
 
     /// Read source from an input file. If the file is "-", reads from stdin.

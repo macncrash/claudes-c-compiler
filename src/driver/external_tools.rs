@@ -352,6 +352,10 @@ impl Driver {
     pub(super) fn write_dep_file(&self, input_file: &str, output_file: &str) {
         if let Some(ref dep_path) = self.dep_file {
             let dep_path = if dep_path.is_empty() {
+                // Output went to stdout; there is no name to derive from.
+                if output_file == "-" {
+                    return;
+                }
                 // Derive from output: replace extension with .d
                 let p = std::path::Path::new(output_file);
                 p.with_extension("d").to_string_lossy().into_owned()
