@@ -212,7 +212,8 @@ def run_test(test, args, ref_cache, ref_cc_version):
                        "stdout": r["stdout"].decode("latin-1")}
             ref_cache[key] = ref
         if ref["status"] != "exit" or (ref["code"] is not None and ref["code"] < 0):
-            detail = ref.get("detail") or describe(ref)
+            # strip_repo again: the cache may predate first_line doing it.
+            detail = strip_repo(ref.get("detail") or describe(ref))
             return {"status": REF_FAIL, "detail": detail}
 
         # ccc side.
@@ -240,10 +241,14 @@ def run_test(test, args, ref_cache, ref_cc_version):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def first_line(text):
+def strip_repo(text):
     # Report paths relative to the repo, so baselines don't record the
     # checkout location (and with it the user's home directory).
-    text = text.replace(REPO + os.sep, "")
+    return text.replace(REPO + os.sep, "")
+
+
+def first_line(text):
+    text = strip_repo(text)
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("WARNING"):
