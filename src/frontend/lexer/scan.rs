@@ -269,7 +269,7 @@ impl Lexer {
             1
         } else if self.pos < self.input.len() && (self.input[self.pos] == b'l' || self.input[self.pos] == b'L') {
             self.pos += 1;
-            long_double_literal_kind()
+            2
         } else {
             0
         }
@@ -390,7 +390,7 @@ impl Lexer {
                 self.pos += 1;
                 is_imaginary = true;
             }
-            long_double_literal_kind()
+            2
         } else if self.pos < self.input.len() && (self.input[self.pos] == b'i' || self.input[self.pos] == b'I') {
             self.pos += 1;
             is_imaginary = true;
@@ -421,6 +421,10 @@ impl Lexer {
         if is_imaginary {
             match float_kind {
                 1 => Token::new(TokenKind::ImaginaryLiteralF32(value), span),
+                // `_Complex long double` is `_Complex double` on Apple arm64.
+                2 if crate::common::types::long_double_is_f64() => {
+                    Token::new(TokenKind::ImaginaryLiteral(value), span)
+                }
                 2 => {
                     let f128_bytes = crate::common::long_double::parse_long_double_to_f128_bytes(text);
                     Token::new(TokenKind::ImaginaryLiteralLongDouble(value, f128_bytes), span)
@@ -1185,10 +1189,4 @@ fn hex_digit_val(c: u8) -> u8 {
         b'A'..=b'F' => c - b'A' + 10,
         _ => 0,
     }
-}
-
-/// Float-literal kind for an `L` suffix: 2 (long double), or 0 (double) on
-/// Apple arm64 where `long double` is IEEE double.
-fn long_double_literal_kind() -> u8 {
-    if crate::common::types::target_is_darwin() { 0 } else { 2 }
 }

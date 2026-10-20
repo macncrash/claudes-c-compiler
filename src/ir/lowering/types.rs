@@ -134,7 +134,12 @@ impl Lowerer {
     /// qualifiers, resolves typedefs, but considers signed/unsigned as distinct.
     /// `base_const` says whether each type's base type was written `const`,
     /// which matters when it sits under a pointer (`const char *`).
-    pub(super) fn eval_types_compatible(&self, type1: &TypeSpecifier, type2: &TypeSpecifier, base_const: [bool; 2]) -> i32 {
+    /// Sema computes this with enum identity intact (the lowerer resolves enums
+    /// to int), so its value for `expr` takes precedence.
+    pub(super) fn eval_types_compatible(&self, expr: &Expr, type1: &TypeSpecifier, type2: &TypeSpecifier, base_const: [bool; 2]) -> i32 {
+        if let Some(v) = self.sema_const_values.get(&expr.id()).and_then(|c| c.to_i64()) {
+            return v as i32;
+        }
         let ctype1 = self.type_spec_to_ctype(type1);
         let ctype2 = self.type_spec_to_ctype(type2);
         let compatible = builtin_types_compatible(&ctype1, &ctype2)
@@ -162,6 +167,7 @@ impl Lowerer {
             TypeSpecifier::UnsignedInt128 => IrType::U128,
             TypeSpecifier::Float => IrType::F32,
             TypeSpecifier::Double => IrType::F64,
+            TypeSpecifier::LongDouble if crate::common::types::long_double_is_f64() => IrType::F64,
             TypeSpecifier::LongDouble => IrType::F128,
             TypeSpecifier::ComplexFloat | TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble => IrType::Ptr,
             TypeSpecifier::Pointer(_, _) => IrType::Ptr,
@@ -230,7 +236,8 @@ impl Lowerer {
                 Some((8, align))
             }
             TypeSpecifier::LongDouble => {
-                if ptr_sz == 4 { Some((12, 4)) } else { Some((16, 16)) }
+                if crate::common::types::long_double_is_f64() { Some((8, 8)) }
+                else if ptr_sz == 4 { Some((12, 4)) } else { Some((16, 16)) }
             }
             TypeSpecifier::ComplexFloat => Some((8, 4)),
             TypeSpecifier::ComplexDouble => {

@@ -641,7 +641,8 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             8 => {
-                if matches!(target, CType::Double) {
+                // (long double is 8 bytes on Apple arm64.)
+                if matches!(target, CType::Double | CType::LongDouble) {
                     let int_val = if target_signed { bits as i64 as f64 } else { bits as f64 };
                     IrConst::F64(int_val)
                 } else {
@@ -709,7 +710,7 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             8 => {
-                if matches!(target, CType::Double) {
+                if matches!(target, CType::Double | CType::LongDouble) {
                     let fv = if src_unsigned { (v128 as u128) as f64 } else { v128 as f64 };
                     IrConst::F64(fv)
                 } else {
@@ -792,6 +793,7 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some(16),
             TypeSpecifier::Float => Some(4),
             TypeSpecifier::Double => Some(8),
+            TypeSpecifier::LongDouble if crate::common::types::long_double_is_f64() => Some(8),
             TypeSpecifier::LongDouble => Some(if ptr_sz == 4 { 12 } else { 16 }),
             TypeSpecifier::Bool => Some(1),
             TypeSpecifier::ComplexFloat => Some(8),
@@ -924,6 +926,7 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::Float => 4,
             TypeSpecifier::Double => if ptr_sz == 4 { 4 } else { 8 },
             // On i686, long double is 80-bit x87 aligned to 4 bytes
+            TypeSpecifier::LongDouble if crate::common::types::long_double_is_f64() => 8,
             TypeSpecifier::LongDouble => if ptr_sz == 4 { 4 } else { 16 },
             TypeSpecifier::ComplexFloat => 4,
             TypeSpecifier::ComplexDouble => if ptr_sz == 4 { 4 } else { 8 },

@@ -5,7 +5,7 @@
 ///
 /// Float encoding utilities (`f64_to_f128_bytes`, `f64_to_x87_bytes`) convert
 /// between Rust f64 and target-specific long double formats.
-use crate::common::types::IrType;
+use crate::common::types::{long_double_is_f64, IrType};
 
 /// IR constants.
 #[derive(Debug, Clone, Copy)]
@@ -166,17 +166,26 @@ impl IrConst {
     /// Create a LongDouble constant from an f64 value (low precision - bytes derived from f64).
     /// Use this when no full-precision source text is available.
     pub fn long_double(v: f64) -> IrConst {
+        if long_double_is_f64() {
+            return IrConst::F64(v);
+        }
         IrConst::LongDouble(v, crate::common::long_double::f64_to_f128_bytes_lossless(v))
     }
 
     /// Create a LongDouble constant with full-precision f128 bytes.
     pub fn long_double_with_bytes(v: f64, bytes: [u8; 16]) -> IrConst {
+        if long_double_is_f64() {
+            return IrConst::F64(v);
+        }
         IrConst::LongDouble(v, bytes)
     }
 
     /// Create a LongDouble constant from a signed i64 with full precision.
     /// Uses direct integer-to-f128 conversion to preserve all 64 bits of precision.
     pub fn long_double_from_i64(val: i64) -> IrConst {
+        if long_double_is_f64() {
+            return IrConst::F64(val as f64);
+        }
         let bytes = crate::common::long_double::i64_to_f128_bytes(val);
         IrConst::LongDouble(val as f64, bytes)
     }
@@ -184,6 +193,9 @@ impl IrConst {
     /// Create a LongDouble constant from an unsigned u64 with full precision.
     /// Uses direct integer-to-f128 conversion to preserve all 64 bits of precision.
     pub fn long_double_from_u64(val: u64) -> IrConst {
+        if long_double_is_f64() {
+            return IrConst::F64(val as f64);
+        }
         let bytes = crate::common::long_double::u64_to_f128_bytes(val);
         IrConst::LongDouble(val as f64, bytes)
     }
@@ -192,6 +204,9 @@ impl IrConst {
     /// Uses direct integer-to-f128 conversion. Values up to 2^112 are exact;
     /// larger values are rounded (f128 has 112-bit mantissa).
     pub fn long_double_from_u128(val: u128) -> IrConst {
+        if long_double_is_f64() {
+            return IrConst::F64(val as f64);
+        }
         let bytes = crate::common::long_double::u128_to_f128_bytes(val);
         IrConst::LongDouble(val as f64, bytes)
     }
@@ -200,6 +215,9 @@ impl IrConst {
     /// Uses direct integer-to-f128 conversion. Values with magnitude up to 2^112
     /// are exact; larger values are rounded.
     pub fn long_double_from_i128(val: i128) -> IrConst {
+        if long_double_is_f64() {
+            return IrConst::F64(val as f64);
+        }
         let bytes = crate::common::long_double::i128_to_f128_bytes(val);
         IrConst::LongDouble(val as f64, bytes)
     }

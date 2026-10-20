@@ -261,7 +261,7 @@ impl Lowerer {
                 self.eval_offsetof_pattern(inner)
             }
             Expr::BuiltinTypesCompatibleP(ref type1, ref type2, base_const, _) => {
-                let result = self.eval_types_compatible(type1, type2, *base_const);
+                let result = self.eval_types_compatible(expr, type1, type2, *base_const);
                 Some(IrConst::I64(result as i64))
             }
             // Handle compile-time builtin function calls in constant expressions.

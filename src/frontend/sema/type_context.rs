@@ -145,6 +145,10 @@ pub struct TypeContext {
     /// Stored when a packed enum definition is processed so that forward
     /// references can look up the correct size.
     pub packed_enum_types: FxHashMap<String, crate::common::types::EnumType>,
+    /// Every named enum definition (variants and values), keyed by tag name,
+    /// so a later `enum E` reference keeps the enum's identity and
+    /// underlying type (for `__builtin_types_compatible_p`).
+    pub enum_types: FxHashMap<String, crate::common::types::EnumType>,
     /// Return CType for known functions
     pub func_return_ctypes: FxHashMap<String, CType>,
     /// Cache for CType of named struct/union types.
@@ -177,6 +181,7 @@ impl TypeContext {
             func_ptr_typedef_info: FxHashMap::default(),
             enum_typedefs: FxHashSet::default(),
             packed_enum_types: FxHashMap::default(),
+            enum_types: FxHashMap::default(),
             func_return_ctypes: FxHashMap::default(),
             ctype_cache: RefCell::new(FxHashMap::default()),
             scope_stack: RefCell::new(Vec::new()),

@@ -404,10 +404,16 @@ impl Parser {
         } else if has_float {
             if has_complex { TypeSpecifier::ComplexFloat } else { TypeSpecifier::Float }
         } else if has_double {
-            // `long double` is plain IEEE double on Apple arm64.
-            let is_long = long_count > 0 && !crate::common::types::target_is_darwin();
+            // On Apple arm64 `long double` stays a distinct type with the
+            // representation of double; `_Complex long double` is simply
+            // `_Complex double` there.
+            let is_long = long_count > 0;
             if has_complex {
-                if is_long { TypeSpecifier::ComplexLongDouble } else { TypeSpecifier::ComplexDouble }
+                if is_long && !crate::common::types::long_double_is_f64() {
+                    TypeSpecifier::ComplexLongDouble
+                } else {
+                    TypeSpecifier::ComplexDouble
+                }
             } else if is_long {
                 TypeSpecifier::LongDouble
             } else {
@@ -557,7 +563,9 @@ impl Parser {
                     base = match base {
                         TypeSpecifier::Float => TypeSpecifier::ComplexFloat,
                         TypeSpecifier::Double => TypeSpecifier::ComplexDouble,
-                        TypeSpecifier::LongDouble => TypeSpecifier::ComplexLongDouble,
+                        TypeSpecifier::LongDouble if !crate::common::types::long_double_is_f64() => {
+                            TypeSpecifier::ComplexLongDouble
+                        }
                         _ => TypeSpecifier::ComplexDouble,
                     };
                 }

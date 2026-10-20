@@ -262,7 +262,7 @@ impl Lowerer {
             // Float literal with f suffix: type float (4 bytes)
             Expr::FloatLiteralF32(_, _) => 4,
             // Float literal with L suffix: type long double (16 on LP64, 12 on ILP32)
-            Expr::FloatLiteralLongDouble(_, _, _) => if crate::common::types::target_is_32bit() { 12 } else { 16 },
+            Expr::FloatLiteralLongDouble(_, _, _) => CType::LongDouble.size(),
             // Char literal: type int in C (4 bytes)
             Expr::CharLiteral(_, _) => 4,
             // String literal: array of char, size = length + 1 (null terminator)

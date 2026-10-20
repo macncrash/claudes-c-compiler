@@ -723,7 +723,7 @@ impl Lowerer {
             Expr::ULongLongLiteral(_, _) => IrType::U64,
             Expr::FloatLiteral(_, _) => IrType::F64,
             Expr::FloatLiteralF32(_, _) => IrType::F32,
-            Expr::FloatLiteralLongDouble(_, _, _) => IrType::F128,
+            Expr::FloatLiteralLongDouble(_, _, _) => IrType::from_ctype(&CType::LongDouble),
             Expr::ImaginaryLiteral(_, _) | Expr::ImaginaryLiteralF32(_, _)
             | Expr::ImaginaryLiteralLongDouble(_, _, _) => IrType::Ptr,
             Expr::StringLiteral(_, _) | Expr::WideStringLiteral(_, _)

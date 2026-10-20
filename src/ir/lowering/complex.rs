@@ -457,7 +457,7 @@ impl Lowerer {
                             let arg_ct = self.expr_ctype(first_arg);
                             return match arg_ct {
                                 CType::Float => CType::ComplexFloat,
-                                CType::LongDouble => CType::ComplexLongDouble,
+                                CType::LongDouble => CType::complex_long_double(),
                                 _ => CType::ComplexDouble,
                             };
                         }
@@ -533,7 +533,7 @@ impl Lowerer {
         // If one is complex and the other is integer (rank 0), the complex type wins.
         let max_rank = a_rank.max(b_rank);
         match max_rank {
-            3 => CType::ComplexLongDouble,
+            3 => CType::complex_long_double(),
             2 => CType::ComplexDouble,
             1 => CType::ComplexFloat,
             _ => {

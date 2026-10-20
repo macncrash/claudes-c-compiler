@@ -1188,6 +1188,7 @@ impl Parser {
             | TypeSpecifier::Double => Some(8),
             TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => Some(ptr_sz),
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some(16),
+            TypeSpecifier::LongDouble if crate::common::types::long_double_is_f64() => Some(8),
             TypeSpecifier::LongDouble => Some(if ptr_sz == 4 { 12 } else { 16 }),
             TypeSpecifier::ComplexFloat => Some(8),
             TypeSpecifier::ComplexDouble => Some(16),
@@ -1245,6 +1246,7 @@ impl Parser {
             TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => ptr_sz,
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => 16,
             // On i686, long double is 80-bit x87 but aligned to 4 bytes
+            TypeSpecifier::LongDouble if crate::common::types::long_double_is_f64() => 8,
             TypeSpecifier::LongDouble => if ptr_sz == 4 { 4 } else { 16 },
             TypeSpecifier::ComplexFloat => 4,
             TypeSpecifier::ComplexDouble => if ptr_sz == 4 { 4 } else { 8 },

@@ -58,6 +58,14 @@ pub fn target_long_double_is_f128() -> bool {
     TARGET_LONG_DOUBLE_IS_F128.with(|c| c.get())
 }
 
+/// Whether `long double` is stored and computed as IEEE double (Apple arm64).
+/// It stays a distinct C type (for `_Generic`, `__builtin_types_compatible_p`,
+/// diagnostics); only its size, alignment, IR type and constants are those
+/// of `double`.
+pub fn long_double_is_f64() -> bool {
+    target_is_darwin()
+}
+
 /// Return the IR type used for pointer-width integers (I64 on LP64, I32 on ILP32).
 /// This is the natural "word" type for the target: the size of `long`, `size_t`,
 /// and pointer arithmetic results. On 64-bit targets this is I64; on 32-bit (i686)
@@ -275,8 +283,8 @@ pub struct EnumType {
 pub fn builtin_types_compatible(a: &CType, b: &CType) -> bool {
     match (a, b) {
         (CType::Enum(e1), CType::Enum(e2)) => e1 == e2,
-        (CType::Enum(_), _) => builtin_types_compatible(&CType::Int, b),
-        (_, CType::Enum(_)) => builtin_types_compatible(a, &CType::Int),
+        (CType::Enum(e), _) => builtin_types_compatible(&e.underlying_type(), b),
+        (_, CType::Enum(e)) => builtin_types_compatible(a, &e.underlying_type()),
         (CType::Pointer(p1, _), CType::Pointer(p2, _)) => builtin_types_compatible(p1, p2),
         (CType::Array(e1, s1), CType::Array(e2, s2)) => {
             builtin_types_compatible(e1, e2) && (s1.is_none() || s2.is_none() || s1 == s2)
@@ -296,6 +304,22 @@ pub fn has_pointer_level(t: &CType) -> bool {
 }
 
 impl EnumType {
+    /// The integer type the enum is compatible with (GCC/Clang): unsigned
+    /// unless some value is negative, of the enum's size.
+    pub fn underlying_type(&self) -> CType {
+        let signed = self.variants.iter().any(|(_, v)| *v < 0);
+        match (self.packed_size(), signed) {
+            (1, true) => CType::Char,
+            (1, false) => CType::UChar,
+            (2, true) => CType::Short,
+            (2, false) => CType::UShort,
+            (8, true) => CType::Long,
+            (8, false) => CType::ULong,
+            (_, true) => CType::Int,
+            (_, false) => CType::UInt,
+        }
+    }
+
     /// Returns the size (and alignment) in bytes for this enum.
     /// Non-packed enums are always 4 bytes (int). Packed enums use the
     /// smallest integer type that can represent all variant values.
@@ -1003,6 +1027,9 @@ impl StructLayout {
                 CType::Double => {
                     float_fields.push((offset, 8));
                 }
+                CType::LongDouble if long_double_is_f64() => {
+                    float_fields.push((offset, 8));
+                }
                 // Nested struct: recurse
                 CType::Struct(key) | CType::Union(key) => {
                     if let Some(layout) = ctx.get_struct_layout(key) {
@@ -1028,6 +1055,7 @@ impl StructLayout {
                         match elem_ty.as_ref() {
                             CType::Float => float_fields.push((elem_offset, 4)),
                             CType::Double => float_fields.push((elem_offset, 8)),
+                            CType::LongDouble if long_double_is_f64() => float_fields.push((elem_offset, 8)),
                             CType::Struct(key) | CType::Union(key) => {
                                 if let Some(layout) = ctx.get_struct_layout(key) {
                                     if layout.is_union {
@@ -1384,6 +1412,8 @@ impl CType {
             // i686: long double is 12 bytes (80-bit x87 with 4 bytes padding)
             // x86-64: long double is 16 bytes (80-bit x87 with 6 bytes padding)
             // ARM/RISC-V: long double is 16 bytes (IEEE binary128)
+            // Apple arm64: long double is IEEE double
+            CType::LongDouble if long_double_is_f64() => 8,
             CType::LongDouble => if ptr_sz == 4 { 12 } else { 16 },
             CType::ComplexFloat => 8,     // 2 * sizeof(float)
             CType::ComplexDouble => 16,   // 2 * sizeof(double)
@@ -1418,6 +1448,7 @@ impl CType {
             CType::Float => 4,
             CType::Double => if ptr_sz == 4 { 4 } else { 8 },
             // i686: long double aligned to 4; LP64: aligned to 16
+            CType::LongDouble if long_double_is_f64() => 8,
             CType::LongDouble => if ptr_sz == 4 { 4 } else { 16 },
             CType::ComplexFloat => 4,       // align of float component
             CType::ComplexDouble => if ptr_sz == 4 { 4 } else { 8 },
@@ -1541,6 +1572,13 @@ impl CType {
         }
     }
 
+    /// The type of `_Complex long double` on the current target. Apple arm64
+    /// keeps it as `_Complex double`: only the real `long double` stays a
+    /// distinct type there.
+    pub fn complex_long_double() -> CType {
+        if long_double_is_f64() { CType::ComplexDouble } else { CType::ComplexLongDouble }
+    }
+
     /// Get the component type for a complex type (e.g., ComplexFloat -> Float).
     pub fn complex_component_type(&self) -> CType {
         match self {
@@ -1622,7 +1660,7 @@ impl CType {
             };
             let max_rank = l_real_rank.max(r_real_rank);
             return match max_rank {
-                3 => CType::ComplexLongDouble,
+                3 => CType::complex_long_double(),
                 2 => CType::ComplexDouble,
                 1 => CType::ComplexFloat,
                 _ => {
@@ -1964,6 +2002,7 @@ impl IrType {
             CType::UInt128 => IrType::U128,
             CType::Float => IrType::F32,
             CType::Double => IrType::F64,
+            CType::LongDouble if long_double_is_f64() => IrType::F64,
             CType::LongDouble => IrType::F128,
             // Complex types are handled as aggregate (pointer to stack slot)
             CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => IrType::Ptr,

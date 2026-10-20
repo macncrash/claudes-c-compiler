@@ -586,12 +586,13 @@ impl Lowerer {
                 return self.ctype_matches_generic(elem, pointee);
             }
         }
-        // Enum matches int
-        if matches!(controlling, CType::Enum(_)) && matches!(assoc, CType::Int) {
-            return true;
+        // An enum matches its underlying integer type (unsigned int unless
+        // some value is negative).
+        if let CType::Enum(e) = controlling {
+            return e.underlying_type() == *assoc;
         }
-        if matches!(controlling, CType::Int) && matches!(assoc, CType::Enum(_)) {
-            return true;
+        if let CType::Enum(e) = assoc {
+            return e.underlying_type() == *controlling;
         }
         false
     }

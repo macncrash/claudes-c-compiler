@@ -753,29 +753,29 @@ impl SemanticAnalyzer {
         match ts {
             TypeSpecifier::Enum(name, Some(variants), is_packed) => {
                 self.process_enum_variants(variants);
-                // Store packed enum info for forward-reference lookups
-                if *is_packed {
-                    if let Some(tag) = name {
-                        let mut variant_values = Vec::new();
-                        let mut next_val: i64 = 0;
-                        for v in variants {
-                            if let Some(ref val_expr) = v.value {
-                                if let Some(val) = self.eval_const_expr(val_expr) {
-                                    next_val = val;
-                                }
+                // Store the definition for later `enum tag` references; packed
+                // enums also go in packed_enum_types for their size.
+                if let Some(tag) = name {
+                    let mut variant_values = Vec::new();
+                    let mut next_val: i64 = 0;
+                    for v in variants {
+                        if let Some(ref val_expr) = v.value {
+                            if let Some(val) = self.eval_const_expr(val_expr) {
+                                next_val = val;
                             }
-                            variant_values.push((v.name.clone(), next_val));
-                            next_val += 1;
                         }
-                        self.result.type_context.packed_enum_types.insert(
-                            tag.clone(),
-                            crate::common::types::EnumType {
-                                name: Some(tag.clone()),
-                                variants: variant_values,
-                                is_packed: true,
-                            },
-                        );
+                        variant_values.push((v.name.clone(), next_val));
+                        next_val += 1;
                     }
+                    let et = crate::common::types::EnumType {
+                        name: Some(tag.clone()),
+                        variants: variant_values,
+                        is_packed: *is_packed,
+                    };
+                    if *is_packed {
+                        self.result.type_context.packed_enum_types.insert(tag.clone(), et.clone());
+                    }
+                    self.result.type_context.enum_types.insert(tag.clone(), et);
                 }
             }
             TypeSpecifier::Struct(_, Some(fields), _, _, _)
@@ -1546,6 +1546,18 @@ impl SemanticAnalyzer {
     /// SemaConstEval and record the result in the const_values map.
     /// The lowerer will consult this as an O(1) fast path.
     fn annotate_const_value(&mut self, expr: &Expr) {
+        // Resolve the operands with enum identity intact (SemaConstEval and
+        // the lowerer see enums as int); the lowerer uses this value.
+        if let Expr::BuiltinTypesCompatibleP(type1, type2, base_const, _) = expr {
+            use type_builder::TypeConvertContext;
+            let ctype1 = self.resolve_type_spec_to_ctype(type1);
+            let ctype2 = self.resolve_type_spec_to_ctype(type2);
+            let compatible = crate::common::types::builtin_types_compatible(&ctype1, &ctype2)
+                && (base_const[0] == base_const[1]
+                    || !crate::common::types::has_pointer_level(&ctype1));
+            self.result.const_values.insert(expr.id(), crate::ir::reexports::IrConst::I64(compatible as i64));
+            return;
+        }
         let evaluator = SemaConstEval {
             types: &self.result.type_context,
             symbols: &self.symbol_table,
@@ -1982,8 +1994,9 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             }
             result
         } else if let Some(n) = name {
-            // Forward reference: look up previously stored packed enum info
-            if let Some(et) = self.result.type_context.packed_enum_types.get(n) {
+            // Reference to a previously defined enum: use its stored variants
+            // so the type compares equal to the definition's.
+            if let Some(et) = self.result.type_context.enum_types.get(n) {
                 et.variants.clone()
             } else {
                 Vec::new()
