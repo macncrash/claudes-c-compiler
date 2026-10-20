@@ -379,3 +379,53 @@ fn resolve_numeric_data_values(
         }
     }).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parser::{parse_asm, AsmStatement};
+    use super::encoder::{encode_instruction, EncodeResult};
+
+    /// Instruction forms the AArch64 codegen and peephole optimizer emit
+    /// (logical immediates, register-offset loads/stores, csel, memcpy
+    /// chunks), checked against encodings from clang/LLVM.
+    #[test]
+    fn test_codegen_instruction_forms_match_llvm() {
+        let cases = [
+            ("and w0, w1, #-8", 0x121d7020u32),
+            ("and x11, x1, #63", 0x9240142b),
+            ("orr x3, x4, #0xff00", 0xb2781c83),
+            ("eor w5, w6, #1", 0x520000c5),
+            ("and x7, x8, #-8", 0x927df107),
+            ("ldr x12, [x14, #112]", 0xf94039cc),
+            ("ldrsw x22, [x21, #184]", 0xb980bab6),
+            ("ldrsb x12, [x15]", 0x398001ec),
+            ("ldrb w3, [x4, #120]", 0x3941e083),
+            ("ldrh w3, [x4, #6]", 0x79400c83),
+            ("str w13, [x21, #192]", 0xb900c2ad),
+            ("strb wzr, [x15, #1]", 0x390005ff),
+            ("strh w2, [x3, #2]", 0x79000462),
+            ("str xzr, [x22, #1016]", 0xf901fedf),
+            ("add x15, x11, x0", 0x8b00016f),
+            ("sub x3, x4, #8", 0xd1002083),
+            ("csel x0, x2, x3, le", 0x9a83d040),
+            ("csel x15, x2, x0, gt", 0x9a80c04f),
+            ("sxtw x23, w11", 0x93407d77),
+            ("mov x3, x0", 0xaa0003e3),
+            ("ldp x12, x13, [x10], #16", 0xa8c1354c),
+            ("stp x12, x13, [x9], #16", 0xa881352c),
+            ("subs x11, x11, #1", 0xf100056b),
+        ];
+        for (text, expected) in cases {
+            let stmts = parse_asm(text).unwrap_or_else(|e| panic!("{}: {}", text, e));
+            let Some(AsmStatement::Instruction { mnemonic, operands, raw_operands }) =
+                stmts.into_iter().find(|s| matches!(s, AsmStatement::Instruction { .. }))
+            else {
+                panic!("{}: not parsed as an instruction", text)
+            };
+            match encode_instruction(&mnemonic, &operands, &raw_operands) {
+                Ok(EncodeResult::Word(w)) => assert_eq!(w, expected, "{}: got {:#010x}", text, w),
+                other => panic!("{}: unexpected encoding {:?}", text, other.map(|_| ())),
+            }
+        }
+    }
+}
