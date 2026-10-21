@@ -10,7 +10,8 @@ CFLAGS ?= -O2
 
 all: perft
 
-perft: perft.c
+# Rebuild when the compiler changes too (when CCC names a file).
+perft: perft.c $(wildcard $(firstword $(CCC)))
 	$(CCC) $(CFLAGS) -DCOMPILER_NAME='"ccc"' -o $@ perft.c
 
 perft-clang: perft.c
