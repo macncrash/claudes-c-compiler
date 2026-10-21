@@ -9,3 +9,6 @@ core
 
 # difftest external suites and reference-output cache
 /tests/difftest/suites/
+
+# macOS Finder metadata
+.DS_Store
