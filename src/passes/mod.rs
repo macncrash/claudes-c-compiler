@@ -23,6 +23,7 @@ pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_rotate;
 pub(crate) mod narrow;
 mod resolve_asm;
 pub(crate) mod simplify;

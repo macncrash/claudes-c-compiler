@@ -63,8 +63,16 @@ The optimizer executes in four sequential phases:
    +-------------------------------------------------------+
          |
          v
+ Phase 10b: Induction Variable Widening (64-bit targets, not with -fwrapv)
+     iv_widen
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
+         |
+         v
+ Phi elimination (src/ir/mem2reg), then:
+     loop_rotate
 ```
 
 ## Phase Structure
@@ -662,6 +670,23 @@ computations are removed by subsequent DCE.
 Runs only during the first iteration of the main loop. Uses shared CFG analysis
 with GVN and LICM.
 
+### iv_widen -- Induction Variable Widening
+
+Runs once after the main loop, on 64-bit targets. A signed `int` loop counter
+stepped by a constant is kept as a 64-bit value equal to its sign extension
+(signed overflow being undefined), so the step needs no `sxtw` and indexing
+needs no extension. Compares against constants or loop-invariant values are
+widened; other uses read an explicit truncation. Disabled by `-fwrapv`.
+
+### loop_rotate -- Loop Rotation
+
+Runs after phi elimination, just before codegen. A latch that branches back
+unconditionally to a small header (at most 6 simple instructions ending in a
+conditional branch) gets a copy of the header, so each iteration ends with one
+conditional branch and the original header is left as the entry guard. Header
+values used outside the header become variables assigned by a Copy in both
+places, as lowered phis are.
+
 ### if_convert -- If-Conversion
 
 Converts simple diamond and triangle branch-and-phi patterns into `Select`
@@ -872,7 +897,8 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 ```
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
-`constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`.
+`constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
+`iv_widen`, `loop_rotate`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -904,8 +930,10 @@ behavior across iterations.
 | `inline.rs`              | Function inlining with tiered size heuristics          |
 | `ipcp.rs`                | Interprocedural constant propagation                   |
 | `iv_strength_reduce.rs`  | Loop induction variable strength reduction             |
+| `iv_widen.rs`            | Signed 32-bit loop counters kept as 64-bit values      |
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
+| `loop_rotate.rs`         | Header duplication into latches (bottom-tested loops)  |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |
