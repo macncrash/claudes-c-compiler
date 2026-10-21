@@ -865,7 +865,9 @@ impl<'a> SemaConstEval<'a> {
                     .and_then(|n| self.types.packed_enum_types.get(n))
                     .is_some();
                 if !effective_packed {
-                    Some(4)
+                    // 8 bytes if a value needs more than 32 bits
+                    Some(name.as_ref().and_then(|n| self.types.enum_types.get(n))
+                        .map_or(4, |et| et.packed_size()))
                 } else {
                     // Resolve the packed enum to get its correct size
                     let et = self.resolve_packed_enum_type(name, variants);
@@ -986,7 +988,8 @@ impl<'a> SemaConstEval<'a> {
                     .and_then(|n| self.types.packed_enum_types.get(n))
                     .is_some();
                 if !effective_packed {
-                    4
+                    name.as_ref().and_then(|n| self.types.enum_types.get(n))
+                        .map_or(4, |et| et.packed_size())
                 } else {
                     let et = self.resolve_packed_enum_type(name, variants);
                     et.packed_size()

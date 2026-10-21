@@ -1036,6 +1036,7 @@ impl Driver {
             sema_result.functions,
             sema_result.expr_types,
             sema_result.const_values,
+            sema_result.generic_assoc_types,
             diagnostics,
             self.gnu89_inline,
         );

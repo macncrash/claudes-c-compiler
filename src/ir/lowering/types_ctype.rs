@@ -427,11 +427,13 @@ impl type_builder::TypeConvertContext for Lowerer {
             .is_some();
         if !effective_packed {
             // Non-packed enum: normally int (4 bytes), but if any variant
-            // value exceeds i32 range while fitting in u32, use unsigned int.
-            // Values like `1U << 31` (0x80000000) require unsigned int.
-            let needs_unsigned = if let Some(vars) = variants {
+            // value exceeds i32 range while fitting in u32, use unsigned int
+            // (`1U << 31`), and if some value needs more than 32 bits, long or
+            // unsigned long (GCC extension, matching EnumType::packed_size).
+            // A tag reference uses the values sema recorded for the definition.
+            let values: Vec<i64> = if let Some(vars) = variants {
+                let mut values = Vec::new();
                 let mut next_val: i64 = 0;
-                let mut result = false;
                 for v in vars {
                     if let Some(ref expr) = v.value {
                         if let Some(val) = self.eval_const_expr(expr) {
@@ -440,16 +442,21 @@ impl type_builder::TypeConvertContext for Lowerer {
                             }
                         }
                     }
-                    if next_val > i32::MAX as i64 {
-                        result = true;
-                    }
+                    values.push(next_val);
                     next_val += 1;
                 }
-                result
+                values
             } else {
-                false
+                name.as_ref()
+                    .and_then(|n| self.types.enum_types.get(n))
+                    .map(|et| et.variants.iter().map(|(_, v)| *v).collect())
+                    .unwrap_or_default()
             };
-            return if needs_unsigned { CType::UInt } else { CType::Int };
+            let negative = values.iter().any(|v| *v < 0);
+            if values.iter().any(|v| *v > u32::MAX as i64 || *v < i32::MIN as i64) {
+                return if negative { CType::Long } else { CType::ULong };
+            }
+            return if values.iter().any(|v| *v > i32::MAX as i64) { CType::UInt } else { CType::Int };
         }
         // For packed enums, compute the minimum integer type from variant values
         let variant_values: Vec<i64> = if let Some(vars) = variants {

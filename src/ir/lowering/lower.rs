@@ -26,7 +26,7 @@ use crate::frontend::parser::ast::{
     TranslationUnit,
     TypeSpecifier,
 };
-use crate::frontend::sema::{FunctionInfo, ExprTypeMap, ConstMap};
+use crate::frontend::sema::{FunctionInfo, ExprTypeMap, ConstMap, GenericAssocTypeMap};
 use crate::ir::reexports::{
     BasicBlock,
     BlockId,
@@ -103,6 +103,9 @@ pub struct Lowerer {
     /// falls back to its own evaluation (which handles lowering-specific cases
     /// like global addresses, func_state const locals, etc.).
     pub(super) sema_const_values: ConstMap,
+    /// _Generic association types from sema with enum identity intact, keyed
+    /// by the controlling expression's `ExprId` (see resolve_generic_selection_expr).
+    pub(super) sema_generic_assoc_types: GenericAssocTypeMap,
     /// Stack of local label scopes from GNU __label__ declarations.
     /// Each entry maps a label name to its scope-qualified name.
     /// When resolving a label, the stack is searched top-down so that
@@ -175,6 +178,7 @@ impl Lowerer {
         sema_functions: FxHashMap<String, FunctionInfo>,
         sema_expr_types: ExprTypeMap,
         sema_const_values: ConstMap,
+        sema_generic_assoc_types: GenericAssocTypeMap,
         diagnostics: DiagnosticEngine,
         gnu89_inline: bool,
     ) -> Self {
@@ -208,6 +212,7 @@ impl Lowerer {
             sema_functions,
             sema_expr_types,
             sema_const_values,
+            sema_generic_assoc_types,
             local_label_scopes: Vec::new(),
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),

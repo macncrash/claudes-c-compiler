@@ -609,6 +609,13 @@ impl<'a> ExprTypeChecker<'a> {
                 }
             }
             TypeSpecifier::Enum(name, variants, _is_packed) => {
+                // A reference to a defined enum keeps its identity, as in
+                // declarations (`(enum E)x` has type enum E).
+                if variants.is_none() {
+                    if let Some(et) = name.as_ref().and_then(|n| self.types.enum_types.get(n)) {
+                        return CType::Enum(et.clone());
+                    }
+                }
                 // GCC extension: determine underlying enum type based on value range.
                 // Uses progression: int -> unsigned int -> long long -> unsigned long long.
                 let values = if let Some(vars) = variants {

@@ -1508,6 +1508,15 @@ impl CType {
         matches!(self, CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128)
     }
 
+    /// Whether this is an enum type, or a pointer to or array of one.
+    pub fn contains_enum(&self) -> bool {
+        match self {
+            CType::Enum(_) => true,
+            CType::Pointer(inner, _) | CType::Array(inner, _) => inner.contains_enum(),
+            _ => false,
+        }
+    }
+
     /// Whether this is a complex type (_Complex float/double/long double).
     pub fn is_complex(&self) -> bool {
         matches!(self, CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble)

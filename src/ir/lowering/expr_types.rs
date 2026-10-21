@@ -603,11 +603,7 @@ impl Lowerer {
     /// Both resolve_generic_selection_ctype and resolve_generic_selection_type
     /// delegate to this to avoid duplicating the matching logic.
     pub(super) fn resolve_generic_selection_expr<'a>(&self, controlling: &Expr, associations: &'a [GenericAssociation]) -> Option<&'a Expr> {
-        // For _Generic, compute the controlling expression's type fresh to avoid
-        // stale cached values that may have been computed before the controlling
-        // expression's dependencies were fully available.
-        let controlling_ctype = self.get_expr_ctype_lowerer(controlling)
-            .or_else(|| self.lookup_sema_expr_type(controlling));
+        let controlling_ctype = self.generic_controlling_ctype(controlling);
         let controlling_ir_type = self.get_expr_type(controlling);
         // Per C11 6.5.1.1p2, lvalue conversion includes array-to-pointer and
         // function-to-pointer decay.
@@ -628,12 +624,19 @@ impl Lowerer {
             let assocs_differ = non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
             assocs_differ || ctrl_is_const
         };
+        // Enum association types come from sema: type_spec_to_ctype resolves
+        // an enum to its integer type, which would make `enum E` match `int`.
+        let sema_assoc_types = self.sema_generic_assoc_types.get(&controlling.id())
+            .filter(|types| types.len() == associations.len());
         let mut default_expr: Option<&Expr> = None;
-        for assoc in associations {
+        for (i, assoc) in associations.iter().enumerate() {
             match &assoc.type_spec {
                 None => { default_expr = Some(&assoc.expr); }
                 Some(type_spec) => {
-                    let assoc_ctype = self.type_spec_to_ctype(type_spec);
+                    let assoc_ctype = sema_assoc_types
+                        .and_then(|types| types[i].clone())
+                        .filter(CType::contains_enum)
+                        .unwrap_or_else(|| self.type_spec_to_ctype(type_spec));
                     if let Some(ref ctrl_ct) = controlling_ctype {
                         if self.ctype_matches_generic(ctrl_ct, &assoc_ctype) {
                             if has_const_diff && assoc.is_const != ctrl_is_const {
@@ -654,6 +657,31 @@ impl Lowerer {
             }
         }
         default_expr
+    }
+
+    /// The type of a _Generic controlling expression, computed fresh to avoid
+    /// stale cached values that may have been computed before the controlling
+    /// expression's dependencies were fully available. The lowerer resolves
+    /// enums to their integer type, so where sema's type is the same but with
+    /// enum identity intact (`enum E` for `int`, `enum E *` for `int *`), sema's
+    /// is used: an enum is compatible with its underlying type, which is
+    /// unsigned unless some value is negative.
+    fn generic_controlling_ctype(&self, controlling: &Expr) -> Option<CType> {
+        fn same_but_enum(sema: &CType, lowered: &CType) -> bool {
+            match (sema, lowered) {
+                (CType::Enum(_), l) => l.is_integer(),
+                (CType::Pointer(s, _), CType::Pointer(l, _))
+                | (CType::Array(s, _), CType::Array(l, _))
+                | (CType::Array(s, _), CType::Pointer(l, _)) => same_but_enum(s, l),
+                (s, l) => s == l,
+            }
+        }
+        let lowered = self.get_expr_ctype_lowerer(controlling);
+        let sema = self.lookup_sema_expr_type(controlling);
+        match (lowered, sema) {
+            (Some(l), Some(s)) if s.contains_enum() && same_but_enum(&s, &l) => Some(s),
+            (lowered, sema) => lowered.or(sema),
+        }
     }
 
     /// Resolve the CType of a _Generic selection expression.

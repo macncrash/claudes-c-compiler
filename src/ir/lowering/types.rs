@@ -343,15 +343,10 @@ impl Lowerer {
             }
             return crate::common::types::target_ptr_size(); // fallback
         }
-        // Handle packed enums (explicit or forward-reference to packed) via CType resolution
-        if let TypeSpecifier::Enum(name, _, is_packed) = ts {
-            let effective_packed = *is_packed || name.as_ref()
-                .and_then(|n| self.types.packed_enum_types.get(n))
-                .is_some();
-            if effective_packed {
-                let ctype = self.type_spec_to_ctype(ts);
-                return ctype.size_ctx(&*self.types.borrow_struct_layouts());
-            }
+        // Enums (packed, or with values beyond 32 bits) via CType resolution
+        if let TypeSpecifier::Enum(..) = ts {
+            let ctype = self.type_spec_to_ctype(ts);
+            return ctype.size_ctx(&*self.types.borrow_struct_layouts());
         }
         // Handle typeof(expr) by resolving the expression's type
         if let TypeSpecifier::Typeof(expr) = ts {
@@ -407,6 +402,9 @@ impl Lowerer {
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.alignof_type(inner);
         }
+        if let TypeSpecifier::Enum(..) = ts {
+            return self.ctype_align(&self.type_spec_to_ctype(ts));
+        }
         // Handle vector types: alignment equals total vector size (power-of-2 aligned)
         if let TypeSpecifier::Vector(_, total_bytes) = ts {
             // Vector alignment is typically the total vector size, capped at 16
@@ -450,6 +448,9 @@ impl Lowerer {
         }
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.preferred_alignof_type(inner);
+        }
+        if let TypeSpecifier::Enum(..) = ts {
+            return self.type_spec_to_ctype(ts).preferred_align_ctx(&*self.types.borrow_struct_layouts());
         }
         if let TypeSpecifier::Vector(_, total_bytes) = ts {
             return (*total_bytes).min(16);

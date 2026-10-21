@@ -101,7 +101,14 @@ pub struct SemaResult {
     /// binary ops with proper signedness semantics). The lowerer consults
     /// this as an O(1) fast path before its own eval_const_expr.
     pub const_values: ConstMap,
+    /// _Generic association types with enum identity intact, keyed by the
+    /// controlling expression's `ExprId` (None for `default`). Recorded only
+    /// when some association names an enum type: the lowerer resolves enums
+    /// to their integer type, which would make `enum E` match `int`.
+    pub generic_assoc_types: GenericAssocTypeMap,
 }
+
+pub type GenericAssocTypeMap = FxHashMap<ExprId, Vec<Option<CType>>>;
 
 impl Default for SemaResult {
     fn default() -> Self {
@@ -110,6 +117,7 @@ impl Default for SemaResult {
             type_context: TypeContext::new(),
             expr_types: ExprTypeMap::default(),
             const_values: ConstMap::default(),
+            generic_assoc_types: GenericAssocTypeMap::default(),
         }
     }
 }
@@ -1491,6 +1499,12 @@ impl SemanticAnalyzer {
                 self.analyze_expr(controlling);
                 for assoc in associations {
                     self.analyze_expr(&assoc.expr);
+                }
+                let assoc_types: Vec<Option<CType>> = associations.iter()
+                    .map(|a| a.type_spec.as_ref().map(|ts| self.type_spec_to_ctype(ts)))
+                    .collect();
+                if assoc_types.iter().flatten().any(CType::contains_enum) {
+                    self.result.generic_assoc_types.insert(controlling.id(), assoc_types);
                 }
             }
             // Literals don't need analysis
