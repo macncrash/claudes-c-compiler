@@ -1,8 +1,8 @@
 {
  "meta": {
   "platform": "darwin-arm64",
-  "date": "2026-10-20",
-  "ccc_rev": "8b89269a",
+  "date": "2026-10-21",
+  "ccc_rev": "e065cd8d",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -710,6 +710,9 @@
    "status": "pass"
   },
   "cases/fp_regs": {
+   "status": "pass"
+  },
+  "cases/generic_enum_types": {
    "status": "pass"
   },
   "cases/globals_data": {
@@ -1593,7 +1596,7 @@
   },
   "gcc-torture/20041114-1": {
    "status": "link_error",
-   "detail": "ccc: error: linker failed (clang): clang: error: couldn't create cache file '/var/folders/4x/8v702dbd30l6xjkp3lgrx23h0000gp/T/xcrun_db-H7K3cKRg' (errno=Operation not permitted)"
+   "detail": "ccc: error: linker failed (clang): Undefined symbols for architecture arm64:"
   },
   "gcc-torture/20041124-1": {
    "status": "pass"
@@ -5074,7 +5077,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b876daf 0x16b876daf 0x16b876daf 0x16b876daf'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b2a2daf 0x16b2a2daf 0x16b2a2daf 0x16b2a2daf'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
