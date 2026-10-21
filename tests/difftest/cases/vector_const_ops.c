@@ -90,6 +90,24 @@ __attribute__((noinline)) static void reloads(u32x4 *p, int n) {
     }
 }
 
+/* Shift-and-accumulate: a constant right shift added to a running value
+ * (unsigned and signed lanes, shift on either side of the +), and the same
+ * with the shifted vector changed between the shift and the add. */
+static u8x8 pa[16], pb[16], pout[16];
+static s16x8 sa[16], sout[16];
+
+__attribute__((noinline)) static void accumulate_shifts(void) {
+    for (int i = 0; i < 16; i++) {
+        pout[i] = (pa[i] >> 1) + (pa[i] >> 2) + (pb[i] >> 3);
+        sout[i] = (sa[i] >> 4) + ((sa[i] >> 1) + (sa[i] >> 15));
+    }
+    for (int i = 0; i < 15; i++) {
+        u8x8 t = pa[i] >> 2;
+        pa[i] = pb[i];                 /* not the source the add reads */
+        pout[i] += t + (pa[i + 1] >> 1);
+    }
+}
+
 int main(int argc, char **argv) {
     (void)argv;
     shifts();
@@ -99,6 +117,18 @@ int main(int argc, char **argv) {
     }
     literals(40 + argc);
     reloads(uv, 64);
+    for (int i = 0; i < 16; i++) {
+        for (int k = 0; k < 8; k++) {
+            pa[i][k] = (unsigned char)(i * 37 + k * 11);
+            pb[i][k] = (unsigned char)(255 - i * 13 - k);
+            sa[i][k] = (short)((i - 8) * 3001 + k * 77);
+        }
+    }
+    accumulate_shifts();
+    mix(pout, sizeof pout);
+    mix(sout, sizeof sout);
+    mix(pa, sizeof pa);
+    printf("accumulate %u %u %d %d\n", pout[0][3], pout[15][7], sout[2][5], sout[13][0]);
     mix(dv, sizeof dv);
     mix(uv, sizeof uv);
     mix(tab_out, sizeof tab_out);

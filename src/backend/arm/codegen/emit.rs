@@ -245,6 +245,9 @@ pub struct ArmCodegen {
     /// Not results read only by one And, which emits `bic` on the Not's
     /// source instead (fold_vec_nots): temporary -> source.
     pub(super) vec_not_folds: FxHashMap<u32, u32>,
+    /// Constant right shifts read only by one Add, which accumulates them
+    /// (usra/ssra, fold_vec_shift_adds): shift result -> (source, count).
+    pub(super) vec_shift_adds: FxHashMap<u32, (u32, u32)>,
     /// HFA return: the (dest, src) of each Memcpy into the return buffer
     /// that directly precedes the Return. It loads the result registers
     /// from `src` instead (emit_hfa_ret_copy) and sets `hfa_ret_loaded`, so
@@ -297,6 +300,7 @@ impl ArmCodegen {
             vec_spills: FxHashMap::default(),
             vec_scratch: (usize::MAX, [None; 2]),
             vec_not_folds: FxHashMap::default(),
+            vec_shift_adds: FxHashMap::default(),
             hfa_ret_copies: FxHashSet::default(),
             hfa_ret_loaded: false,
             hfa_ret_ptr_loads: None,

@@ -556,6 +556,52 @@ impl ArmCodegen {
         folds
     }
 
+    /// Integer right shifts by a constant whose result one Add reads and
+    /// nothing else, where the Add's result goes to the register holding its
+    /// other operand: the Add becomes a shift-and-accumulate (usra/ssra) of
+    /// the shift's source. The source must be unchanged in between: in a
+    /// register only vector ops writing other registers may come between, in
+    /// memory only vector ops with register results. Returns shift result ->
+    /// (source, count).
+    pub(super) fn fold_vec_shift_adds(func: &IrFunction, regs: &FxHashMap<u32, u8>,
+                                      lanes: &FxHashMap<u32, (u8, i64)>) -> FxHashMap<u32, (u32, u32)> {
+        let mut folds = FxHashMap::default();
+        let mut use_count: FxHashMap<u32, usize> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|id| *use_count.entry(id).or_default() += 1);
+            }
+            block.terminator.for_each_used_value(|id| *use_count.entry(id).or_default() += 2);
+        }
+        let reg_of = |id: u32| regs.get(&id).copied().or_else(|| lanes.get(&id).filter(|l| l.1 == 0).map(|l| l.0));
+        for block in &func.blocks {
+            let insts = &block.instructions;
+            for (p, inst) in insts.iter().enumerate() {
+                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { op: op @ VecOpKind::Shr, elem, splat, .. }, dest_ptr: Some(t), args, .. } = inst
+                    else { continue };
+                let Some(n) = Self::vec_shift_imm(*op, *elem, *splat, args).filter(|&n| n >= 1) else { continue };
+                let Some(Operand::Value(src)) = args.first() else { continue };
+                if elem.is_float() || splat & 1 != 0 || !regs.contains_key(&t.0) || use_count.get(&t.0) != Some(&2) {
+                    continue;
+                }
+                let Some(q) = (p + 1..insts.len()).find(|&q| insts[q].used_values().contains(&t.0)) else { continue };
+                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { op: VecOpKind::Add, elem: add_elem, splat: 0, .. },
+                                             dest_ptr: Some(d), args: add_args, .. } = &insts[q] else { continue };
+                let others: Vec<&Operand> = add_args.iter().filter(|a| !matches!(a, Operand::Value(v) if v == t)).collect();
+                let [Operand::Value(other)] = others[..] else { continue };
+                let src_reg = reg_of(src.0);
+                let dest_reg = reg_of(d.0);
+                let untouched = insts[p + 1..q].iter().all(|i| matches!(i,
+                    Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr: Some(w), .. }
+                        if reg_of(w.0).is_some_and(|r| Some(r) != src_reg)));
+                if add_elem == elem && dest_reg.is_some() && reg_of(other.0) == dest_reg && untouched {
+                    folds.insert(t.0, (src.0, n));
+                }
+            }
+        }
+        folds
+    }
+
     pub(super) fn assign_vec_temp_regs(func: &IrFunction) -> FxHashMap<u32, u8> {
         let mut regs = FxHashMap::default();
         let alloca_sizes: FxHashMap<u32, usize> = func.blocks.iter()
@@ -807,21 +853,37 @@ impl ArmCodegen {
     fn emit_vec_op(&mut self, op: VecOpKind, elem: VecElem, bytes: u8, splat: u8, dest_ptr: &Value, args: &[Operand]) {
         // A Not folded into the And that reads it: nothing here, and the And
         // becomes bic with the Not's source (fold_vec_nots).
-        if matches!(op, VecOpKind::Not) && self.vec_not_folds.contains_key(&dest_ptr.0) {
+        // Likewise a shift folded into the Add after it (usra/ssra,
+        // fold_vec_shift_adds).
+        if matches!(op, VecOpKind::Not) && self.vec_not_folds.contains_key(&dest_ptr.0)
+            || matches!(op, VecOpKind::Shr) && self.vec_shift_adds.contains_key(&dest_ptr.0) {
             return;
         }
+        let folded_from = |folds: &FxHashMap<u32, u32>| args.iter().position(|a| matches!(a, Operand::Value(v) if folds.contains_key(&v.0)));
         let folded = match op {
-            VecOpKind::And => args.iter().position(|a| matches!(a, Operand::Value(v) if self.vec_not_folds.contains_key(&v.0))),
+            VecOpKind::And => folded_from(&self.vec_not_folds),
             _ => None,
         };
-        let bic_args;
-        let (splat, args) = match folded {
-            Some(i) => {
+        let accumulate = match op {
+            VecOpKind::Add => args.iter().position(|a| matches!(a, Operand::Value(v) if self.vec_shift_adds.contains_key(&v.0))),
+            _ => None,
+        };
+        let new_args;
+        let mut shift_count = 0;
+        let (splat, args) = match (folded, accumulate) {
+            (Some(i), _) => {
                 let Operand::Value(t) = args[i] else { unreachable!() };
-                bic_args = [args[1 - i], Operand::Value(Value(self.vec_not_folds[&t.0]))];
-                ((splat >> (1 - i)) & 1, &bic_args[..])
+                new_args = [args[1 - i], Operand::Value(Value(self.vec_not_folds[&t.0]))];
+                ((splat >> (1 - i)) & 1, &new_args[..])
             }
-            None => (splat, args),
+            (None, Some(i)) => {
+                let Operand::Value(t) = args[i] else { unreachable!() };
+                let (src, n) = self.vec_shift_adds[&t.0];
+                shift_count = n;
+                new_args = [args[1 - i], Operand::Value(Value(src))];
+                ((splat >> (1 - i)) & 1, &new_args[..])
+            }
+            (None, None) => (splat, args),
         };
         let q = bytes == 16;
         let mem = if q { "q" } else { "d" };
@@ -873,6 +935,15 @@ impl ArmCodegen {
         let ge = if f { "fcmge" } else if u { "cmhs" } else { "cmge" };
         let shl = if u { "ushl" } else { "sshl" };
         let lines = match op {
+            // d += b >> n, with d already holding the other operand (a).
+            VecOpKind::Add if accumulate.is_some() => {
+                let mut lines = Vec::new();
+                if *a != d {
+                    lines.push(format!("    orr {d}.{bits}, {a}.{bits}, {a}.{bits}"));
+                }
+                lines.push(format!("    {} {d}.{arr}, {b}.{arr}, #{shift_count}", if u { "usra" } else { "ssra" }));
+                lines
+            }
             VecOpKind::Add => vec![bin(if f { "fadd" } else { "add" })],
             VecOpKind::Sub => vec![bin(if f { "fsub" } else { "sub" })],
             VecOpKind::Mul => vec![bin(if f { "fmul" } else { "mul" })],

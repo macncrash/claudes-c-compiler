@@ -21,6 +21,7 @@ pub(crate) mod inline;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
+pub(crate) mod lftr;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_rotate;
@@ -547,6 +548,17 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     if !wrapv && !disabled.contains("iv_widen") {
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             if iv_widen::widen_function(func) > 0 {
+                copy_prop::propagate_copies(func);
+                dce::eliminate_dead_code(func);
+            }
+        }
+    }
+    // Phase 10c: Move each loop's exit test off a counter that is otherwise
+    // only stepped or shifted, so one induction variable remains. Also
+    // assumes the counter does not wrap.
+    if !wrapv && !disabled.contains("lftr") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if lftr::lftr_function(func) > 0 {
                 copy_prop::propagate_copies(func);
                 dce::eliminate_dead_code(func);
             }

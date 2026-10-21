@@ -334,7 +334,7 @@ fn build_live_segments(
             }
         });
 
-        let mut add = |dense: usize, lo: u32, cap: u32| {
+        let mut add = |dense: usize, lo: u32, cap: u32, apart: bool| {
             let iv_start = ps.def_points[dense];
             if iv_start == u32::MAX {
                 return;
@@ -348,7 +348,10 @@ fn build_live_segments(
             }
             let list = &mut segs[dense];
             match list.last_mut() {
-                Some(prev) if prev.1 + 1 >= lo => prev.1 = prev.1.max(hi),
+                // (A piece starting at a redefinition stays apart from the one
+                // ending just before it, so a value defined in between, at the
+                // use and read by the redefinition, may share the register.)
+                Some(prev) if prev.1 >= lo || (!apart && prev.1 + 1 == lo) => prev.1 = prev.1.max(hi),
                 _ => list.push((lo, hi)),
             }
         };
@@ -357,17 +360,17 @@ fn build_live_segments(
             // pieces. (Live in with no read before the redefinition can only
             // be over-approximated liveness; keep the whole block.)
             (def, used) if def != u32::MAX && used != u32::MAX && used < def => {
-                add(dense, block_start, used);
-                add(dense, def, u32::MAX);
+                add(dense, block_start, used, false);
+                add(dense, def, u32::MAX, true);
             }
-            _ => add(dense, block_start, u32::MAX),
+            _ => add(dense, block_start, u32::MAX, false),
         });
         for dense in redef_touched.drain(..) {
             redef[dense] = (u32::MAX, u32::MAX);
         }
         for &dense in &touched {
             if !live_in[bi].contains(dense) {
-                add(dense, first_seen[dense], u32::MAX);
+                add(dense, first_seen[dense], u32::MAX, false);
             }
             first_seen[dense] = u32::MAX;
         }
@@ -1528,5 +1531,47 @@ mod tests {
         // .L1 [2,3], then .L4 and .L2 merged [6,8].
         assert_eq!(segs, vec![(2, 3), (6, 8)]);
         assert!(segs.iter().all(|&(lo, hi)| call_point < lo || call_point > hi));
+    }
+
+    /// A lowered phi whose step is right before its redefinition keeps two
+    /// pieces even though they touch (point 2, then from 3), so the step's
+    /// result can take the phi's register.
+    #[test]
+    fn test_segments_redefinition_stays_apart() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        // .L0: v0 = 0; br .L1
+        // .L1: v1 = v0 + 1; v0 = v1; v2 = v0 < 10; condbr v2, .L1, .L2
+        // .L2: ret v0
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![copy(0, 0)],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::BinOp { dest: Value(1), op: IrBinOp::Add, lhs: Operand::Value(Value(0)),
+                                     rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 },
+                Instruction::Copy { dest: Value(0), src: Operand::Value(Value(1)) },
+                Instruction::Cmp { dest: Value(2), op: crate::ir::reexports::IrCmpOp::Slt, lhs: Operand::Value(Value(0)),
+                                   rhs: Operand::Const(IrConst::I64(10)), ty: IrType::I64 },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)), true_label: BlockId(1), false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+
+        let result = compute_live_intervals(&func);
+        let iv = result.intervals.iter().find(|iv| iv.value_id == 0).unwrap();
+        assert_eq!(result.segments_of(iv), vec![(0, 2), (3, 6)]);
     }
 }

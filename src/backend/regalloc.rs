@@ -358,12 +358,9 @@ fn dest_reuse_points(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<u32>)> {
                 | Instruction::UnaryOp { .. } | Instruction::Cmp { .. }
                 | Instruction::GetElementPtr { .. } | Instruction::Load { .. });
             if let (true, Some(dest)) = (simple, inst.dest()) {
-                let mut ops = Vec::new();
-                for_each_operand_in_instruction(inst, |op| {
-                    if let Operand::Value(v) = op {
-                        ops.push(v.0);
-                    }
-                });
+                // (All read values: a GEP's base and a load's pointer are not
+                // Operands.)
+                let ops = inst.used_values();
                 points.insert(point, (dest.0, ops));
             }
             point += 1;

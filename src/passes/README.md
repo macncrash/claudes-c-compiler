@@ -67,6 +67,10 @@ The optimizer executes in four sequential phases:
      iv_widen
          |
          v
+ Phase 10c: Linear Function Test Replacement (same conditions)
+     lftr
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
          |
@@ -684,6 +688,19 @@ stepped by a constant is kept as a 64-bit value equal to its sign extension
 needs no extension. Compares against constants or loop-invariant values are
 widened; other uses read an explicit truncation. Disabled by `-fwrapv`.
 
+### lftr -- Linear Function Test Replacement
+
+Runs after iv_widen, under the same conditions. When a loop's counter is only
+stepped and tested (strength reduction having moved the addressing to a
+pointer), the exit test compares that pointer against its end address instead
+(computed in the preheader) and the counter goes away. When the counter is also
+shifted to index memory, the shifted value becomes the induction variable,
+pointers stepping by the same amount from offset 0 become `base + offset`,
+and one register indexes every array (`[base, offset]` on AArch64). The bound
+and start must be small constants or sign-extended 32-bit values, so the
+scaled bound cannot overflow; pointer tests are signed, or unsigned when
+constant bounds show the loop runs.
+
 ### loop_rotate -- Loop Rotation
 
 Runs after phi elimination, just before codegen. A latch that branches back
@@ -904,7 +921,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`iv_widen`, `loop_rotate`.
+`iv_widen`, `lftr`, `loop_rotate`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -937,6 +954,7 @@ behavior across iterations.
 | `ipcp.rs`                | Interprocedural constant propagation                   |
 | `iv_strength_reduce.rs`  | Loop induction variable strength reduction             |
 | `iv_widen.rs`            | Signed 32-bit loop counters kept as 64-bit values      |
+| `lftr.rs`                | Exit tests moved off counters (one IV per loop)        |
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
 | `loop_rotate.rs`         | Header duplication into latches (bottom-tested loops)  |

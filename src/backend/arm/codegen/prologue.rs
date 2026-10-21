@@ -38,6 +38,7 @@ impl ArmCodegen {
             .collect();
         self.vec_lanes = lanes;
         self.vec_not_folds = Self::fold_vec_nots(func, &self.vec_regs, &self.vec_lanes);
+        self.vec_shift_adds = Self::fold_vec_shift_adds(func, &self.vec_regs, &self.vec_lanes);
         let free: Vec<u8> = super::emit::ARM_VEC_VAR_REGS.iter().copied()
             .filter(|r| !self.vec_regs.values().any(|v| v == r))
             .collect();
