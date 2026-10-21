@@ -313,12 +313,17 @@ impl Lowerer {
         }
     }
 
-    /// AArch64: the HFA class of a struct type, if it is one. Returned HFAs
-    /// come back in s0-s3/d0-d3, which lowering models as sret.
+    /// AArch64: the HFA class of a struct type or short vector, if it is one.
+    /// Returned HFAs come back in v0-v3, which lowering models as sret.
     pub(super) fn hfa_class_of(&self, ret_ct: &CType) -> Option<crate::common::types::RiscvFloatClass> {
         use crate::common::types::StructLayoutProvider;
         if self.target != Target::Aarch64 {
             return None;
+        }
+        // AAPCS64 short vectors go in one SIMD register (d or q), like a
+        // one-member HFA of that size.
+        if let CType::Vector(_, size @ (8 | 16)) = ret_ct {
+            return Some(crate::common::types::RiscvFloatClass::Hfa { count: 1, elem_size: *size });
         }
         let CType::Struct(key) = ret_ct else { return None };
         let layouts = self.types.borrow_struct_layouts();
@@ -912,14 +917,20 @@ impl Lowerer {
             }
             // Vector types use the same by-value return convention as structs:
             // small vectors (<=8 bytes) are packed into a register, larger ones use sret.
+            // AArch64 short vectors come back in d0/q0, lowered as sret like
+            // an HFA.
             if full_ret_ctype.is_vector() {
                 let size = self.sizeof_type(ret_type_spec);
                 let (s, t) = Self::classify_struct_return(size);
                 sret_size = s;
                 two_reg_ret_size = t;
-                // Small vector returns (<=8 bytes, no sret/two_reg) need I64 return type
-                // so the packed vector data is returned in a register, not as a pointer.
-                if s.is_none() && t.is_none() {
+                ret_hfa = self.hfa_class_of(&full_ret_ctype);
+                if ret_hfa.is_some() {
+                    sret_size = Some(size);
+                    two_reg_ret_size = None;
+                } else if s.is_none() && t.is_none() {
+                    // Small vector returns (<=8 bytes, no sret/two_reg) need I64 return type
+                    // so the packed vector data is returned in a register, not as a pointer.
                     ret_ty = IrType::I64;
                 }
             }
@@ -1040,7 +1051,11 @@ impl Lowerer {
         // Compute RISC-V LP64D float field classification for struct params
         let param_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> = params.iter().enumerate().map(|(i, p)| {
             if param_struct_sizes.get(i).copied().flatten().is_some() {
-                if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
+                let ctype = self.type_spec_to_ctype(&p.type_spec);
+                if ctype.is_vector() {
+                    // AArch64 short vectors: one d/q register.
+                    self.hfa_class_of(&ctype)
+                } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
                     self.fp_struct_class(&layout, &*self.types.borrow_struct_layouts())
                 } else {
                     None

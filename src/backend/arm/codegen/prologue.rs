@@ -168,11 +168,11 @@ impl ArmCodegen {
         // here (up to four doubles); the param stores point x8 at it.
         self.hfa_ret = None;
         if func.uses_sret {
-            if let Some(crate::common::types::RiscvFloatClass::Hfa { count, is_double }) =
+            if let Some(crate::common::types::RiscvFloatClass::Hfa { count, elem_size }) =
                 func.params.first().and_then(|p| p.riscv_float_class)
             {
                 space = (space + 15) & !15;
-                self.hfa_ret = Some((count, is_double, space));
+                self.hfa_ret = Some((count, elem_size, space));
                 space += 32;
             }
         }

@@ -37,7 +37,7 @@ pub enum CallArgClass {
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
     /// AArch64 HFA: `count` float or double members in consecutive FP
     /// registers starting at `first_fp_idx`.
-    StructHfaReg { first_fp_idx: usize, count: usize, is_double: bool, size: usize },
+    StructHfaReg { first_fp_idx: usize, count: usize, elem_size: usize, size: usize },
     /// Small struct where first eightbyte is INTEGER and second is SSE (mixed).
     StructMixedIntSseReg { int_reg_idx: usize, fp_reg_idx: usize, size: usize },
     /// Small struct where first eightbyte is SSE and second is INTEGER (mixed).
@@ -127,7 +127,7 @@ pub enum ParamClass {
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
     /// AArch64 HFA: `count` float or double members in consecutive FP
     /// registers starting at `first_fp_idx`.
-    StructHfaReg { first_fp_idx: usize, count: usize, is_double: bool },
+    StructHfaReg { first_fp_idx: usize, count: usize, elem_size: usize },
     /// Small struct: first eightbyte INTEGER, second SSE.
     /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
     #[allow(dead_code)] // size field not yet read by any backend
@@ -387,7 +387,7 @@ enum CoreArgClass {
     F128Stack,
     StructByValReg { base_reg_idx: usize, size: usize },
     StructSseReg { lo_fp_idx: usize, hi_fp_idx: Option<usize>, size: usize },
-    StructHfaReg { first_fp_idx: usize, count: usize, is_double: bool, size: usize },
+    StructHfaReg { first_fp_idx: usize, count: usize, elem_size: usize, size: usize },
     StructMixedIntSseReg { int_reg_idx: usize, fp_reg_idx: usize, size: usize },
     StructMixedSseIntReg { fp_reg_idx: usize, int_reg_idx: usize, size: usize },
     StructByValStack { size: usize },
@@ -435,14 +435,14 @@ fn classify_args_core(
 
             let eb_classes = info.eightbyte_classes;
 
-            if let (true, Some(crate::common::types::RiscvFloatClass::Hfa { count, is_double })) =
+            if let (true, Some(crate::common::types::RiscvFloatClass::Hfa { count, elem_size })) =
                 (config.use_hfa_classification, info.riscv_float_class)
             {
                 // AAPCS64 C.2/C.3: an HFA takes `count` consecutive FP registers,
                 // or if too few remain, goes wholly on the stack and no later
                 // argument may use an FP register.
                 if float_idx + count <= config.max_float_regs {
-                    result.push(CoreArgClass::StructHfaReg { first_fp_idx: float_idx, count, is_double, size });
+                    result.push(CoreArgClass::StructHfaReg { first_fp_idx: float_idx, count, elem_size, size });
                     float_idx += count;
                 } else {
                     result.push(CoreArgClass::StructByValStack { size });
@@ -651,7 +651,7 @@ pub fn classify_call_args(
         CoreArgClass::F128Stack => CallArgClass::F128Stack,
         CoreArgClass::StructByValReg { base_reg_idx, size } => CallArgClass::StructByValReg { base_reg_idx, size },
         CoreArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size } => CallArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size },
-        CoreArgClass::StructHfaReg { first_fp_idx, count, is_double, size } => CallArgClass::StructHfaReg { first_fp_idx, count, is_double, size },
+        CoreArgClass::StructHfaReg { first_fp_idx, count, elem_size, size } => CallArgClass::StructHfaReg { first_fp_idx, count, elem_size, size },
         CoreArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size } => CallArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size },
         CoreArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size } => CallArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size },
         CoreArgClass::StructByValStack { size } => CallArgClass::StructByValStack { size },
@@ -766,7 +766,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             CoreArgClass::I128RegPair { base_reg_idx } => ParamClass::I128RegPair { base_reg_idx },
             CoreArgClass::StructByValReg { base_reg_idx, size } => ParamClass::StructByValReg { base_reg_idx, size },
             CoreArgClass::StructSseReg { lo_fp_idx, hi_fp_idx, size } => ParamClass::StructSseReg { lo_fp_idx, hi_fp_idx, size },
-            CoreArgClass::StructHfaReg { first_fp_idx, count, is_double, .. } => ParamClass::StructHfaReg { first_fp_idx, count, is_double },
+            CoreArgClass::StructHfaReg { first_fp_idx, count, elem_size, .. } => ParamClass::StructHfaReg { first_fp_idx, count, elem_size },
             CoreArgClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size } => ParamClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size },
             CoreArgClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size } => ParamClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size },
             CoreArgClass::F128FpReg { reg_idx } => ParamClass::F128FpReg { reg_idx },

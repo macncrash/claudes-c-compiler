@@ -196,9 +196,9 @@ pub struct ArmCodegen {
     /// This includes all stack-passed scalars, F128, I128, and structs with alignment.
     pub(super) va_named_stack_bytes: usize,
     /// For a function returning an HFA (lowered as sret): (member count,
-    /// is_double) and the frame offset of the buffer the sret pointer (x8)
-    /// is pointed at, from which the return loads s0-s3/d0-d3.
-    pub(super) hfa_ret: Option<(usize, bool, i64)>,
+    /// member size) and the frame offset of the buffer the sret pointer (x8)
+    /// is pointed at, from which the return loads v0-v3.
+    pub(super) hfa_ret: Option<(usize, usize, i64)>,
     /// Scratch register index for inline asm GP register allocation
     pub(super) asm_scratch_idx: usize,
     /// Scratch register index for inline asm FP register allocation
@@ -1362,6 +1362,16 @@ impl ArmCodegen {
 
     /// Load the address represented by a pointer Value into the given register.
     /// For alloca values, computes the address; for others, loads the stored pointer.
+    /// The FP/SIMD register prefix for an HFA member (or short vector) of
+    /// `elem_size` bytes: s, d or q.
+    pub(super) fn hfa_reg_prefix(elem_size: usize) -> char {
+        match elem_size {
+            4 => 's',
+            8 => 'd',
+            _ => 'q',
+        }
+    }
+
     pub(super) fn load_ptr_to_reg(&mut self, ptr: &Value, reg: &str) {
         if let Some(slot) = self.state.get_slot(ptr.0) {
             if self.state.is_alloca(ptr.0) {
@@ -1649,9 +1659,9 @@ impl ArmCodegen {
                         self.state.emit_fmt(format_args!("    ldr {}, [x17, #8]", ARM_ARG_REGS[base_reg_idx + 1]));
                     }
                 }
-                CallArgClass::StructHfaReg { first_fp_idx, count, is_double, .. } => {
+                CallArgClass::StructHfaReg { first_fp_idx, count, elem_size, .. } => {
                     self.emit_load_arg_to_reg(arg, "x17", slot_adjust, 0, needs_adjusted_load);
-                    let (prefix, elem_size) = if is_double { ('d', 8) } else { ('s', 4) };
+                    let prefix = Self::hfa_reg_prefix(elem_size);
                     for k in 0..count {
                         self.state.emit_fmt(format_args!("    ldr {}{}, [x17, #{}]", prefix, first_fp_idx + k, k * elem_size));
                     }
@@ -1783,12 +1793,12 @@ impl ArmCodegen {
 
         // HFA params: copy each member from the saved Q area into the slot.
         for (i, _) in func.params.iter().enumerate() {
-            let ParamClass::StructHfaReg { first_fp_idx, count, is_double, .. } = param_classes[i] else { continue };
+            let ParamClass::StructHfaReg { first_fp_idx, count, elem_size, .. } = param_classes[i] else { continue };
             let Some((slot, _, _)) = self.resolve_param_slot(func, i) else { continue };
-            let (reg, elem_size) = if is_double { ("d0", 8) } else { ("s0", 4) };
+            let reg = format!("{}0", Self::hfa_reg_prefix(elem_size));
             for k in 0..count {
                 self.state.emit_fmt(format_args!("    ldr {}, [sp, #{}]", reg, (first_fp_idx + k) * 16));
-                self.emit_store_to_sp(reg, slot.0 + 128 + (k * elem_size) as i64, "str");
+                self.emit_store_to_sp(&reg, slot.0 + 128 + (k * elem_size) as i64, "str");
             }
         }
 
@@ -1836,9 +1846,9 @@ impl ArmCodegen {
         }
         // HFA params: store each member register into the struct's slot.
         for (i, _) in func.params.iter().enumerate() {
-            let ParamClass::StructHfaReg { first_fp_idx, count, is_double, .. } = param_classes[i] else { continue };
+            let ParamClass::StructHfaReg { first_fp_idx, count, elem_size, .. } = param_classes[i] else { continue };
             let Some((slot, _, _)) = self.resolve_param_slot(func, i) else { continue };
-            let (prefix, elem_size) = if is_double { ('d', 8) } else { ('s', 4) };
+            let prefix = Self::hfa_reg_prefix(elem_size);
             for k in 0..count {
                 self.emit_store_to_sp(&format!("{}{}", prefix, first_fp_idx + k), slot.0 + (k * elem_size) as i64, "str");
             }
@@ -2079,10 +2089,10 @@ impl ArchCodegen for ArmCodegen {
         let needs_adjusted = total_sp_adjust > 0;
         self.emit_load_arg_to_reg(sret_operand, "x8", slot_adjust, 0, needs_adjusted);
     }
-    fn emit_call_store_hfa_return(&mut self, sret_operand: &Operand, count: usize, is_double: bool) {
+    fn emit_call_store_hfa_return(&mut self, sret_operand: &Operand, count: usize, elem_size: usize) {
         // Runs after the call's stack cleanup, so slots need no adjustment.
         self.emit_load_arg_to_reg(sret_operand, "x17", 0, 0, false);
-        let (prefix, elem_size) = if is_double { ('d', 8) } else { ('s', 4) };
+        let prefix = Self::hfa_reg_prefix(elem_size);
         for k in 0..count {
             self.state.emit_fmt(format_args!("    str {}{}, [x17, #{}]", prefix, k, k * elem_size));
         }

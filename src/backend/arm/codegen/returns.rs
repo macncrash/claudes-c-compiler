@@ -7,9 +7,9 @@ use super::emit::ArmCodegen;
 impl ArmCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         // HFA return: the struct is in the frame buffer the sret pointer
-        // targets; hand it back in s0-s3/d0-d3.
-        if let Some((count, is_double, buf_offset)) = self.hfa_ret {
-            let (prefix, elem_size) = if is_double { ('d', 8) } else { ('s', 4) };
+        // targets; hand it back in v0-v3.
+        if let Some((count, elem_size, buf_offset)) = self.hfa_ret {
+            let prefix = Self::hfa_reg_prefix(elem_size);
             for k in 0..count {
                 self.emit_load_from_sp(&format!("{}{}", prefix, k), buf_offset + (k * elem_size) as i64, "ldr");
             }

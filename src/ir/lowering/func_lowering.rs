@@ -223,6 +223,9 @@ impl Lowerer {
                         let classes = layout.classify_sysv_eightbytes(ctx);
                         let rv_class = self.fp_struct_class(&layout, ctx);
                         (Some(layout.align), classes, rv_class)
+                    } else if param_ctype.is_vector() {
+                        // AArch64 short vectors arrive in one d/q register.
+                        (None, Vec::new(), self.hfa_class_of(&param_ctype))
                     } else {
                         (None, Vec::new(), None)
                     }

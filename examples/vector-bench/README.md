@@ -38,10 +38,12 @@ at the time of writing (`./vecbench`, Apple M-series):
 | `select`   |    27 |  659 | 1227 |
 | `dmix`     |   333 |  880 | 3493 |
 | `blend`    |    79 | 1103 | 3450 |
-| `call`     |   150 |  150 | 1193 |
+| `call`     |   150 |  138 | 1193 |
 
 "Before NEON codegen" lowered every vector operation lane by lane through
 memory. ccc now emits one NEON instruction per operation and keeps
-temporaries, local vector variables and loop-invariant constant broadcasts in
-NEON registers. `call` is unchanged because vector arguments and return
-values still pass through memory.
+temporaries, local vector variables, vector parameters and loop-invariant
+constant broadcasts in NEON registers. Vector arguments and return values use
+SIMD registers as AAPCS64 requires (the earlier general-register passing was
+faster here but did not interoperate with clang); `call` is still slow because
+both sides copy those registers through stack slots.

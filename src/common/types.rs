@@ -182,10 +182,12 @@ pub enum RiscvFloatClass {
         float_offset: usize,
     },
     /// AArch64 homogeneous floating-point aggregate: 1-4 members, all float
-    /// or all double (arrays and nested structs flattened). Passed in
-    /// consecutive s/d registers and returned in s0-s3/d0-d3. Produced only
-    /// for AArch64 targets, by `classify_hfa`.
-    Hfa { count: usize, is_double: bool },
+    /// or all double (arrays and nested structs flattened), or a short vector
+    /// (one 8- or 16-byte member). `elem_size` (4, 8 or 16) selects s, d or
+    /// q registers. Passed in consecutive FP/SIMD registers and returned in
+    /// v0-v3. Produced only for AArch64 targets, by `classify_hfa` and
+    /// `Lowerer::hfa_class_of`.
+    Hfa { count: usize, elem_size: usize },
 }
 
 /// Address space for pointer types (GCC named address space extension).
@@ -996,7 +998,7 @@ impl StructLayout {
         if float_fields.iter().any(|&(_, size)| size != elem_size) || self.size != count * elem_size {
             return None;
         }
-        Some(RiscvFloatClass::Hfa { count, is_double: elem_size == 8 })
+        Some(RiscvFloatClass::Hfa { count, elem_size })
     }
 
     /// Recursively collect scalar float and int fields from a struct.

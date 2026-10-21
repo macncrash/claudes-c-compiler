@@ -554,6 +554,14 @@ impl Lowerer {
             let is_bool_param = param_bool_flags.as_ref()
                 .is_some_and(|flags| i < flags.len() && flags[i]);
 
+            // A vector argument is passed by address like a struct; the
+            // parameter's IR type is its element type, so an implicit cast
+            // would convert the address to that type.
+            if self.get_expr_ctype(a).is_some_and(|ct| ct.is_vector()) {
+                arg_types.push(IrType::Ptr);
+                return val;
+            }
+
             if let Some(ref ptypes) = param_types {
                 if i < ptypes.len() {
                     let param_ty = ptypes[i];

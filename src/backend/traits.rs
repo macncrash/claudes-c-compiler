@@ -572,10 +572,10 @@ pub trait ArchCodegen {
 
         // Phase 5.5: AArch64 HFA return, lowered as sret: the callee left the
         // struct in s0-s3/d0-d3, so store it into the sret buffer.
-        if let (true, Some(Some(crate::common::types::RiscvFloatClass::Hfa { count, is_double }))) =
+        if let (true, Some(Some(crate::common::types::RiscvFloatClass::Hfa { count, elem_size }))) =
             (is_sret && config.use_hfa_classification, struct_arg_riscv_float_classes.first())
         {
-            self.emit_call_store_hfa_return(&args[0], *count, *is_double);
+            self.emit_call_store_hfa_return(&args[0], *count, *elem_size);
         }
 
         // Phase 6: Store return value.
@@ -639,7 +639,7 @@ pub trait ArchCodegen {
 
     /// Store an HFA returned in FP registers into the call's sret buffer
     /// (`sret_operand`). Required when `CallAbiConfig::use_hfa_classification`.
-    fn emit_call_store_hfa_return(&mut self, _sret_operand: &Operand, _count: usize, _is_double: bool) {
+    fn emit_call_store_hfa_return(&mut self, _sret_operand: &Operand, _count: usize, _elem_size: usize) {
         unreachable!("HFA returns need a backend with use_hfa_classification");
     }
 
