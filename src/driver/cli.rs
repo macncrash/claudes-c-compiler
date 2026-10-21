@@ -554,6 +554,8 @@ impl Driver {
                 "-fno-data-sections" => self.data_sections = false,
                 "-fcommon" => self.fcommon = true,
                 "-fno-common" => self.fcommon = false,
+                "-fwrapv" => self.fwrapv = true,
+                "-fno-wrapv" => self.fwrapv = false,
                 "-fgnu89-inline" => self.gnu89_inline = true,
                 "-fno-gnu89-inline" => self.gnu89_inline = false,
                 // Diagnostic color: -fdiagnostics-color, -fdiagnostics-color={auto,always,never}

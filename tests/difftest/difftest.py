@@ -96,7 +96,9 @@ class Test:
 
 # GCC torture tests that rely on target-specific options or GCC-only behavior
 # carry dg- directives; tests that require options we don't model are skipped.
-DG_SKIP = re.compile(r"dg-(require-effective-target|skip-if|additional-sources)|dg-options\s+\"[^\"]*-f(no-)?(trapv|wrapv|strict)")
+DG_SKIP = re.compile(r"dg-(require-effective-target|skip-if|additional-sources)|dg-options\s+\"[^\"]*-f(no-)?(trapv|strict)")
+# -fwrapv is modeled: both compilers get it (dg-options "..." or { "..." }).
+DG_WRAPV = re.compile(r"dg-options\s+\{?\s*\"[^\"]*-fwrapv")
 
 
 def discover(suite):
@@ -121,9 +123,11 @@ def discover(suite):
                 continue
             path = os.path.join(d, f)
             with open(path, errors="replace") as fh:
-                if DG_SKIP.search(fh.read()):
-                    continue
-            tests.append(Test(suite, f[:-2], path))
+                text = fh.read()
+            if DG_SKIP.search(text):
+                continue
+            flags = ["-fwrapv"] if DG_WRAPV.search(text) else []
+            tests.append(Test(suite, f[:-2], path, extra_flags=flags))
     else:
         raise SystemExit(f"unknown suite: {suite}")
     return tests

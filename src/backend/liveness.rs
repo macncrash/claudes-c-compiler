@@ -267,6 +267,12 @@ fn build_live_segments(
     let mut segs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); num_values];
     let mut first_seen: Vec<u32> = vec![u32::MAX; num_values];
     let mut touched: Vec<usize> = Vec::new();
+    // A value live into a block that is also defined there (a lowered phi:
+    // the loop's latch copy) is dead from its last use before that
+    // definition until the definition. Per block: (first def point, last
+    // use point before it).
+    let mut redef: Vec<(u32, u32)> = vec![(u32::MAX, u32::MAX); num_values];
+    let mut redef_touched: Vec<usize> = Vec::new();
 
     for (bi, block) in func.blocks.iter().enumerate() {
         let block_start = ps.block_start_points[bi];
@@ -284,19 +290,42 @@ fn build_live_segments(
         };
         for (i, inst) in block.instructions.iter().enumerate() {
             let point = block_start + i as u32;
+            let mut used_here = |vid: u32, redef: &mut [(u32, u32)]| {
+                if let Some(&dense) = id_to_dense.get(&vid) {
+                    if redef[dense].0 == u32::MAX {
+                        if redef[dense].1 == u32::MAX {
+                            redef_touched.push(dense);
+                        }
+                        redef[dense].1 = point;
+                    }
+                }
+            };
             for_each_operand_in_instruction(inst, |op| {
                 if let Operand::Value(v) = op {
                     note(v.0, point, &mut first_seen, &mut touched);
+                    used_here(v.0, &mut redef);
                 }
             });
-            for_each_value_use_in_instruction(inst, |v| note(v.0, point, &mut first_seen, &mut touched));
+            for_each_value_use_in_instruction(inst, |v| {
+                note(v.0, point, &mut first_seen, &mut touched);
+                used_here(v.0, &mut redef);
+            });
             if let Instruction::InlineAsm { outputs, .. } = inst {
                 for (_, out_val, _) in outputs {
                     note(out_val.0, point, &mut first_seen, &mut touched);
+                    used_here(out_val.0, &mut redef);
                 }
             }
             if let Some(dest) = inst.dest() {
                 note(dest.0, point, &mut first_seen, &mut touched);
+                if let Some(&dense) = id_to_dense.get(&dest.0) {
+                    if redef[dense].0 == u32::MAX {
+                        if redef[dense].1 == u32::MAX {
+                            redef_touched.push(dense);
+                        }
+                        redef[dense].0 = point;
+                    }
+                }
             }
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
@@ -305,7 +334,7 @@ fn build_live_segments(
             }
         });
 
-        let mut add = |dense: usize, lo: u32| {
+        let mut add = |dense: usize, lo: u32, cap: u32| {
             let iv_start = ps.def_points[dense];
             if iv_start == u32::MAX {
                 return;
@@ -313,7 +342,7 @@ fn build_live_segments(
             let last = ps.last_use_points[dense];
             let iv_end = if last == u32::MAX { iv_start } else { last.max(iv_start) };
             let lo = lo.max(iv_start);
-            let hi = if live_out[bi].contains(dense) { block_end } else { block_end.min(iv_end) };
+            let hi = if live_out[bi].contains(dense) { block_end } else { block_end.min(iv_end) }.min(cap);
             if hi < lo {
                 return;
             }
@@ -323,10 +352,22 @@ fn build_live_segments(
                 _ => list.push((lo, hi)),
             }
         };
-        live_in[bi].for_each_set_bit(|dense| add(dense, block_start));
+        live_in[bi].for_each_set_bit(|dense| match redef[dense] {
+            // Live in, last read at `used`, then redefined at `def`: two
+            // pieces. (Live in with no read before the redefinition can only
+            // be over-approximated liveness; keep the whole block.)
+            (def, used) if def != u32::MAX && used != u32::MAX && used < def => {
+                add(dense, block_start, used);
+                add(dense, def, u32::MAX);
+            }
+            _ => add(dense, block_start, u32::MAX),
+        });
+        for dense in redef_touched.drain(..) {
+            redef[dense] = (u32::MAX, u32::MAX);
+        }
         for &dense in &touched {
             if !live_in[bi].contains(dense) {
-                add(dense, first_seen[dense]);
+                add(dense, first_seen[dense], u32::MAX);
             }
             first_seen[dense] = u32::MAX;
         }

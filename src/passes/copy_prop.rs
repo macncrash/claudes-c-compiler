@@ -190,7 +190,7 @@ fn resolve_chain_with_compression(copies: &mut [Option<Operand>], start: u32) {
 
 /// Replace operands in an instruction that reference copied values.
 /// Returns the number of replacements made.
-fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Operand>]) -> usize {
+pub(crate) fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Operand>]) -> usize {
     let mut count = 0;
 
     match inst {
@@ -320,7 +320,7 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
 }
 
 /// Replace operands in a terminator.
-fn replace_operands_in_terminator(term: &mut Terminator, copy_map: &[Option<Operand>]) -> usize {
+pub(crate) fn replace_operands_in_terminator(term: &mut Terminator, copy_map: &[Option<Operand>]) -> usize {
     let mut count = 0;
     match term {
         Terminator::Return(Some(val)) => {

@@ -74,6 +74,12 @@ pub struct RegAllocConfig {
     /// Whether Memcpy pointer operands may be register-allocated. Requires a
     /// backend whose memcpy reads register-assigned pointers (AArch64).
     pub allow_memcpy_regalloc: bool,
+    /// Whether the dest of a Copy, Cast, BinOp, UnaryOp, Cmp, GEP or Load
+    /// may share a register with an operand whose live range ends at that
+    /// instruction (`i = i + 1` in place, and a loop's latch copy becoming
+    /// a no-op). Requires a backend that reads every operand of those
+    /// instructions before writing the dest's register (AArch64).
+    pub dest_reuses_operand_reg: bool,
 }
 
 /// Run the linear scan register allocator on a function.
@@ -231,27 +237,60 @@ pub fn allocate_registers(
     // Candidates are assigned in priority order, not program order, so each
     // register keeps all its intervals and a candidate may fill any gap.
     // Intervals are inclusive, so a value used by the instruction that defines
-    // another never shares its register.
+    // another never shares its register, except at the instructions in
+    // `reuse_points` (see RegAllocConfig::dest_reuses_operand_reg).
+    let reuse_points = if config.dest_reuses_operand_reg { dest_reuse_points(func) } else { FxHashMap::default() };
+    // Whether a piece of `a` ending at `p` and a piece of `b` starting there
+    // may share a register: the instruction at `p` defines `b` and reads `a`.
+    let handoff = |a: u32, b: u32, p: u32| {
+        reuse_points.get(&p).is_some_and(|(dest, ops)| *dest == b && ops.contains(&a))
+    };
     let callee = &config.available_regs;
     let caller = &config.caller_saved_regs;
-    let mut callee_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); callee.len()];
-    let mut caller_busy: Vec<Vec<(u32, u32)>> = vec![Vec::new(); caller.len()];
-    let fits = |busy: &[(u32, u32)], segs: &[(u32, u32)]| {
-        segs.iter().all(|&(lo, hi)| busy.iter().all(|&(s, e)| hi < s || lo > e))
+    // Each register's busy pieces: (start, end, value).
+    let mut callee_busy: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); callee.len()];
+    let mut caller_busy: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); caller.len()];
+    let fits = |busy: &[(u32, u32, u32)], segs: &[(u32, u32)], v: u32| {
+        segs.iter().all(|&(lo, hi)| busy.iter().all(|&(s, e, w)| {
+            hi < s || lo > e || (e == lo && handoff(w, v, lo)) || (hi == s && handoff(v, w, s))
+        }))
     };
     // Prefer a callee-saved register that is already saved by the prologue.
-    let pick_callee = |busy: &[Vec<(u32, u32)>], segs: &[(u32, u32)]| {
-        let free = || (0..callee.len()).filter(|&i| fits(&busy[i], segs));
+    let pick_callee = |busy: &[Vec<(u32, u32, u32)>], segs: &[(u32, u32)], v: u32| {
+        let free = || (0..callee.len()).filter(|&i| fits(&busy[i], segs, v));
         free().find(|&i| !busy[i].is_empty()).or_else(|| free().next())
+    };
+    let occupy = |busy: &mut Vec<(u32, u32, u32)>, segs: &[(u32, u32)], v: u32| {
+        busy.extend(segs.iter().map(|&(lo, hi)| (lo, hi, v)));
+    };
+    // Values that may hand a register to each other at a reuse point. A
+    // candidate first tries its assigned partners' registers, so that the
+    // handoff actually happens (`add x20, x20, #1`, no copy).
+    let mut partners: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (dest, ops) in reuse_points.values() {
+        for &op in ops {
+            partners.entry(*dest).or_default().push(op);
+            partners.entry(op).or_default().push(*dest);
+        }
+    }
+    let partner_reg = |v: u32, assignments: &FxHashMap<u32, PhysReg>, pool: &[PhysReg],
+                       busy: &[Vec<(u32, u32, u32)>], segs: &[(u32, u32)]| {
+        partners.get(&v)?.iter()
+            .filter_map(|p| assignments.get(p))
+            .filter_map(|r| pool.iter().position(|x| x == r))
+            .find(|&i| fits(&busy[i], segs, v))
     };
     let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
 
     // Phase 1: Callee-saved registers for call-spanning values.
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(true)) {
         let segs = liveness.segments_of(interval);
-        if let Some(i) = pick_callee(&callee_busy, &segs) {
-            callee_busy[i].extend_from_slice(&segs);
-            assignments.insert(interval.value_id, callee[i]);
+        let v = interval.value_id;
+        let pick = partner_reg(v, &assignments, callee, &callee_busy, &segs)
+            .or_else(|| pick_callee(&callee_busy, &segs, v));
+        if let Some(i) = pick {
+            occupy(&mut callee_busy[i], &segs, v);
+            assignments.insert(v, callee[i]);
         }
     }
 
@@ -262,12 +301,18 @@ pub fn allocate_registers(
     // loops).
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(false)) {
         let segs = liveness.segments_of(interval);
-        if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], &segs)) {
-            caller_busy[i].extend_from_slice(&segs);
-            assignments.insert(interval.value_id, caller[i]);
-        } else if let Some(i) = pick_callee(&callee_busy, &segs) {
-            callee_busy[i].extend_from_slice(&segs);
-            assignments.insert(interval.value_id, callee[i]);
+        let v = interval.value_id;
+        if let Some(i) = partner_reg(v, &assignments, callee, &callee_busy, &segs) {
+            occupy(&mut callee_busy[i], &segs, v);
+            assignments.insert(v, callee[i]);
+        } else if let Some(i) = partner_reg(v, &assignments, caller, &caller_busy, &segs)
+            .or_else(|| (0..caller.len()).find(|&i| fits(&caller_busy[i], &segs, v)))
+        {
+            occupy(&mut caller_busy[i], &segs, v);
+            assignments.insert(v, caller[i]);
+        } else if let Some(i) = pick_callee(&callee_busy, &segs, v) {
+            occupy(&mut callee_busy[i], &segs, v);
+            assignments.insert(v, callee[i]);
         }
     }
 
@@ -298,6 +343,34 @@ pub fn allocate_registers(
         used_regs,
         liveness: Some(liveness),
     }
+}
+
+/// Program points (numbered as in liveness: one per instruction, then one
+/// for the block's terminator) of the instructions whose dest may take the
+/// register of an operand that dies there: point -> (dest, operands).
+fn dest_reuse_points(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<u32>)> {
+    let mut points = FxHashMap::default();
+    let mut point = 0u32;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let simple = matches!(inst,
+                Instruction::Copy { .. } | Instruction::Cast { .. } | Instruction::BinOp { .. }
+                | Instruction::UnaryOp { .. } | Instruction::Cmp { .. }
+                | Instruction::GetElementPtr { .. } | Instruction::Load { .. });
+            if let (true, Some(dest)) = (simple, inst.dest()) {
+                let mut ops = Vec::new();
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        ops.push(v.0);
+                    }
+                });
+                points.insert(point, (dest.0, ops));
+            }
+            point += 1;
+        }
+        point += 1;
+    }
+    points
 }
 
 /// Count uses per value, weighted by loop depth: a use inside a loop at depth D

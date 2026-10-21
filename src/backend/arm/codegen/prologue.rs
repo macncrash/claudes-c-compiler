@@ -78,6 +78,7 @@ impl ArmCodegen {
             false,
             true, // argument setup leaves x10-x15 intact (calls.rs)
             true, // memcpy reads register-assigned pointers (memory.rs)
+            true, // simple ops read their operands before writing the dest
         );
 
         // FP registers for F32/F64 values. Skipped for variadic functions

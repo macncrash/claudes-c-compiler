@@ -647,8 +647,14 @@ impl ArmCodegen {
         }
     }
 
-    /// Check if an IrConst is a small unsigned immediate that fits in AArch64
-    /// `cmp Xn, #imm12` instruction (0..=4095).
+    /// Whether `v` fits an add/sub immediate: 0..=4095, optionally shifted
+    /// left by 12 (written unshifted; assemblers pick the `lsl #12` form).
+    fn is_add_sub_imm(v: i64) -> bool {
+        (0..=0xfff).contains(&v) || (v & 0xfff == 0 && (0..=0xfff_000).contains(&v))
+    }
+
+    /// Check if an IrConst is an unsigned immediate that fits in an AArch64
+    /// `cmp Xn, #imm` instruction (see is_add_sub_imm).
     fn const_as_cmp_imm12(c: &IrConst) -> Option<u64> {
         let v = match c {
             IrConst::I8(v) => *v as i64,
@@ -658,17 +664,15 @@ impl ArmCodegen {
             IrConst::Zero => 0,
             _ => return None,
         };
-        // AArch64 cmp (alias of subs) accepts unsigned 12-bit immediate (0..4095),
-        // optionally shifted left by 12. We only use the unshifted form.
-        if (0..=4095).contains(&v) {
+        if Self::is_add_sub_imm(v) {
             Some(v as u64)
         } else {
             None
         }
     }
 
-    /// Check if an IrConst is a small negative value that can use `cmn Xn, #imm12`
-    /// (i.e., the negated value fits in 0..=4095).
+    /// Check if an IrConst is a negative value that can use `cmn Xn, #imm`
+    /// (i.e., the negated value fits, see is_add_sub_imm).
     fn const_as_cmn_imm12(c: &IrConst) -> Option<u64> {
         let v = match c {
             IrConst::I8(v) => *v as i64,
@@ -678,7 +682,7 @@ impl ArmCodegen {
             _ => return None,
         };
         let neg = v.checked_neg()?;
-        if (1..=4095).contains(&neg) {
+        if neg > 0 && Self::is_add_sub_imm(neg) {
             Some(neg as u64)
         } else {
             None

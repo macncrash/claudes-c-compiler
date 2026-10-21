@@ -20,6 +20,7 @@ pub(crate) mod if_convert;
 pub(crate) mod inline;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
+pub(crate) mod iv_widen;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
 pub(crate) mod narrow;
@@ -266,7 +267,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
 /// like the Linux kernel depend on (e.g., `BUILD_BUG()` uses `__OPTIMIZE__` to
 /// select between a noreturn function call and a no-op). The actual pass pipeline
 /// is unaffected by these flags.
-pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::backend::Target) {
+pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::backend::Target, wrapv: bool) {
     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     if disabled.contains("all") {
         return;
@@ -537,6 +538,18 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
         // Prepare dirty set for next iteration: only re-visit functions that changed.
         std::mem::swap(&mut dirty, &mut changed);
+    }
+
+    // Phase 10b: Widen signed 32-bit loop counters to 64 bits (after narrowing
+    // has produced their I32 increments), then fold the copies it leaves.
+    // Not with -fwrapv: the widened counter assumes signed overflow is UB.
+    if !wrapv && !disabled.contains("iv_widen") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if iv_widen::widen_function(func) > 0 {
+                copy_prop::propagate_copies(func);
+                dce::eliminate_dead_code(func);
+            }
+        }
     }
 
     // Phase 11: Dead static function elimination.

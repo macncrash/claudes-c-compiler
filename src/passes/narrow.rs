@@ -150,7 +150,31 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
 
     let mut narrowed_map: Vec<Option<IrType>> = vec![None; max_id + 1];
 
-    changes += narrow_binops_with_cast(func, &binop_map, &use_counts, &widen_map, &mut narrowed_map);
+    // Values defined with a sub-64-bit integer type. Phase 4 truncates the
+    // result, so such a value can be used as is: the low bits of the result
+    // depend only on the low bits of the operands. (Lowering's widening
+    // casts are often folded away by the time loop counters reach here,
+    // leaving `Add I64 %i32_phi, 1` followed by a truncation.)
+    let mut narrow_def_map: Vec<Option<IrType>> = vec![None; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let def = match inst {
+                Instruction::Phi { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. }
+                | Instruction::ParamRef { dest, ty, .. }
+                | Instruction::BinOp { dest, ty, .. } => Some((*dest, *ty)),
+                Instruction::Cast { dest, to_ty, .. } => Some((*dest, *to_ty)),
+                _ => None,
+            };
+            if let Some((dest, ty)) = def {
+                if ty.is_integer() && ty.size() < 8 && (dest.0 as usize) <= max_id {
+                    narrow_def_map[dest.0 as usize] = Some(ty);
+                }
+            }
+        }
+    }
+
+    changes += narrow_binops_with_cast(func, &binop_map, &use_counts, &widen_map, &narrow_def_map, &mut narrowed_map);
     changes += narrow_binops_without_cast(func, &use_counts, &widen_map, &mut narrowed_map);
     changes += narrow_cmps(func, &widen_map);
 
@@ -168,6 +192,7 @@ fn narrow_binops_with_cast(
     binop_map: &[Option<BinOpDef>],
     use_counts: &[u32],
     widen_map: &[Option<CastInfo>],
+    narrow_def_map: &[Option<IrType>],
     narrowed_map: &mut [Option<IrType>],
 ) -> usize {
     let max_id = narrowed_map.len() - 1;
@@ -229,8 +254,8 @@ fn narrow_binops_with_cast(
                     continue;
                 }
 
-                let narrow_lhs = try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
-                let narrow_rhs = try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map);
+                let narrow_lhs = try_narrow_operand(&binop_info.lhs, *to_ty, Some(narrow_def_map), widen_map, narrowed_map);
+                let narrow_rhs = try_narrow_operand(&binop_info.rhs, *to_ty, Some(narrow_def_map), widen_map, narrowed_map);
 
                 if let (Some(new_lhs), Some(new_rhs)) = (narrow_lhs, narrow_rhs) {
                     let narrow_dest = *dest;

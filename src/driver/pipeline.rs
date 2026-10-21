@@ -218,6 +218,9 @@ pub struct Driver {
     /// When false (-fno-common, the default), tentative definitions go to BSS with
     /// strong linkage, and duplicate definitions cause link errors.
     pub(super) fcommon: bool,
+    /// Signed overflow wraps (-fwrapv), so optimizations may not assume it
+    /// never happens (see passes::iv_widen).
+    pub(super) fwrapv: bool,
     /// Number of integer arguments to pass in registers for i686 (-mregparm=N).
     /// 0 = standard cdecl (all on stack), 1-3 = pass first N int args in EAX/EDX/ECX.
     pub(super) regparm: u8,
@@ -297,6 +300,7 @@ impl Driver {
             dump_defines: false,
             color_mode: ColorMode::Auto,
             fcommon: false,
+            fwrapv: false,
             regparm: 0,
             omit_frame_pointer: false,
             no_unwind_tables: false,
@@ -1098,7 +1102,7 @@ impl Driver {
         if time_phases { eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64()); }
 
         let t6 = std::time::Instant::now();
-        run_passes(&mut module, self.opt_level, self.target);
+        run_passes(&mut module, self.opt_level, self.target, self.fwrapv);
         if time_phases { eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64()); }
 
         // Lower SSA phi nodes to copies before codegen
