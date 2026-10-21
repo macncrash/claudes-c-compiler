@@ -1,6 +1,6 @@
 //! ArmCodegen: prologue/epilogue and stack frame operations.
 
-use crate::ir::reexports::{IrFunction, Instruction, Value};
+use crate::ir::reexports::{IrFunction, Instruction, Operand, Terminator, Value};
 use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{ParamClass, classify_params};
@@ -174,6 +174,18 @@ impl ArmCodegen {
                 space = (space + 15) & !15;
                 self.hfa_ret = Some((count, elem_size, space));
                 space += 32;
+            }
+        }
+        self.hfa_ret_copies.clear();
+        self.hfa_ret_loaded = false;
+        if let Some((count, elem_size, _)) = self.hfa_ret {
+            for block in &func.blocks {
+                let Terminator::Return(Some(Operand::Value(ret))) = &block.terminator else { continue };
+                if let Some(Instruction::Memcpy { dest, src, size }) = block.instructions.last() {
+                    if dest == ret && *size == count * elem_size {
+                        self.hfa_ret_copies.insert((dest.0, src.0));
+                    }
+                }
             }
         }
 

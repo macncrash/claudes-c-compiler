@@ -14,7 +14,7 @@ use crate::ir::reexports::{
     VecElem,
 };
 use crate::common::types::IrType;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::backend::common::PtrDirective;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
@@ -232,6 +232,12 @@ pub struct ArmCodegen {
     /// Vector parameters kept in a register: (parameter alloca, register,
     /// size). Loaded once the prologue has stored them (emit_vec_param_loads).
     pub(super) vec_param_loads: Vec<(Value, u8, u8)>,
+    /// HFA return: the (dest, src) of each Memcpy into the return buffer
+    /// that directly precedes the Return. It loads the result registers
+    /// from `src` instead (emit_hfa_ret_copy) and sets `hfa_ret_loaded`, so
+    /// the Return skips the buffer.
+    pub(super) hfa_ret_copies: FxHashSet<(u32, u32)>,
+    pub(super) hfa_ret_loaded: bool,
     /// Which callee-saved FP registers (d8-d15) are used (for save/restore).
     pub(super) used_fp_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved FP registers are stored.
@@ -271,6 +277,8 @@ impl ArmCodegen {
             vec_lanes: FxHashMap::default(),
             vec_consts: Vec::new(),
             vec_param_loads: Vec::new(),
+            hfa_ret_copies: FxHashSet::default(),
+            hfa_ret_loaded: false,
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
             prestore_regs: Vec::new(),
@@ -1847,7 +1855,14 @@ impl ArmCodegen {
         // HFA params: store each member register into the struct's slot.
         for (i, _) in func.params.iter().enumerate() {
             let ParamClass::StructHfaReg { first_fp_idx, count, elem_size, .. } = param_classes[i] else { continue };
-            let Some((slot, _, _)) = self.resolve_param_slot(func, i) else { continue };
+            let Some((slot, _, dest)) = self.resolve_param_slot(func, i) else { continue };
+            // A vector parameter kept in a NEON register moves straight there
+            // and skips its slot (and emit_vec_param_loads).
+            if let Some(pos) = self.vec_param_loads.iter().position(|p| p.0 == dest && count == 1) {
+                let reg = self.vec_param_loads.remove(pos).1;
+                self.state.emit_fmt(format_args!("    orr v{reg}.16b, v{first_fp_idx}.16b, v{first_fp_idx}.16b"));
+                continue;
+            }
             let prefix = Self::hfa_reg_prefix(elem_size);
             for k in 0..count {
                 self.emit_store_to_sp(&format!("{}{}", prefix, first_fp_idx + k), slot.0 + (k * elem_size) as i64, "str");
@@ -2070,7 +2085,9 @@ impl ArchCodegen for ArmCodegen {
     fn emit_memcpy_store_dest_from_acc(&mut self) { }
     fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    mov x10, x9"); }
     fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
-        if !self.try_emit_vec_copy(dest, src, size) {
+        if self.hfa_ret_copies.contains(&(dest.0, src.0)) {
+            self.emit_hfa_ret_copy(src);
+        } else if !self.try_emit_vec_copy(dest, src, size) {
             self.emit_memcpy_arm(dest, src, size);
         }
     }
@@ -2090,6 +2107,13 @@ impl ArchCodegen for ArmCodegen {
         self.emit_load_arg_to_reg(sret_operand, "x8", slot_adjust, 0, needs_adjusted);
     }
     fn emit_call_store_hfa_return(&mut self, sret_operand: &Operand, count: usize, elem_size: usize) {
+        // A vector result buffer held in a register (assign_vec_temp_regs).
+        if let Operand::Value(v) = sret_operand {
+            if let Some(&reg) = self.vec_regs.get(&v.0).filter(|_| count == 1) {
+                self.state.emit_fmt(format_args!("    orr v{reg}.16b, v0.16b, v0.16b"));
+                return;
+            }
+        }
         // Runs after the call's stack cleanup, so slots need no adjustment.
         self.emit_load_arg_to_reg(sret_operand, "x17", 0, 0, false);
         let prefix = Self::hfa_reg_prefix(elem_size);

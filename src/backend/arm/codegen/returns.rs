@@ -8,10 +8,13 @@ impl ArmCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         // HFA return: the struct is in the frame buffer the sret pointer
         // targets; hand it back in v0-v3.
+        // Skipped when the copy into the buffer already loaded them.
         if let Some((count, elem_size, buf_offset)) = self.hfa_ret {
-            let prefix = Self::hfa_reg_prefix(elem_size);
-            for k in 0..count {
-                self.emit_load_from_sp(&format!("{}{}", prefix, k), buf_offset + (k * elem_size) as i64, "ldr");
+            if !std::mem::take(&mut self.hfa_ret_loaded) {
+                let prefix = Self::hfa_reg_prefix(elem_size);
+                for k in 0..count {
+                    self.emit_load_from_sp(&format!("{}{}", prefix, k), buf_offset + (k * elem_size) as i64, "ldr");
+                }
             }
             self.emit_epilogue_and_ret_impl(frame_size);
             return;
@@ -25,6 +28,33 @@ impl ArmCodegen {
             }
         }
         crate::backend::traits::emit_return_default(self, val, frame_size);
+    }
+
+    /// The copy of an HFA return value into the return buffer, just before
+    /// the Return (see `hfa_ret_copies`): load the result registers straight
+    /// from `src` (a register move for a vector held in one).
+    pub(super) fn emit_hfa_ret_copy(&mut self, src: &Value) {
+        let Some((count, elem_size, _)) = self.hfa_ret else { return };
+        if let Some(&reg) = self.vec_regs.get(&src.0).filter(|_| count == 1) {
+            self.state.emit_fmt(format_args!("    orr v0.16b, v{reg}.16b, v{reg}.16b"));
+        } else {
+            let prefix = Self::hfa_reg_prefix(elem_size);
+            let slot = match self.state.resolve_slot_addr(src.0) {
+                Some(crate::backend::state::SlotAddr::Direct(slot)) => Some(slot.0),
+                _ => {
+                    self.operand_to_x0(&Operand::Value(*src));
+                    None
+                }
+            };
+            for k in 0..count {
+                let (reg, off) = (format!("{prefix}{k}"), (k * elem_size) as i64);
+                match slot {
+                    Some(s) => self.emit_load_from_sp(&reg, s + off, "ldr"),
+                    None => self.state.emit_fmt(format_args!("    ldr {reg}, [x0, #{off}]")),
+                }
+            }
+        }
+        self.hfa_ret_loaded = true;
     }
 
     pub(super) fn emit_return_i128_to_regs_impl(&mut self) {

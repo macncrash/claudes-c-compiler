@@ -3,10 +3,10 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, IrFunction, Operand, Terminator, Value, VecElem, VecOpKind};
+use crate::ir::reexports::{CallInfo, Instruction, IntrinsicOp, IrConst, IrFunction, Operand, Terminator, Value, VecElem, VecOpKind};
 use crate::backend::state::SlotAddr;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::IrType;
+use crate::common::types::{IrType, RiscvFloatClass};
 use super::emit::{ARM_VEC_TEMP_REGS, ARM_VEC_VAR_REGS};
 use super::emit::ArmCodegen;
 
@@ -336,6 +336,22 @@ impl ArmCodegen {
                         kinds.push((dest.0, 2));
                         kinds.push((src.0, if alloca_sizes.get(&src.0) == Some(size) { 1 } else { 2 }));
                     }
+                    // A call returning a short vector in v0 writes its result
+                    // buffer (emit_call_store_hfa_return), like a VecOp.
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
+                        if Self::vec_ret_buffer(info).is_some() =>
+                    {
+                        let buf = Self::vec_ret_buffer(info);
+                        if let Instruction::CallIndirect { func_ptr: Operand::Value(v), .. } = inst {
+                            kinds.push((v.0, 2));
+                        }
+                        for arg in &info.args {
+                            if let Operand::Value(v) = arg {
+                                let whole = buf.is_some_and(|(b, n)| b == v.0 && alloca_sizes.get(&b) == Some(&n));
+                                kinds.push((v.0, if whole { 0 } else { 2 }));
+                            }
+                        }
+                    }
                     Instruction::InlineAsm { .. } => return FxHashMap::default(),
                     other => other.for_each_used_value(|id| kinds.push((id, 2))),
                 }
@@ -379,6 +395,16 @@ impl ArmCodegen {
             }
         }
         regs
+    }
+
+    /// The result buffer of a call returning a one-member HFA (a short
+    /// vector) in v0: (buffer value, size).
+    fn vec_ret_buffer(info: &CallInfo) -> Option<(u32, usize)> {
+        match (info.is_sret, info.struct_arg_riscv_float_classes.first(), info.args.first()) {
+            (true, Some(Some(RiscvFloatClass::Hfa { count: 1, elem_size })), Some(Operand::Value(v))) =>
+                Some((v.0, *elem_size)),
+            _ => None,
+        }
     }
 
     /// Whether an instruction may clobber v16-v31, which hold vector
