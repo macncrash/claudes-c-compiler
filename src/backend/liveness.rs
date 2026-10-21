@@ -271,7 +271,7 @@ fn build_live_segments(
     for (bi, block) in func.blocks.iter().enumerate() {
         let block_start = ps.block_start_points[bi];
         let block_end = ps.block_end_points[bi];
-        let mut note = |vid: u32, point: u32, first_seen: &mut [u32], touched: &mut Vec<usize>| {
+        let note = |vid: u32, point: u32, first_seen: &mut [u32], touched: &mut Vec<usize>| {
             if alloca_set.contains(&vid) {
                 return;
             }
