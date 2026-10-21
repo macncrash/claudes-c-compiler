@@ -77,13 +77,15 @@ impl ArmCodegen {
     }
 
     /// Pick the vector variables that can live in a NEON register
-    /// (ARM_VEC_VAR_REGS) for the whole function: an 8- or 16-byte local
-    /// (not a parameter, not volatile or over-aligned) that some VecOp uses
+    /// (ARM_VEC_VAR_REGS) for the whole function: an 8- or 16-byte local or
+    /// parameter (not volatile or over-aligned) that some VecOp uses
     /// and whose address never escapes. Every use of the alloca, or of a
     /// constant GEP from it, must be a whole read or write by a VecOp or
     /// Memcpy, or a load or store of one aligned lane of up to 8 bytes.
     /// Calls and other instructions that may clobber v16-v31 spill and
-    /// reload the register around themselves (spill_vec_vars).
+    /// reload the register around themselves (spill_vec_vars). A parameter
+    /// is loaded into its register once the prologue has stored it
+    /// (emit_vec_param_loads).
     ///
     /// Temporaries (`temps`) are not candidates. Returns (alloca ->
     /// register, each variable's (register, size), lane pointer ->
@@ -100,8 +102,7 @@ impl ArmCodegen {
         let mut size_of: FxHashMap<u32, i64> = insts()
             .filter_map(|inst| match inst {
                 Instruction::Alloca { dest, size: size @ (8 | 16), align, volatile: false, .. }
-                    if *align <= 16 && !func.param_alloca_values.contains(dest)
-                        && !temps.contains_key(&dest.0) =>
+                    if *align <= 16 && !temps.contains_key(&dest.0) =>
                     Some((dest.0, *size as i64)),
                 _ => None,
             })
@@ -483,6 +484,15 @@ impl ArmCodegen {
         counts.into_iter().zip(free_regs.iter())
             .map(|((c, e, b, _), &reg)| (c, e, b, reg))
             .collect()
+    }
+
+    /// Load vector parameters kept in registers from the slots the
+    /// parameter stores just wrote.
+    pub(super) fn emit_vec_param_loads(&mut self) {
+        for (param, reg, size) in self.vec_param_loads.clone() {
+            let width = if size == 16 { "q" } else { "d" };
+            self.vec_mem_access("ldr", &format!("{width}{reg}"), &param);
+        }
     }
 
     /// Materialize the hoisted constant broadcasts in their registers.

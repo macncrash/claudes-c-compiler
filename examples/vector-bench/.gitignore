@@ -1,0 +1,4 @@
+/vecbench
+/vecbench-clang
+/build-*.txt
+/build-*.cmp

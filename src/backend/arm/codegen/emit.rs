@@ -229,6 +229,9 @@ pub struct ArmCodegen {
     /// Built after the parameter stores and rebuilt after anything that may
     /// clobber v16-v31 (emit_vec_consts).
     pub(super) vec_consts: Vec<(IrConst, VecElem, u8, u8)>,
+    /// Vector parameters kept in a register: (parameter alloca, register,
+    /// size). Loaded once the prologue has stored them (emit_vec_param_loads).
+    pub(super) vec_param_loads: Vec<(Value, u8, u8)>,
     /// Which callee-saved FP registers (d8-d15) are used (for save/restore).
     pub(super) used_fp_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved FP registers are stored.
@@ -267,6 +270,7 @@ impl ArmCodegen {
             vec_vars: Vec::new(),
             vec_lanes: FxHashMap::default(),
             vec_consts: Vec::new(),
+            vec_param_loads: Vec::new(),
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
             prestore_regs: Vec::new(),

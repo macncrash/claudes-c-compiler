@@ -23,6 +23,13 @@ impl ArmCodegen {
         let (var_regs, vars, lanes) = Self::assign_vec_var_regs(func, &temp_regs);
         self.vec_regs = var_regs.into_iter().chain(temp_regs).collect();
         self.vec_vars = vars.into_iter().map(|(reg, size)| (reg, size, 0)).collect();
+        self.vec_param_loads = func.param_alloca_values.iter()
+            .filter_map(|p| {
+                let reg = *self.vec_regs.get(&p.0)?;
+                let size = self.vec_vars.iter().find(|v| v.0 == reg)?.1;
+                Some((*p, reg, size))
+            })
+            .collect();
         self.vec_lanes = lanes;
         let free: Vec<u8> = super::emit::ARM_VEC_VAR_REGS.iter().copied()
             .filter(|r| !self.vec_regs.values().any(|v| v == r))
@@ -422,6 +429,7 @@ impl ArmCodegen {
         self.emit_store_gp_params(func, &param_classes);
         self.emit_store_fp_params(func, &param_classes);
         self.emit_store_stack_params(func, &param_classes);
+        self.emit_vec_param_loads();
         self.emit_vec_consts();
     }
 
