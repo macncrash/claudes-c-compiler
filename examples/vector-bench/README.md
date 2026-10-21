@@ -29,16 +29,17 @@ make bench           # ccc and clang builds; check lines must be identical
 ```
 
 `make check` passes with ccc on arm64 macOS. Millions of vectors per second
-at the time of writing (`./vecbench`, Apple M-series):
+at the time of writing (`./vecbench`, Apple M-series; median of several runs
+after the first, which is consistently slower):
 
 | kernel     | ccc before NEON codegen | ccc | clang -O2 |
 |------------|------:|------:|------:|
-| `saxpy`    |   249 | 3290 | 3498 |
-| `xorshift` |    82 | 1820 | 1997 |
-| `select`   |    27 | 1130 | 1227 |
-| `dmix`     |   333 | 3260 | 3493 |
-| `blend`    |    79 | 2750 | 3450 |
-| `call`     |   150 | 1110 | 1193 |
+| `saxpy`    |   249 | 3800 | 3660 |
+| `xorshift` |    82 | 1820 | 2070 |
+| `select`   |    27 | 1140 | 1315 |
+| `dmix`     |   333 | 3320 | 3700 |
+| `blend`    |    79 | 3720 | 3570 |
+| `call`     |   150 | 1125 | 1250 |
 
 "Before NEON codegen" lowered every vector operation lane by lane through
 memory. ccc now emits one NEON instruction per operation and keeps
