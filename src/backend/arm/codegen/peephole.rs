@@ -977,7 +977,7 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
         | "umull" | "smulh" | "umulh" | "sdiv" | "udiv" | "neg" | "mvn" | "sxtw" | "sxth"
         | "sxtb" | "uxtb" | "uxth" | "cset" | "csetm" | "csel" | "csinc" | "csinv"
         | "csneg" | "cinc" | "clz" | "rbit" | "rev" | "rev16" | "rev32" | "ubfx" | "sbfx"
-        | "ubfiz" | "sbfiz" | "fmov" | "fcvtzs" | "fcvtzu" if !has_symbol => {
+        | "ubfiz" | "sbfiz" | "fmov" | "fcvtzs" | "fcvtzu" | "umov" if !has_symbol => {
             Access::Write { deletable: true }
         }
         // Loads write their destination; never delete them (volatile/MMIO).
@@ -996,6 +996,8 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
         {
             Access::ReadOnly
         }
+        // A NEON lane insert or broadcast reads at most one GPR.
+        "dup" | "ins" if first.starts_with('v') && !has_symbol => Access::ReadOnly,
         _ => Access::Barrier,
     }
 }
@@ -2748,6 +2750,16 @@ f:
         let input = "    mov x8, #64\n    svc #0\n    mov x8, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("mov x8, #64"), "{}", result);
+    }
+
+    #[test]
+    fn test_neon_lane_writes_read_one_gpr() {
+        // dup/ins read their GPR source and write no GPR, so the dead copy
+        // to x10 goes and the source is propagated into the lane writes.
+        let input = "    mov w0, w20\n    mov x10, x0\n    dup v27.4s, w0\n    neg x0, x0\n    ins v27.s[1], w0\n    mov x10, #1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x10, x0"), "{}", result);
+        assert!(result.contains("ins v27.s[1], w0"), "{}", result);
     }
 
     #[test]

@@ -232,6 +232,10 @@ pub struct ArmCodegen {
     /// Vector parameters kept in a register: (parameter alloca, register,
     /// size). Loaded once the prologue has stored them (emit_vec_param_loads).
     pub(super) vec_param_loads: Vec<(Value, u8, u8)>,
+    /// Lane stores that may write the whole register (fresh_lane_stores).
+    pub(super) vec_fresh_stores: FxHashSet<usize>,
+    /// Variables to spill around each clobbering instruction (vec_vars_live_across).
+    pub(super) vec_spills: FxHashMap<usize, u32>,
     /// HFA return: the (dest, src) of each Memcpy into the return buffer
     /// that directly precedes the Return. It loads the result registers
     /// from `src` instead (emit_hfa_ret_copy) and sets `hfa_ret_loaded`, so
@@ -277,6 +281,8 @@ impl ArmCodegen {
             vec_lanes: FxHashMap::default(),
             vec_consts: Vec::new(),
             vec_param_loads: Vec::new(),
+            vec_fresh_stores: FxHashSet::default(),
+            vec_spills: FxHashMap::default(),
             hfa_ret_copies: FxHashSet::default(),
             hfa_ret_loaded: false,
             used_fp_callee_saved: Vec::new(),
@@ -1668,6 +1674,13 @@ impl ArmCodegen {
                     }
                 }
                 CallArgClass::StructHfaReg { first_fp_idx, count, elem_size, .. } => {
+                    // A vector variable held in a register (spilled, not
+                    // clobbered, ahead of the call).
+                    let in_reg = match arg { Operand::Value(v) if count == 1 => self.vec_reg_of(v.0), _ => None };
+                    if let Some(reg) = in_reg {
+                        self.state.emit_fmt(format_args!("    orr v{first_fp_idx}.16b, v{reg}.16b, v{reg}.16b"));
+                        continue;
+                    }
                     self.emit_load_arg_to_reg(arg, "x17", slot_adjust, 0, needs_adjusted_load);
                     let prefix = Self::hfa_reg_prefix(elem_size);
                     for k in 0..count {

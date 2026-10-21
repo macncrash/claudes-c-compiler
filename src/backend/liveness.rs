@@ -1052,7 +1052,7 @@ fn collect_terminator_gen_dense(
 }
 
 /// Get successor block IDs from a terminator.
-fn terminator_targets(term: &Terminator) -> Vec<u32> {
+pub(crate) fn terminator_targets(term: &Terminator) -> Vec<u32> {
     match term {
         Terminator::Branch(target) => vec![target.0],
         Terminator::CondBranch { true_label, false_label, .. } => {

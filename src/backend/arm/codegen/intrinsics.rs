@@ -9,6 +9,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{IrType, RiscvFloatClass};
 use super::emit::{ARM_VEC_TEMP_REGS, ARM_VEC_VAR_REGS};
 use super::emit::ArmCodegen;
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, classify_call_args};
 
 impl ArmCodegen {
     pub(super) fn emit_neon_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], neon_inst: &str) {
@@ -78,23 +79,26 @@ impl ArmCodegen {
 
     /// Pick the vector variables that can live in a NEON register
     /// (ARM_VEC_VAR_REGS) for the whole function: an 8- or 16-byte local or
-    /// parameter (not volatile or over-aligned) that some VecOp uses
-    /// and whose address never escapes. Every use of the alloca, or of a
-    /// constant GEP from it, must be a whole read or write by a VecOp or
-    /// Memcpy, or a load or store of one aligned lane of up to 8 bytes.
-    /// Calls and other instructions that may clobber v16-v31 spill and
-    /// reload the register around themselves (spill_vec_vars). A parameter
-    /// is loaded into its register once the prologue has stored it
-    /// (emit_vec_param_loads).
+    /// parameter (not volatile or over-aligned) that some VecOp uses, or
+    /// that is built lane by lane and then read whole (an initializer that
+    /// is copied, returned or passed), and whose address never escapes.
+    /// Every use of the alloca, or of a constant GEP from it, must be a
+    /// whole read or write by a VecOp or Memcpy, a load or store of one
+    /// aligned lane of up to 8 bytes, or a call argument passed in a SIMD
+    /// register. Calls and other instructions that may clobber v16-v31
+    /// spill and reload the register around themselves (spill_vec_vars). A
+    /// parameter is loaded into its register once the prologue has stored
+    /// it (emit_vec_param_loads).
     ///
     /// Temporaries (`temps`) are not candidates. Returns (alloca ->
     /// register, each variable's (register, size), lane pointer ->
-    /// (register, offset)).
+    /// (register, offset), fresh_lane_stores, vec_vars_live_across).
     #[allow(clippy::type_complexity)]
-    pub(super) fn assign_vec_var_regs(func: &IrFunction, temps: &FxHashMap<u32, u8>)
-        -> (FxHashMap<u32, u8>, Vec<(u8, u8)>, FxHashMap<u32, (u8, i64)>)
+    pub(super) fn assign_vec_var_regs(func: &IrFunction, temps: &FxHashMap<u32, u8>, config: &CallAbiConfig,
+                                    const_count: usize)
+        -> (FxHashMap<u32, u8>, Vec<(u8, u8)>, FxHashMap<u32, (u8, i64)>, FxHashSet<usize>, FxHashMap<usize, u32>)
     {
-        let none = || (FxHashMap::default(), Vec::new(), FxHashMap::default());
+        let none = || (FxHashMap::default(), Vec::new(), FxHashMap::default(), FxHashSet::default(), FxHashMap::default());
         let insts = || func.blocks.iter().flat_map(|b| &b.instructions);
         if insts().any(|i| matches!(i, Instruction::InlineAsm { .. })) {
             return none();
@@ -129,6 +133,8 @@ impl ArmCodegen {
         }
         let mut bad: FxHashSet<u32> = FxHashSet::default();
         let mut vec_used: FxHashSet<u32> = FxHashSet::default();
+        let mut lane_built: FxHashSet<u32> = FxHashSet::default();
+        let mut read_whole: FxHashSet<u32> = FxHashSet::default();
         let lane_ok = |lanes: &FxHashMap<u32, (u32, i64)>, size_of: &FxHashMap<u32, i64>, ptr: u32, ty: IrType| {
             let (var, off) = lanes[&ptr];
             let n = ty.size() as i64;
@@ -155,8 +161,12 @@ impl ArmCodegen {
                     if let Operand::Value(v) = val {
                         reject(v.0);
                     }
-                    if lanes.contains_key(&ptr.0) && !lane_ok(&lanes, &size_of, ptr.0, *ty) {
-                        reject(ptr.0);
+                    if lanes.contains_key(&ptr.0) {
+                        if lane_ok(&lanes, &size_of, ptr.0, *ty) {
+                            lane_built.insert(lanes[&ptr.0].0);
+                        } else {
+                            reject(ptr.0);
+                        }
                     }
                 }
                 Instruction::GetElementPtr { base, offset, .. } => {
@@ -195,6 +205,37 @@ impl ArmCodegen {
                             reject(p);
                         }
                     }
+                    if lanes.contains_key(&src.0) {
+                        read_whole.insert(lanes[&src.0].0);
+                    }
+                }
+                // A variable passed whole in a SIMD register (see
+                // emit_call_struct_byval_reg_args); anything else escapes.
+                // Not with F128 arguments: converting those calls out after
+                // the variables are spilled, which may clobber them.
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    if let Instruction::CallIndirect { func_ptr: Operand::Value(v), .. } = inst {
+                        reject(v.0);
+                    }
+                    let classes = classify_call_args(&info.args, &info.arg_types, &info.struct_arg_sizes,
+                        &info.struct_arg_aligns, &info.struct_arg_classes, &info.struct_arg_riscv_float_classes,
+                        info.is_variadic, config);
+                    let has_f128 = info.arg_types.contains(&IrType::F128);
+                    for (i, arg) in info.args.iter().enumerate() {
+                        let Operand::Value(v) = arg else { continue };
+                        if !lanes.contains_key(&v.0) {
+                            continue;
+                        }
+                        let in_reg = matches!(classes.get(i), Some(CallArgClass::StructHfaReg { count: 1, .. }))
+                            && !(info.is_sret && i == 0) && !has_f128
+                            && size_of.contains_key(&v.0)
+                            && info.struct_arg_sizes.get(i) == Some(&Some(size_of[&v.0] as usize));
+                        if in_reg {
+                            read_whole.insert(v.0);
+                        } else {
+                            reject(v.0);
+                        }
+                    }
                 }
                 Instruction::Alloca { .. } => {}
                 other => other.for_each_used_value(|id| reject(id)),
@@ -207,19 +248,131 @@ impl ArmCodegen {
                 }
             });
         }
-        size_of.retain(|id, _| vec_used.contains(id) && !bad.contains(id));
-        let mut vars: Vec<(u32, i64)> = size_of.into_iter().collect();
+        size_of.retain(|id, _| {
+            (vec_used.contains(id) || lane_built.contains(id) && read_whole.contains(id)) && !bad.contains(id)
+        });
+        // Variables a VecOp uses come first; the initializer-only ones get
+        // what is left after `const_count` hoisted constant broadcasts.
+        let mut vars: Vec<(bool, u32, i64)> = size_of.iter()
+            .map(|(&id, &size)| (!vec_used.contains(&id), id, size))
+            .collect();
         vars.sort_unstable();
+        let primary = vars.iter().filter(|v| !v.0).count();
+        let limit = primary.max(ARM_VEC_VAR_REGS.len().saturating_sub(const_count));
         let mut regs = FxHashMap::default();
         let mut var_list = Vec::new();
-        for ((id, size), &reg) in vars.into_iter().zip(ARM_VEC_VAR_REGS.iter()) {
+        for ((_, id, size), &reg) in vars.into_iter().zip(ARM_VEC_VAR_REGS.iter()).take(limit) {
             regs.insert(id, reg);
             var_list.push((reg, size as u8));
         }
+        let fresh = Self::fresh_lane_stores(func, &lanes, &size_of, &regs);
+        let spills = Self::vec_vars_live_across(func, &lanes, &regs, &fresh);
         let lane_regs = lanes.into_iter()
             .filter_map(|(ptr, (var, off))| regs.get(&var).map(|&r| (ptr, (r, off))))
             .collect();
-        (regs, var_list, lane_regs)
+        (regs, var_list, lane_regs, fresh, spills)
+    }
+
+    /// Which register variables are live after each instruction that may
+    /// clobber them, as a mask of `1 << reg`, keyed by Instruction address:
+    /// only those are spilled and reloaded around it (spill_vec_vars). A
+    /// whole write, or a fresh lane store, starts a new value; other lane
+    /// stores keep the remaining lanes, so they count as uses.
+    fn vec_vars_live_across(func: &IrFunction, lanes: &FxHashMap<u32, (u32, i64)>,
+                            regs: &FxHashMap<u32, u8>, fresh: &FxHashSet<usize>) -> FxHashMap<usize, u32> {
+        let bit = |id: u32| lanes.get(&id).and_then(|l| regs.get(&l.0)).map_or(0u32, |&r| 1 << r);
+        // (uses, defs) of one instruction.
+        let effect = |inst: &Instruction| -> (u32, u32) {
+            match inst {
+                Instruction::Load { ptr, .. } => (bit(ptr.0), 0),
+                Instruction::Store { ptr, .. } if fresh.contains(&(inst as *const Instruction as usize)) => (0, bit(ptr.0)),
+                Instruction::Store { ptr, .. } => (bit(ptr.0), 0),
+                Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr, args, .. } => {
+                    let uses = args.iter().fold(0, |m, a| m | if let Operand::Value(v) = a { bit(v.0) } else { 0 });
+                    (uses, dest_ptr.map_or(0, |d| bit(d.0)))
+                }
+                Instruction::Memcpy { dest, src, .. } => (bit(src.0), bit(dest.0)),
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    (info.args.iter().fold(0, |m, a| m | if let Operand::Value(v) = a { bit(v.0) } else { 0 }), 0)
+                }
+                _ => (0, 0),
+            }
+        };
+        let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
+        let succs: Vec<Vec<usize>> = func.blocks.iter()
+            .map(|b| crate::backend::liveness::terminator_targets(&b.terminator).iter()
+                .filter_map(|t| index.get(t).copied()).collect())
+            .collect();
+        let step = |live: u32, inst: &Instruction| {
+            let (uses, defs) = effect(inst);
+            (live & !defs) | uses
+        };
+        let mut live_in = vec![0u32; func.blocks.len()];
+        loop {
+            let mut changed = false;
+            for (b, block) in func.blocks.iter().enumerate().rev() {
+                let out = succs[b].iter().fold(0, |m, &s| m | live_in[s]);
+                let inn = block.instructions.iter().rev().fold(out, step);
+                if inn != live_in[b] {
+                    live_in[b] = inn;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut spills = FxHashMap::default();
+        for (b, block) in func.blocks.iter().enumerate() {
+            let mut live = succs[b].iter().fold(0, |m, &s| m | live_in[s]);
+            for inst in block.instructions.iter().rev() {
+                if Self::clobbers_vec_regs(inst) {
+                    spills.insert(inst as *const Instruction as usize, live);
+                }
+                live = step(live, inst);
+            }
+        }
+        spills
+    }
+
+    /// The lane stores that start initializing a register variable: every
+    /// other byte of it is stored, in the same block, before anything reads
+    /// it, so the store may write the whole register, which breaks the
+    /// dependency on its old contents. Keyed by Instruction address (see
+    /// vec_before_instruction).
+    fn fresh_lane_stores(func: &IrFunction, lanes: &FxHashMap<u32, (u32, i64)>,
+                         size_of: &FxHashMap<u32, i64>, regs: &FxHashMap<u32, u8>) -> FxHashSet<usize> {
+        let var_of = |id: u32| lanes.get(&id).map(|l| l.0).filter(|v| regs.contains_key(v));
+        let mut fresh = FxHashSet::default();
+        for block in &func.blocks {
+            let insts = &block.instructions;
+            for (i, inst) in insts.iter().enumerate() {
+                let Instruction::Store { ptr, .. } = inst else { continue };
+                let Some(var) = var_of(ptr.0) else { continue };
+                let full = (1u32 << size_of[&var]) - 1;
+                let mut covered = 0u32;
+                for later in &insts[i..] {
+                    let mut reads = false;
+                    match later {
+                        Instruction::Store { ptr, ty, val, .. } if var_of(ptr.0) == Some(var) => {
+                            if let Operand::Value(v) = val {
+                                reads = var_of(v.0) == Some(var);
+                            }
+                            covered |= ((1u32 << ty.size()) - 1) << lanes[&ptr.0].1;
+                        }
+                        Instruction::GetElementPtr { .. } => {}
+                        other => other.for_each_used_value(|id| reads |= var_of(id) == Some(var)),
+                    }
+                    if reads || covered == full {
+                        break;
+                    }
+                }
+                if covered == full {
+                    fresh.insert(inst as *const Instruction as usize);
+                }
+            }
+        }
+        fresh
     }
 
     /// Before an instruction: emit the lane loads and stores, GEPs and
@@ -257,12 +410,18 @@ impl ArmCodegen {
                 let n = ty.size() as i64;
                 self.operand_to_x0(val);
                 let gpr = if n == 8 { "x0" } else { "w0" };
-                self.state.emit_fmt(format_args!("    ins v{}.{}[{}], {}", reg, Self::lane_suffix(n), off / n, gpr));
+                if self.vec_fresh_stores.contains(&(inst as *const Instruction as usize)) {
+                    // The rest is stored before it is read: broadcast.
+                    let arr = match n { 1 => "16b", 2 => "8h", 4 => "4s", _ => "2d" };
+                    self.state.emit_fmt(format_args!("    dup v{reg}.{arr}, {gpr}"));
+                } else {
+                    self.state.emit_fmt(format_args!("    ins v{}.{}[{}], {}", reg, Self::lane_suffix(n), off / n, gpr));
+                }
                 true
             }
             _ => {
                 if Self::clobbers_vec_regs(inst) {
-                    self.spill_vec_vars("str");
+                    self.spill_vec_vars(inst, "str");
                 }
                 false
             }
@@ -272,15 +431,19 @@ impl ArmCodegen {
     /// After an instruction: reload the vector variables spilled before it.
     pub(super) fn vec_after_instruction(&mut self, inst: &Instruction) {
         if Self::clobbers_vec_regs(inst) {
-            self.spill_vec_vars("ldr");
+            self.spill_vec_vars(inst, "ldr");
             self.emit_vec_consts();
         }
     }
 
-    /// Store (`str`) or reload (`ldr`) every vector variable's register
-    /// to or from its save slot.
-    fn spill_vec_vars(&mut self, instr: &str) {
+    /// Store (`str`) or reload (`ldr`) the register of every vector
+    /// variable live after `inst` to or from its save slot.
+    fn spill_vec_vars(&mut self, inst: &Instruction, instr: &str) {
+        let live = self.vec_spills.get(&(inst as *const Instruction as usize)).copied().unwrap_or(u32::MAX);
         for (reg, size, offset) in self.vec_vars.clone() {
+            if live & (1 << reg) == 0 {
+                continue;
+            }
             let width = if size == 16 { "q" } else { "d" };
             if instr == "str" {
                 self.emit_store_to_sp(&format!("{width}{reg}"), offset, instr);
@@ -607,13 +770,20 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_acc();
     }
 
+    /// The register holding the whole vector at pointer value `id`: a
+    /// temporary, a variable, or a constant GEP of offset 0 from one.
+    pub(super) fn vec_reg_of(&self, id: u32) -> Option<u8> {
+        self.vec_regs.get(&id).copied()
+            .or_else(|| self.vec_lanes.get(&id).filter(|l| l.1 == 0).map(|l| l.0))
+    }
+
     /// Memcpy to or from a vector value held in a register: a register
     /// move, or one whole-vector load or store. Returns false when neither
     /// side is in a register.
     pub(super) fn try_emit_vec_copy(&mut self, dest: &Value, src: &Value, size: usize) -> bool {
         let width = if size == 16 { "q" } else { "d" };
         let bits = if size == 16 { "16b" } else { "8b" };
-        match (self.vec_regs.get(&dest.0).copied(), self.vec_regs.get(&src.0).copied()) {
+        match (self.vec_reg_of(dest.0), self.vec_reg_of(src.0)) {
             (Some(d), Some(s)) => {
                 if d != s {
                     self.state.emit_fmt(format_args!("    orr v{d}.{bits}, v{s}.{bits}, v{s}.{bits}"));

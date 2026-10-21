@@ -20,7 +20,11 @@ impl ArmCodegen {
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
         let temp_regs = Self::assign_vec_temp_regs(func);
-        let (var_regs, vars, lanes) = Self::assign_vec_var_regs(func, &temp_regs);
+        let const_count = Self::assign_vec_const_regs(func, &super::emit::ARM_VEC_VAR_REGS).len();
+        let (var_regs, vars, lanes, fresh, spills) =
+            Self::assign_vec_var_regs(func, &temp_regs, &self.call_abi_config_impl(), const_count);
+        self.vec_fresh_stores = fresh;
+        self.vec_spills = spills;
         self.vec_regs = var_regs.into_iter().chain(temp_regs).collect();
         self.vec_vars = vars.into_iter().map(|(reg, size)| (reg, size, 0)).collect();
         self.vec_param_loads = func.param_alloca_values.iter()

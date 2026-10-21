@@ -34,8 +34,15 @@ impl ArmCodegen {
     /// the Return (see `hfa_ret_copies`): load the result registers straight
     /// from `src` (a register move for a vector held in one).
     pub(super) fn emit_hfa_ret_copy(&mut self, src: &Value) {
-        let Some((count, elem_size, _)) = self.hfa_ret else { return };
-        if let Some(&reg) = self.vec_regs.get(&src.0).filter(|_| count == 1) {
+        let Some((count, elem_size, buf_offset)) = self.hfa_ret else { return };
+        if let Some(reg) = self.vec_reg_of(src.0) {
+            if count > 1 {
+                // A struct held in a vector register: leave it in the buffer
+                // for the Return to load member by member.
+                let width = if count * elem_size == 16 { "q" } else { "d" };
+                self.emit_store_to_sp(&format!("{width}{reg}"), buf_offset, "str");
+                return;
+            }
             self.state.emit_fmt(format_args!("    orr v0.16b, v{reg}.16b, v{reg}.16b"));
         } else {
             let prefix = Self::hfa_reg_prefix(elem_size);
