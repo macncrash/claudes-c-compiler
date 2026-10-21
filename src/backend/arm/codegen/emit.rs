@@ -236,6 +236,10 @@ pub struct ArmCodegen {
     pub(super) vec_fresh_stores: FxHashSet<usize>,
     /// Variables to spill around each clobbering instruction (vec_vars_live_across).
     pub(super) vec_spills: FxHashMap<usize, u32>,
+    /// What scratch registers v0 and v1 hold after the last vector op: the
+    /// (pointer, size) each was loaded from, valid while the output is still
+    /// the length it had then (nothing emitted since).
+    pub(super) vec_scratch: (usize, [Option<(u32, u8)>; 2]),
     /// HFA return: the (dest, src) of each Memcpy into the return buffer
     /// that directly precedes the Return. It loads the result registers
     /// from `src` instead (emit_hfa_ret_copy) and sets `hfa_ret_loaded`, so
@@ -283,6 +287,7 @@ impl ArmCodegen {
             vec_param_loads: Vec::new(),
             vec_fresh_stores: FxHashSet::default(),
             vec_spills: FxHashMap::default(),
+            vec_scratch: (usize::MAX, [None; 2]),
             hfa_ret_copies: FxHashSet::default(),
             hfa_ret_loaded: false,
             used_fp_callee_saved: Vec::new(),

@@ -33,16 +33,17 @@ at the time of writing (`./vecbench`, Apple M-series):
 
 | kernel     | ccc before NEON codegen | ccc | clang -O2 |
 |------------|------:|------:|------:|
-| `saxpy`    |   249 | 3330 | 3498 |
-| `xorshift` |    82 | 1120 | 1997 |
-| `select`   |    27 |  790 | 1227 |
-| `dmix`     |   333 | 1765 | 3493 |
-| `blend`    |    79 | 1520 | 3450 |
-| `call`     |   150 |  765 | 1193 |
+| `saxpy`    |   249 | 3200 | 3498 |
+| `xorshift` |    82 | 1775 | 1997 |
+| `select`   |    27 |  865 | 1227 |
+| `dmix`     |   333 | 3150 | 3493 |
+| `blend`    |    79 | 2660 | 3450 |
+| `call`     |   150 |  750 | 1193 |
 
 "Before NEON codegen" lowered every vector operation lane by lane through
 memory. ccc now emits one NEON instruction per operation and keeps
-temporaries, local vector variables, vector parameters, initializers and
-loop-invariant constant broadcasts in NEON registers. Vector arguments and return values use
-SIMD registers as AAPCS64 requires, and move between those and the registers
-holding the values without going through the stack.
+temporaries, local vector variables, vector parameters, initializers,
+constant vector literals and loop-invariant constant broadcasts in NEON
+registers; shifts by constants use the immediate forms. Vector arguments and
+return values use SIMD registers as AAPCS64 requires, and move between those
+and the registers holding the values without going through the stack.

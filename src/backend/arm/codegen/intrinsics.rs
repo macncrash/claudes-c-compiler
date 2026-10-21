@@ -616,6 +616,17 @@ impl ArmCodegen {
         Some(if elem.size() == 8 { bits } else { bits & ((1u64 << (8 * elem.size())) - 1) })
     }
 
+    /// The count of a shift by a broadcast constant that fits the immediate
+    /// forms (shl #n, ushr/sshr #n), if `op` is such a shift.
+    fn vec_shift_imm(op: VecOpKind, elem: VecElem, splat: u8, args: &[Operand]) -> Option<u32> {
+        if !matches!(op, VecOpKind::Shl | VecOpKind::Shr) || splat & 2 == 0 {
+            return None;
+        }
+        let Some(Operand::Const(c)) = args.get(1) else { return None };
+        let n = c.to_i64()?;
+        (0..8 * elem.size() as i64).contains(&n).then_some(n as u32)
+    }
+
     /// The register holding a hoisted constant broadcast of `arg`, if any.
     fn vec_const_reg(&self, arg: &Operand, elem: VecElem, bytes: u8) -> Option<u8> {
         let Operand::Const(c) = arg else { return None };
@@ -655,10 +666,11 @@ impl ArmCodegen {
         let mut counts: Vec<(IrConst, VecElem, u8, usize)> = Vec::new();
         for (_, block) in func.blocks.iter().enumerate().filter(|(i, _)| in_loop[*i]) {
             for inst in &block.instructions {
-                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { elem, bytes, splat, .. }, args, .. } = inst else { continue };
+                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { op, elem, bytes, splat }, args, .. } = inst else { continue };
                 for (i, arg) in args.iter().enumerate() {
                     let Operand::Const(c) = arg else { continue };
-                    if splat & (1 << i) == 0 {
+                    // (A shift count that fits an immediate needs no register.)
+                    if splat & (1 << i) == 0 || (i == 1 && Self::vec_shift_imm(*op, *elem, *splat, args).is_some()) {
                         continue;
                     }
                     let Some(bits) = Self::splat_bits(c, *elem) else { continue };
@@ -704,25 +716,39 @@ impl ArmCodegen {
         let mem = if q { "q" } else { "d" };
         let arr = Self::vec_arrangement(elem, bytes);
         let bits = if q { "16b" } else { "8b" };
+        let imm_shift = Self::vec_shift_imm(op, elem, splat, args);
+        // What v0/v1 still hold from the previous vector op, if nothing has
+        // been emitted since.
+        let mut held = if self.vec_scratch.0 == self.state.out.buf.len() { self.vec_scratch.1 } else { [None; 2] };
         // Operand registers: a temporary's own register, else v0/v1.
         let mut src = [String::new(), String::new()];
         for (i, arg) in args.iter().enumerate() {
             src[i] = format!("v{i}");
+            if i == 1 && imm_shift.is_some() {
+                continue;
+            }
             if let Some(reg) = self.vec_const_reg(arg, elem, bytes).filter(|_| splat & (1 << i) != 0) {
                 src[i] = format!("v{reg}");
             } else if splat & (1 << i) != 0 {
                 self.operand_to_x0(arg);
                 let gpr = if elem.size() == 8 { "x0" } else { "w0" };
                 self.state.emit_fmt(format_args!("    dup v{}.{}, {}", i, arr, gpr));
+                held[i] = None;
             } else if let Operand::Value(v) = arg {
                 if let Some(&reg) = self.vec_regs.get(&v.0) {
                     src[i] = format!("v{reg}");
+                } else if held[i] == Some((v.0, bytes)) {
+                    // Already loaded.
+                } else if i == 1 && held[0] == Some((v.0, bytes)) {
+                    src[1] = "v0".to_string();
                 } else {
                     self.vec_mem_access("ldr", &format!("{mem}{i}"), v);
+                    held[i] = Some((v.0, bytes));
                 }
             } else {
                 self.operand_to_x0(arg);
                 self.state.emit_fmt(format_args!("    ldr {}{}, [x0]", mem, i));
+                held[i] = None;
             }
         }
         let dest_reg = self.vec_regs.get(&dest_ptr.0).copied();
@@ -746,6 +772,14 @@ impl ArmCodegen {
             // ushl/sshl shift left by a signed per-lane amount; right shifts
             // shift left by the negated amount (logical for ushl, arithmetic
             // for sshl), negated into v1 so a temporary count survives.
+            // A constant count uses the immediate forms (ushr/sshr take
+            // 1..=lane bits, so a shift by 0 is a move).
+            VecOpKind::Shl | VecOpKind::Shr if imm_shift == Some(0) =>
+                vec![format!("    orr {d}.{bits}, {a}.{bits}, {a}.{bits}")],
+            VecOpKind::Shl | VecOpKind::Shr if imm_shift.is_some() => {
+                let name = match op { VecOpKind::Shl => "shl", _ if u => "ushr", _ => "sshr" };
+                vec![format!("    {name} {d}.{arr}, {a}.{arr}, #{}", imm_shift.unwrap())]
+            }
             VecOpKind::Shl => vec![bin(shl)],
             VecOpKind::Shr => vec![
                 format!("    neg v1.{arr}, {b}.{arr}"),
@@ -768,6 +802,14 @@ impl ArmCodegen {
             self.vec_mem_access("str", &format!("{mem}0"), dest_ptr);
         }
         self.state.reg_cache.invalidate_acc();
+        // The result went to v0 and memory, or a register right shift
+        // negated its count into v1.
+        if dest_reg.is_none() {
+            held = [None; 2];
+        } else if matches!(op, VecOpKind::Shr) && imm_shift.is_none() {
+            held[1] = None;
+        }
+        self.vec_scratch = (self.state.out.buf.len(), held);
     }
 
     /// The register holding the whole vector at pointer value `id`: a
@@ -806,6 +848,8 @@ impl ArmCodegen {
             } else {
                 self.emit_load_from_sp(reg, slot.0, instr);
             }
+        } else if let Some(base) = self.ptr_in_reg(ptr) {
+            self.state.emit_fmt(format_args!("    {} {}, [{}]", instr, reg, base));
         } else {
             self.operand_to_x0(&Operand::Value(*ptr));
             self.state.emit_fmt(format_args!("    {} {}, [x0]", instr, reg));

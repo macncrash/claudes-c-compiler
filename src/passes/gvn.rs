@@ -43,6 +43,8 @@ enum ExprKey {
     /// Load CSE key: two loads from the same pointer with the same type
     /// produce the same value if no intervening memory modification occurs.
     Load { ptr: VNOperand, ty: IrType },
+    /// A symbol's address, the same everywhere in the function.
+    GlobalAddr { name: String },
 }
 
 /// Returns true if the ExprKey represents a Load (memory-dependent expression).
@@ -252,6 +254,7 @@ impl GvnState {
                 let ptr_vn = self.operand_to_vn(&Operand::Value(*ptr));
                 Some((ExprKey::Load { ptr: ptr_vn, ty: *ty }, *dest))
             }
+            Instruction::GlobalAddr { dest, name } => Some((ExprKey::GlobalAddr { name: name.clone() }, *dest)),
             // Other instructions (Store, Call, AtomicLoad, etc.) are not eligible.
             // AtomicLoad is excluded because it has memory ordering semantics that
             // require the load to actually execute.
@@ -1355,6 +1358,23 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
         }
+    }
+
+    #[test]
+    fn test_global_addr_cse() {
+        // Two addresses of the same symbol are one value; another symbol's is not.
+        let global = |dest: u32, name: &str| Instruction::GlobalAddr { dest: Value(dest), name: name.to_string() };
+        let block = BasicBlock {
+            label: BlockId(0),
+            instructions: vec![global(0, "g"), global(1, "h"), global(2, "g")],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        };
+        let mut module = make_module(make_func(vec![block], 3));
+        assert_eq!(module.for_each_function(run_gvn_function), 1);
+        let insts = &module.functions[0].blocks[0].instructions;
+        assert!(matches!(insts[1], Instruction::GlobalAddr { .. }));
+        assert!(matches!(insts[2], Instruction::Copy { dest: Value(2), src: Operand::Value(Value(0)) }), "{:?}", insts[2]);
     }
 
     #[test]

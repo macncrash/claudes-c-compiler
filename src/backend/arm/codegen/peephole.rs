@@ -486,14 +486,72 @@ pub fn peephole_optimize(asm: String) -> String {
     }
 
     // Build result, filtering out Nop lines
+    let align = small_loop_alignment(&lines, &kinds, n);
     let mut result = String::with_capacity(asm.len());
     for i in 0..n {
+        if let Some(p) = align[i] {
+            result.push_str("    .p2align ");
+            result.push_str(if p == 5 { "5" } else { "6" });
+            result.push('\n');
+        }
         if kinds[i] != LineKind::Nop {
             result.push_str(&lines[i]);
             result.push('\n');
         }
     }
     result
+}
+
+// ── Loop alignment ───────────────────────────────────────────────────────────
+//
+// A loop that straddles a 64-byte boundary needs two instruction fetches per
+// iteration; a short loop body that fits in one line runs up to twice as fast
+// (measured on Apple M-series). The head of each loop of at most 16
+// instructions without calls (counting from its label to the last branch back
+// to it) is aligned to 32 bytes if the loop fits in 32, else to 64.
+
+/// For each line, the alignment (log2) to emit before it, if any.
+fn small_loop_alignment(lines: &[String], kinds: &[LineKind], n: usize) -> Vec<Option<u8>> {
+    let mut align = vec![None; n];
+    for (start, end) in function_ranges(lines, n) {
+        let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for k in start..end {
+            if kinds[k] == LineKind::Label {
+                if let Some(name) = label_name(&lines[k]) {
+                    labels.insert(name, k);
+                }
+            }
+        }
+        // The last backward branch to each label.
+        let mut back: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for j in start..end {
+            if !matches!(kinds[j], LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch) {
+                continue;
+            }
+            let Some((_, ops)) = split_insn(&lines[j]) else { continue };
+            if let Some(&i) = labels.get(last_operand(ops)) {
+                if i < j {
+                    back.insert(i, j);
+                }
+            }
+        }
+        for (head, last) in back {
+            let mut insns = 0;
+            let mut call = false;
+            for k in head..=last {
+                match kinds[k] {
+                    LineKind::Nop | LineKind::Label | LineKind::Directive => {}
+                    LineKind::Call => call = true,
+                    _ if lines[k].trim_start().starts_with('.') => {}
+                    _ => insns += 1,
+                }
+            }
+            if !call && insns <= 16 {
+                align[head] = Some(if insns <= 8 { 5 } else { 6 });
+            }
+        }
+    }
+    align
 }
 
 // ── Pass 1: Adjacent store/load elimination ──────────────────────────────────
@@ -998,6 +1056,10 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
         }
         // A NEON lane insert or broadcast reads at most one GPR.
         "dup" | "ins" if first.starts_with('v') && !has_symbol => Access::ReadOnly,
+        // Other NEON arithmetic on vector registers (ushr v1.8b, v0.8b, #1)
+        // touches no GPR and no memory.
+        _ if first.starts_with('v') && first.contains('.') && !ops.contains('[') && !has_symbol
+            && regs_in(rest) == 0 => Access::ReadOnly,
         _ => Access::Barrier,
     }
 }
@@ -2413,6 +2475,30 @@ mod tests {
         // The address is used again afterwards.
         let input = ".type f, %function\nf:\n    add x15, x4, x3\n    ldr x10, [x15]\n    str x10, [x15, #8]\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("add x15, x4, x3"));
+    }
+
+    #[test]
+    fn test_index_folded_across_neon_ops() {
+        // NEON arithmetic reads no GPR, so x11 is dead after the load.
+        let input = ".type f, %function\nf:\n    add x11, x4, x3\n    ldr d0, [x11]\n    ushr v28.8b, v0.8b, #1\n    add x11, x5, x3\n    ldr d1, [x11]\n    add v28.8b, v28.8b, v1.8b\n    str d28, [x6]\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr d0, [x4, x3]") && result.contains("ldr d1, [x5, x3]"), "{}", result);
+        assert!(!result.contains("add x11"), "{}", result);
+    }
+
+    #[test]
+    fn test_small_loops_aligned() {
+        let body = |n: usize| "    add x1, x1, x2\n".repeat(n);
+        // 5 instructions: 32-byte alignment; 13: 64; 21, or a call: none.
+        for (n, call, align) in [(3, false, Some("5")), (11, false, Some("6")), (19, false, None), (3, true, None)] {
+            let call_line = if call { "    bl g\n" } else { "" };
+            let input = format!(".type f, %function\nf:\n    mov x1, #0\n.LBB1:\n{}{}    subs x2, x2, #1\n    b.ne .LBB1\n    mov x0, x1\n    ret\n.size f, .-f\n", body(n), call_line);
+            let result = peephole_optimize(input);
+            match align {
+                Some(p) => assert!(result.contains(&format!(".p2align {p}\n.LBB1:")), "{n}: {result}"),
+                None => assert!(!result.contains(".p2align"), "{n}: {result}"),
+            }
+        }
     }
 
     #[test]

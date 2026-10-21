@@ -627,6 +627,12 @@ insertion into the preheader to ensure def-before-use ordering.
 - **All other loads** (runtime-computed pointers) are conservatively rejected
   since there is no alias analysis.
 
+**Constant locals.** A local whose only writes are constant stores in one loop
+block, and whose address is only loaded from, read by vector ops or copied
+from (a vector literal such as `(double2){ 0.5, 1.5 }` or a constant table in
+a loop body), holds the same bytes every iteration: its alloca, the addresses
+into it and the stores move to the end of the entry block.
+
 ### iv_strength_reduce -- Induction Variable Strength Reduction
 
 Transforms expensive per-iteration index computations in loops into cheaper

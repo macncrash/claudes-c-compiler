@@ -29,8 +29,10 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis;
+use crate::common::source::Span;
 use crate::ir::reexports::{
     Instruction,
+    IntrinsicOp,
     IrFunction,
     Operand,
     Terminator,
@@ -67,7 +69,184 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
         total_hoisted += hoist_loop_invariants(func, natural_loop, &cfg.preds, &alloca_info);
     }
 
-    total_hoisted
+    total_hoisted + hoist_constant_locals(func, &sorted_loops)
+}
+
+/// A local object whose only writes are constant stores in one loop block,
+/// and whose address is only loaded from, read by vector ops or copied from,
+/// holds the same bytes on every iteration (e.g. a vector literal
+/// `(double2){ 0.5, 1.5 }` in a loop body). Its alloca, the address
+/// computations into it and the stores move to the end of the entry block.
+/// (A read before the stores in an iteration would read an object whose
+/// lifetime just began, an indeterminate value.)
+fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize {
+    // Pointers into each non-volatile alloca: value -> (alloca, byte offset).
+    let mut derived: FxHashMap<u32, (u32, i64)> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Alloca { dest, volatile: false, .. } = inst {
+            derived.insert(dest.0, (dest.0, 0));
+        }
+    }
+    if derived.is_empty() {
+        return 0;
+    }
+    loop {
+        let mut grew = false;
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
+                if let (Some(&(root, off)), Some(k), false) = (derived.get(&base.0), c.to_i64(), derived.contains_key(&dest.0)) {
+                    derived.insert(dest.0, (root, off + k));
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    // Allocas whose address escapes or that something other than a constant
+    // store writes, and the constant stores to the others.
+    let mut bad: FxHashSet<u32> = FxHashSet::default();
+    let mut stores: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let mut escape = |v: u32| {
+                if let Some(&(root, _)) = derived.get(&v) {
+                    bad.insert(root);
+                }
+            };
+            match inst {
+                Instruction::Alloca { .. } | Instruction::Load { .. } => {}
+                Instruction::Store { val, ptr, .. } => {
+                    if let Operand::Value(v) = val {
+                        escape(v.0);
+                    }
+                    if let Some(&(root, _)) = derived.get(&ptr.0) {
+                        if matches!(val, Operand::Const(_)) {
+                            stores.entry(root).or_default().push((bi, ii));
+                        } else {
+                            bad.insert(root);
+                        }
+                    }
+                }
+                Instruction::GetElementPtr { dest, base, offset, .. } => {
+                    if !derived.contains_key(&dest.0) {
+                        escape(base.0);
+                    }
+                    if let Operand::Value(v) = offset {
+                        escape(v.0);
+                    }
+                }
+                // Vector ops read their operands through pointers.
+                Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr, .. } => {
+                    if let Some(p) = dest_ptr {
+                        escape(p.0);
+                    }
+                }
+                Instruction::Memcpy { dest, .. } => escape(dest.0),
+                _ => inst.for_each_used_value(&mut escape),
+            }
+        }
+        block.terminator.for_each_used_value(|v| {
+            if let Some(&(root, _)) = derived.get(&v) {
+                bad.insert(root);
+            }
+        });
+    }
+
+    // All stores in one loop block (not the entry), writing disjoint bytes.
+    let in_loop = |b: usize| loops.iter().any(|l| l.body.contains(&b));
+    let mut roots: Vec<(u32, usize, usize)> = Vec::new();
+    for (&root, sites) in &stores {
+        let block = sites[0].0;
+        if bad.contains(&root) || block == 0 || !in_loop(block) || sites.iter().any(|s| s.0 != block) {
+            continue;
+        }
+        let mut ranges: Vec<(i64, i64)> = sites.iter().filter_map(|&(b, i)| match &func.blocks[b].instructions[i] {
+            Instruction::Store { ptr, ty, .. } => {
+                let off = derived[&ptr.0].1;
+                Some((off, off + ty.size() as i64))
+            }
+            _ => None,
+        }).collect();
+        ranges.sort_unstable();
+        if ranges.windows(2).all(|w| w[0].1 <= w[1].0) {
+            roots.push((root, block, sites.len()));
+        }
+    }
+    roots.sort_unstable();
+
+    let mut moved = 0;
+    for (root, block, count) in roots {
+        // Take the alloca, every constant-offset address into it and the
+        // stores out of their blocks, in order, and append them to the entry.
+        let mut taken: Vec<(Instruction, Option<Span>)> = Vec::new();
+        for b in 0..func.blocks.len() {
+            let blk = &mut func.blocks[b];
+            let has_spans = blk.source_spans.len() == blk.instructions.len();
+            let mut k = 0;
+            while k < blk.instructions.len() {
+                let take = match &blk.instructions[k] {
+                    Instruction::Alloca { dest, .. } => dest.0 == root && b != 0,
+                    Instruction::GetElementPtr { dest, .. } => derived.get(&dest.0).is_some_and(|d| d.0 == root),
+                    Instruction::Store { ptr, .. } => b == block && derived.get(&ptr.0).is_some_and(|d| d.0 == root),
+                    _ => false,
+                };
+                if take {
+                    let span = has_spans.then(|| blk.source_spans.remove(k));
+                    taken.push((blk.instructions.remove(k), span));
+                } else {
+                    k += 1;
+                }
+            }
+        }
+        // Allocas first, then addresses after their bases, then the stores.
+        let entry = &mut func.blocks[0];
+        let has_spans = entry.source_spans.len() == entry.instructions.len();
+        let mut placed: FxHashSet<u32> = FxHashSet::default();
+        placed.insert(root);
+        let mut order: Vec<(Instruction, Option<Span>)> = Vec::new();
+        let (allocas, mut rest): (Vec<_>, Vec<_>) = taken.into_iter().partition(|(i, _)| matches!(i, Instruction::Alloca { .. }));
+        let at = entry.instructions.iter().take_while(|i| matches!(i, Instruction::Alloca { .. })).count();
+        for (n, (inst, span)) in allocas.into_iter().enumerate() {
+            entry.instructions.insert(at + n, inst);
+            if has_spans {
+                entry.source_spans.insert(at + n, span.unwrap_or_else(Span::dummy));
+            }
+        }
+        while !rest.is_empty() {
+            let before = rest.len();
+            let mut k = 0;
+            while k < rest.len() {
+                let ready = match &rest[k].0 {
+                    Instruction::GetElementPtr { base, .. } => placed.contains(&base.0),
+                    Instruction::Store { ptr, .. } => placed.contains(&ptr.0),
+                    _ => true,
+                };
+                if ready {
+                    let item = rest.remove(k);
+                    if let Some(d) = item.0.dest() {
+                        placed.insert(d.0);
+                    }
+                    order.push(item);
+                } else {
+                    k += 1;
+                }
+            }
+            if rest.len() == before {
+                order.append(&mut rest); // (cannot happen: every address has its base)
+            }
+        }
+        for (inst, span) in order {
+            entry.instructions.push(inst);
+            if has_spans {
+                entry.source_spans.push(span.unwrap_or_else(Span::dummy));
+            }
+        }
+        moved += count;
+    }
+    moved
 }
 
 /// Check if an instruction is safe to hoist (pure, no side effects, not a phi).
@@ -1513,5 +1692,40 @@ mod tests {
 
         // The body block should still have all 3 instructions
         assert_eq!(func.blocks[2].instructions.len(), 3);
+    }
+
+    #[test]
+    fn test_constant_local_moves_to_entry() {
+        // In the loop body: a local written only with constants (moved to
+        // the entry block, its load stays), and one written with the loop
+        // counter (left alone).
+        let mut func = make_loop_func();
+        let alloca = |dest: u32| Instruction::Alloca { dest: Value(dest), ty: IrType::Ptr, size: 8, align: 4, volatile: false };
+        let store = |val: Operand, ptr: u32| Instruction::Store { val, ptr: Value(ptr), ty: IrType::I32, seg_override: AddressSpace::Default };
+        let body = vec![
+            alloca(6),
+            Instruction::GetElementPtr { dest: Value(7), base: Value(6), offset: Operand::Const(IrConst::I64(4)), ty: IrType::I32 },
+            store(Operand::Const(IrConst::I32(5)), 6),
+            store(Operand::Const(IrConst::I32(9)), 7),
+            Instruction::Load { dest: Value(8), ptr: Value(7), ty: IrType::I32, seg_override: AddressSpace::Default },
+            alloca(9),
+            store(Operand::Value(Value(2)), 9),
+            Instruction::Load { dest: Value(10), ptr: Value(9), ty: IrType::I32, seg_override: AddressSpace::Default },
+        ];
+        func.blocks[2].instructions.splice(0..0, body);
+        func.next_value_id = 11;
+
+        let cfg = analysis::CfgAnalysis::build(&func);
+        let loops = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        assert_eq!(hoist_constant_locals(&mut func, &loops), 2);
+
+        let defines = |b: usize, v: u32| func.blocks[b].instructions.iter().any(|i| i.dest() == Some(Value(v)));
+        assert!(defines(0, 6) && defines(0, 7), "{:?}", func.blocks[0].instructions);
+        let entry_stores = func.blocks[0].instructions.iter().filter(|i| matches!(i, Instruction::Store { .. })).count();
+        assert_eq!(entry_stores, 2);
+        // The alloca goes with the other allocas, before the stores.
+        assert!(matches!(func.blocks[0].instructions[0], Instruction::Alloca { dest: Value(6), .. }));
+        assert!(defines(2, 8) && defines(2, 9) && defines(2, 10));
+        assert!(func.blocks[2].instructions.iter().any(|i| matches!(i, Instruction::Store { ptr: Value(9), .. })));
     }
 }
