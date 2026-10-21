@@ -1,6 +1,7 @@
 //! ArmCodegen: prologue/epilogue and stack frame operations.
 
 use crate::ir::reexports::{IrFunction, Instruction, Operand, Terminator, Value};
+use crate::common::fx_hash::FxHashSet;
 use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{ParamClass, classify_params};
@@ -19,12 +20,13 @@ impl ArmCodegen {
 
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
-        let temp_regs = Self::assign_vec_temp_regs(func);
+        let mut temp_regs = Self::assign_vec_temp_regs(func);
         let const_count = Self::assign_vec_const_regs(func, &super::emit::ARM_VEC_VAR_REGS).len();
         let (var_regs, vars, lanes, fresh, spills) =
             Self::assign_vec_var_regs(func, &temp_regs, &self.call_abi_config_impl(), const_count);
         self.vec_fresh_stores = fresh;
         self.vec_spills = spills;
+        Self::fold_vec_temp_copies(func, &mut temp_regs, &var_regs, &lanes);
         self.vec_regs = var_regs.into_iter().chain(temp_regs).collect();
         self.vec_vars = vars.into_iter().map(|(reg, size)| (reg, size, 0)).collect();
         self.vec_param_loads = func.param_alloca_values.iter()
@@ -35,6 +37,7 @@ impl ArmCodegen {
             })
             .collect();
         self.vec_lanes = lanes;
+        self.vec_not_folds = Self::fold_vec_nots(func, &self.vec_regs, &self.vec_lanes);
         let free: Vec<u8> = super::emit::ARM_VEC_VAR_REGS.iter().copied()
             .filter(|r| !self.vec_regs.values().any(|v| v == r))
             .collect();
@@ -193,6 +196,19 @@ impl ArmCodegen {
                 }
             }
         }
+        self.hfa_ret_ptr_loads = None;
+        if let (Some(_), Some((ptr, _))) = (self.hfa_ret, find_param_alloca(func, 0)) {
+            self.hfa_ret_ptr_loads = Self::hfa_ret_ptr_only_loaded(func, ptr, &self.hfa_ret_copies);
+        }
+        // Those loads are never emitted: free their registers (a callee-saved
+        // one need not be saved if nothing else has it).
+        for v in self.hfa_ret_ptr_loads.iter().flatten() {
+            if let Some(r) = self.reg_assignments.remove(v) {
+                if !self.reg_assignments.values().any(|x| *x == r) {
+                    self.used_callee_saved.retain(|x| *x != r);
+                }
+            }
+        }
 
         let save_count = self.used_callee_saved.len() as i64;
         if save_count > 0 {
@@ -227,6 +243,8 @@ impl ArmCodegen {
         // Tells the peephole optimizer how many of x0/x1 carry the return
         // value at `ret`; it always removes this line.
         let ret_regs = match func.return_type {
+            // (An HFA comes back in v0-v3, not through the sret pointer.)
+            _ if self.hfa_ret.is_some() => Some(peephole::RET_NONE_MARKER),
             IrType::Void | IrType::F32 | IrType::F64 | IrType::F128 => Some(peephole::RET_NONE_MARKER),
             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
             | IrType::I64 | IrType::U64 | IrType::Ptr if !func.uses_sret => Some(peephole::RET_X0_MARKER),
@@ -342,13 +360,52 @@ impl ArmCodegen {
         in_prefix == total
     }
 
+    /// The loads of the sret pointer from its slot `ptr`, if those loads are
+    /// its only uses and the loaded pointer is only the destination of
+    /// `copies` (which load the result registers from their source) or
+    /// returned (which an HFA return ignores).
+    fn hfa_ret_ptr_only_loaded(func: &IrFunction, ptr: Value, copies: &FxHashSet<(u32, u32)>)
+                               -> Option<FxHashSet<u32>> {
+        let mut loads = FxHashSet::default();
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                Instruction::Load { dest, ptr: p, .. } if *p == ptr => {
+                    loads.insert(dest.0);
+                }
+                _ if inst.used_values().contains(&ptr.0) => return None,
+                _ => {}
+            }
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Memcpy { dest, src, .. } = inst {
+                    if copies.contains(&(dest.0, src.0)) {
+                        continue;
+                    }
+                }
+                if matches!(inst, Instruction::Load { ptr: p, .. } if *p == ptr) {
+                    continue;
+                }
+                if inst.used_values().iter().any(|v| *v == ptr.0 || loads.contains(v)) {
+                    return None;
+                }
+            }
+            match &block.terminator {
+                Terminator::Return(Some(Operand::Value(v))) if loads.contains(&v.0) => {}
+                t if t.used_values().iter().any(|v| *v == ptr.0 || loads.contains(v)) => return None,
+                _ => {}
+            }
+        }
+        Some(loads)
+    }
+
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
         if func.is_variadic {
             self.emit_save_variadic_regs();
         }
         // HFA return: point the sret pointer (read from x8 below) at the
         // frame buffer the return loads from.
-        if let Some((_, _, buf_offset)) = self.hfa_ret {
+        if let Some((_, _, buf_offset)) = self.hfa_ret.filter(|_| self.hfa_ret_ptr_loads.is_none()) {
             self.emit_add_sp_offset("x8", buf_offset);
         }
 

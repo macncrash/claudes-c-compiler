@@ -33,12 +33,12 @@ at the time of writing (`./vecbench`, Apple M-series):
 
 | kernel     | ccc before NEON codegen | ccc | clang -O2 |
 |------------|------:|------:|------:|
-| `saxpy`    |   249 | 3200 | 3498 |
-| `xorshift` |    82 | 1775 | 1997 |
-| `select`   |    27 |  865 | 1227 |
-| `dmix`     |   333 | 3150 | 3493 |
-| `blend`    |    79 | 2660 | 3450 |
-| `call`     |   150 |  750 | 1193 |
+| `saxpy`    |   249 | 3290 | 3498 |
+| `xorshift` |    82 | 1820 | 1997 |
+| `select`   |    27 | 1130 | 1227 |
+| `dmix`     |   333 | 3260 | 3493 |
+| `blend`    |    79 | 2750 | 3450 |
+| `call`     |   150 | 1110 | 1193 |
 
 "Before NEON codegen" lowered every vector operation lane by lane through
 memory. ccc now emits one NEON instruction per operation and keeps

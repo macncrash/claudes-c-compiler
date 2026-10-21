@@ -78,8 +78,22 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
 /// `(double2){ 0.5, 1.5 }` in a loop body). Its alloca, the address
 /// computations into it and the stores move to the end of the entry block.
 /// (A read before the stores in an iteration would read an object whose
-/// lifetime just began, an indeterminate value.)
+/// lifetime just began, an indeterminate value.) A whole copy of a local
+/// whose constant stores are all in the entry block counts as constant too,
+/// so a variable initialized from such a literal follows it in a later round.
 fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize {
+    let mut moved = 0;
+    for _ in 0..3 {
+        let n = hoist_constant_locals_once(func, loops);
+        if n == 0 {
+            break;
+        }
+        moved += n;
+    }
+    moved
+}
+
+fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize {
     // Pointers into each non-volatile alloca: value -> (alloca, byte offset).
     let mut derived: FxHashMap<u32, (u32, i64)> = FxHashMap::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
@@ -106,7 +120,7 @@ fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize 
     }
 
     // Allocas whose address escapes or that something other than a constant
-    // store writes, and the constant stores to the others.
+    // store or a copy of a whole local writes, and those writes to the others.
     let mut bad: FxHashSet<u32> = FxHashSet::default();
     let mut stores: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -144,7 +158,12 @@ fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize 
                         escape(p.0);
                     }
                 }
-                Instruction::Memcpy { dest, .. } => escape(dest.0),
+                Instruction::Memcpy { dest, src, .. } => match derived.get(&dest.0) {
+                    Some(&(root, _)) if derived.get(&src.0).is_some_and(|s| s.0 == src.0) => {
+                        stores.entry(root).or_default().push((bi, ii));
+                    }
+                    _ => escape(dest.0),
+                },
                 _ => inst.for_each_used_value(&mut escape),
             }
         }
@@ -155,7 +174,13 @@ fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize 
         });
     }
 
-    // All stores in one loop block (not the entry), writing disjoint bytes.
+    // A local holding constants from the start: only constant stores, all in
+    // the entry block.
+    let constant_in_entry = |root: u32| !bad.contains(&root) && stores.get(&root).is_some_and(|sites| {
+        sites.iter().all(|&(b, i)| b == 0 && matches!(func.blocks[b].instructions[i], Instruction::Store { .. }))
+    });
+    // All writes in one loop block (not the entry), writing disjoint bytes,
+    // copies only from such constant locals.
     let in_loop = |b: usize| loops.iter().any(|l| l.body.contains(&b));
     let mut roots: Vec<(u32, usize, usize)> = Vec::new();
     for (&root, sites) in &stores {
@@ -163,10 +188,21 @@ fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize 
         if bad.contains(&root) || block == 0 || !in_loop(block) || sites.iter().any(|s| s.0 != block) {
             continue;
         }
+        let copies_constant = sites.iter().all(|&(b, i)| match &func.blocks[b].instructions[i] {
+            Instruction::Memcpy { src, .. } => src.0 != root && constant_in_entry(src.0),
+            _ => true,
+        });
+        if !copies_constant {
+            continue;
+        }
         let mut ranges: Vec<(i64, i64)> = sites.iter().filter_map(|&(b, i)| match &func.blocks[b].instructions[i] {
             Instruction::Store { ptr, ty, .. } => {
                 let off = derived[&ptr.0].1;
                 Some((off, off + ty.size() as i64))
+            }
+            Instruction::Memcpy { dest, size, .. } => {
+                let off = derived[&dest.0].1;
+                Some((off, off + *size as i64))
             }
             _ => None,
         }).collect();
@@ -190,7 +226,8 @@ fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize 
                 let take = match &blk.instructions[k] {
                     Instruction::Alloca { dest, .. } => dest.0 == root && b != 0,
                     Instruction::GetElementPtr { dest, .. } => derived.get(&dest.0).is_some_and(|d| d.0 == root),
-                    Instruction::Store { ptr, .. } => b == block && derived.get(&ptr.0).is_some_and(|d| d.0 == root),
+                    Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } =>
+                        b == block && derived.get(&ptr.0).is_some_and(|d| d.0 == root),
                     _ => false,
                 };
                 if take {
@@ -221,7 +258,7 @@ fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize 
             while k < rest.len() {
                 let ready = match &rest[k].0 {
                     Instruction::GetElementPtr { base, .. } => placed.contains(&base.0),
-                    Instruction::Store { ptr, .. } => placed.contains(&ptr.0),
+                    Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } => placed.contains(&ptr.0),
                     _ => true,
                 };
                 if ready {
@@ -1711,13 +1748,18 @@ mod tests {
             alloca(9),
             store(Operand::Value(Value(2)), 9),
             Instruction::Load { dest: Value(10), ptr: Value(9), ty: IrType::I32, seg_override: AddressSpace::Default },
+            // A copy of the constant local: follows it in a second round.
+            alloca(11),
+            Instruction::Memcpy { dest: Value(11), src: Value(6), size: 8 },
+            Instruction::Load { dest: Value(12), ptr: Value(11), ty: IrType::I32, seg_override: AddressSpace::Default },
         ];
         func.blocks[2].instructions.splice(0..0, body);
-        func.next_value_id = 11;
+        func.next_value_id = 13;
 
         let cfg = analysis::CfgAnalysis::build(&func);
         let loops = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
-        assert_eq!(hoist_constant_locals(&mut func, &loops), 2);
+        assert_eq!(hoist_constant_locals(&mut func, &loops), 3);
+        assert!(matches!(func.blocks[0].instructions.last(), Some(Instruction::Memcpy { dest: Value(11), .. })));
 
         let defines = |b: usize, v: u32| func.blocks[b].instructions.iter().any(|i| i.dest() == Some(Value(v)));
         assert!(defines(0, 6) && defines(0, 7), "{:?}", func.blocks[0].instructions);
@@ -1725,7 +1767,7 @@ mod tests {
         assert_eq!(entry_stores, 2);
         // The alloca goes with the other allocas, before the stores.
         assert!(matches!(func.blocks[0].instructions[0], Instruction::Alloca { dest: Value(6), .. }));
-        assert!(defines(2, 8) && defines(2, 9) && defines(2, 10));
+        assert!(defines(2, 8) && defines(2, 9) && defines(2, 10) && defines(2, 12));
         assert!(func.blocks[2].instructions.iter().any(|i| matches!(i, Instruction::Store { ptr: Value(9), .. })));
     }
 }

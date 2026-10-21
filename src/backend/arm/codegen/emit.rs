@@ -75,8 +75,10 @@ pub(super) const ARM_FP_CALLER_SAVED: [PhysReg; 16] = [
 pub(super) const ARM_VEC_TEMP_REGS: [u8; 4] = [28, 29, 30, 31];
 
 /// NEON registers that hold vector-extension local variables for a whole
-/// function (see ArmCodegen::assign_vec_var_regs).
-pub(super) const ARM_VEC_VAR_REGS: [u8; 8] = [27, 26, 25, 24, 23, 22, 21, 20];
+/// function (see ArmCodegen::assign_vec_var_regs), then hoisted constant
+/// broadcasts. (v16-v19 are otherwise only inline asm scratch, around which
+/// variables are spilled and constants rebuilt.)
+pub(super) const ARM_VEC_VAR_REGS: [u8; 12] = [27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16];
 
 /// Offset added to FP register numbers when FP assignments are merged with
 /// GPR assignments for stack layout, so the two never compare equal.
@@ -240,12 +242,18 @@ pub struct ArmCodegen {
     /// (pointer, size) each was loaded from, valid while the output is still
     /// the length it had then (nothing emitted since).
     pub(super) vec_scratch: (usize, [Option<(u32, u8)>; 2]),
+    /// Not results read only by one And, which emits `bic` on the Not's
+    /// source instead (fold_vec_nots): temporary -> source.
+    pub(super) vec_not_folds: FxHashMap<u32, u32>,
     /// HFA return: the (dest, src) of each Memcpy into the return buffer
     /// that directly precedes the Return. It loads the result registers
     /// from `src` instead (emit_hfa_ret_copy) and sets `hfa_ret_loaded`, so
     /// the Return skips the buffer.
     pub(super) hfa_ret_copies: FxHashSet<(u32, u32)>,
     pub(super) hfa_ret_loaded: bool,
+    /// HFA return whose sret pointer is only loaded for those copies and
+    /// the Return: the loads (skipped, as are the x8 setup and its store).
+    pub(super) hfa_ret_ptr_loads: Option<FxHashSet<u32>>,
     /// Which callee-saved FP registers (d8-d15) are used (for save/restore).
     pub(super) used_fp_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved FP registers are stored.
@@ -288,8 +296,10 @@ impl ArmCodegen {
             vec_fresh_stores: FxHashSet::default(),
             vec_spills: FxHashMap::default(),
             vec_scratch: (usize::MAX, [None; 2]),
+            vec_not_folds: FxHashMap::default(),
             hfa_ret_copies: FxHashSet::default(),
             hfa_ret_loaded: false,
+            hfa_ret_ptr_loads: None,
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
             prestore_regs: Vec::new(),
@@ -1742,6 +1752,9 @@ impl ArmCodegen {
 
             match class {
                 ParamClass::IntReg { reg_idx } => {
+                    if sret_shift > 0 && reg_idx == 0 && i == 0 && self.hfa_ret_ptr_loads.is_some() {
+                        continue;
+                    }
                     if sret_shift > 0 && reg_idx == 0 && i == 0 {
                         // sret pointer: comes in x8 on AArch64
                         self.emit_store_to_sp("x8", slot.0, "str");

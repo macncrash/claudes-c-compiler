@@ -463,6 +463,99 @@ impl ArmCodegen {
     /// by VecOps or a Memcpy in the same block, with nothing in between that
     /// could call out or use v28-v31 (clobbers_vec_regs). Its slot is then never written or read. Registers are assigned
     /// greedily by live range within each block.
+    /// A temporary whose only use is a whole copy into a register variable
+    /// (`v = a & b`: VecOp into T, then Memcpy V <- T) can live in the
+    /// variable's register when nothing between the two reads or writes the
+    /// variable: the VecOp then writes the variable directly and the copy
+    /// becomes a move of the register to itself, which emits nothing. (The
+    /// VecOp may read the variable too: each op reads its operands before
+    /// writing its result.)
+    pub(super) fn fold_vec_temp_copies(func: &IrFunction, temps: &mut FxHashMap<u32, u8>,
+                                       vars: &FxHashMap<u32, u8>, lanes: &FxHashMap<u32, (u8, i64)>) {
+        let reg_of = |id: u32| vars.get(&id).copied().or_else(|| lanes.get(&id).map(|l| l.0));
+        let mut use_count: FxHashMap<u32, usize> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|id| {
+                    if temps.contains_key(&id) {
+                        *use_count.entry(id).or_default() += 1;
+                    }
+                });
+            }
+            block.terminator.for_each_used_value(|id| {
+                if temps.contains_key(&id) {
+                    *use_count.entry(id).or_default() += 2;
+                }
+            });
+        }
+        for block in &func.blocks {
+            let insts = &block.instructions;
+            for (p, inst) in insts.iter().enumerate() {
+                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr: Some(t), .. } = inst else { continue };
+                // Producer and copy are its only two uses.
+                if !temps.contains_key(&t.0) || use_count.get(&t.0) != Some(&2) {
+                    continue;
+                }
+                let Some(q) = (p + 1..insts.len()).find(|&q| insts[q].used_values().contains(&t.0)) else { continue };
+                let Instruction::Memcpy { dest: v, src, .. } = &insts[q] else { continue };
+                let Some(reg) = vars.get(&v.0).copied() else { continue };
+                if src != t {
+                    continue;
+                }
+                let touches = |i: &Instruction| {
+                    let mut hit = false;
+                    i.for_each_used_value(|id| hit |= reg_of(id) == Some(reg));
+                    hit || i.dest().is_some_and(|d| reg_of(d.0) == Some(reg))
+                };
+                if insts[p + 1..q].iter().any(touches) {
+                    continue;
+                }
+                temps.insert(t.0, reg);
+            }
+        }
+    }
+
+    /// Vector Not results that one And reads and nothing else: the And can
+    /// compute `a & ~s` as `bic` from the Not's source `s` directly, if `s`
+    /// is in a register that no instruction between the two writes (only
+    /// vector ops writing other registers may come between). Returns
+    /// Not result -> its source.
+    pub(super) fn fold_vec_nots(func: &IrFunction, regs: &FxHashMap<u32, u8>,
+                                lanes: &FxHashMap<u32, (u8, i64)>) -> FxHashMap<u32, u32> {
+        let mut folds = FxHashMap::default();
+        let mut use_count: FxHashMap<u32, usize> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|id| *use_count.entry(id).or_default() += 1);
+            }
+            block.terminator.for_each_used_value(|id| *use_count.entry(id).or_default() += 2);
+        }
+        let reg_of = |id: u32| regs.get(&id).copied().or_else(|| lanes.get(&id).filter(|l| l.1 == 0).map(|l| l.0));
+        for block in &func.blocks {
+            let insts = &block.instructions;
+            for (p, inst) in insts.iter().enumerate() {
+                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { op: VecOpKind::Not, .. }, dest_ptr: Some(t), args, .. } = inst
+                    else { continue };
+                let [Operand::Value(src)] = args[..] else { continue };
+                let Some(src_reg) = regs.get(&src.0).copied() else { continue };
+                if !regs.contains_key(&t.0) || use_count.get(&t.0) != Some(&2) {
+                    continue;
+                }
+                let Some(q) = (p + 1..insts.len()).find(|&q| insts[q].used_values().contains(&t.0)) else { continue };
+                let reads_t = matches!(&insts[q], Instruction::Intrinsic {
+                    op: IntrinsicOp::VecOp { op: VecOpKind::And, splat: 0, .. }, args, ..
+                } if args.iter().filter(|a| matches!(a, Operand::Value(v) if *v == *t)).count() == 1);
+                let untouched = insts[p + 1..q].iter().all(|i| matches!(i,
+                    Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr: Some(d), .. }
+                        if reg_of(d.0).is_some_and(|r| r != src_reg)));
+                if reads_t && untouched {
+                    folds.insert(t.0, src.0);
+                }
+            }
+        }
+        folds
+    }
+
     pub(super) fn assign_vec_temp_regs(func: &IrFunction) -> FxHashMap<u32, u8> {
         let mut regs = FxHashMap::default();
         let alloca_sizes: FxHashMap<u32, usize> = func.blocks.iter()
@@ -712,6 +805,24 @@ impl ArmCodegen {
     /// their pointers or broadcast from a scalar, and the result is computed in
     /// v0 and stored through `dest_ptr`. v0-v7 are codegen scratch.
     fn emit_vec_op(&mut self, op: VecOpKind, elem: VecElem, bytes: u8, splat: u8, dest_ptr: &Value, args: &[Operand]) {
+        // A Not folded into the And that reads it: nothing here, and the And
+        // becomes bic with the Not's source (fold_vec_nots).
+        if matches!(op, VecOpKind::Not) && self.vec_not_folds.contains_key(&dest_ptr.0) {
+            return;
+        }
+        let folded = match op {
+            VecOpKind::And => args.iter().position(|a| matches!(a, Operand::Value(v) if self.vec_not_folds.contains_key(&v.0))),
+            _ => None,
+        };
+        let bic_args;
+        let (splat, args) = match folded {
+            Some(i) => {
+                let Operand::Value(t) = args[i] else { unreachable!() };
+                bic_args = [args[1 - i], Operand::Value(Value(self.vec_not_folds[&t.0]))];
+                ((splat >> (1 - i)) & 1, &bic_args[..])
+            }
+            None => (splat, args),
+        };
         let q = bytes == 16;
         let mem = if q { "q" } else { "d" };
         let arr = Self::vec_arrangement(elem, bytes);
@@ -766,7 +877,7 @@ impl ArmCodegen {
             VecOpKind::Sub => vec![bin(if f { "fsub" } else { "sub" })],
             VecOpKind::Mul => vec![bin(if f { "fmul" } else { "mul" })],
             VecOpKind::Div => vec![bin("fdiv")],
-            VecOpKind::And => vec![bitwise("and")],
+            VecOpKind::And => vec![bitwise(if folded.is_some() { "bic" } else { "and" })],
             VecOpKind::Or => vec![bitwise("orr")],
             VecOpKind::Xor => vec![bitwise("eor")],
             // ushl/sshl shift left by a signed per-lane amount; right shifts

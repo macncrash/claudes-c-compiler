@@ -23,6 +23,10 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_load_impl(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
+        // A reload of an HFA return's unused sret pointer.
+        if self.hfa_ret_ptr_loads.as_ref().is_some_and(|l| l.contains(&dest.0)) {
+            return;
+        }
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_load(self, dest, ptr);
             return;

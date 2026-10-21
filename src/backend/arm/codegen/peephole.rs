@@ -1369,8 +1369,9 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
 // ── Leaf frame omission ──────────────────────────────────────────────────────
 //
 // A function that calls nothing and, after the other passes, never touches
-// the stack, fp, or lr does not need its 16-byte frame record:
-//   stp x29, x30, [sp, #-16]!; mov x29, sp; ...; ldp x29, x30, [sp], #16; ret
+// the stack, fp, or lr does not need its frame record (nor the stack slots
+// that come with it in a frame of N > 16 bytes):
+//   stp x29, x30, [sp, #-N]!; mov x29, sp; ...; ldp x29, x30, [sp], #N; ret
 // Dropping it (and its CFI) leaves the default CFA of sp with the return
 // address in x30, which is what clang emits for such leaves.
 
@@ -1392,9 +1393,11 @@ fn omit_leaf_frames(lines: &[String], kinds: &mut [LineKind], n: usize) {
 }
 
 fn omit_leaf_frame_in(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) {
-    const FRAME_CFI: [&str; 4] = [
-        ".cfi_def_cfa_offset 16", ".cfi_offset x29, -16", ".cfi_offset x30, -8", ".cfi_def_cfa_register x29",
-    ];
+    // The frame record may sit in a larger frame (stack slots that nothing
+    // uses any more): stp x29, x30, [sp, #-N]! ... ldp x29, x30, [sp], #N.
+    let mut size = 0;
+    let mut frame_cfi: Vec<String> = Vec::new();
+    let mut epilogue = String::new();
     let mut prologue: Vec<usize> = Vec::new();
     let mut epilogues: Vec<usize> = Vec::new();
     let mut saw_stp = false;
@@ -1406,7 +1409,12 @@ fn omit_leaf_frame_in(lines: &[String], kinds: &mut [LineKind], start: usize, en
         let t = lines[k].trim();
         if !saw_stp {
             // Everything before the frame setup must be the label/directives.
-            if t == "stp x29, x30, [sp, #-16]!" {
+            if let Some(n) = t.strip_prefix("stp x29, x30, [sp, #-").and_then(|r| r.strip_suffix("]!")) {
+                let Ok(n) = n.parse::<i64>() else { return };
+                size = n;
+                frame_cfi = vec![format!(".cfi_def_cfa_offset {n}"), format!(".cfi_offset x29, -{n}"),
+                                 format!(".cfi_offset x30, -{}", n - 8), ".cfi_def_cfa_register x29".to_string()];
+                epilogue = format!("ldp x29, x30, [sp], #{n}");
                 saw_stp = true;
                 prologue.push(k);
                 continue;
@@ -1417,7 +1425,7 @@ fn omit_leaf_frame_in(lines: &[String], kinds: &mut [LineKind], start: usize, en
             return;
         }
         if !saw_mov_fp {
-            if FRAME_CFI.contains(&t) {
+            if frame_cfi.iter().any(|c| c == t) {
                 prologue.push(k);
                 continue;
             }
@@ -1432,7 +1440,7 @@ fn omit_leaf_frame_in(lines: &[String], kinds: &mut [LineKind], start: usize, en
             prologue.push(k);
             continue;
         }
-        if t == "ldp x29, x30, [sp], #16" {
+        if t == epilogue {
             epilogues.push(k);
             continue;
         }
@@ -1445,7 +1453,7 @@ fn omit_leaf_frame_in(lines: &[String], kinds: &mut [LineKind], start: usize, en
             return;
         }
     }
-    if !saw_mov_fp || epilogues.is_empty() {
+    if !saw_mov_fp || epilogues.is_empty() || size < 16 {
         return;
     }
     for k in prologue.into_iter().chain(epilogues) {
@@ -2425,6 +2433,13 @@ mod tests {
             let result = peephole_optimize(format!("{}{}{}", frame, body, tail));
             assert!(result.contains("stp x29, x30") && result.contains("ldp x29, x30"), "{}", result);
         }
+        // A larger frame whose slots nothing uses goes too; mismatched sizes stay.
+        let big = frame.replace("#-16]!", "#-128]!").replace("offset 16", "offset 128")
+            .replace("x29, -16", "x29, -128").replace("x30, -8", "x30, -120");
+        let result = peephole_optimize(format!("{}    add x0, x0, x1\n{}", big, tail.replace("#16", "#128")));
+        assert!(!result.contains("x29") && !result.contains("cfa"), "{}", result);
+        let result = peephole_optimize(format!("{}    add x0, x0, x1\n{}", big, tail));
+        assert!(result.contains("stp x29, x30"), "{}", result);
     }
 
     #[test]

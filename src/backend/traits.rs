@@ -556,7 +556,11 @@ pub trait ArchCodegen {
                                 struct_arg_riscv_float_classes);
 
         // Phase 3.5: Set up sret pointer in dedicated register (x8 on AArch64).
-        if let Some(sret_op) = sret_operand {
+        // Not for an HFA return (Phase 5.5): the callee returns it in
+        // registers and takes no pointer.
+        let hfa_return = is_sret && config.use_hfa_classification
+            && matches!(struct_arg_riscv_float_classes.first(), Some(Some(crate::common::types::RiscvFloatClass::Hfa { .. })));
+        if let Some(sret_op) = sret_operand.filter(|_| !hfa_return) {
             self.emit_call_sret_setup(sret_op, total_sp_adjust);
         }
 
