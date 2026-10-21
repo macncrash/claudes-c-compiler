@@ -679,6 +679,8 @@ impl Lowerer {
             } else {
                 self.lower_1d_array_init(items, alloca, da, decl);
             }
+        } else if let Some((vec_elem_ct, lanes)) = Self::array_vector_elem(da) {
+            self.lower_array_of_vectors_init(items, alloca, da, &vec_elem_ct, lanes);
         } else if da.array_dim_strides.len() > 1 && elem_struct_layout.is_none() {
             // Multi-dimensional array of scalars
             self.zero_init_alloca(alloca, da.alloc_size);
@@ -1051,6 +1053,44 @@ impl Lowerer {
                 }
             }
             current_idx += 1;
+        }
+    }
+
+    /// The lane type and count of a one-dimensional array of vectors.
+    fn array_vector_elem(da: &DeclAnalysis) -> Option<(CType, usize)> {
+        match &da.c_type {
+            Some(CType::Array(inner, _)) if da.array_dim_strides.len() == 1 => {
+                inner.vector_info().map(|(elem, lanes)| (elem.clone(), lanes))
+            }
+            _ => None,
+        }
+    }
+
+    /// Array of vectors: `v4si a[2] = { {1, 2, 3, 4}, v };`. Each element is
+    /// a braced lane list or a vector expression; `[i] =` picks the element.
+    fn lower_array_of_vectors_init(&mut self, items: &[InitializerItem], alloca: Value, da: &DeclAnalysis, elem_ct: &CType, lanes: usize) {
+        let vec_size = da.elem_size;
+        self.zero_init_alloca(alloca, da.alloc_size);
+        let mut idx = 0usize;
+        for item in items {
+            if let Some(Designator::Index(e)) = item.designators.first() {
+                if let Some(i) = self.expr_as_array_size(e) {
+                    idx = i as usize;
+                }
+            }
+            if (idx + 1) * vec_size > da.alloc_size {
+                break;
+            }
+            let elem_addr = self.emit_gep_offset(alloca, idx * vec_size, IrType::I8);
+            match &item.init {
+                Initializer::List(sub) => self.lower_vector_init_list(sub, elem_addr, elem_ct, lanes),
+                Initializer::Expr(e) => {
+                    let src = self.lower_expr(e);
+                    let src = self.operand_to_value(src);
+                    self.emit(Instruction::Memcpy { dest: elem_addr, src, size: vec_size });
+                }
+            }
+            idx += 1;
         }
     }
 

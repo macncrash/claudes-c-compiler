@@ -102,7 +102,11 @@ impl Lowerer {
                 } else {
                     self.get_expr_ctype(expr)
                 };
-                if let Some(ctype) = ctype {
+                if let Some(CType::Vector(elem, total_bytes)) = ctype {
+                    // ctype_to_type_spec gives a vector's element type (for
+                    // implicit casts); a declaration needs the whole vector.
+                    TypeSpecifier::Vector(Box::new(Self::ctype_to_type_spec(&elem)), total_bytes)
+                } else if let Some(ctype) = ctype {
                     Self::ctype_to_type_spec(&ctype)
                 } else {
                     self.emit_warning(
