@@ -690,10 +690,12 @@ impl Lowerer {
         if self.eval_const_expr(arg).is_some() {
             return Some(Operand::Const(IrConst::I32(1)));
         }
-        // In non-inline-candidate functions, non-constant expressions always resolve to 0.
+        // In non-inline-candidate functions, non-constant expressions resolve to 0,
+        // except a plain local the optimizer may prove constant (see
+        // constant_p_defers_to_optimizer).
         // The argument is NOT evaluated per GCC semantics -- __builtin_constant_p
         // never has side effects regardless of its argument.
-        if !self.func().is_inline_candidate {
+        if !self.func().is_inline_candidate && !self.constant_p_defers_to_optimizer(arg) {
             return Some(Operand::Const(IrConst::I32(0)));
         }
         // For inline candidates, emit an IsConstant instruction to be resolved after
@@ -710,6 +712,25 @@ impl Lowerer {
             ty: src_ty,
         });
         Some(Operand::Value(dest))
+    }
+
+    /// Whether `__builtin_constant_p(arg)` is left to the optimizer even outside
+    /// inline candidates: `arg` is a plain scalar local (not a parameter, static,
+    /// array, aggregate or register variable), so after mem2reg and constant
+    /// folding it may become a constant (`int size = sizeof(int);`). Volatile
+    /// and address-taken locals stay in memory and resolve to 0. Parameters
+    /// keep the early 0 that kernel macros rely on to prune branches.
+    pub(super) fn constant_p_defers_to_optimizer(&self, arg: &Expr) -> bool {
+        let Expr::Identifier(name, _) = arg else { return false };
+        let Some(func) = self.func_state.as_ref() else { return false };
+        let Some(info) = func.locals.get(name) else { return false };
+        !info.is_array
+            && !info.is_struct
+            && !info.c_type.as_ref().is_some_and(|ct| ct.is_complex() || ct.is_vector())
+            && info.static_global_name.is_none()
+            && info.asm_register.is_none()
+            && info.vla_size.is_none()
+            && !func.param_alloca_values.contains(&info.alloca)
     }
 
     /// Lower __builtin_complex(real, imag): construct a complex value on the stack.

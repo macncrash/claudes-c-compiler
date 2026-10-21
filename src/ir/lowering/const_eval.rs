@@ -97,6 +97,16 @@ impl Lowerer {
     /// for expressions that require lowering-specific state (global addresses,
     /// const local values, etc.).
     pub(super) fn eval_const_expr(&self, expr: &Expr) -> Option<IrConst> {
+        // __builtin_constant_p of a local the optimizer may prove constant has
+        // no value yet (sema answered 0), so `?:`/`if` must keep both branches.
+        if let Expr::FunctionCall(func, args, _) = expr {
+            if matches!(func.as_ref(), Expr::Identifier(name, _) if name == "__builtin_constant_p")
+                && args.first().is_some_and(|a| self.eval_const_expr(a).is_none()
+                    && self.constant_p_defers_to_optimizer(a))
+            {
+                return None;
+            }
+        }
         // Fast path: consult sema's pre-computed constant values.
         // This avoids re-evaluating expressions that sema already handled.
         // We skip the sema lookup for:
