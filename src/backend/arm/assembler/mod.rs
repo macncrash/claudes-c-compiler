@@ -445,6 +445,128 @@ mod tests {
         }
     }
 
+    /// NEON forms the vector-extension codegen emits (whole-vector ops on
+    /// every arrangement, dup from a GPR, lane moves, q/d loads and stores),
+    /// checked against encodings from clang/LLVM.
+    #[test]
+    fn test_vector_instruction_forms_match_llvm() {
+        let cases = [
+            ("dup v1.4s, w0", 0x4e040c01u32),
+            ("add v27.4s, v0.4s, v1.4s", 0x4ea1841b),
+            ("fmul v27.4s, v0.4s, v1.4s", 0x6e21dc1b),
+            ("ins v26.b[0], w0", 0x4e011c1a),
+            ("dup v1.16b, w0", 0x4e010c01),
+            ("mul v28.16b, v26.16b, v1.16b", 0x4e219f5c),
+            ("orr v27.16b, v28.16b, v28.16b", 0x4ebc1f9b),
+            ("add v28.16b, v27.16b, v25.16b", 0x4e39877c),
+            ("sub v28.16b, v27.16b, v25.16b", 0x6e39877c),
+            ("and v28.16b, v27.16b, v25.16b", 0x4e391f7c),
+            ("eor v28.16b, v27.16b, v25.16b", 0x6e391f7c),
+            ("sshl v28.16b, v27.16b, v24.16b", 0x4e38477c),
+            ("neg v1.16b, v23.16b", 0x6e20bae1),
+            ("cmeq v28.16b, v27.16b, v25.16b", 0x6e398f7c),
+            ("mvn v28.16b, v28.16b", 0x6e205b9c),
+            ("cmgt v28.16b, v25.16b, v27.16b", 0x4e3b373c),
+            ("cmge v28.16b, v25.16b, v27.16b", 0x4e3b3f3c),
+            ("ushl v28.16b, v21.16b, v1.16b", 0x6e2146bc),
+            ("cmhi v28.16b, v1.16b, v21.16b", 0x6e35343c),
+            ("cmhs v28.16b, v1.16b, v21.16b", 0x6e353c3c),
+            ("dup v1.8h, w0", 0x4e020c01),
+            ("mul v28.8h, v0.8h, v1.8h", 0x4e619c1c),
+            ("add v28.8h, v0.8h, v1.8h", 0x4e61841c),
+            ("sub v28.8h, v0.8h, v1.8h", 0x6e61841c),
+            ("sshl v28.8h, v0.8h, v1.8h", 0x4e61441c),
+            ("neg v1.8h, v1.8h", 0x6e60b821),
+            ("cmeq v28.8h, v0.8h, v1.8h", 0x6e618c1c),
+            ("cmgt v28.8h, v1.8h, v0.8h", 0x4e60343c),
+            ("cmge v28.8h, v1.8h, v0.8h", 0x4e603c3c),
+            ("ushl v28.8h, v0.8h, v1.8h", 0x6e61441c),
+            ("cmhi v28.8h, v1.8h, v0.8h", 0x6e60343c),
+            ("cmhs v28.8h, v1.8h, v0.8h", 0x6e603c3c),
+            ("mul v28.4s, v0.4s, v1.4s", 0x4ea19c1c),
+            ("sub v28.4s, v0.4s, v1.4s", 0x6ea1841c),
+            ("sshl v28.4s, v0.4s, v1.4s", 0x4ea1441c),
+            ("neg v1.4s, v1.4s", 0x6ea0b821),
+            ("cmeq v28.4s, v0.4s, v1.4s", 0x6ea18c1c),
+            ("cmgt v28.4s, v1.4s, v0.4s", 0x4ea0343c),
+            ("cmge v28.4s, v1.4s, v0.4s", 0x4ea03c3c),
+            ("ushl v28.4s, v0.4s, v1.4s", 0x6ea1441c),
+            ("cmhi v28.4s, v1.4s, v0.4s", 0x6ea0343c),
+            ("cmhs v28.4s, v1.4s, v0.4s", 0x6ea03c3c),
+            ("add v28.2d, v0.2d, v1.2d", 0x4ee1841c),
+            ("sub v28.2d, v0.2d, v1.2d", 0x6ee1841c),
+            ("sshl v28.2d, v0.2d, v1.2d", 0x4ee1441c),
+            ("neg v1.2d, v1.2d", 0x6ee0b821),
+            ("dup v1.2d, x0", 0x4e080c01),
+            ("cmeq v28.2d, v0.2d, v1.2d", 0x6ee18c1c),
+            ("cmgt v28.2d, v1.2d, v0.2d", 0x4ee0343c),
+            ("cmge v28.2d, v1.2d, v0.2d", 0x4ee03c3c),
+            ("ushl v28.2d, v0.2d, v1.2d", 0x6ee1441c),
+            ("cmhi v28.2d, v1.2d, v0.2d", 0x6ee0343c),
+            ("cmhs v28.2d, v1.2d, v0.2d", 0x6ee03c3c),
+            ("fadd v28.4s, v0.4s, v1.4s", 0x4e21d41c),
+            ("fsub v28.4s, v0.4s, v1.4s", 0x4ea1d41c),
+            ("fdiv v28.4s, v0.4s, v1.4s", 0x6e21fc1c),
+            ("fcmeq v28.4s, v0.4s, v1.4s", 0x4e21e41c),
+            ("fcmgt v28.4s, v1.4s, v0.4s", 0x6ea0e43c),
+            ("fcmge v28.4s, v1.4s, v0.4s", 0x6e20e43c),
+            ("fneg v28.4s, v0.4s", 0x6ea0f81c),
+            ("fmul v28.2d, v0.2d, v1.2d", 0x6e61dc1c),
+            ("fadd v28.2d, v0.2d, v1.2d", 0x4e61d41c),
+            ("fsub v28.2d, v0.2d, v1.2d", 0x4ee1d41c),
+            ("fdiv v28.2d, v0.2d, v1.2d", 0x6e61fc1c),
+            ("fcmeq v28.2d, v0.2d, v1.2d", 0x4e61e41c),
+            ("fcmgt v28.2d, v1.2d, v0.2d", 0x6ee0e43c),
+            ("fcmge v28.2d, v1.2d, v0.2d", 0x6e60e43c),
+            ("fneg v28.2d, v0.2d", 0x6ee0f81c),
+            ("ins v27.s[0], w0", 0x4e041c1b),
+            ("ins v22.d[0], x0", 0x4e081c16),
+            ("add v28.8b, v0.8b, v1.8b", 0x0e21841c),
+            ("mul v28.4h, v0.4h, v1.4h", 0x0e619c1c),
+            ("fadd v28.2s, v0.2s, v1.2s", 0x0e21d41c),
+            ("fcmgt v28.2s, v1.2s, v0.2s", 0x2ea0e43c),
+            ("cmhi v28.4h, v1.4h, v0.4h", 0x2e60343c),
+            ("dup v1.2s, w0", 0x0e040c01),
+            ("dup v1.8b, w0", 0x0e010c01),
+            ("dup v1.4h, w0", 0x0e020c01),
+            ("neg v1.2s, v1.2s", 0x2ea0b821),
+            ("ushl v28.2s, v0.2s, v1.2s", 0x2ea1441c),
+            ("orr v20.8b, v28.8b, v28.8b", 0x0ebc1f94),
+            ("mvn v28.8b, v28.8b", 0x2e205b9c),
+            ("and v28.8b, v0.8b, v1.8b", 0x0e211c1c),
+            ("umov w0, v27.s[1]", 0x0e0c3f60),
+            ("umov x0, v27.d[1]", 0x4e183f60),
+            ("umov w0, v27.b[3]", 0x0e073f60),
+            ("umov w0, v27.h[2]", 0x0e0a3f60),
+            ("ins v27.h[1], w0", 0x4e061c1b),
+            ("ins v21.d[1], x0", 0x4e181c15),
+            ("sxtb x0, w0", 0x93401c00),
+            ("sxth x0, w0", 0x93403c00),
+            ("ldr q27, [sp, #384]", 0x3dc063fb),
+            ("str q28, [x22]", 0x3d8002dc),
+            ("ldr q1, [x26, x10]", 0x3cea6b41),
+            ("ldr d26, [x0]", 0xfd40001a),
+            ("str d27, [sp, #16]", 0xfd000bfb),
+            ("ldr q0, [x0]", 0x3dc00000),
+            ("str q27, [x29, #32]", 0x3d800bbb),
+        ];
+        let mut failures = Vec::new();
+        for (text, expected) in cases {
+            let stmts = parse_asm(text).unwrap_or_else(|e| panic!("{}: {}", text, e));
+            let Some(AsmStatement::Instruction { mnemonic, operands, raw_operands }) =
+                stmts.into_iter().find(|s| matches!(s, AsmStatement::Instruction { .. }))
+            else {
+                panic!("{}: not parsed as an instruction", text)
+            };
+            match encode_instruction(&mnemonic, &operands, &raw_operands) {
+                Ok(EncodeResult::Word(w)) if w == expected => {}
+                Ok(EncodeResult::Word(w)) => failures.push(format!("{}: got {:#010x}, want {:#010x}", text, w, expected)),
+                other => failures.push(format!("{}: unexpected encoding {:?}", text, other.map(|_| ()))),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// Global addresses with a constant offset folded into the relocation
     /// addend (peephole `fold_offset_into_global_addr`). Words match LLVM's
     /// unrelocated encodings.

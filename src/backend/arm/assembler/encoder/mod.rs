@@ -403,7 +403,7 @@ pub fn encode_instruction(mnemonic: &str, operands: &[Operand], raw_operands: &s
             encode_neon_float_three_same(operands, 0, 1, 0b11000)
         } else { encode_fp_arith(operands, 0b0111) },
         "fneg" => if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
-            encode_neon_float_two_misc(operands, 1, 0, 0b01111)
+            encode_neon_float_two_misc(operands, 1, 1, 0b01111)
         } else { encode_fneg(operands) },
         "fabs" => if matches!(operands.first(), Some(Operand::RegArrangement { .. })) {
             encode_neon_float_two_misc(operands, 0, 1, 0b01111)
