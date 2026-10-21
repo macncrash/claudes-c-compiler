@@ -3,7 +3,7 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use crate::ir::reexports::{Instruction, IntrinsicOp, IrFunction, Operand, Value, VecElem, VecOpKind};
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, IrFunction, Operand, Terminator, Value, VecElem, VecOpKind};
 use crate::backend::state::SlotAddr;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -226,7 +226,7 @@ impl ArmCodegen {
     /// instruction is fully handled), and spill vector variables ahead of
     /// anything that may clobber their registers.
     pub(super) fn vec_before_instruction(&mut self, inst: &Instruction) -> bool {
-        if self.vec_vars.is_empty() {
+        if self.vec_vars.is_empty() && self.vec_consts.is_empty() {
             return false;
         }
         match inst {
@@ -270,8 +270,9 @@ impl ArmCodegen {
 
     /// After an instruction: reload the vector variables spilled before it.
     pub(super) fn vec_after_instruction(&mut self, inst: &Instruction) {
-        if !self.vec_vars.is_empty() && Self::clobbers_vec_regs(inst) {
+        if Self::clobbers_vec_regs(inst) {
             self.spill_vec_vars("ldr");
+            self.emit_vec_consts();
         }
     }
 
@@ -400,24 +401,117 @@ impl ArmCodegen {
         }
     }
 
+    fn vec_arrangement(elem: VecElem, bytes: u8) -> &'static str {
+        match (elem.size(), bytes == 16) {
+            (1, true) => "16b", (1, false) => "8b",
+            (2, true) => "8h", (2, false) => "4h",
+            (4, true) => "4s", (4, false) => "2s",
+            (_, true) => "2d", (_, false) => "1d",
+        }
+    }
+
+    /// The lane bits a constant broadcast puts in each lane: the low bits of
+    /// the constant as operand_to_x0 loads it.
+    fn splat_bits(c: &IrConst, elem: VecElem) -> Option<u64> {
+        let bits = match c {
+            IrConst::I8(v) => *v as u64,
+            IrConst::I16(v) => *v as u64,
+            IrConst::I32(v) => *v as u64,
+            IrConst::I64(v) => *v as u64,
+            IrConst::F32(v) => v.to_bits() as u64,
+            IrConst::F64(v) => v.to_bits(),
+            IrConst::Zero => 0,
+            _ => return None,
+        };
+        Some(if elem.size() == 8 { bits } else { bits & ((1u64 << (8 * elem.size())) - 1) })
+    }
+
+    /// The register holding a hoisted constant broadcast of `arg`, if any.
+    fn vec_const_reg(&self, arg: &Operand, elem: VecElem, bytes: u8) -> Option<u8> {
+        let Operand::Const(c) = arg else { return None };
+        let bits = Self::splat_bits(c, elem)?;
+        self.vec_consts.iter()
+            .find(|(k, e, b, _)| *e == elem && *b == bytes && Self::splat_bits(k, *e) == Some(bits))
+            .map(|&(_, _, _, reg)| reg)
+    }
+
+    /// Pick the constant broadcasts worth keeping in a register: those that
+    /// vector ops use in a loop (a block some later block branches back
+    /// to, or that branches back itself), most used first, one per free
+    /// register.
+    pub(super) fn assign_vec_const_regs(func: &IrFunction, free_regs: &[u8]) -> Vec<(IrConst, VecElem, u8, u8)> {
+        let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
+        let mut in_loop = vec![false; func.blocks.len()];
+        for (j, block) in func.blocks.iter().enumerate() {
+            let mut targets = Vec::new();
+            match &block.terminator {
+                Terminator::Branch(l) => targets.push(*l),
+                Terminator::CondBranch { true_label, false_label, .. } => targets.extend([*true_label, *false_label]),
+                Terminator::Switch { cases, default, .. } => {
+                    targets.extend(cases.iter().map(|c| c.1));
+                    targets.push(*default);
+                }
+                Terminator::IndirectBranch { possible_targets, .. } => targets.extend(possible_targets.iter().copied()),
+                _ => {}
+            }
+            for t in targets {
+                if let Some(&k) = index.get(&t.0) {
+                    if k <= j {
+                        in_loop[k..=j].iter_mut().for_each(|b| *b = true);
+                    }
+                }
+            }
+        }
+        let mut counts: Vec<(IrConst, VecElem, u8, usize)> = Vec::new();
+        for (_, block) in func.blocks.iter().enumerate().filter(|(i, _)| in_loop[*i]) {
+            for inst in &block.instructions {
+                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { elem, bytes, splat, .. }, args, .. } = inst else { continue };
+                for (i, arg) in args.iter().enumerate() {
+                    let Operand::Const(c) = arg else { continue };
+                    if splat & (1 << i) == 0 {
+                        continue;
+                    }
+                    let Some(bits) = Self::splat_bits(c, *elem) else { continue };
+                    match counts.iter_mut().find(|(k, e, b, _)| e == elem && b == bytes && Self::splat_bits(k, *e) == Some(bits)) {
+                        Some(entry) => entry.3 += 1,
+                        None => counts.push((*c, *elem, *bytes, 1)),
+                    }
+                }
+            }
+        }
+        counts.sort_by(|a, b| b.3.cmp(&a.3));
+        counts.into_iter().zip(free_regs.iter())
+            .map(|((c, e, b, _), &reg)| (c, e, b, reg))
+            .collect()
+    }
+
+    /// Materialize the hoisted constant broadcasts in their registers.
+    pub(super) fn emit_vec_consts(&mut self) {
+        for (c, elem, bytes, reg) in self.vec_consts.clone() {
+            self.operand_to_x0(&Operand::Const(c));
+            let gpr = if elem.size() == 8 { "x0" } else { "w0" };
+            self.state.emit_fmt(format_args!("    dup v{}.{}, {}", reg, Self::vec_arrangement(elem, bytes), gpr));
+        }
+        if !self.vec_consts.is_empty() {
+            self.state.reg_cache.invalidate_acc();
+        }
+    }
+
     /// Emit an IntrinsicOp::VecOp: operands go to v0 (and v1), loaded through
     /// their pointers or broadcast from a scalar, and the result is computed in
     /// v0 and stored through `dest_ptr`. v0-v7 are codegen scratch.
     fn emit_vec_op(&mut self, op: VecOpKind, elem: VecElem, bytes: u8, splat: u8, dest_ptr: &Value, args: &[Operand]) {
         let q = bytes == 16;
         let mem = if q { "q" } else { "d" };
-        let arr = match (elem.size(), q) {
-            (1, true) => "16b", (1, false) => "8b",
-            (2, true) => "8h", (2, false) => "4h",
-            (4, true) => "4s", (4, false) => "2s",
-            (_, true) => "2d", (_, false) => "1d",
-        };
+        let arr = Self::vec_arrangement(elem, bytes);
         let bits = if q { "16b" } else { "8b" };
         // Operand registers: a temporary's own register, else v0/v1.
         let mut src = [String::new(), String::new()];
         for (i, arg) in args.iter().enumerate() {
             src[i] = format!("v{i}");
-            if splat & (1 << i) != 0 {
+            if let Some(reg) = self.vec_const_reg(arg, elem, bytes).filter(|_| splat & (1 << i) != 0) {
+                src[i] = format!("v{reg}");
+            } else if splat & (1 << i) != 0 {
                 self.operand_to_x0(arg);
                 let gpr = if elem.size() == 8 { "x0" } else { "w0" };
                 self.state.emit_fmt(format_args!("    dup v{}.{}, {}", i, arr, gpr));

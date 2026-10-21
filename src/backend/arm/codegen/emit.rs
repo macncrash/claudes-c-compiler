@@ -11,6 +11,7 @@ use crate::ir::reexports::{
     IrFunction,
     Operand,
     Value,
+    VecElem,
 };
 use crate::common::types::IrType;
 use crate::common::fx_hash::FxHashMap;
@@ -223,6 +224,11 @@ pub struct ArmCodegen {
     /// Pointers to a lane of a vector variable (the alloca itself, or a
     /// constant GEP from it): value ID -> (register, byte offset).
     pub(super) vec_lanes: FxHashMap<u32, (u8, i64)>,
+    /// Constant broadcasts used by vector ops in loops, kept in a register
+    /// for the whole function: (constant, lane type, vector bytes, register).
+    /// Built after the parameter stores and rebuilt after anything that may
+    /// clobber v16-v31 (emit_vec_consts).
+    pub(super) vec_consts: Vec<(IrConst, VecElem, u8, u8)>,
     /// Which callee-saved FP registers (d8-d15) are used (for save/restore).
     pub(super) used_fp_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved FP registers are stored.
@@ -260,6 +266,7 @@ impl ArmCodegen {
             vec_regs: FxHashMap::default(),
             vec_vars: Vec::new(),
             vec_lanes: FxHashMap::default(),
+            vec_consts: Vec::new(),
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
             prestore_regs: Vec::new(),

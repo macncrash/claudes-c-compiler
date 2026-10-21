@@ -24,6 +24,10 @@ impl ArmCodegen {
         self.vec_regs = var_regs.into_iter().chain(temp_regs).collect();
         self.vec_vars = vars.into_iter().map(|(reg, size)| (reg, size, 0)).collect();
         self.vec_lanes = lanes;
+        let free: Vec<u8> = super::emit::ARM_VEC_VAR_REGS.iter().copied()
+            .filter(|r| !self.vec_regs.values().any(|v| v == r))
+            .collect();
+        self.vec_consts = Self::assign_vec_const_regs(func, &free);
         let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
         let available_regs = crate::backend::generation::filter_available_regs(base_regs, &asm_clobbered_regs);
 
@@ -76,7 +80,8 @@ impl ArmCodegen {
                 callee_saved_regs: ARM_FP_CALLEE_SAVED.to_vec(),
                 // Registers holding vector values are not for scalars.
                 caller_saved_regs: ARM_FP_CALLER_SAVED.iter().copied()
-                    .filter(|r| !self.vec_regs.values().any(|&v| v == r.0))
+                    .filter(|r| !self.vec_regs.values().any(|&v| v == r.0)
+                        && !self.vec_consts.iter().any(|c| c.3 == r.0))
                     .collect(),
             };
             let fp = crate::backend::regalloc::allocate_fp_registers(func, &liveness, &config);
@@ -417,6 +422,7 @@ impl ArmCodegen {
         self.emit_store_gp_params(func, &param_classes);
         self.emit_store_fp_params(func, &param_classes);
         self.emit_store_stack_params(func, &param_classes);
+        self.emit_vec_consts();
     }
 
     // ---- emit_param_ref ----
