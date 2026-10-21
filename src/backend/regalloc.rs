@@ -27,6 +27,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::reexports::{
     Instruction,
+    IntrinsicOp,
     IrConst,
     IrFunction,
     Operand,
@@ -70,6 +71,9 @@ pub struct RegAllocConfig {
     /// argument). Requires a backend whose argument setup and result copy
     /// leave the caller-saved pool untouched (AArch64).
     pub caller_saved_at_call_boundaries: bool,
+    /// Whether Memcpy pointer operands may be register-allocated. Requires a
+    /// backend whose memcpy reads register-assigned pointers (AArch64).
+    pub allow_memcpy_regalloc: bool,
 }
 
 /// Run the linear scan register allocator on a function.
@@ -498,7 +502,8 @@ pub fn allocate_fp_registers(
     for block in &func.blocks {
         for inst in &block.instructions {
             let calls_helper = match inst {
-                Instruction::Intrinsic { .. } => true,
+                // Whole-vector ops use only v0/v1 and the vector temp registers.
+                Instruction::Intrinsic { op, .. } => !matches!(op, IntrinsicOp::VecOp { .. }),
                 Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
                 | Instruction::Cmp { ty, .. } | Instruction::Load { ty, .. }
                 | Instruction::Store { ty, .. } => *ty == IrType::F128,
@@ -662,7 +667,7 @@ fn remove_ineligible_operands(func: &IrFunction, eligible: &mut FxHashSet<u32>, 
                 Instruction::CallIndirect { func_ptr: Operand::Value(v), .. } => {
                     eligible.remove(&v.0);
                 }
-                Instruction::Memcpy { dest, src, .. } => {
+                Instruction::Memcpy { dest, src, .. } if !config.allow_memcpy_regalloc => {
                     eligible.remove(&dest.0);
                     eligible.remove(&src.0);
                 }

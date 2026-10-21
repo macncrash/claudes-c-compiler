@@ -55,16 +55,20 @@ pub(super) const ARM_FP_CALLEE_SAVED: [PhysReg; 8] = [
     PhysReg(12), PhysReg(13), PhysReg(14), PhysReg(15),
 ];
 
-/// Caller-saved FP registers available for allocation: v16-v31.
+/// Caller-saved FP registers available for allocation: v16-v27.
 ///
 /// The codegen uses only v0-v7 as FP scratch. v16 and up appear only as
 /// inline asm scratch, and functions with inline asm skip FP allocation.
-pub(super) const ARM_FP_CALLER_SAVED: [PhysReg; 16] = [
+pub(super) const ARM_FP_CALLER_SAVED: [PhysReg; 12] = [
     PhysReg(16), PhysReg(17), PhysReg(18), PhysReg(19),
     PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23),
     PhysReg(24), PhysReg(25), PhysReg(26), PhysReg(27),
-    PhysReg(28), PhysReg(29), PhysReg(30), PhysReg(31),
 ];
+
+/// NEON registers that hold vector-extension temporaries between the
+/// vector op that produces one and the ops that consume it
+/// (see ArmCodegen::assign_vec_temp_regs).
+pub(super) const ARM_VEC_TEMP_REGS: [u8; 4] = [28, 29, 30, 31];
 
 /// Offset added to FP register numbers when FP assignments are merged with
 /// GPR assignments for stack layout, so the two never compare equal.
@@ -200,6 +204,9 @@ pub struct ArmCodegen {
     /// FP register allocator: value ID -> (FP register, value is F32).
     /// Kept apart from `reg_assignments`, whose users all expect GPRs.
     pub(super) fp_reg_assignments: FxHashMap<u32, (PhysReg, bool)>,
+    /// Vector temporaries kept in a NEON register instead of their stack
+    /// slot: alloca value ID -> register number (from ARM_VEC_TEMP_REGS).
+    pub(super) vec_temp_regs: FxHashMap<u32, u8>,
     /// Which callee-saved FP registers (d8-d15) are used (for save/restore).
     pub(super) used_fp_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved FP registers are stored.
@@ -234,6 +241,7 @@ impl ArmCodegen {
             used_callee_saved: Vec::new(),
             callee_save_offset: 0,
             fp_reg_assignments: FxHashMap::default(),
+            vec_temp_regs: FxHashMap::default(),
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
             prestore_regs: Vec::new(),
@@ -2015,7 +2023,9 @@ impl ArchCodegen for ArmCodegen {
     fn emit_memcpy_store_dest_from_acc(&mut self) { }
     fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    mov x10, x9"); }
     fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
-        self.emit_memcpy_arm(dest, src, size);
+        if !self.try_emit_vec_temp_copy(dest, src, size) {
+            self.emit_memcpy_arm(dest, src, size);
+        }
     }
     fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) {
         self.operand_to_x0(func_ptr);

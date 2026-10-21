@@ -36,6 +36,12 @@ static void mix(const char *what, const void *p, size_t n) {
 }
 #define MIX(name, v) do { __typeof__(v) t_ = (v); mix(name, &t_, sizeof t_); } while (0)
 
+typedef unsigned v4u32_t __attribute__((vector_size(16)));
+typedef float v4f32_t __attribute__((vector_size(16)));
+
+__attribute__((noinline)) static v4u32_t bump(v4u32_t v) { return v + 1u; }
+__attribute__((noinline)) static v4f32_t scale(v4f32_t v) { return v * 0.5f; }
+
 /* Integer vectors: every operator, vector/scalar mixes, compound forms. */
 #define INT_TESTS(T, a, b, s, sh)                                        \
     do {                                                                 \
@@ -129,6 +135,17 @@ int main(int argc, char **argv) {
     __typeof__(-dinit[1]) tneg = -dinit[1];
     MIX("typeof", tsum);
     MIX("typeofneg", tneg);
+
+    /* Intermediate results kept in registers: a temporary used as a shift
+     * count and again afterwards, a call between producer and consumer, and
+     * more simultaneously live temporaries than there are registers. */
+    v4u32 ua = { 1, 2, 3, 4 }, ub = { 5, 6, 7, 8 };
+    MIX("tmpshift", ((ua * ub) >> (ub - ua)) + (ub - ua) * (ua << (ub - ua)));
+    MIX("tmpcall", (ua * ub) + bump(ub) * (ua - ub));
+    MIX("tmpdeep", ((ua + ub) * (ua - ub)) ^ ((ua * 3u + ub) | ((ub >> 1) - (ua & ub)))
+                   ^ (((ua ^ ub) + (ua | ub)) * ((ub - 1u) + (ua + 2u))));
+    v4f32 fx = { 1.5f, -2.0f, 3.25f, 0.5f };
+    MIX("tmpfloat", (fx * fx - fx / (fx + 4.0f)) * (fx - 1.0f) + fx * scale((v4f32){ 2, 2, 2, 2 }));
 
     printf("all %016llx\n", hash);
     return 0;

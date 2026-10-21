@@ -3,8 +3,11 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use crate::ir::reexports::{IntrinsicOp, Operand, Value, VecElem, VecOpKind};
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrFunction, Operand, Value, VecElem, VecOpKind};
 use crate::backend::state::SlotAddr;
+use crate::common::fx_hash::FxHashMap;
+use crate::common::types::IrType;
+use super::emit::ARM_VEC_TEMP_REGS;
 use super::emit::ArmCodegen;
 
 impl ArmCodegen {
@@ -73,6 +76,112 @@ impl ArmCodegen {
         }
     }
 
+    /// Pick the vector temporaries that can live in a NEON register
+    /// (ARM_VEC_TEMP_REGS) instead of their stack slot: an 8- or 16-byte
+    /// alloca written by exactly one VecOp and afterwards only read, whole,
+    /// by VecOps or a Memcpy in the same block, with nothing in between that
+    /// could call out or use v28-v31 (calls, F128/I128 arithmetic, inline
+    /// asm). Its slot is then never written or read. Registers are assigned
+    /// greedily by live range within each block.
+    pub(super) fn assign_vec_temp_regs(func: &IrFunction) -> FxHashMap<u32, u8> {
+        let mut regs = FxHashMap::default();
+        let alloca_sizes: FxHashMap<u32, usize> = func.blocks.iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| match inst {
+                Instruction::Alloca { dest, size: size @ (8 | 16), .. } => Some((dest.0, *size)),
+                _ => None,
+            })
+            .collect();
+        if alloca_sizes.is_empty() {
+            return regs;
+        }
+        // Each candidate's uses: (block, index, kind). Kind: 0 = written by a
+        // VecOp, 1 = read whole by a VecOp or Memcpy, 2 = anything else.
+        let mut uses: FxHashMap<u32, Vec<(usize, usize, u8)>> = FxHashMap::default();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                let mut kinds: Vec<(u32, u8)> = Vec::new();
+                match inst {
+                    Instruction::Intrinsic { op: IntrinsicOp::VecOp { bytes, splat, .. }, dest_ptr, args, .. } => {
+                        if let Some(d) = dest_ptr {
+                            let whole = alloca_sizes.get(&d.0) == Some(&(*bytes as usize));
+                            kinds.push((d.0, if whole { 0 } else { 2 }));
+                        }
+                        for (i, arg) in args.iter().enumerate() {
+                            if let Operand::Value(v) = arg {
+                                let whole = splat & (1 << i) == 0
+                                    && alloca_sizes.get(&v.0) == Some(&(*bytes as usize));
+                                kinds.push((v.0, if whole { 1 } else { 2 }));
+                            }
+                        }
+                    }
+                    Instruction::Memcpy { dest, src, size } => {
+                        kinds.push((dest.0, 2));
+                        kinds.push((src.0, if alloca_sizes.get(&src.0) == Some(size) { 1 } else { 2 }));
+                    }
+                    Instruction::InlineAsm { .. } => return FxHashMap::default(),
+                    other => other.for_each_used_value(|id| kinds.push((id, 2))),
+                }
+                for (id, kind) in kinds {
+                    if alloca_sizes.contains_key(&id) {
+                        uses.entry(id).or_default().push((bi, ii, kind));
+                    }
+                }
+            }
+            block.terminator.for_each_used_value(|id| {
+                if alloca_sizes.contains_key(&id) {
+                    uses.entry(id).or_default().push((bi, usize::MAX, 2));
+                }
+            });
+        }
+        // Live range (block, producer index, last read index) of each temp.
+        let mut ranges: Vec<(usize, usize, usize, u32)> = Vec::new();
+        for (&id, list) in &uses {
+            let Some(&(bi, prod, _)) = list.iter().find(|u| u.2 == 0) else { continue };
+            let ok = list.iter().all(|&(b, i, k)| b == bi && (k == 1 && i > prod || k == 0 && i == prod))
+                && list.iter().filter(|u| u.2 == 0).count() == 1
+                && list.len() > 1;
+            if !ok {
+                continue;
+            }
+            let last = list.iter().map(|u| u.1).max().unwrap_or(prod);
+            let insts = &func.blocks[bi].instructions;
+            if insts[prod + 1..last].iter().all(Self::keeps_vec_temp_regs) {
+                ranges.push((bi, prod, last, id));
+            }
+        }
+        ranges.sort_unstable();
+        // Greedy assignment per block: a register is free again at the
+        // instruction that last reads it (NEON ops read before they write).
+        let mut busy: Vec<(usize, usize, u8)> = Vec::new(); // (block, last read, reg)
+        for (bi, prod, last, id) in ranges {
+            busy.retain(|&(b, end, _)| b == bi && end > prod);
+            if let Some(&reg) = ARM_VEC_TEMP_REGS.iter().find(|r| busy.iter().all(|b| b.2 != **r)) {
+                busy.push((bi, last, reg));
+                regs.insert(id, reg);
+            }
+        }
+        regs
+    }
+
+    /// Whether an instruction between a vector temporary's producer and its
+    /// readers leaves v28-v31 alone: no calls, inline asm, or F128/I128
+    /// arithmetic (soft-float and 128-bit division call out).
+    fn keeps_vec_temp_regs(inst: &Instruction) -> bool {
+        let plain = |ty: &IrType| !matches!(ty, IrType::F128 | IrType::I128 | IrType::U128);
+        match inst {
+            Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, .. }
+            | Instruction::GetElementPtr { .. } | Instruction::Copy { .. }
+            | Instruction::GlobalAddr { .. } | Instruction::Alloca { .. }
+            | Instruction::Memcpy { .. } => true,
+            Instruction::Load { ty, .. } | Instruction::Store { ty, .. }
+            | Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
+            | Instruction::Cmp { ty, .. } | Instruction::Select { ty, .. } => plain(ty),
+            Instruction::Cast { from_ty, to_ty, .. } => plain(from_ty) && plain(to_ty),
+            _ => false,
+        }
+    }
+
     /// Emit an IntrinsicOp::VecOp: operands go to v0 (and v1), loaded through
     /// their pointers or broadcast from a scalar, and the result is computed in
     /// v0 and stored through `dest_ptr`. v0-v7 are codegen scratch.
@@ -86,21 +195,32 @@ impl ArmCodegen {
             (_, true) => "2d", (_, false) => "1d",
         };
         let bits = if q { "16b" } else { "8b" };
+        // Operand registers: a temporary's own register, else v0/v1.
+        let mut src = [String::new(), String::new()];
         for (i, arg) in args.iter().enumerate() {
+            src[i] = format!("v{i}");
             if splat & (1 << i) != 0 {
                 self.operand_to_x0(arg);
-                let src = if elem.size() == 8 { "x0" } else { "w0" };
-                self.state.emit_fmt(format_args!("    dup v{}.{}, {}", i, arr, src));
+                let gpr = if elem.size() == 8 { "x0" } else { "w0" };
+                self.state.emit_fmt(format_args!("    dup v{}.{}, {}", i, arr, gpr));
             } else if let Operand::Value(v) = arg {
-                self.vec_mem_access("ldr", &format!("{mem}{i}"), v);
+                if let Some(&reg) = self.vec_temp_regs.get(&v.0) {
+                    src[i] = format!("v{reg}");
+                } else {
+                    self.vec_mem_access("ldr", &format!("{mem}{i}"), v);
+                }
             } else {
                 self.operand_to_x0(arg);
                 self.state.emit_fmt(format_args!("    ldr {}{}, [x0]", mem, i));
             }
         }
+        let dest_reg = self.vec_temp_regs.get(&dest_ptr.0).copied();
+        let d = format!("v{}", dest_reg.unwrap_or(0));
+        let [a, b] = &src;
         let (f, u) = (elem.is_float(), elem.is_unsigned());
-        let bin = |name: &str| format!("    {name} v0.{arr}, v0.{arr}, v1.{arr}");
-        let swapped = |name: &str| format!("    {name} v0.{arr}, v1.{arr}, v0.{arr}");
+        let bin = |name: &str| format!("    {name} {d}.{arr}, {a}.{arr}, {b}.{arr}");
+        let swapped = |name: &str| format!("    {name} {d}.{arr}, {b}.{arr}, {a}.{arr}");
+        let bitwise = |name: &str| format!("    {name} {d}.{bits}, {a}.{bits}, {b}.{bits}");
         let gt = if f { "fcmgt" } else if u { "cmhi" } else { "cmgt" };
         let ge = if f { "fcmge" } else if u { "cmhs" } else { "cmge" };
         let shl = if u { "ushl" } else { "sshl" };
@@ -109,29 +229,44 @@ impl ArmCodegen {
             VecOpKind::Sub => vec![bin(if f { "fsub" } else { "sub" })],
             VecOpKind::Mul => vec![bin(if f { "fmul" } else { "mul" })],
             VecOpKind::Div => vec![bin("fdiv")],
-            VecOpKind::And => vec![format!("    and v0.{bits}, v0.{bits}, v1.{bits}")],
-            VecOpKind::Or => vec![format!("    orr v0.{bits}, v0.{bits}, v1.{bits}")],
-            VecOpKind::Xor => vec![format!("    eor v0.{bits}, v0.{bits}, v1.{bits}")],
+            VecOpKind::And => vec![bitwise("and")],
+            VecOpKind::Or => vec![bitwise("orr")],
+            VecOpKind::Xor => vec![bitwise("eor")],
             // ushl/sshl shift left by a signed per-lane amount; right shifts
             // shift left by the negated amount (logical for ushl, arithmetic
-            // for sshl).
+            // for sshl), negated into v1 so a temporary count survives.
             VecOpKind::Shl => vec![bin(shl)],
-            VecOpKind::Shr => vec![format!("    neg v1.{arr}, v1.{arr}"), bin(shl)],
+            VecOpKind::Shr => vec![
+                format!("    neg v1.{arr}, {b}.{arr}"),
+                format!("    {shl} {d}.{arr}, {a}.{arr}, v1.{arr}"),
+            ],
             VecOpKind::Eq => vec![bin(if f { "fcmeq" } else { "cmeq" })],
             VecOpKind::Ne => vec![bin(if f { "fcmeq" } else { "cmeq" }),
-                                  format!("    mvn v0.{bits}, v0.{bits}")],
+                                  format!("    mvn {d}.{bits}, {d}.{bits}")],
             VecOpKind::Gt => vec![bin(gt)],
             VecOpKind::Ge => vec![bin(ge)],
             VecOpKind::Lt => vec![swapped(gt)],
             VecOpKind::Le => vec![swapped(ge)],
-            VecOpKind::Neg => vec![format!("    {} v0.{arr}, v0.{arr}", if f { "fneg" } else { "neg" })],
-            VecOpKind::Not => vec![format!("    mvn v0.{bits}, v0.{bits}")],
+            VecOpKind::Neg => vec![format!("    {} {d}.{arr}, {a}.{arr}", if f { "fneg" } else { "neg" })],
+            VecOpKind::Not => vec![format!("    mvn {d}.{bits}, {a}.{bits}")],
         };
         for line in &lines {
             self.state.emit(line);
         }
-        self.vec_mem_access("str", &format!("{mem}0"), dest_ptr);
+        if dest_reg.is_none() {
+            self.vec_mem_access("str", &format!("{mem}0"), dest_ptr);
+        }
         self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Memcpy from a vector temporary held in a register: store it whole.
+    /// Returns false when `src` is not such a temporary.
+    pub(super) fn try_emit_vec_temp_copy(&mut self, dest: &Value, src: &Value, size: usize) -> bool {
+        let Some(&reg) = self.vec_temp_regs.get(&src.0) else { return false };
+        let width = if size == 16 { "q" } else { "d" };
+        self.vec_mem_access("str", &format!("{width}{reg}"), dest);
+        self.state.reg_cache.invalidate_acc();
+        true
     }
 
     /// Load or store a whole vector register (`q`/`d`) through pointer value

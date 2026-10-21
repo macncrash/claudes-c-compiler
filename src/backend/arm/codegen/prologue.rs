@@ -19,6 +19,7 @@ impl ArmCodegen {
 
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
+        self.vec_temp_regs = Self::assign_vec_temp_regs(func);
         let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
         let available_regs = crate::backend::generation::filter_available_regs(base_regs, &asm_clobbered_regs);
 
@@ -57,6 +58,7 @@ impl ArmCodegen {
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
             true, // argument setup leaves x10-x15 intact (calls.rs)
+            true, // memcpy reads register-assigned pointers (memory.rs)
         );
 
         // FP registers for F32/F64 values. Skipped for variadic functions

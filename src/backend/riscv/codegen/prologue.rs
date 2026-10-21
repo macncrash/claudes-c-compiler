@@ -57,6 +57,7 @@ impl RiscvCodegen {
             &mut self.reg_assignments, &mut self.used_callee_saved,
             true, // RISC-V asm emitter checks reg_assignments for inline asm operands
             false,
+            false,
         );
 
         let space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
