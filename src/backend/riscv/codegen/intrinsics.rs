@@ -8,6 +8,7 @@ use super::emit::RiscvCodegen;
 impl RiscvCodegen {
     pub(super) fn emit_intrinsic_rv(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
         match op {
+            IntrinsicOp::VecOp { .. } => unreachable!("VecOp is only lowered for AArch64"),
             IntrinsicOp::Lfence | IntrinsicOp::Mfence => {
                 self.state.emit("    fence iorw, iorw");
             }

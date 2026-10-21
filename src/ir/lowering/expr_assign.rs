@@ -10,12 +10,16 @@
 use crate::frontend::parser::ast::{BinOp, Expr, UnaryOp};
 use crate::ir::reexports::{
     Instruction,
+    IntrinsicOp,
     IrBinOp,
     IrConst,
     IrUnaryOp,
     Operand,
     Value,
+    VecElem,
+    VecOpKind,
 };
+use crate::backend::Target;
 use crate::common::types::{AddressSpace, CType, IrType, widened_op_type};
 use super::lower::Lowerer;
 
@@ -688,6 +692,65 @@ impl Lowerer {
         IrType::from_ctype(elem_ct)
     }
 
+    /// The whole-vector (NEON) form of `kind` on a vector of `elem_ct` lanes
+    /// and `total_size` bytes, when the target has one; otherwise the vector
+    /// operation is lowered lane by lane.
+    fn neon_vec_op(&self, kind: VecOpKind, elem_ct: &CType, total_size: usize, splat: u8) -> Option<IntrinsicOp> {
+        if self.target != Target::Aarch64 || !matches!(total_size, 8 | 16) {
+            return None;
+        }
+        let elem = match elem_ct {
+            CType::Float => VecElem::F32,
+            CType::Double => VecElem::F64,
+            CType::Bool => return None,
+            ct if ct.is_integer() => match (ct.size(), ct.is_unsigned()) {
+                (1, false) => VecElem::I8,
+                (1, true) => VecElem::U8,
+                (2, false) => VecElem::I16,
+                (2, true) => VecElem::U16,
+                (4, false) => VecElem::I32,
+                (4, true) => VecElem::U32,
+                (8, false) => VecElem::I64,
+                (8, true) => VecElem::U64,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // A single 64-bit lane would need the scalar d-register forms.
+        if elem.size() == 8 && total_size == 8 {
+            return None;
+        }
+        let supported = match kind {
+            VecOpKind::Mul => elem.is_float() || elem.size() < 8,
+            VecOpKind::Div => elem.is_float(),
+            VecOpKind::And | VecOpKind::Or | VecOpKind::Xor
+            | VecOpKind::Shl | VecOpKind::Shr | VecOpKind::Not => !elem.is_float(),
+            _ => true,
+        };
+        supported.then_some(IntrinsicOp::VecOp { op: kind, elem, bytes: total_size as u8, splat })
+    }
+
+    fn vec_op_kind(op: BinOp) -> Option<VecOpKind> {
+        Some(match op {
+            BinOp::Add => VecOpKind::Add,
+            BinOp::Sub => VecOpKind::Sub,
+            BinOp::Mul => VecOpKind::Mul,
+            BinOp::Div => VecOpKind::Div,
+            BinOp::BitAnd => VecOpKind::And,
+            BinOp::BitOr => VecOpKind::Or,
+            BinOp::BitXor => VecOpKind::Xor,
+            BinOp::Shl => VecOpKind::Shl,
+            BinOp::Shr => VecOpKind::Shr,
+            BinOp::Eq => VecOpKind::Eq,
+            BinOp::Ne => VecOpKind::Ne,
+            BinOp::Lt => VecOpKind::Lt,
+            BinOp::Le => VecOpKind::Le,
+            BinOp::Gt => VecOpKind::Gt,
+            BinOp::Ge => VecOpKind::Ge,
+            BinOp::Mod | BinOp::LogicalAnd | BinOp::LogicalOr => return None,
+        })
+    }
+
     /// Lower vector assignment (a = b): memcpy the whole vector.
     /// When the RHS is a function call returning a small vector (<=8 bytes),
     /// the return value is packed into a register (I64), not a pointer.
@@ -783,6 +846,18 @@ impl Lowerer {
             None
         };
 
+        let splat = if rhs_is_vector { 0 } else { 2 };
+        if let Some(vop) = Self::vec_op_kind(*op)
+            .and_then(|kind| self.neon_vec_op(kind, &elem_ct, num_elems * elem_size, splat))
+        {
+            let rhs_arg = rhs_scalar.unwrap_or(Operand::Value(rhs_val));
+            self.emit(Instruction::Intrinsic {
+                dest: None, op: vop, dest_ptr: Some(lhs_ptr_val),
+                args: vec![Operand::Value(lhs_ptr_val), rhs_arg],
+            });
+            return Operand::Value(lhs_ptr_val);
+        }
+
         // Element-wise operation
         let ptr_int_ty = crate::common::types::target_int_ir_type();
         for i in 0..num_elems {
@@ -834,6 +909,14 @@ impl Lowerer {
         let total_size = num_elems * elem_size;
         let ir_op = if op == UnaryOp::Neg { IrUnaryOp::Neg } else { IrUnaryOp::Not };
         let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
+        let kind = if op == UnaryOp::Neg { VecOpKind::Neg } else { VecOpKind::Not };
+        if let Some(vop) = self.neon_vec_op(kind, &elem_ct, total_size, 0) {
+            self.emit(Instruction::Intrinsic {
+                dest: None, op: vop, dest_ptr: Some(result_alloca),
+                args: vec![Operand::Value(src_ptr)],
+            });
+            return Operand::Value(result_alloca);
+        }
         let ptr_int_ty = crate::common::types::target_int_ir_type();
         for i in 0..num_elems {
             let offset = Operand::Const(IrConst::ptr_int((i * elem_size) as i64));
@@ -904,6 +987,18 @@ impl Lowerer {
         } else {
             None
         };
+
+        let splat = u8::from(lhs_scalar.is_some()) | (u8::from(rhs_scalar.is_some()) << 1);
+        if let Some(vop) = Self::vec_op_kind(*op)
+            .and_then(|kind| self.neon_vec_op(kind, &elem_ct, total_size, splat))
+        {
+            let args = vec![
+                lhs_scalar.unwrap_or(Operand::Value(lhs_val)),
+                rhs_scalar.unwrap_or(Operand::Value(rhs_val)),
+            ];
+            self.emit(Instruction::Intrinsic { dest: None, op: vop, dest_ptr: Some(result_alloca), args });
+            return Operand::Value(result_alloca);
+        }
 
         // Element-wise operation
         let ptr_int_ty = crate::common::types::target_int_ir_type();

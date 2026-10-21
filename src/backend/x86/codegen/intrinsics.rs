@@ -135,6 +135,7 @@ impl X86Codegen {
 
     pub(super) fn emit_intrinsic_impl(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
         match op {
+            IntrinsicOp::VecOp { .. } => unreachable!("VecOp is only lowered for AArch64"),
             IntrinsicOp::Lfence => { self.state.emit("    lfence"); }
             IntrinsicOp::Mfence => { self.state.emit("    mfence"); }
             IntrinsicOp::Sfence => { self.state.emit("    sfence"); }

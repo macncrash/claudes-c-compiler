@@ -21,6 +21,7 @@ use super::emit::I686Codegen;
 impl I686Codegen {
     pub(super) fn emit_intrinsic_impl(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
         match op {
+            IntrinsicOp::VecOp { .. } => unreachable!("VecOp is only lowered for AArch64"),
             // --- Memory fences (same x86 instructions as x86-64) ---
             IntrinsicOp::Lfence => { self.state.emit("    lfence"); }
             IntrinsicOp::Mfence => { self.state.emit("    mfence"); }

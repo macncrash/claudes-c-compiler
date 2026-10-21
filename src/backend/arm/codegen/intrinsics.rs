@@ -3,7 +3,8 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use crate::ir::reexports::{IntrinsicOp, Operand, Value};
+use crate::ir::reexports::{IntrinsicOp, Operand, Value, VecElem, VecOpKind};
+use crate::backend::state::SlotAddr;
 use super::emit::ArmCodegen;
 
 impl ArmCodegen {
@@ -72,8 +73,89 @@ impl ArmCodegen {
         }
     }
 
+    /// Emit an IntrinsicOp::VecOp: operands go to v0 (and v1), loaded through
+    /// their pointers or broadcast from a scalar, and the result is computed in
+    /// v0 and stored through `dest_ptr`. v0-v7 are codegen scratch.
+    fn emit_vec_op(&mut self, op: VecOpKind, elem: VecElem, bytes: u8, splat: u8, dest_ptr: &Value, args: &[Operand]) {
+        let q = bytes == 16;
+        let mem = if q { "q" } else { "d" };
+        let arr = match (elem.size(), q) {
+            (1, true) => "16b", (1, false) => "8b",
+            (2, true) => "8h", (2, false) => "4h",
+            (4, true) => "4s", (4, false) => "2s",
+            (_, true) => "2d", (_, false) => "1d",
+        };
+        let bits = if q { "16b" } else { "8b" };
+        for (i, arg) in args.iter().enumerate() {
+            if splat & (1 << i) != 0 {
+                self.operand_to_x0(arg);
+                let src = if elem.size() == 8 { "x0" } else { "w0" };
+                self.state.emit_fmt(format_args!("    dup v{}.{}, {}", i, arr, src));
+            } else if let Operand::Value(v) = arg {
+                self.vec_mem_access("ldr", &format!("{mem}{i}"), v);
+            } else {
+                self.operand_to_x0(arg);
+                self.state.emit_fmt(format_args!("    ldr {}{}, [x0]", mem, i));
+            }
+        }
+        let (f, u) = (elem.is_float(), elem.is_unsigned());
+        let bin = |name: &str| format!("    {name} v0.{arr}, v0.{arr}, v1.{arr}");
+        let swapped = |name: &str| format!("    {name} v0.{arr}, v1.{arr}, v0.{arr}");
+        let gt = if f { "fcmgt" } else if u { "cmhi" } else { "cmgt" };
+        let ge = if f { "fcmge" } else if u { "cmhs" } else { "cmge" };
+        let shl = if u { "ushl" } else { "sshl" };
+        let lines = match op {
+            VecOpKind::Add => vec![bin(if f { "fadd" } else { "add" })],
+            VecOpKind::Sub => vec![bin(if f { "fsub" } else { "sub" })],
+            VecOpKind::Mul => vec![bin(if f { "fmul" } else { "mul" })],
+            VecOpKind::Div => vec![bin("fdiv")],
+            VecOpKind::And => vec![format!("    and v0.{bits}, v0.{bits}, v1.{bits}")],
+            VecOpKind::Or => vec![format!("    orr v0.{bits}, v0.{bits}, v1.{bits}")],
+            VecOpKind::Xor => vec![format!("    eor v0.{bits}, v0.{bits}, v1.{bits}")],
+            // ushl/sshl shift left by a signed per-lane amount; right shifts
+            // shift left by the negated amount (logical for ushl, arithmetic
+            // for sshl).
+            VecOpKind::Shl => vec![bin(shl)],
+            VecOpKind::Shr => vec![format!("    neg v1.{arr}, v1.{arr}"), bin(shl)],
+            VecOpKind::Eq => vec![bin(if f { "fcmeq" } else { "cmeq" })],
+            VecOpKind::Ne => vec![bin(if f { "fcmeq" } else { "cmeq" }),
+                                  format!("    mvn v0.{bits}, v0.{bits}")],
+            VecOpKind::Gt => vec![bin(gt)],
+            VecOpKind::Ge => vec![bin(ge)],
+            VecOpKind::Lt => vec![swapped(gt)],
+            VecOpKind::Le => vec![swapped(ge)],
+            VecOpKind::Neg => vec![format!("    {} v0.{arr}, v0.{arr}", if f { "fneg" } else { "neg" })],
+            VecOpKind::Not => vec![format!("    mvn v0.{bits}, v0.{bits}")],
+        };
+        for line in &lines {
+            self.state.emit(line);
+        }
+        self.vec_mem_access("str", &format!("{mem}0"), dest_ptr);
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Load or store a whole vector register (`q`/`d`) through pointer value
+    /// `ptr`, addressing a plain stack alloca directly off the frame.
+    fn vec_mem_access(&mut self, instr: &str, reg: &str, ptr: &Value) {
+        if let Some(SlotAddr::Direct(slot)) = self.state.resolve_slot_addr(ptr.0) {
+            if instr == "str" {
+                self.emit_store_to_sp(reg, slot.0, instr);
+            } else {
+                self.emit_load_from_sp(reg, slot.0, instr);
+            }
+        } else {
+            self.operand_to_x0(&Operand::Value(*ptr));
+            self.state.emit_fmt(format_args!("    {} {}, [x0]", instr, reg));
+        }
+    }
+
     pub(super) fn emit_intrinsic_arm(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
         match op {
+            IntrinsicOp::VecOp { op: vop, elem, bytes, splat } => {
+                if let Some(dptr) = dest_ptr {
+                    self.emit_vec_op(*vop, *elem, *bytes, *splat, dptr, args);
+                }
+            }
             IntrinsicOp::Lfence | IntrinsicOp::Mfence => {
                 self.state.emit("    dmb ish");
             }

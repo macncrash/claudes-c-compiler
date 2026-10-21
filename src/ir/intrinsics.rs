@@ -185,6 +185,46 @@ pub enum IntrinsicOp {
     Pinsrq128,
     /// Extract 64-bit value at lane (PEXTRQ) - returns scalar i64
     Pextrq128,
+    /// Element-wise operation on a whole GCC vector-extension value of
+    /// `bytes` (8 or 16) bytes, emitted only for AArch64 (NEON).
+    /// args[0] and, for binary ops, args[1] are operand pointers, or the
+    /// scalar itself when its bit in `splat` (1 = args[0], 2 = args[1]) is
+    /// set, broadcast to every lane. dest_ptr = result pointer; comparisons
+    /// store -1/0 lane masks of the element size.
+    VecOp { op: VecOpKind, elem: VecElem, bytes: u8, splat: u8 },
+}
+
+/// The operation of an [`IntrinsicOp::VecOp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VecOpKind {
+    Add, Sub, Mul, Div, And, Or, Xor, Shl, Shr,
+    Eq, Ne, Lt, Le, Gt, Ge,
+    Neg, Not,
+}
+
+/// The lane type of an [`IntrinsicOp::VecOp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VecElem {
+    I8, U8, I16, U16, I32, U32, I64, U64, F32, F64,
+}
+
+impl VecElem {
+    pub fn size(self) -> usize {
+        match self {
+            VecElem::I8 | VecElem::U8 => 1,
+            VecElem::I16 | VecElem::U16 => 2,
+            VecElem::I32 | VecElem::U32 | VecElem::F32 => 4,
+            VecElem::I64 | VecElem::U64 | VecElem::F64 => 8,
+        }
+    }
+
+    pub fn is_float(self) -> bool {
+        matches!(self, VecElem::F32 | VecElem::F64)
+    }
+
+    pub fn is_unsigned(self) -> bool {
+        matches!(self, VecElem::U8 | VecElem::U16 | VecElem::U32 | VecElem::U64)
+    }
 }
 
 impl IntrinsicOp {
