@@ -5,9 +5,9 @@
 
 use crate::ir::reexports::{Instruction, IntrinsicOp, IrFunction, Operand, Value, VecElem, VecOpKind};
 use crate::backend::state::SlotAddr;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use super::emit::ARM_VEC_TEMP_REGS;
+use super::emit::{ARM_VEC_TEMP_REGS, ARM_VEC_VAR_REGS};
 use super::emit::ArmCodegen;
 
 impl ArmCodegen {
@@ -76,12 +76,227 @@ impl ArmCodegen {
         }
     }
 
+    /// Pick the vector variables that can live in a NEON register
+    /// (ARM_VEC_VAR_REGS) for the whole function: an 8- or 16-byte local
+    /// (not a parameter, not volatile or over-aligned) that some VecOp uses
+    /// and whose address never escapes. Every use of the alloca, or of a
+    /// constant GEP from it, must be a whole read or write by a VecOp or
+    /// Memcpy, or a load or store of one aligned lane of up to 8 bytes.
+    /// Calls and other instructions that may clobber v16-v31 spill and
+    /// reload the register around themselves (spill_vec_vars).
+    ///
+    /// Temporaries (`temps`) are not candidates. Returns (alloca ->
+    /// register, each variable's (register, size), lane pointer ->
+    /// (register, offset)).
+    #[allow(clippy::type_complexity)]
+    pub(super) fn assign_vec_var_regs(func: &IrFunction, temps: &FxHashMap<u32, u8>)
+        -> (FxHashMap<u32, u8>, Vec<(u8, u8)>, FxHashMap<u32, (u8, i64)>)
+    {
+        let none = || (FxHashMap::default(), Vec::new(), FxHashMap::default());
+        let insts = || func.blocks.iter().flat_map(|b| &b.instructions);
+        if insts().any(|i| matches!(i, Instruction::InlineAsm { .. })) {
+            return none();
+        }
+        let mut size_of: FxHashMap<u32, i64> = insts()
+            .filter_map(|inst| match inst {
+                Instruction::Alloca { dest, size: size @ (8 | 16), align, volatile: false, .. }
+                    if *align <= 16 && !func.param_alloca_values.contains(dest)
+                        && !temps.contains_key(&dest.0) =>
+                    Some((dest.0, *size as i64)),
+                _ => None,
+            })
+            .collect();
+        if size_of.is_empty() {
+            return none();
+        }
+        // Pointers into a candidate: value -> (alloca, byte offset). GEPs may
+        // chain and appear in any block order, so iterate to a fixed point.
+        let mut lanes: FxHashMap<u32, (u32, i64)> = size_of.keys().map(|&id| (id, (id, 0))).collect();
+        loop {
+            let mut changed = false;
+            for inst in insts() {
+                if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
+                    if let (Some(&(var, off)), Some(k), false) = (lanes.get(&base.0), c.to_i64(), lanes.contains_key(&dest.0)) {
+                        lanes.insert(dest.0, (var, off + k));
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut bad: FxHashSet<u32> = FxHashSet::default();
+        let mut vec_used: FxHashSet<u32> = FxHashSet::default();
+        let lane_ok = |lanes: &FxHashMap<u32, (u32, i64)>, size_of: &FxHashMap<u32, i64>, ptr: u32, ty: IrType| {
+            let (var, off) = lanes[&ptr];
+            let n = ty.size() as i64;
+            matches!(n, 1 | 2 | 4 | 8) && !matches!(ty, IrType::F128 | IrType::I128 | IrType::U128)
+                && off >= 0 && off % n == 0 && off + n <= size_of[&var]
+        };
+        let whole = |lanes: &FxHashMap<u32, (u32, i64)>, size_of: &FxHashMap<u32, i64>, ptr: u32, n: i64| {
+            let (var, off) = lanes[&ptr];
+            off == 0 && size_of[&var] == n
+        };
+        for inst in insts() {
+            let mut reject = |id: u32| {
+                if let Some(&(var, _)) = lanes.get(&id) {
+                    bad.insert(var);
+                }
+            };
+            match inst {
+                Instruction::Load { ptr, ty, .. } if lanes.contains_key(&ptr.0) => {
+                    if !lane_ok(&lanes, &size_of, ptr.0, *ty) {
+                        reject(ptr.0);
+                    }
+                }
+                Instruction::Store { val, ptr, ty, .. } => {
+                    if let Operand::Value(v) = val {
+                        reject(v.0);
+                    }
+                    if lanes.contains_key(&ptr.0) && !lane_ok(&lanes, &size_of, ptr.0, *ty) {
+                        reject(ptr.0);
+                    }
+                }
+                Instruction::GetElementPtr { base, offset, .. } => {
+                    if !matches!(offset, Operand::Const(_)) {
+                        reject(base.0);
+                    }
+                    if let Operand::Value(v) = offset {
+                        reject(v.0);
+                    }
+                }
+                Instruction::Intrinsic { op: IntrinsicOp::VecOp { bytes, splat, .. }, dest_ptr, args, .. } => {
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Operand::Value(v) = arg {
+                            if lanes.contains_key(&v.0) {
+                                if splat & (1 << i) == 0 && whole(&lanes, &size_of, v.0, *bytes as i64) {
+                                    vec_used.insert(lanes[&v.0].0);
+                                } else {
+                                    reject(v.0);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(d) = dest_ptr {
+                        if lanes.contains_key(&d.0) {
+                            if whole(&lanes, &size_of, d.0, *bytes as i64) {
+                                vec_used.insert(lanes[&d.0].0);
+                            } else {
+                                reject(d.0);
+                            }
+                        }
+                    }
+                }
+                Instruction::Memcpy { dest, src, size } => {
+                    for p in [dest.0, src.0] {
+                        if lanes.contains_key(&p) && !whole(&lanes, &size_of, p, *size as i64) {
+                            reject(p);
+                        }
+                    }
+                }
+                Instruction::Alloca { .. } => {}
+                other => other.for_each_used_value(|id| reject(id)),
+            }
+        }
+        for block in &func.blocks {
+            block.terminator.for_each_used_value(|id| {
+                if let Some(&(var, _)) = lanes.get(&id) {
+                    bad.insert(var);
+                }
+            });
+        }
+        size_of.retain(|id, _| vec_used.contains(id) && !bad.contains(id));
+        let mut vars: Vec<(u32, i64)> = size_of.into_iter().collect();
+        vars.sort_unstable();
+        let mut regs = FxHashMap::default();
+        let mut var_list = Vec::new();
+        for ((id, size), &reg) in vars.into_iter().zip(ARM_VEC_VAR_REGS.iter()) {
+            regs.insert(id, reg);
+            var_list.push((reg, size as u8));
+        }
+        let lane_regs = lanes.into_iter()
+            .filter_map(|(ptr, (var, off))| regs.get(&var).map(|&r| (ptr, (r, off))))
+            .collect();
+        (regs, var_list, lane_regs)
+    }
+
+    /// Before an instruction: emit the lane loads and stores, GEPs and
+    /// copies that involve a vector variable (returns true when the
+    /// instruction is fully handled), and spill vector variables ahead of
+    /// anything that may clobber their registers.
+    pub(super) fn vec_before_instruction(&mut self, inst: &Instruction) -> bool {
+        if self.vec_vars.is_empty() {
+            return false;
+        }
+        match inst {
+            Instruction::GetElementPtr { dest, .. } if self.vec_lanes.contains_key(&dest.0) => true,
+            Instruction::Load { dest, ptr, ty, .. } if self.vec_lanes.contains_key(&ptr.0) => {
+                let (reg, off) = self.vec_lanes[&ptr.0];
+                let n = ty.size() as i64;
+                let (lane, idx) = (Self::lane_suffix(n), off / n);
+                match ty {
+                    IrType::I8 | IrType::I16 => {
+                        self.state.emit_fmt(format_args!("    umov w0, v{}.{}[{}]", reg, lane, idx));
+                        let ext = if n == 1 { "sxtb" } else { "sxth" };
+                        self.state.emit_fmt(format_args!("    {} x0, w0", ext));
+                    }
+                    IrType::I32 => {
+                        self.state.emit_fmt(format_args!("    umov w0, v{}.s[{}]", reg, idx));
+                        self.state.emit("    sxtw x0, w0");
+                    }
+                    _ if n == 8 => self.state.emit_fmt(format_args!("    umov x0, v{}.d[{}]", reg, idx)),
+                    _ => self.state.emit_fmt(format_args!("    umov w0, v{}.{}[{}]", reg, lane, idx)),
+                }
+                self.store_x0_to(dest);
+                true
+            }
+            Instruction::Store { val, ptr, ty, .. } if self.vec_lanes.contains_key(&ptr.0) => {
+                let (reg, off) = self.vec_lanes[&ptr.0];
+                let n = ty.size() as i64;
+                self.operand_to_x0(val);
+                let gpr = if n == 8 { "x0" } else { "w0" };
+                self.state.emit_fmt(format_args!("    ins v{}.{}[{}], {}", reg, Self::lane_suffix(n), off / n, gpr));
+                true
+            }
+            _ => {
+                if Self::clobbers_vec_regs(inst) {
+                    self.spill_vec_vars("str");
+                }
+                false
+            }
+        }
+    }
+
+    /// After an instruction: reload the vector variables spilled before it.
+    pub(super) fn vec_after_instruction(&mut self, inst: &Instruction) {
+        if !self.vec_vars.is_empty() && Self::clobbers_vec_regs(inst) {
+            self.spill_vec_vars("ldr");
+        }
+    }
+
+    /// Store (`str`) or reload (`ldr`) every vector variable's register
+    /// to or from its save slot.
+    fn spill_vec_vars(&mut self, instr: &str) {
+        for (reg, size, offset) in self.vec_vars.clone() {
+            let width = if size == 16 { "q" } else { "d" };
+            if instr == "str" {
+                self.emit_store_to_sp(&format!("{width}{reg}"), offset, instr);
+            } else {
+                self.emit_load_from_sp(&format!("{width}{reg}"), offset, instr);
+            }
+        }
+    }
+
+    fn lane_suffix(n: i64) -> &'static str {
+        match n { 1 => "b", 2 => "h", 4 => "s", _ => "d" }
+    }
+
     /// Pick the vector temporaries that can live in a NEON register
     /// (ARM_VEC_TEMP_REGS) instead of their stack slot: an 8- or 16-byte
     /// alloca written by exactly one VecOp and afterwards only read, whole,
     /// by VecOps or a Memcpy in the same block, with nothing in between that
-    /// could call out or use v28-v31 (calls, F128/I128 arithmetic, inline
-    /// asm). Its slot is then never written or read. Registers are assigned
+    /// could call out or use v28-v31 (clobbers_vec_regs). Its slot is then never written or read. Registers are assigned
     /// greedily by live range within each block.
     pub(super) fn assign_vec_temp_regs(func: &IrFunction) -> FxHashMap<u32, u8> {
         let mut regs = FxHashMap::default();
@@ -146,7 +361,7 @@ impl ArmCodegen {
             }
             let last = list.iter().map(|u| u.1).max().unwrap_or(prod);
             let insts = &func.blocks[bi].instructions;
-            if insts[prod + 1..last].iter().all(Self::keeps_vec_temp_regs) {
+            if !insts[prod + 1..last].iter().any(Self::clobbers_vec_regs) {
                 ranges.push((bi, prod, last, id));
             }
         }
@@ -164,20 +379,23 @@ impl ArmCodegen {
         regs
     }
 
-    /// Whether an instruction between a vector temporary's producer and its
-    /// readers leaves v28-v31 alone: no calls, inline asm, or F128/I128
-    /// arithmetic (soft-float and 128-bit division call out).
-    fn keeps_vec_temp_regs(inst: &Instruction) -> bool {
-        let plain = |ty: &IrType| !matches!(ty, IrType::F128 | IrType::I128 | IrType::U128);
+    /// Whether an instruction may clobber v16-v31, which hold vector
+    /// temporaries and variables: calls, inline asm, other intrinsics,
+    /// va_* and atomics, and F128/I128 arithmetic (soft-float and 128-bit
+    /// division call out).
+    pub(super) fn clobbers_vec_regs(inst: &Instruction) -> bool {
+        let wide = |ty: &IrType| matches!(ty, IrType::F128 | IrType::I128 | IrType::U128);
         match inst {
-            Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, .. }
-            | Instruction::GetElementPtr { .. } | Instruction::Copy { .. }
-            | Instruction::GlobalAddr { .. } | Instruction::Alloca { .. }
-            | Instruction::Memcpy { .. } => true,
+            Instruction::Intrinsic { op, .. } => !matches!(op, IntrinsicOp::VecOp { .. }),
             Instruction::Load { ty, .. } | Instruction::Store { ty, .. }
             | Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
-            | Instruction::Cmp { ty, .. } | Instruction::Select { ty, .. } => plain(ty),
-            Instruction::Cast { from_ty, to_ty, .. } => plain(from_ty) && plain(to_ty),
+            | Instruction::Cmp { ty, .. } | Instruction::Select { ty, .. } => wide(ty),
+            Instruction::Cast { from_ty, to_ty, .. } => wide(from_ty) || wide(to_ty),
+            Instruction::Call { .. } | Instruction::CallIndirect { .. } | Instruction::InlineAsm { .. }
+            | Instruction::VaArg { .. } | Instruction::VaStart { .. } | Instruction::VaEnd { .. }
+            | Instruction::VaCopy { .. } | Instruction::VaArgStruct { .. }
+            | Instruction::AtomicRmw { .. } | Instruction::AtomicCmpxchg { .. }
+            | Instruction::AtomicLoad { .. } | Instruction::AtomicStore { .. } => true,
             _ => false,
         }
     }
@@ -204,7 +422,7 @@ impl ArmCodegen {
                 let gpr = if elem.size() == 8 { "x0" } else { "w0" };
                 self.state.emit_fmt(format_args!("    dup v{}.{}, {}", i, arr, gpr));
             } else if let Operand::Value(v) = arg {
-                if let Some(&reg) = self.vec_temp_regs.get(&v.0) {
+                if let Some(&reg) = self.vec_regs.get(&v.0) {
                     src[i] = format!("v{reg}");
                 } else {
                     self.vec_mem_access("ldr", &format!("{mem}{i}"), v);
@@ -214,7 +432,7 @@ impl ArmCodegen {
                 self.state.emit_fmt(format_args!("    ldr {}{}, [x0]", mem, i));
             }
         }
-        let dest_reg = self.vec_temp_regs.get(&dest_ptr.0).copied();
+        let dest_reg = self.vec_regs.get(&dest_ptr.0).copied();
         let d = format!("v{}", dest_reg.unwrap_or(0));
         let [a, b] = &src;
         let (f, u) = (elem.is_float(), elem.is_unsigned());
@@ -259,12 +477,22 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_acc();
     }
 
-    /// Memcpy from a vector temporary held in a register: store it whole.
-    /// Returns false when `src` is not such a temporary.
-    pub(super) fn try_emit_vec_temp_copy(&mut self, dest: &Value, src: &Value, size: usize) -> bool {
-        let Some(&reg) = self.vec_temp_regs.get(&src.0) else { return false };
+    /// Memcpy to or from a vector value held in a register: a register
+    /// move, or one whole-vector load or store. Returns false when neither
+    /// side is in a register.
+    pub(super) fn try_emit_vec_copy(&mut self, dest: &Value, src: &Value, size: usize) -> bool {
         let width = if size == 16 { "q" } else { "d" };
-        self.vec_mem_access("str", &format!("{width}{reg}"), dest);
+        let bits = if size == 16 { "16b" } else { "8b" };
+        match (self.vec_regs.get(&dest.0).copied(), self.vec_regs.get(&src.0).copied()) {
+            (Some(d), Some(s)) => {
+                if d != s {
+                    self.state.emit_fmt(format_args!("    orr v{d}.{bits}, v{s}.{bits}, v{s}.{bits}"));
+                }
+            }
+            (Some(d), None) => self.vec_mem_access("ldr", &format!("{width}{d}"), src),
+            (None, Some(s)) => self.vec_mem_access("str", &format!("{width}{s}"), dest),
+            (None, None) => return false,
+        }
         self.state.reg_cache.invalidate_acc();
         true
     }

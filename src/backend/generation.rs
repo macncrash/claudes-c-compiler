@@ -958,6 +958,9 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
                 // Skip this Cmp -- it will be emitted fused with the terminator
                 continue;
             }
+            if cg.before_instruction(inst) {
+                continue;
+            }
             // Skip GEP instructions whose offset has been folded into Load/Store.
             // Safe to skip when:
             // 1. Base is an alloca (Direct or OverAligned): alloca slots are stable
@@ -982,6 +985,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             }
 
             generate_instruction(cg, inst, &gep_fold_map, &global_addr_map, &global_addr_ptr_set, &dead_global_addrs);
+            cg.after_instruction(inst);
         }
 
         if let Some(fi) = fuse_idx {

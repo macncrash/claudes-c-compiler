@@ -147,6 +147,21 @@ int main(int argc, char **argv) {
     v4f32 fx = { 1.5f, -2.0f, 3.25f, 0.5f };
     MIX("tmpfloat", (fx * fx - fx / (fx + 4.0f)) * (fx - 1.0f) + fx * scale((v4f32){ 2, 2, 2, 2 }));
 
+    /* Vector variables kept in registers across a loop with a call in it,
+     * mixing whole-vector updates with lane reads and writes. */
+    v4u32 acc = { 0, 1, 2, 3 }, step = { 3, 5, 7, 11 };
+    v2f64 dacc = { 1.0, -1.0 };
+    for (int i = 0; i < 5 + k; i++) {
+        acc = acc * 3u + step;
+        acc[i & 3] ^= (unsigned)i;
+        step = bump(step) - acc[0];
+        dacc = dacc * 0.5 + (v2f64){ (double)acc[1], (double)i };
+        dacc[1] -= dacc[0];
+    }
+    MIX("varloop", acc);
+    MIX("varstep", step);
+    MIX("vardacc", dacc);
+
     printf("all %016llx\n", hash);
     return 0;
 }

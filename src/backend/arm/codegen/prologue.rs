@@ -19,7 +19,11 @@ impl ArmCodegen {
 
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
-        self.vec_temp_regs = Self::assign_vec_temp_regs(func);
+        let temp_regs = Self::assign_vec_temp_regs(func);
+        let (var_regs, vars, lanes) = Self::assign_vec_var_regs(func, &temp_regs);
+        self.vec_regs = var_regs.into_iter().chain(temp_regs).collect();
+        self.vec_vars = vars.into_iter().map(|(reg, size)| (reg, size, 0)).collect();
+        self.vec_lanes = lanes;
         let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
         let available_regs = crate::backend::generation::filter_available_regs(base_regs, &asm_clobbered_regs);
 
@@ -70,7 +74,10 @@ impl ArmCodegen {
                 .unwrap_or_else(|| crate::backend::liveness::compute_live_intervals(func));
             let config = crate::backend::regalloc::FpRegAllocConfig {
                 callee_saved_regs: ARM_FP_CALLEE_SAVED.to_vec(),
-                caller_saved_regs: ARM_FP_CALLER_SAVED.to_vec(),
+                // Registers holding vector values are not for scalars.
+                caller_saved_regs: ARM_FP_CALLER_SAVED.iter().copied()
+                    .filter(|r| !self.vec_regs.values().any(|&v| v == r.0))
+                    .collect(),
             };
             let fp = crate::backend::regalloc::allocate_fp_registers(func, &liveness, &config);
             cached_liveness = Some(liveness);
@@ -96,6 +103,15 @@ impl ArmCodegen {
             let new_space = slot + ((alloc_size + 7) & !7).max(8);
             (slot, new_space)
         }, &reg_assigned, &prestore_regs, cached_liveness, false);
+
+        // Save slots for vector variables across calls.
+        if !self.vec_vars.is_empty() {
+            space = (space + 15) & !15;
+            for var in &mut self.vec_vars {
+                var.2 = space;
+                space += 16;
+            }
+        }
 
         if func.is_variadic {
             space = (space + 7) & !7;

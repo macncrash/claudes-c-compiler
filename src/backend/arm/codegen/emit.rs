@@ -55,20 +55,27 @@ pub(super) const ARM_FP_CALLEE_SAVED: [PhysReg; 8] = [
     PhysReg(12), PhysReg(13), PhysReg(14), PhysReg(15),
 ];
 
-/// Caller-saved FP registers available for allocation: v16-v27.
+/// Caller-saved FP registers available for allocation: v16-v31, less any
+/// that hold vector values in the function (ARM_VEC_TEMP_REGS,
+/// ARM_VEC_VAR_REGS).
 ///
 /// The codegen uses only v0-v7 as FP scratch. v16 and up appear only as
 /// inline asm scratch, and functions with inline asm skip FP allocation.
-pub(super) const ARM_FP_CALLER_SAVED: [PhysReg; 12] = [
+pub(super) const ARM_FP_CALLER_SAVED: [PhysReg; 16] = [
     PhysReg(16), PhysReg(17), PhysReg(18), PhysReg(19),
     PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23),
     PhysReg(24), PhysReg(25), PhysReg(26), PhysReg(27),
+    PhysReg(28), PhysReg(29), PhysReg(30), PhysReg(31),
 ];
 
 /// NEON registers that hold vector-extension temporaries between the
 /// vector op that produces one and the ops that consume it
 /// (see ArmCodegen::assign_vec_temp_regs).
 pub(super) const ARM_VEC_TEMP_REGS: [u8; 4] = [28, 29, 30, 31];
+
+/// NEON registers that hold vector-extension local variables for a whole
+/// function (see ArmCodegen::assign_vec_var_regs).
+pub(super) const ARM_VEC_VAR_REGS: [u8; 8] = [27, 26, 25, 24, 23, 22, 21, 20];
 
 /// Offset added to FP register numbers when FP assignments are merged with
 /// GPR assignments for stack layout, so the two never compare equal.
@@ -204,9 +211,18 @@ pub struct ArmCodegen {
     /// FP register allocator: value ID -> (FP register, value is F32).
     /// Kept apart from `reg_assignments`, whose users all expect GPRs.
     pub(super) fp_reg_assignments: FxHashMap<u32, (PhysReg, bool)>,
-    /// Vector temporaries kept in a NEON register instead of their stack
-    /// slot: alloca value ID -> register number (from ARM_VEC_TEMP_REGS).
-    pub(super) vec_temp_regs: FxHashMap<u32, u8>,
+    /// Vector temporaries and variables kept in a NEON register instead of
+    /// their stack slot: alloca value ID -> register number.
+    pub(super) vec_regs: FxHashMap<u32, u8>,
+    /// The vector variables among them: (register, size in bytes, frame
+    /// offset of a 16-byte save slot that holds the value across calls;
+    /// see spill_vec_vars). The save slots are reserved apart from the
+    /// alloca slots, which the stack layout may share between allocas whose
+    /// IR live ranges don't overlap.
+    pub(super) vec_vars: Vec<(u8, u8, i64)>,
+    /// Pointers to a lane of a vector variable (the alloca itself, or a
+    /// constant GEP from it): value ID -> (register, byte offset).
+    pub(super) vec_lanes: FxHashMap<u32, (u8, i64)>,
     /// Which callee-saved FP registers (d8-d15) are used (for save/restore).
     pub(super) used_fp_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved FP registers are stored.
@@ -241,7 +257,9 @@ impl ArmCodegen {
             used_callee_saved: Vec::new(),
             callee_save_offset: 0,
             fp_reg_assignments: FxHashMap::default(),
-            vec_temp_regs: FxHashMap::default(),
+            vec_regs: FxHashMap::default(),
+            vec_vars: Vec::new(),
+            vec_lanes: FxHashMap::default(),
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
             prestore_regs: Vec::new(),
@@ -1887,6 +1905,14 @@ impl ArchCodegen for ArmCodegen {
     fn state(&mut self) -> &mut CodegenState { &mut self.state }
     fn state_ref(&self) -> &CodegenState { &self.state }
 
+    fn before_instruction(&mut self, inst: &Instruction) -> bool {
+        self.vec_before_instruction(inst)
+    }
+
+    fn after_instruction(&mut self, inst: &Instruction) {
+        self.vec_after_instruction(inst);
+    }
+
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
         self.reg_assignments.get(&val_id).copied()
     }
@@ -2023,7 +2049,7 @@ impl ArchCodegen for ArmCodegen {
     fn emit_memcpy_store_dest_from_acc(&mut self) { }
     fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    mov x10, x9"); }
     fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
-        if !self.try_emit_vec_temp_copy(dest, src, size) {
+        if !self.try_emit_vec_copy(dest, src, size) {
             self.emit_memcpy_arm(dest, src, size);
         }
     }

@@ -67,6 +67,7 @@ use crate::ir::reexports::{
     AtomicOrdering,
     AtomicRmwOp,
     BlockId,
+    Instruction,
     IntrinsicOp,
     IrBinOp,
     IrCmpOp,
@@ -246,6 +247,17 @@ pub trait ArchCodegen {
     fn supports_global_addr_fold(&self) -> bool {
         false
     }
+
+    /// Called before each instruction is generated. Returns true when the
+    /// backend has fully emitted the instruction itself (the generic
+    /// dispatch is skipped). Default: does nothing.
+    fn before_instruction(&mut self, _inst: &Instruction) -> bool {
+        false
+    }
+
+    /// Called after each instruction is generated (unless before_instruction
+    /// handled it). Default: does nothing.
+    fn after_instruction(&mut self, _inst: &Instruction) {}
 
     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).
     /// Used to fold GlobalAddr + Load into a single `movl symbol(%rip), %eax`
