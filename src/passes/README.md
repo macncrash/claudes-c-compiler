@@ -83,6 +83,10 @@ The optimizer executes in four sequential phases:
      remat
          |
          v
+ Phase 10g: Return Tail Duplication
+     ret_dup
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
          |
@@ -773,6 +777,18 @@ simple instruction's result may take one. All or nothing: the changes stay
 only if every block then fits, since otherwise the function saves a
 callee-saved register (and builds a frame) anyway.
 
+### ret_dup -- Return Tail Duplication
+
+Runs once after remat. A return block with phis, at most two pure
+instructions and at most eight predecessors (an `a || b || c` returned from
+a function: a phi of 1 from each early exit and the last test's result,
+cast to int) gets a copy for each predecessor that passes constants into
+every phi, with the phis replaced by them. Constant folding then turns each
+copy into `ret 1`, so an exit no longer sets a register, jumps, and extends
+it; when one predecessor is left, CFG simplification merges the block into
+it. Predecessors through a switch, or on both edges of a conditional branch,
+keep the shared block.
+
 ### loop_rotate -- Loop Rotation
 
 Runs after phi elimination, just before codegen. A latch that branches back
@@ -993,7 +1009,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`iv_widen`, `lftr`, `pressure_hoist`, `gep_reassoc`, `remat`, `loop_rotate`.
+`iv_widen`, `lftr`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1034,5 +1050,6 @@ behavior across iterations.
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
 | `pressure_hoist.rs`      | Instructions hoisted to end several live ranges early  |
 | `remat.rs`               | Cheap values recomputed where a leaf runs out of registers |
+| `ret_dup.rs`             | Return blocks copied into predecessors passing constants |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |

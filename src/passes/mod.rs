@@ -32,6 +32,7 @@ pub(crate) mod narrow;
 mod pressure_hoist;
 mod remat;
 mod resolve_asm;
+mod ret_dup;
 pub(crate) mod simplify;
 
 use crate::ir::analysis::CfgAnalysis;
@@ -598,6 +599,20 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
                 if remat::remat_function(func, budget) > 0 {
                     dce::eliminate_dead_code(func);
                 }
+            }
+        }
+    }
+
+    // Phase 10g: Give each predecessor of a small return block its own
+    // copy, so early exits return their constant directly.
+    if !disabled.contains("ret_dup") {
+        let mut dup = vec![false; module.functions.len()];
+        if ret_dup::duplicate_returns(module, &mut dup) > 0 {
+            for (func, _) in module.functions.iter_mut().zip(&dup).filter(|(_, d)| **d) {
+                constant_fold::fold_function(func);
+                copy_prop::propagate_copies(func);
+                dce::eliminate_dead_code(func);
+                cfg_simplify::simplify_cfg(func);
             }
         }
     }
