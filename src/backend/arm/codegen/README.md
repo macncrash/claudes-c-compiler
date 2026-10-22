@@ -736,7 +736,9 @@ Removes `str` instructions to stack slots that are overwritten before being read
   extension, halfword) store of wA stores wB instead.
 - `sxtw xA, wB` whose reads, until A dies, can all take wB with the
   extension folded in (`add xC, xD, wB, sxtw #s`, `[xD, wB, sxtw #s]`,
-  `smaddl` for a `madd` by a 32-bit constant, or a 32-bit read) goes away.
+  `smaddl` for a `madd` by a 32-bit constant, `cbz`/`cbnz wB` as A's last
+  read, or a 32-bit read) goes away. A may be B: `sxtw x0, w0; cbnz x0`
+  after a call returning int becomes `cbnz w0`.
 
 **10. Jump Threading** (local cleanup)
 

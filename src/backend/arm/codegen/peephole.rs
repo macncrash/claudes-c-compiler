@@ -517,7 +517,9 @@ pub fn peephole_optimize(asm: String) -> String {
 // iteration; a short loop body that fits in one line runs up to twice as fast
 // (measured on Apple M-series). The head of each loop of at most 16
 // instructions without calls (counting from its label to the last branch back
-// to it) is aligned to 32 bytes if the loop fits in 32, else to 64.
+// to it) is aligned to 32 bytes if the loop fits in 32, else to 64. A range
+// with a return in it is not a loop: a cold block placed after the epilogue
+// that branches back into the body.
 
 /// For each line, the alignment (log2) to emit before it, if any.
 fn small_loop_alignment(lines: &[String], kinds: &[LineKind], n: usize) -> Vec<Option<u8>> {
@@ -550,7 +552,7 @@ fn small_loop_alignment(lines: &[String], kinds: &[LineKind], n: usize) -> Vec<O
             for k in head..=last {
                 match kinds[k] {
                     LineKind::Nop | LineKind::Label | LineKind::Directive => {}
-                    LineKind::Call => call = true,
+                    LineKind::Call | LineKind::Ret => call = true,
                     _ if lines[k].trim_start().starts_with('.') => {}
                     _ => insns += 1,
                 }
@@ -1259,7 +1261,11 @@ fn forward_copy_propagation(lines: &mut [String], kinds: &mut [LineKind], n: usi
 }
 
 /// `op xS, ...` then `mov xR, xS` with S dead afterwards: compute into R.
+/// A few lines that touch neither R nor S may come between (argument set-up:
+/// `clz x0, x0; mov x2, x27; mov x1, x0`).
 fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    /// Most lines skipped between the op and the move.
+    const MAX_BETWEEN: usize = 3;
     let mut changed = false;
     // Only removes a read of a dead register; precomputed liveness stays safe.
     let live = live_out_all(lines, kinds, n);
@@ -1270,8 +1276,16 @@ fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> b
         let Some((mnemonic, ops)) = split_insn(&lines[i]) else { continue };
         let (dest, srcs) = first_and_rest(ops);
         let Some(s) = gpr_operand(dest) else { continue };
+        // The first line after the op that reads or writes S.
         let mut j = i + 1;
-        while j < n && kinds[j] == LineKind::Nop {
+        let mut between: Vec<usize> = Vec::new();
+        while j < n && between.len() <= MAX_BETWEEN {
+            if kinds[j] != LineKind::Nop {
+                if classify_access(&lines[j], kinds[j]) == Access::Barrier || mentions_reg(&lines[j], s) {
+                    break;
+                }
+                between.push(j);
+            }
             j += 1;
         }
         if j >= n {
@@ -1284,6 +1298,10 @@ fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> b
             continue;
         }
         if src != s || r > 28 || r == s || (live[j] & (1 << s) != 0 && !reg_dead_after(lines, kinds, j + 1, n, s)) {
+            continue;
+        }
+        // R now changes earlier: nothing in between may read or write it.
+        if between.iter().any(|&k| mentions_reg(&lines[k], r)) {
             continue;
         }
         let new_dest = if dest.starts_with('w') { wreg_name(r) } else { xreg_name(r) };
@@ -1504,14 +1522,16 @@ fn fold_extend_into_narrow_store(lines: &mut [String], kinds: &mut [LineKind], n
 ///   ldr|str R, [xD, xA [, lsl #s]]     -> [xD, wB, sxtw [#s]]
 ///   madd|msub xC, xA, xM, xN           -> smaddl|smsubl xC, wB, wM, xN
 ///     (xM set by the line before from a 32-bit constant)
+///   cbz|cbnz xA, L                     -> cbz|cbnz wB, L
 ///   a 32-bit read of wA                -> wB
-/// B must keep its value until A's last read. The sxtw then goes.
+/// B must keep its value until A's last read. The sxtw then goes. (A may be
+/// B: `sxtw x0, w0; cbnz x0, L` tests w0.)
 fn fold_sxtw_into_users(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
     for i in 0..n {
         let LineKind::Sxtw { dst: a, src: b } = kinds[i] else { continue };
-        if a == b || a > 28 || b > 28 || live[i] & (1 << a) == 0 {
+        if a > 28 || b > 28 || live[i] & (1 << a) == 0 {
             continue;
         }
         let mut rewrites: Vec<(usize, String)> = Vec::new();
@@ -1526,6 +1546,14 @@ fn fold_sxtw_into_users(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
                 break;
             }
             let Some((mnemonic, ops)) = split_insn(&lines[k]) else { break };
+            // A compare-and-branch that is A's last read on both paths.
+            if kinds[k] == LineKind::CmpBranch && live[k] & (1 << a) == 0 {
+                if let Some(new) = rewrite_sxtw_use(mnemonic, ops, false, a, b, &lines[prev]) {
+                    rewrites.push((k, new));
+                    ok = true;
+                }
+                break;
+            }
             let access = classify_access(&lines[k], kinds[k]);
             if access == Access::Barrier {
                 break;
@@ -1583,6 +1611,10 @@ fn rewrite_sxtw_use(mnemonic: &str, ops: &str, first_is_dest: bool, a: u8, b: u8
                 Some(s) => format!("sxtw #{}", shift_amount(s)?),
             };
             (p.len() <= 4).then(|| format!("    {} {}, {}, {}, {}", mnemonic, c, d, wb, ext))
+        }
+        "cbz" | "cbnz" => {
+            let [x, target] = p[..] else { return None };
+            (x == xa).then(|| format!("    {} {}, {}", mnemonic, wb, target))
         }
         "madd" | "msub" => {
             let [c, m1, m2, acc] = p[..] else { return None };
@@ -3124,6 +3156,29 @@ mod tests {
     }
 
     #[test]
+    fn test_result_retargeted_past_unrelated_lines() {
+        let input = ".type f, %function\nf:\n    rbit x0, x10\n    clz x0, x0\n    mov x2, x27\n    mov x1, x0\n    add x0, sp, #16\n    bl g\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("clz x1, x0") && !result.contains("mov x1"), "{}", result);
+        // Not when a line in between reads the target.
+        for between in ["    mov x2, x1\n", "    str x1, [x9]\n"] {
+            let input = format!(".type f, %function\nf:\n    rbit x0, x10\n    clz x0, x0\n{between}    mov x1, x0\n    add x0, sp, #16\n    bl g\n    ret\n.size f, .-f\n");
+            let result = peephole_optimize(input);
+            assert!(result.contains("clz x0, x0"), "{between}{result}");
+        }
+    }
+
+    #[test]
+    fn test_sxtw_folded_into_cbnz() {
+        let input = ".type f, %function\nf:\n    bl g\n    sxtw x0, w0\n    cbnz x0, .LBB1\n    mov x0, #1\n.LBB1:\n    mov x0, #2\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("cbnz w0, .LBB1") && !result.contains("sxtw"), "{}", result);
+        // Not when the extended value is read after the branch.
+        let input = ".type f, %function\nf:\n    bl g\n    sxtw x0, w0\n    cbnz x0, .LBB1\n    mov x0, #1\n.LBB1:\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("sxtw x0, w0"));
+    }
+
+    #[test]
     fn test_index_folded_into_later_access() {
         // Other loads and NEON ops may come between the add and its access.
         let input = ".type f, %function\nf:\n    add x11, x4, x3\n    ldr q0, [x5, x3]\n    fmul v28.4s, v0.4s, v26.4s\n    ldr q1, [x11]\n    fmla v28.4s, v27.4s, v1.4s\n    str q28, [x5, x3]\n    ret\n.size f, .-f\n";
@@ -3140,10 +3195,11 @@ mod tests {
     #[test]
     fn test_small_loops_aligned() {
         let body = |n: usize| "    add x1, x1, x2\n".repeat(n);
-        // 5 instructions: 32-byte alignment; 13: 64; 21, or a call: none.
-        for (n, call, align) in [(3, false, Some("5")), (11, false, Some("6")), (19, false, None), (3, true, None)] {
-            let call_line = if call { "    bl g\n" } else { "" };
-            let input = format!(".type f, %function\nf:\n    mov x1, #0\n.LBB1:\n{}{}    subs x2, x2, #1\n    b.ne .LBB1\n    mov x0, x1\n    ret\n.size f, .-f\n", body(n), call_line);
+        // 5 instructions: 32-byte alignment; 13: 64; 21, or a call or a
+        // return: none.
+        for (n, extra, align) in [(3, "", Some("5")), (11, "", Some("6")), (19, "", None), (3, "    bl g\n", None),
+                                 (3, "    cbz x2, .LBB2\n    ret\n.LBB2:\n", None)] {
+            let input = format!(".type f, %function\nf:\n    mov x1, #0\n.LBB1:\n{}{extra}    subs x2, x2, #1\n    b.ne .LBB1\n    mov x0, x1\n    ret\n.size f, .-f\n", body(n));
             let result = peephole_optimize(input);
             match align {
                 Some(p) => assert!(result.contains(&format!(".p2align {p}\n.LBB1:")), "{n}: {result}"),

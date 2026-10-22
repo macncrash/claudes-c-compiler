@@ -5,6 +5,9 @@ use crate::common::types::IrType;
 use crate::backend::state::{StackSlot, SlotAddr};
 use super::emit::{ArmCodegen, callee_saved_name, callee_saved_name_32};
 
+/// Largest memcpy copied in straight-line q-pair chunks (offsets reach 1008).
+const MAX_UNROLLED_CHUNKS: usize = 16;
+
 impl ArmCodegen {
     // ---- Store/Load overrides ----
 
@@ -370,6 +373,14 @@ impl ArmCodegen {
                 SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr_impl(slot, false, dest.0),
             }
         }
+        // An unrolled copy reads a source pointer held in a register in
+        // place, unless that is a register the copy itself uses.
+        let src_reg = self.reg_assignments.get(&src.0).map(|&r| callee_saved_name(r))
+            .filter(|r| size / 32 <= MAX_UNROLLED_CHUNKS && !matches!(*r, "x10" | "x11" | "x12"));
+        if let Some(r) = src_reg {
+            self.emit_memcpy_chunks(size, "x9", r);
+            return;
+        }
         if let Some(addr) = self.state.resolve_slot_addr(src.0) {
             match addr {
                 SlotAddr::OverAligned(slot, id) => {
@@ -426,17 +437,21 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_acc();
     }
 
-    /// Copy `size` bytes from [x10] to [x9] in 16-byte ldp/stp chunks, then an
-    /// 8/4/2/1-byte tail. Uses only GPRs (safe under -mgeneral-regs-only);
-    /// x11-x13 are free because Memcpy is a liveness call point.
     /// Copy `size` bytes from [x10] to [x9]: 32-byte chunks through q0/q1
     /// (codegen scratch; this runs only for IR Memcpy, between instructions),
-    /// then smaller tails.
+    /// then smaller tails through x12/w12.
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
-        const MAX_UNROLLED_CHUNKS: usize = 16; // q-pair offsets reach 1008
+        self.emit_memcpy_chunks(size, "x9", "x10");
+    }
+
+    /// emit_memcpy_impl_impl from [src] to [dst]. Over MAX_UNROLLED_CHUNKS
+    /// chunks the copy is a loop that advances x9 and x10, which must then
+    /// be dst and src.
+    fn emit_memcpy_chunks(&mut self, size: usize, dst: &str, src: &str) {
         let chunks = size / 32;
         let mut offset = 0usize;
         if chunks > MAX_UNROLLED_CHUNKS {
+            debug_assert!(dst == "x9" && src == "x10");
             let label_id = self.state.next_label_id();
             let loop_label = format!(".Lmemcpy_loop_{}", label_id);
             self.load_large_imm("x11", chunks as i64);
@@ -447,8 +462,8 @@ impl ArmCodegen {
             self.state.emit_fmt(format_args!("    b.ne {}", loop_label));
         } else {
             for _ in 0..chunks {
-                self.state.emit_fmt(format_args!("    ldp q0, q1, [x10, #{}]", offset));
-                self.state.emit_fmt(format_args!("    stp q0, q1, [x9, #{}]", offset));
+                self.state.emit_fmt(format_args!("    ldp q0, q1, [{}, #{}]", src, offset));
+                self.state.emit_fmt(format_args!("    stp q0, q1, [{}, #{}]", dst, offset));
                 offset += 32;
             }
         }
@@ -458,8 +473,8 @@ impl ArmCodegen {
             (2, "w12", "ldrh", "strh"), (1, "w12", "ldrb", "strb"),
         ] {
             if tail >= width {
-                self.state.emit_fmt(format_args!("    {} {}, [x10, #{}]", load, reg, offset));
-                self.state.emit_fmt(format_args!("    {} {}, [x9, #{}]", store, reg, offset));
+                self.state.emit_fmt(format_args!("    {} {}, [{}, #{}]", load, reg, src, offset));
+                self.state.emit_fmt(format_args!("    {} {}, [{}, #{}]", store, reg, dst, offset));
                 offset += width;
                 tail -= width;
             }

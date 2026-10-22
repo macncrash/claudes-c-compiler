@@ -517,7 +517,10 @@ whose live pieces meet only where one hands its register to the next form a
 group. When the first member comes up, the allocator tries to give the whole
 group one register, so the copies become no-ops and a split edge holding only
 a copy becomes a jump the peephole threads away. Assigned one at a time, an
-unrelated value could take the register in a gap between members.
+unrelated value could take the register in a gap between members. A group
+with a call-spanning member (a sum carried around a loop that calls
+functions) is placed in phase 1, in one callee-saved register; one that
+does not fit there is allocated member by member.
 
 ### Eligibility Filtering
 

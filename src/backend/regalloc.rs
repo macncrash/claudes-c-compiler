@@ -288,23 +288,45 @@ pub fn allocate_registers(
     };
 
     // Copy groups: values joined by Copy instructions (a lowered phi and its
-    // incoming values) whose live pieces only meet at those copies. Phase 2
-    // first tries to give a whole group one register, so every copy in it
-    // becomes a no-op; assigning members one at a time lets an unrelated value
-    // take the register in a gap between them.
-    let groups = copy_groups(func, &liveness, &eligible, &folded, call_points, boundary_ok, &handoff);
+    // incoming values) whose live pieces only meet at those copies. The first
+    // member to be allocated tries to give the whole group one register, so
+    // every copy in it becomes a no-op; assigning members one at a time lets
+    // an unrelated value take the register in a gap between them. A group
+    // with a call-spanning member (a sum carried around a loop with calls)
+    // needs a callee-saved register, and is placed in phase 1.
+    let groups = copy_groups(func, &liveness, &eligible, &folded, &handoff);
     let interval_of: FxHashMap<u32, &LiveInterval> = if groups.is_empty() {
         FxHashMap::default()
     } else {
         liveness.intervals.iter().map(|iv| (iv.value_id, iv)).collect()
+    };
+    let group_pieces = |members: &[u32]| -> Vec<(u32, Vec<(u32, u32)>)> {
+        members.iter()
+            .filter_map(|m| interval_of.get(m).map(|iv| (*m, liveness.segments_of(iv))))
+            .collect()
+    };
+    let spans_any = |pieces: &[(u32, Vec<(u32, u32)>)]| {
+        pieces.iter().any(|(m, _)| spans_clobbering_call(&liveness, interval_of[m], call_points, boundary_ok))
     };
 
     // Phase 1: Callee-saved registers for call-spanning values.
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(true)) {
         let segs = liveness.segments_of(interval);
         let v = interval.value_id;
-        if is_folded(v, &assignments) {
+        if is_folded(v, &assignments) || assignments.contains_key(&v) {
             continue;
+        }
+        if let Some(members) = groups.get(&v) {
+            let pieces = group_pieces(members);
+            let fits_all = |busy: &[(u32, u32, u32)]| pieces.iter().all(|(m, sg)| fits(busy, sg, *m));
+            let free = || (0..callee.len()).filter(|&i| fits_all(&callee_busy[i]));
+            if let Some(i) = free().find(|&i| !callee_busy[i].is_empty()).or_else(|| free().next()) {
+                for (m, sg) in &pieces {
+                    occupy(&mut callee_busy[i], sg, *m);
+                    assignments.insert(*m, callee[i]);
+                }
+                continue;
+            }
         }
         // A value never read from its register (a constant-offset address
         // folded into every access) may share a register already saved, but
@@ -330,10 +352,9 @@ pub fn allocate_registers(
         if is_folded(v, &assignments) || assignments.contains_key(&v) {
             continue;
         }
-        if let Some(members) = groups.get(&v) {
-            let pieces: Vec<(u32, Vec<(u32, u32)>)> = members.iter()
-                .filter_map(|m| interval_of.get(m).map(|iv| (*m, liveness.segments_of(iv))))
-                .collect();
+        // (A group with a call-spanning member that phase 1 could not place
+        // is allocated member by member.)
+        if let Some(pieces) = groups.get(&v).map(|m| group_pieces(m)).filter(|p| !spans_any(p)) {
             let fits_all = |busy: &[(u32, u32, u32)]| pieces.iter().all(|(m, sg)| fits(busy, sg, *m));
             let pick = (0..caller.len()).find(|&i| fits_all(&caller_busy[i])).map(|i| (true, i))
                 .or_else(|| (0..callee.len()).find(|&i| !callee_busy[i].is_empty() && fits_all(&callee_busy[i])).map(|i| (false, i)));
@@ -432,7 +453,7 @@ fn dest_reuse_points(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<u32>)> {
 }
 
 /// Copy groups (see allocate_registers): for each member, all members of its
-/// group of two or more. Only non-call-spanning register candidates join, and
+/// group of two or more. Register candidates join (call-spanning or not), and
 /// two groups merge only when no piece of one overlaps a piece of the other,
 /// except where one value hands its register to the next (the copy itself, or
 /// an operation feeding it).
@@ -441,15 +462,12 @@ fn copy_groups(
     liveness: &LivenessResult,
     eligible: &FxHashSet<u32>,
     folded: &FxHashMap<u32, u32>,
-    call_points: &[u32],
-    boundary_ok: &[(u32, Option<u32>)],
     handoff: &dyn Fn(u32, u32, u32) -> bool,
 ) -> FxHashMap<u32, Vec<u32>> {
     /// Largest group: bounds the pairwise overlap checks.
     const MAX_GROUP: usize = 16;
     let pieces: FxHashMap<u32, Vec<(u32, u32)>> = liveness.intervals.iter()
-        .filter(|iv| iv.end > iv.start && eligible.contains(&iv.value_id) && !folded.contains_key(&iv.value_id)
-            && !spans_clobbering_call(liveness, iv, call_points, boundary_ok))
+        .filter(|iv| iv.end > iv.start && eligible.contains(&iv.value_id) && !folded.contains_key(&iv.value_id))
         .map(|iv| (iv.value_id, liveness.segments_of(iv)))
         .collect();
     let compatible = |a: u32, b: u32| {
