@@ -504,6 +504,12 @@ very deep nesting). This ensures inner-loop temporaries receive registers
 ahead of straight-line code values, which is critical for compute-heavy
 loops like zlib's `deflate_slow`, `longest_match`, and `slide_hash`.
 
+A GEP with a constant offset that is only used as a load or store address
+(see GEP Constant Offset Folding) counts its uses toward its base instead,
+and gets no register once its base has one, since codegen then folds it
+into each access and never computes it. Such weightless values never take
+a callee-saved register that is not already saved.
+
 ### Eligibility Filtering
 
 The allocator uses a whitelist approach: only values produced by simple,
@@ -557,7 +563,9 @@ The analysis proceeds in three steps:
    This eliminates per-iteration heap allocation and replaces hash-table
    operations with fast word-level bitwise ops.
 3. **Interval construction**: Build intervals by taking the union of
-   definition/use points and live-through blocks.
+   definition/use points and live-through blocks. A value live into a block
+   but not out of it ends at its last use there, and one defined in a block
+   it is live out of starts at its definition, not the block start.
 
 ### Auxiliary Results
 

@@ -691,23 +691,25 @@ fn extend_intervals_from_liveness(
         let start = block_start_points[idx];
         let end = block_end_points[idx];
 
+        // Live in but not out: the value dies at its last use in the block,
+        // which the use scan (and the GEP and F128 extensions) already
+        // recorded, so only the block start is added here.
         live_in[idx].for_each_set_bit(|dense_idx| {
             let def_entry = &mut def_points[dense_idx];
             if *def_entry == u32::MAX || start < *def_entry {
                 *def_entry = start;
             }
             let entry = &mut last_use_points[dense_idx];
-            if *entry == u32::MAX {
+            if *entry == u32::MAX || start > *entry {
                 *entry = start;
-            }
-            if end > *entry {
-                *entry = end;
             }
         });
 
+        // Live out: either live in too (handled above) or defined in the
+        // block, where its interval starts at the definition.
         live_out[idx].for_each_set_bit(|dense_idx| {
             let def_entry = &mut def_points[dense_idx];
-            if *def_entry == u32::MAX || start < *def_entry {
+            if *def_entry == u32::MAX {
                 *def_entry = start;
             }
             let entry = &mut last_use_points[dense_idx];
@@ -874,7 +876,9 @@ fn extend_gep_base_liveness(
 
     // Phase C: Extend base liveness to Load/Store points that use foldable GEP results.
     let mut block_point: u32 = 0;
+    let mut defined_here: FxHashSet<u32> = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
+        defined_here.clear();
         for inst in &block.instructions {
             match inst {
                 Instruction::Load { .. } | Instruction::Store { .. } => {
@@ -891,13 +895,19 @@ fn extend_gep_base_liveness(
                                 if *entry == u32::MAX || block_point > *entry {
                                     *entry = block_point;
                                 }
-                                // Also add to block's gen set (the base is "used" here)
-                                block_gen[bi].insert(dense);
+                                // Also add to block's gen set (the base is "used"
+                                // here), unless this block defines it first.
+                                if !defined_here.contains(&base_id) {
+                                    block_gen[bi].insert(dense);
+                                }
                             }
                         }
                     }
                 }
                 _ => {}
+            }
+            if let Some(dest) = inst.dest() {
+                defined_here.insert(dest.0);
             }
             block_point += 1;
         }

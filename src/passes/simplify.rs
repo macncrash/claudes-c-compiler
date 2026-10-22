@@ -42,6 +42,9 @@
 //! - Cast(Cast(x, A->B), B->A) where A fits in B => Copy of x (widen-then-narrow)
 //! - Cast(Cast(x, A->B), B->C) => Cast(x, A->C) (double widen/narrow)
 //! - Cast of constant => constant (fold at compile time)
+//! - Cast between 32- and 64-bit integers of a value whose range makes it a
+//!   no-op (`x & 63`, a sign-extended byte) => Copy of x
+//! - BinOp whose operand ranges leave one possible result => that constant
 //!
 //! Comparison simplification (requires def lookup):
 //! - Cmp(Ne, cmp_result, 0) => Copy(cmp_result) -- redundant boolean test
@@ -152,6 +155,13 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     let mut is_boolean = vec![false; max_id + 1];
     // Values whose producer leaves them in canonical form for their type.
     let mut canonical_ty: Vec<Option<IrType>> = vec![None; max_id + 1];
+    let mut use_counts = vec![0u32; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| if let Some(n) = use_counts.get_mut(v as usize) { *n += 1 });
+        }
+        block.terminator.for_each_used_value(|v| if let Some(n) = use_counts.get_mut(v as usize) { *n += 1 });
+    }
 
     // Collect definitions - first pass: mark Cmp results as boolean
     for block in &func.blocks {
@@ -184,8 +194,9 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
                     // This enables constant reassociation: (x + C1) + C2 => x + (C1+C2),
                     // and multiply reassociation: (x * C1) * C2 => x * (C1*C2).
                     if matches!(lhs, Operand::Const(_)) || matches!(rhs, Operand::Const(_)) {
+                        let shared = use_counts.get(dest.0 as usize).is_some_and(|&n| n > 1);
                         set_def(&mut binop_defs, dest.0, BinOpDef {
-                            op: *op, lhs: *lhs, rhs: *rhs, ty: *ty,
+                            op: *op, lhs: *lhs, rhs: *rhs, ty: *ty, shared,
                         });
                     }
                 }
@@ -212,6 +223,30 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
                         }
                     }
             }
+        }
+    }
+
+    // Range-based folds first, in their own sweep: they keep every
+    // register's contents, so the ranges stay valid while they run. The
+    // rewrites below need not (`x ^ 0 => x` on an x not in canonical
+    // form for the xor's type), so they must not see these ranges.
+    let ranges = value_ranges(func, max_id);
+    for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+        let folded = match inst {
+            // An integer operation with a single possible result (the sign
+            // fix-up `x >> 63` of a non-negative x) is that constant.
+            Instruction::BinOp { dest, ty, .. } => match ranges.get(dest.0 as usize) {
+                Some(Some((lo, hi))) if lo == hi && ty.is_integer() && ty.size() >= 4
+                    && !matches!(ty, IrType::I128 | IrType::U128) =>
+                    Some(Instruction::Copy { dest: *dest, src: Operand::Const(IrConst::from_i64(*lo as i64, *ty)) }),
+                _ => None,
+            },
+            Instruction::Cast { dest, src, from_ty, to_ty } => simplify_cast_in_range(*dest, src, *from_ty, *to_ty, &ranges),
+            _ => None,
+        };
+        if let Some(f) = folded {
+            *inst = f;
+            total += 1;
         }
     }
 
@@ -286,6 +321,144 @@ fn canonical_result_type(inst: &Instruction) -> Option<IrType> {
     (ty.is_integer() && !matches!(ty, IrType::I128 | IrType::U128)).then_some(ty)
 }
 
+/// Bounds (inclusive) of a value, for values whose producer leaves them in
+/// canonical form (see canonical_result_type): then, on every 64-bit
+/// backend, the 64-bit register holds exactly that integer (32-bit signed
+/// values sign-extended, unsigned ones zero-extended).
+type Range = Option<(i128, i128)>;
+
+/// The values of an integer type.
+fn type_range(ty: IrType) -> Range {
+    Some(match ty {
+        IrType::I8 => (i8::MIN as i128, i8::MAX as i128),
+        IrType::U8 => (0, u8::MAX as i128),
+        IrType::I16 => (i16::MIN as i128, i16::MAX as i128),
+        IrType::U16 => (0, u16::MAX as i128),
+        IrType::I32 => (i32::MIN as i128, i32::MAX as i128),
+        IrType::U32 => (0, u32::MAX as i128),
+        IrType::I64 => (i64::MIN as i128, i64::MAX as i128),
+        IrType::U64 => (0, u64::MAX as i128),
+        _ => return None,
+    })
+}
+
+fn range_within(r: Range, ty: IrType) -> bool {
+    match (r, type_range(ty)) {
+        (Some((lo, hi)), Some((tlo, thi))) => tlo <= lo && hi <= thi,
+        _ => false,
+    }
+}
+
+/// The range of each value (see Range), from its producer and the ranges
+/// of its operands, in one pass in block order (a value defined later, as
+/// around a loop, is unknown). Masks (`m & 63`), shifts, byte loads,
+/// comparisons and arithmetic on them get bounds; so does an extension of a
+/// value already in range. Empty on 32-bit targets, where I64 values take
+/// two registers.
+fn value_ranges(func: &IrFunction, max_id: usize) -> Vec<Range> {
+    let mut ranges: Vec<Range> = vec![None; max_id + 1];
+    if crate::common::types::target_is_32bit() {
+        return ranges;
+    }
+    let get = |op: &Operand, ranges: &[Range]| -> Range {
+        match op {
+            Operand::Value(v) => ranges.get(v.0 as usize).copied().flatten(),
+            Operand::Const(c) => c.to_i64().map(|k| (k as i128, k as i128)),
+        }
+    };
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        let Some(dest) = inst.dest() else { continue };
+        let r = match inst {
+            Instruction::Load { ty, .. } if !matches!(ty, IrType::I128 | IrType::U128) => type_range(*ty),
+            Instruction::Cmp { .. } => Some((0, 1)),
+            Instruction::Copy { src, .. } => get(src, &ranges),
+            Instruction::Select { true_val, false_val, ty, .. } if ty.is_integer() => {
+                match (get(true_val, &ranges), get(false_val, &ranges)) {
+                    (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
+                    _ => None,
+                }
+            }
+            Instruction::Cast { src, from_ty, to_ty, .. } if from_ty.size() != to_ty.size() => {
+                // The backend extends the low bits per the narrower type to
+                // the whole register (a short widened to unsigned stays
+                // sign-extended).
+                let ext = if from_ty.size() < to_ty.size() { *from_ty } else { *to_ty };
+                let s = get(src, &ranges);
+                if range_within(s, ext) { s } else { type_range(ext) }
+            }
+            Instruction::BinOp { op, lhs, rhs, ty, .. } if ty.size() >= 4 => {
+                binop_range(*op, get(lhs, &ranges), get(rhs, &ranges), *ty)
+            }
+            _ => None,
+        };
+        if let Some(slot) = ranges.get_mut(dest.0 as usize) {
+            *slot = r;
+        }
+    }
+    ranges
+}
+
+/// The range of a canonical BinOp result. Add, Sub, Mul and Shl are exact
+/// modulo 2^width, so their interval holds whenever it fits the type; the
+/// bitwise operations and right shifts read only the low bits, so they use
+/// an operand's range only when it fits the type.
+fn binop_range(op: IrBinOp, a: Range, b: Range, ty: IrType) -> Range {
+    let tr = type_range(ty)?;
+    let in_ty = |r: Range| r.filter(|_| range_within(r, ty));
+    let bits = 8 * ty.size() as u32;
+    let shift = |r: Range| r.filter(|&(lo, hi)| lo == hi && (0..bits as i128).contains(&lo)).map(|(k, _)| k as u32);
+    let exact = match op {
+        IrBinOp::Add => a.zip(b).map(|(a, b)| (a.0 + b.0, a.1 + b.1)),
+        IrBinOp::Sub => a.zip(b).map(|(a, b)| (a.0 - b.1, a.1 - b.0)),
+        IrBinOp::Mul => a.zip(b).and_then(|(a, b)| {
+            // Keep the products well inside i128.
+            let big = |r: (i128, i128)| r.0.abs().max(r.1.abs()) > 1 << 64;
+            if big(a) || big(b) {
+                return None;
+            }
+            let p = [a.0 * b.0, a.0 * b.1, a.1 * b.0, a.1 * b.1];
+            Some((*p.iter().min()?, *p.iter().max()?))
+        }),
+        IrBinOp::Shl => match (a, shift(b)) {
+            (Some(a), Some(k)) if a.0.abs().max(a.1.abs()) <= 1 << 64 => Some((a.0 << k, a.1 << k)),
+            _ => None,
+        },
+        IrBinOp::And => {
+            let nonneg = |r: Range| in_ty(r).filter(|r| r.0 >= 0).map(|r| r.1);
+            match (nonneg(a), nonneg(b)) {
+                (Some(x), Some(y)) => Some((0, x.min(y))),
+                (Some(x), None) | (None, Some(x)) => Some((0, x)),
+                _ => None,
+            }
+        }
+        IrBinOp::Or | IrBinOp::Xor => match (in_ty(a), in_ty(b)) {
+            (Some(a), Some(b)) if a.0 >= 0 && b.0 >= 0 => {
+                let m = a.1.max(b.1);
+                Some((0, (1i128 << (128 - m.leading_zeros())) - 1))
+            }
+            _ => None,
+        },
+        IrBinOp::LShr => match (in_ty(a), shift(b)) {
+            (Some(a), Some(k)) if a.0 >= 0 => Some((a.0 >> k, a.1 >> k)),
+            (_, Some(k)) if k > 0 => Some((0, ((1i128 << bits) - 1) >> k)),
+            _ => None,
+        },
+        IrBinOp::AShr if ty.is_signed() => shift(b).map(|k| {
+            let a = in_ty(a).unwrap_or(tr);
+            (a.0 >> k, a.1 >> k)
+        }),
+        IrBinOp::URem => match (in_ty(a), b) {
+            (Some(a), Some((d, d2))) if a.0 >= 0 && d == d2 && d > 0 => Some((0, a.1.min(d - 1))),
+            _ => None,
+        },
+        _ => None,
+    };
+    match exact {
+        Some((lo, hi)) if tr.0 <= lo && hi <= tr.1 => Some((lo, hi)),
+        _ => Some(tr),
+    }
+}
+
 /// Store a definition in a flat Vec, bounds-checked.
 fn set_def<T>(defs: &mut [Option<T>], id: u32, val: T) {
     let idx = id as usize;
@@ -345,6 +518,8 @@ struct BinOpDef {
     lhs: Operand,
     rhs: Operand,
     ty: IrType,
+    /// The result has other uses, so it stays live after a reassociation.
+    shared: bool,
 }
 
 /// Try to simplify an instruction using algebraic identities and strength reduction.
@@ -370,6 +545,22 @@ fn try_simplify(
             simplify_gep(*dest, *base, offset, *ty, gep_defs)
         }
         Instruction::Cmp { dest, op, lhs, rhs, ty } => {
+            // A compare reads only its type's bits, so an operand widened
+            // from that very type compares as the value before widening.
+            let narrow = |o: &Operand| match o {
+                Operand::Value(v) => match cast_defs.get(v.0 as usize) {
+                    Some(Some(CastDef { src: src @ Operand::Value(_), from_ty, to_ty }))
+                        if *from_ty == *ty && ty.is_integer() && to_ty.is_integer() && to_ty.size() > ty.size() => Some(*src),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let (l, r) = (narrow(lhs), narrow(rhs));
+            if l.is_some() || r.is_some() {
+                let (lhs, rhs) = (l.unwrap_or(*lhs), r.unwrap_or(*rhs));
+                return simplify_cmp(*dest, *op, &lhs, &rhs, *ty, cmp_defs, is_boolean)
+                    .or(Some(Instruction::Cmp { dest: *dest, op: *op, lhs, rhs, ty: *ty }));
+            }
             simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, is_boolean)
         }
         Instruction::Select { dest, cond, true_val, false_val, ty } => {
@@ -529,6 +720,33 @@ fn simplify_noop_cast(
         return Some(Instruction::Copy { dest, src: *src });
     }
     None
+}
+
+/// A cast between 32- and 64-bit integer types that leaves the register
+/// unchanged, given the source's range: the backend sign- or zero-extends
+/// the narrower type's low bits, which is the identity on a value already in
+/// that type's range. (Same-size I32/U32 casts differ between backends, so
+/// they need a value in both; widening needs one in [0, 2^31), see below.) This removes the sext(trunc(x)) pairs that
+/// bitfield extraction and `int` arithmetic on bytes leave behind, where
+/// the 32- and 64-bit versions of a value both stayed live.
+fn simplify_cast_in_range(dest: Value, src: &Operand, from_ty: IrType, to_ty: IrType, ranges: &[Range]) -> Option<Instruction> {
+    let word = |ty: IrType| matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64);
+    let Operand::Value(v) = src else { return None };
+    if !word(from_ty) || !word(to_ty) {
+        return None;
+    }
+    let r = ranges.get(v.0 as usize).copied().flatten();
+    let noop = match from_ty.size().cmp(&to_ty.size()) {
+        // Widening hands the 32-bit value itself to 64-bit readers. Later
+        // passes may produce that value with a 32-bit instruction instead
+        // (narrow turns trunc(~x) into a 32-bit not), which zero-extends on
+        // some targets and sign-extends on others, so only a value both
+        // agree on, in [0, 2^31), may skip the extension.
+        std::cmp::Ordering::Less => r.is_some_and(|(lo, hi)| lo >= 0 && hi <= i32::MAX as i128),
+        std::cmp::Ordering::Greater => range_within(r, to_ty),
+        std::cmp::Ordering::Equal => range_within(r, from_ty) && range_within(r, to_ty),
+    };
+    noop.then_some(Instruction::Copy { dest, src: *src })
 }
 
 /// Fold a cast of a constant at compile time.
@@ -1608,6 +1826,12 @@ fn try_reassociate_bitwise(
     };
     let combined = ty.truncate_i64(combined);
 
+    // (x & C1) & C2 where C2 keeps every bit of C1 is the inner value itself,
+    // and likewise (x | C1) | C2 where C2 sets no new bit.
+    if matches!(op, IrBinOp::And | IrBinOp::Or) && combined == ty.truncate_i64(c1_val) {
+        return Some(Instruction::Copy { dest, src: *lhs });
+    }
+
     // Check if combined result is identity and can eliminate the instruction
     let is_identity = match op {
         IrBinOp::And => is_all_ones(&Operand::Const(IrConst::from_i64(combined, ty)), ty),
@@ -1629,6 +1853,13 @@ fn try_reassociate_bitwise(
             dest,
             src: Operand::Const(IrConst::from_i64(combined, ty)),
         });
+    }
+
+    // Reading x instead of the inner result saves nothing when the inner
+    // result stays live, and keeps x live longer (`m >> 6` next to
+    // `(m >> 6) & 63`).
+    if def.shared {
+        return None;
     }
 
     Some(Instruction::BinOp {
@@ -2796,6 +3027,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I32(10)),
             ty: IrType::I32,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),
@@ -2822,6 +3054,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I32(5)),
             ty: IrType::I32,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),
@@ -2843,6 +3076,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I32(10)),
             ty: IrType::I32,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),
@@ -2869,6 +3103,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I32(0xFF)),
             ty: IrType::I32,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),
@@ -2895,6 +3130,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I32(0xFF)),
             ty: IrType::I32,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),
@@ -2916,6 +3152,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I32(2)),
             ty: IrType::I32,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),
@@ -2942,6 +3179,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I32(20)),
             ty: IrType::I32,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),
@@ -3001,6 +3239,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I32(3)),
             ty: IrType::I32,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),
@@ -3036,6 +3275,7 @@ mod tests {
             lhs: Operand::Value(Value(0)),
             rhs: Operand::Const(IrConst::I64(3)),
             ty: IrType::I64,
+            shared: false,
         });
         let inst = Instruction::BinOp {
             dest: Value(2),

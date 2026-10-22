@@ -472,6 +472,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(retarget_results(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_and_into_tst(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_extend_into_narrow_store(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_sxtw_into_users(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_writes(&lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_writes_global(&lines, &mut kinds, n));
             changed2 |= pass!(fuse_branch_over_branch(&mut lines, &mut kinds, n));
@@ -1039,7 +1042,7 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
         | "umull" | "smulh" | "umulh" | "sdiv" | "udiv" | "neg" | "mvn" | "sxtw" | "sxth"
         | "sxtb" | "uxtb" | "uxth" | "cset" | "csetm" | "csel" | "csinc" | "csinv"
         | "csneg" | "cinc" | "clz" | "rbit" | "rev" | "rev16" | "rev32" | "ubfx" | "sbfx"
-        | "ubfiz" | "sbfiz" | "fmov" | "fcvtzs" | "fcvtzu" | "umov" if !has_symbol => {
+        | "ubfiz" | "sbfiz" | "smaddl" | "smsubl" | "fmov" | "fcvtzs" | "fcvtzu" | "umov" if !has_symbol => {
             Access::Write { deletable: true }
         }
         // Loads write their destination; never delete them (volatile/MMIO).
@@ -1325,6 +1328,237 @@ fn fuse_mul_into_madd(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
         changed = true;
     }
     changed
+}
+
+/// An immediate operand (`#63`, `#0x3f`).
+fn parse_imm(op: &str) -> Option<u64> {
+    let v = op.strip_prefix('#')?;
+    match v.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    }
+}
+
+/// `lsr T, S, #k` immediately followed by `and D, T, #(2^w - 1)` (T dead
+/// afterwards unless it is D) becomes `ubfx D, S, #k, #w`: a bit-field
+/// extraction (`(m >> 6) & 63`) in one instruction.
+fn fuse_shift_mask_into_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        let Some(("lsr", ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [t, s, k] = p[..] else { continue };
+        let (Some(tr), Some(sr), Some(k)) = (gpr_operand(t), gpr_operand(s), parse_imm(k)) else { continue };
+        let width = if t.starts_with('w') { 32 } else { 64 };
+        if s.starts_with('w') != (width == 32) {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some(("and", aops)) = split_insn(&lines[j]) else { continue };
+        let a: Vec<&str> = aops.split(',').map(str::trim).collect();
+        let [d, x, m] = a[..] else { continue };
+        let (Some(dr), Some(m)) = (gpr_operand(d), parse_imm(m)) else { continue };
+        if gpr_operand(x) != Some(tr) || m == 0 || m & (m + 1) != 0 {
+            continue;
+        }
+        let w = 64 - m.leading_zeros() as u64;
+        // A 32-bit shift brings in zeros above bit 31, as does a w-form
+        // result.
+        let limit = if d.starts_with('w') { 32 } else { width };
+        if k + w > limit.min(width) {
+            continue;
+        }
+        if live[j] & (1 << tr) != 0 && dr != tr {
+            continue;
+        }
+        // A field within the low 32 bits extracts in w form (writing wD
+        // clears the upper half), so 32-bit copies of S can feed it.
+        let (d, src) = if k + w <= 32 { (wreg_name(dr), wreg_name(sr)) } else { (xreg_name(dr), xreg_name(sr)) };
+        lines[j] = format!("    ubfx {}, {}, #{}, #{}", d, src, k, w);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `sxtb|uxtb|sxth|uxth A, wB` immediately followed by a byte or halfword
+/// store of wA that the extension does not change (`strb` after a byte or
+/// halfword extension, `strh` after a halfword one), with A dead afterwards:
+/// the store takes wB and the extension goes.
+fn fold_extend_into_narrow_store(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        let Some((ext @ ("sxtb" | "uxtb" | "sxth" | "uxth"), ops)) = split_insn(&lines[i]) else { continue };
+        let (a, b) = first_and_rest(ops);
+        let b = b.trim();
+        let (Some(ar), Some(br)) = (gpr_operand(a), gpr_operand(b)) else { continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((st, sops)) = split_insn(&lines[j]) else { continue };
+        let fits = match st {
+            "strb" | "sturb" => true,
+            "strh" | "sturh" => ext.ends_with('h'),
+            _ => false,
+        };
+        let (v, addr) = first_and_rest(sops);
+        if !fits || gpr_operand(v) != Some(ar) || mentions_reg(addr, ar) || live[j] & (1 << ar) != 0 {
+            continue;
+        }
+        lines[j] = format!("    {} {},{}", st, wreg_name(br), addr);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `sxtw xA, wB` whose every read, until A dies, can take wB with the
+/// extension folded into the instruction:
+///   add|sub xC, xD, xA [, lsl #s]      -> add|sub xC, xD, wB, sxtw [#s]
+///   ldr|str R, [xD, xA [, lsl #s]]     -> [xD, wB, sxtw [#s]]
+///   madd|msub xC, xA, xM, xN           -> smaddl|smsubl xC, wB, wM, xN
+///     (xM set by the line before from a 32-bit constant)
+///   a 32-bit read of wA                -> wB
+/// B must keep its value until A's last read. The sxtw then goes.
+fn fold_sxtw_into_users(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        let LineKind::Sxtw { dst: a, src: b } = kinds[i] else { continue };
+        if a == b || a > 28 || b > 28 || live[i] & (1 << a) == 0 {
+            continue;
+        }
+        let mut rewrites: Vec<(usize, String)> = Vec::new();
+        let mut prev = i;
+        let mut ok = false;
+        for k in i + 1..n {
+            if kinds[k] == LineKind::Nop || access_is_transparent(&lines[k], kinds[k]) {
+                continue;
+            }
+            if live[prev] & (1 << a) == 0 {
+                ok = true;
+                break;
+            }
+            let Some((mnemonic, ops)) = split_insn(&lines[k]) else { break };
+            let access = classify_access(&lines[k], kinds[k]);
+            if access == Access::Barrier {
+                break;
+            }
+            let (dest, srcs) = match access {
+                Access::Write { .. } if !mnemonic.starts_with("str") => {
+                    let (d, s) = first_and_rest(ops);
+                    (gpr_operand(d), s)
+                }
+                _ => (None, ops),
+            };
+            if mentions_reg(srcs, a) {
+                match rewrite_sxtw_use(mnemonic, ops, dest.is_some(), a, b, &lines[prev]) {
+                    Some(new) => rewrites.push((k, new)),
+                    None => break,
+                }
+            }
+            if dest == Some(a) {
+                ok = true;
+                break;
+            }
+            if dest == Some(b) && live[k] & (1 << a) != 0 {
+                break;
+            }
+            prev = k;
+        }
+        if !ok {
+            continue;
+        }
+        for (k, new) in rewrites {
+            lines[k] = new;
+            kinds[k] = classify_line(&lines[k]);
+        }
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// One read of xA rewritten to read wB sign-extended (see
+/// fold_sxtw_into_users), or None.
+fn rewrite_sxtw_use(mnemonic: &str, ops: &str, first_is_dest: bool, a: u8, b: u8, prev_line: &str) -> Option<String> {
+    let (xa, wa, wb) = (xreg_name(a), wreg_name(a), wreg_name(b));
+    let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+    let shift_amount = |s: &str| s.strip_prefix("lsl #").and_then(|k| k.parse::<u8>().ok()).filter(|&k| k <= 4);
+    match mnemonic {
+        "add" | "sub" if !ops.contains('[') => {
+            let (c, d, x) = (p.first()?, p.get(1)?, p.get(2)?);
+            let (d, x) = if *x == xa { (*d, *x) } else if mnemonic == "add" && *d == xa && p.len() == 3 { (*x, *d) } else { return None };
+            if !c.starts_with('x') || !d.starts_with('x') || gpr_operand(d) == Some(a) || x != xa {
+                return None;
+            }
+            let ext = match p.get(3) {
+                None => "sxtw".to_string(),
+                Some(s) => format!("sxtw #{}", shift_amount(s)?),
+            };
+            (p.len() <= 4).then(|| format!("    {} {}, {}, {}, {}", mnemonic, c, d, wb, ext))
+        }
+        "madd" | "msub" => {
+            let [c, m1, m2, acc] = p[..] else { return None };
+            let other = if m1 == xa && m2 != xa { m2 } else if m2 == xa && m1 != xa { m1 } else { return None };
+            if acc == xa || !c.starts_with('x') {
+                return None;
+            }
+            // The other factor must be a sign-extended 32-bit constant.
+            let (pm, pops) = split_insn(prev_line)?;
+            let (pd, pv) = first_and_rest(pops);
+            let k = parse_imm(pv.trim()).map(|v| v as i64)
+                .or_else(|| pv.trim().strip_prefix("#-").and_then(|v| v.parse::<i64>().ok()).map(|v| -v))?;
+            if pm != "mov" || pd != other || !(i32::MIN as i64..=i32::MAX as i64).contains(&k) {
+                return None;
+            }
+            let o = gpr_operand(other)?;
+            let fused = if mnemonic == "madd" { "smaddl" } else { "smsubl" };
+            Some(format!("    {} {}, {}, {}, {}", fused, c, wb, wreg_name(o), acc))
+        }
+        _ if ops.contains('[') => {
+            // Register-offset address: [xD, xA] or [xD, xA, lsl #s].
+            let open = ops.find('[')?;
+            let close = ops.find(']')?;
+            let (before, inner, after) = (&ops[..open], &ops[open + 1..close], &ops[close..]);
+            // A stored register may be wA (a 32-bit read), never xA; a
+            // loaded one is written, not read.
+            if reads_x_form(before, a) || after != "]" {
+                return None;
+            }
+            let before = if first_is_dest { before.to_string() } else { replace_whole_word(before, wa, wb) };
+            let q: Vec<&str> = inner.split(',').map(str::trim).collect();
+            if q.len() < 2 || q[1] != xa || mentions_reg(q[0], a) || !q[0].starts_with('x') {
+                return None;
+            }
+            let ext = match q.get(2) {
+                None => "sxtw".to_string(),
+                Some(s) => format!("sxtw #{}", shift_amount(s)?),
+            };
+            (q.len() <= 3).then(|| format!("    {} {}[{}, {}, {}]", mnemonic, before, q[0], wb, ext))
+        }
+        // Only 32-bit reads of A otherwise: the low half is the same.
+        _ if first_is_dest => {
+            let (d, rest) = first_and_rest(ops);
+            (!reads_x_form(rest, a)).then(|| format!("    {} {},{}", mnemonic, d, replace_whole_word(rest, wa, wb)))
+        }
+        _ if !reads_x_form(ops, a) => Some(format!("    {} {}", mnemonic, replace_whole_word(ops, wa, wb))),
+        _ => None,
+    }
 }
 
 /// Delete register writes that are overwritten before any read.
@@ -1665,9 +1899,10 @@ fn flags_dead_after(lines: &[String], kinds: &[LineKind], start: usize, n: usize
             return true;
         }
         // (movk is a barrier for register tracking, as it also reads its
-        // destination, but leaves the flags alone.)
+        // destination, and so are the register pairs of an epilogue, but
+        // they leave the flags alone.)
         match classify_access(&lines[k], kinds[k]) {
-            Access::Barrier if kinds[k] != LineKind::CmpBranch && m != "movk" => return false,
+            Access::Barrier if kinds[k] != LineKind::CmpBranch && !matches!(m, "movk" | "ldp" | "stp") => return false,
             _ => {}
         }
     }
@@ -2149,6 +2384,13 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
         let base = first_and_rest(srcs).0;
         if let (Some(d), Some(b)) = (gpr_operand(dest), gpr_operand(base)) {
             return LineInfo { uses: 1 << b, defs: 1 << d, flow: Flow::Next, deletable_dest: Some(d) };
+        }
+    }
+    // `movk xD, #imm, lsl #s` replaces 16 bits of D: it reads and writes D
+    // only (a barrier for the rewriting passes, but not for liveness).
+    if mnemonic == "movk" && !srcs.contains(':') && regs_in(srcs) == 0 {
+        if let Some(d) = gpr_operand(dest) {
+            return LineInfo { uses: 1 << d, defs: 1 << d, flow: Flow::Next, deletable_dest: Some(d) };
         }
     }
     // Pair loads/stores and writeback forms (callee-saved register saves and

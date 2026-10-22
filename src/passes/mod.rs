@@ -15,6 +15,7 @@ pub(crate) mod copy_prop;
 pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
+mod gep_reassoc;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
@@ -28,6 +29,7 @@ pub(crate) mod loop_hoist;
 pub(crate) mod loop_rotate;
 pub(crate) mod mod_ref;
 pub(crate) mod narrow;
+mod pressure_hoist;
 mod resolve_asm;
 pub(crate) mod simplify;
 
@@ -563,6 +565,24 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             if lftr::lftr_function(func) > 0 {
                 copy_prop::propagate_copies(func);
+                dce::eliminate_dead_code(func);
+            }
+        }
+    }
+
+    // Phase 10d: Hoist instructions that end several live ranges to where
+    // their operands are defined.
+    if !disabled.contains("pressure_hoist") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            pressure_hoist::hoist_function(func);
+        }
+    }
+
+    // Phase 10e: Move constant GEP offsets past variable ones so the
+    // backend folds them into loads and stores.
+    if !disabled.contains("gep_reassoc") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if gep_reassoc::reassociate_function(func) > 0 {
                 dce::eliminate_dead_code(func);
             }
         }

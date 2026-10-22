@@ -728,6 +728,16 @@ with the original source when the source is still live.
 
 Removes `str` instructions to stack slots that are overwritten before being read.
 
+**9. Extension and Field Folds** (local cleanup)
+
+- `lsr T, S, #k; and D, T, #(2^w - 1)` becomes `ubfx D, S, #k, #w` (in w form
+  when the field lies in the low 32 bits).
+- `sxtb|uxtb|sxth|uxth A, wB` feeding only a byte (or, after a halfword
+  extension, halfword) store of wA stores wB instead.
+- `sxtw xA, wB` whose reads, until A dies, can all take wB with the
+  extension folded in (`add xC, xD, wB, sxtw #s`, `[xD, wB, sxtw #s]`,
+  `smaddl` for a `madd` by a 32-bit constant, or a 32-bit read) goes away.
+
 ---
 
 ## Codegen Options

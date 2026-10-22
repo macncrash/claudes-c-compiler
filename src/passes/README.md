@@ -71,6 +71,14 @@ The optimizer executes in four sequential phases:
      lftr
          |
          v
+ Phase 10d: Pressure Hoisting
+     pressure_hoist
+         |
+         v
+ Phase 10e: GEP Offset Reassociation
+     gep_reassoc
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
          |
@@ -476,7 +484,10 @@ operation with a constant, the two constants are combined. For example:
 `(x + 3) + 5 => x + 8`, `(x * 4) * 8 => x * 32`, `(x & 0xFF) & 0x0F => x & 0x0F`,
 `(x << 2) << 3 => x << 5`. Handles all commutative variants and cross-operator
 interactions (e.g., `(x + C1) - C2 => x + (C1 - C2)`). When the combined
-constant is an identity element, the entire operation is eliminated.
+constant is an identity element, the entire operation is eliminated. A mask
+that keeps every bit of the inner one is the inner value (`(x & 63) & 255 => x & 63`);
+otherwise bitwise operations are not reassociated when the inner result has
+other uses, since reading `x` instead would keep both live.
 
 **Negation elimination.** Rewrites `x - (neg y)` as `x + y` by tracking
 `UnaryOp::Neg` definitions.
@@ -490,6 +501,26 @@ Cast(Cast(x:A, A->B), B->A) where A<=B => Copy(x)     (widen then narrow back)
 Cast(Cast(x, A->B), B->C) where A<B<C  => Cast(x, A->C)  (double widen, same sign)
 Cast(Cast(x, A->B), B->C) where A>B>C  => Cast(x, A->C)  (double narrow)
 ```
+
+**Value ranges.** On 64-bit targets each value whose producer leaves it in
+canonical form (32-bit signed values sign-extended in their register, unsigned
+ones zero-extended, on every backend) gets bounds from its producer: loads and
+extensions of narrow types, masks, shifts, comparisons, selects, and add, sub,
+mul and shl of bounded values (exact modulo the width, so the interval holds
+when it fits the type). Then:
+
+```
+Cast between I32/U32/I64/U64 that leaves the register unchanged => Copy(x)
+    (narrowing a value in range; widening one in [0, 2^31), which every
+    target extends alike however a later pass computes it)
+    (sext(trunc(m & 63)), int arithmetic on a sign-extended byte)
+BinOp with a single possible result => that constant
+    (the sign fix-up x >> 63 of a non-negative x in x / 2)
+```
+
+These run in a sweep of their own before the other rewrites, which may leave
+a value out of canonical form (`x ^ 0 => x`). A compare of type T also reads an
+operand widened from T as the value before widening.
 
 **Comparison simplifications:**
 
@@ -703,6 +734,23 @@ and one register indexes every array (`[base, offset]` on AArch64). The bound
 and start must be small constants or sign-extended 32-bit values, so the
 scaled bound cannot overflow; pointer tests are signed, or unsigned when
 constant bounds show the loop runs.
+
+### pressure_hoist -- Pressure Hoisting
+
+Runs once after lftr. A pure, non-trapping instruction that is the only use of
+two or more values moves to the end of the block defining its last operand
+(before a final compare the branch tests), when its own block post-dominates
+that one and the two are not in a loop together, so it still runs once per
+run of that block. Its operands then die there instead of staying live down to
+it (`promo ? promo : type` computed in a move's first block instead of its
+last).
+
+### gep_reassoc -- GEP Offset Reassociation
+
+Runs once after pressure_hoist. `gep(gep(p, C), i)` whose only uses are load and
+store addresses becomes `gep(gep(p, i), C)`: the backend folds the constant
+into each access (`[t, #120]`) instead of keeping the field address `p + 120`
+in a register for every `p->board[sq]`.
 
 ### loop_rotate -- Loop Rotation
 
@@ -924,7 +972,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`iv_widen`, `lftr`, `loop_rotate`.
+`iv_widen`, `lftr`, `pressure_hoist`, `gep_reassoc`, `loop_rotate`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -951,6 +999,7 @@ behavior across iterations.
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |
 | `dead_statics.rs`        | Dead static function/global elimination (BFS)          |
 | `div_by_const.rs`        | Division by constant strength reduction                |
+| `gep_reassoc.rs`         | Constant GEP offsets moved into loads and stores       |
 | `gvn.rs`                 | Dominator-based GVN/CSE with load elimination          |
 | `if_convert.rs`          | Diamond/triangle to Select conversion                  |
 | `inline.rs`              | Function inlining with tiered size heuristics          |
@@ -962,5 +1011,6 @@ behavior across iterations.
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
 | `loop_rotate.rs`         | Header duplication into latches (bottom-tested loops)  |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
+| `pressure_hoist.rs`      | Instructions hoisted to end several live ranges early  |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |

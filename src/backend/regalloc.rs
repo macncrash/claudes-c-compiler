@@ -24,7 +24,7 @@
 //!    cost is amortized over many loop iterations.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
     Instruction,
     IntrinsicOp,
@@ -281,11 +281,19 @@ pub fn allocate_registers(
             .find(|&i| fits(&busy[i], segs, v))
     };
     let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
+    // A foldable GEP is never computed once its base has a register.
+    let folded = foldable_geps(func);
+    let is_folded = |v: u32, assignments: &FxHashMap<u32, PhysReg>| {
+        folded.get(&v).is_some_and(|b| assignments.contains_key(b))
+    };
 
     // Phase 1: Callee-saved registers for call-spanning values.
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(true)) {
         let segs = liveness.segments_of(interval);
         let v = interval.value_id;
+        if is_folded(v, &assignments) {
+            continue;
+        }
         // A value never read from its register (a constant-offset address
         // folded into every access) may share a register already saved, but
         // is not worth saving another one for.
@@ -307,11 +315,18 @@ pub fn allocate_registers(
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(false)) {
         let segs = liveness.segments_of(interval);
         let v = interval.value_id;
+        if is_folded(v, &assignments) {
+            continue;
+        }
         // A partner's register first (the handoff saves a move), but a
         // callee-saved one only when it is already saved; then any free
         // caller-saved register; a callee-saved register costs a save and
         // restore, so it comes last.
-        let callee_partner = partner_reg(v, &assignments, callee, &callee_busy, &segs);
+        // A weightless value (as in phase 1) never takes a callee-saved
+        // register that is not saved already.
+        let weightless = use_count.get(&v).copied().unwrap_or(0) == 0;
+        let callee_partner = partner_reg(v, &assignments, callee, &callee_busy, &segs)
+            .filter(|&i| !weightless || !callee_busy[i].is_empty());
         if let Some(i) = partner_reg(v, &assignments, caller, &caller_busy, &segs) {
             occupy(&mut caller_busy[i], &segs, v);
             assignments.insert(v, caller[i]);
@@ -324,7 +339,7 @@ pub fn allocate_registers(
         } else if let Some(i) = callee_partner {
             occupy(&mut callee_busy[i], &segs, v);
             assignments.insert(v, callee[i]);
-        } else if let Some(i) = pick_callee(&callee_busy, &segs, v) {
+        } else if let Some(i) = pick_callee(&callee_busy, &segs, v).filter(|&i| !weightless || !callee_busy[i].is_empty()) {
             occupy(&mut callee_busy[i], &segs, v);
             assignments.insert(v, callee[i]);
         }
@@ -384,23 +399,59 @@ fn dest_reuse_points(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<u32>)> {
     points
 }
 
+/// Constant-offset GEPs that codegen folds into the loads and stores using
+/// them ([base, #off]) when the base has a register: dest -> base. Their only
+/// uses are as the address of a load or store (not i128, no segment
+/// override), as in build_gep_fold_map.
+fn foldable_geps(func: &IrFunction) -> FxHashMap<u32, u32> {
+    let mut geps: FxHashMap<u32, u32> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
+            if c.to_i64().is_some_and(|k| k >= i32::MIN as i64 && k <= u32::MAX as i64) {
+                geps.insert(dest.0, base.0);
+            }
+        }
+    }
+    if geps.is_empty() {
+        return geps;
+    }
+    let mut used: FxHashSet<u32> = FxHashSet::default();
+    let mut other_use: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Load { ptr, ty, seg_override, .. }
+                    if !matches!(ty, IrType::I128 | IrType::U128) && *seg_override == AddressSpace::Default => {
+                    used.insert(ptr.0);
+                }
+                Instruction::Store { val, ptr, ty, seg_override, .. }
+                    if !matches!(ty, IrType::I128 | IrType::U128) && *seg_override == AddressSpace::Default => {
+                    used.insert(ptr.0);
+                    if let Operand::Value(v) = val {
+                        other_use.insert(v.0);
+                    }
+                }
+                _ => inst.for_each_used_value(|v| { other_use.insert(v); }),
+            }
+        }
+        block.terminator.for_each_used_value(|v| { other_use.insert(v); });
+    }
+    geps.retain(|d, _| used.contains(d) && !other_use.contains(d));
+    geps
+}
+
 /// Count uses per value, weighted by loop depth: a use inside a loop at depth D
 /// contributes 10^D (capped at 10K), so inner-loop values get priority.
 ///
-/// A use of a constant-offset GEP also counts as a use of its base: codegen
-/// folds such GEPs into the loads and stores that use them (`[base, #off]`),
-/// so those accesses read the base register directly.
+/// A use of a foldable GEP (see foldable_geps) also counts as a use of its
+/// base: codegen folds such GEPs into the loads and stores that use them
+/// (`[base, #off]`), so those accesses read the base register directly.
 fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMap<u32, u64> {
     let mut use_count: FxHashMap<u32, u64> = FxHashMap::default();
-    let mut gep_base: FxHashMap<u32, u32> = FxHashMap::default();
-    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-        if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(_), .. } = inst {
-            gep_base.insert(dest.0, base.0);
-        }
-    }
+    let gep_base = foldable_geps(func);
     let add = |use_count: &mut FxHashMap<u32, u64>, v: u32, weight: u64| {
-        // A constant-offset GEP's uses read its base ([base, #off]); the GEP
-        // itself is not worth a register.
+        // A foldable GEP's uses read its base ([base, #off]); the GEP itself
+        // is not worth a register.
         if !gep_base.contains_key(&v) {
             *use_count.entry(v).or_insert(0) += weight;
         }
