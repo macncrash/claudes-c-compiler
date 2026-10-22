@@ -248,6 +248,10 @@ pub struct ArmCodegen {
     /// Constant right shifts read only by one Add, which accumulates them
     /// (usra/ssra, fold_vec_shift_adds): shift result -> (source, count).
     pub(super) vec_shift_adds: FxHashMap<u32, (u32, u32)>,
+    /// Bitwise selects (fold_vec_selects): Or result -> (x, y, mask), and
+    /// the results of the Ands they absorb.
+    pub(super) vec_selects: FxHashMap<u32, (u32, u32, u32)>,
+    pub(super) vec_select_parts: FxHashSet<u32>,
     /// HFA return: the (dest, src) of each Memcpy into the return buffer
     /// that directly precedes the Return. It loads the result registers
     /// from `src` instead (emit_hfa_ret_copy) and sets `hfa_ret_loaded`, so
@@ -301,6 +305,8 @@ impl ArmCodegen {
             vec_scratch: (usize::MAX, [None; 3]),
             vec_not_folds: FxHashMap::default(),
             vec_shift_adds: FxHashMap::default(),
+            vec_selects: FxHashMap::default(),
+            vec_select_parts: FxHashSet::default(),
             hfa_ret_copies: FxHashSet::default(),
             hfa_ret_loaded: false,
             hfa_ret_ptr_loads: None,
@@ -2149,7 +2155,9 @@ impl ArchCodegen for ArmCodegen {
         // A vector result buffer held in a register (assign_vec_temp_regs).
         if let Operand::Value(v) = sret_operand {
             if let Some(&reg) = self.vec_regs.get(&v.0).filter(|_| count == 1) {
-                self.state.emit_fmt(format_args!("    orr v{reg}.16b, v0.16b, v0.16b"));
+                if reg != 0 {
+                    self.state.emit_fmt(format_args!("    orr v{reg}.16b, v0.16b, v0.16b"));
+                }
                 return;
             }
         }

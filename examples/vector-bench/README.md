@@ -34,17 +34,20 @@ after the first, which is consistently slower):
 
 | kernel     | ccc before NEON codegen | ccc | clang -O2 |
 |------------|------:|------:|------:|
-| `saxpy`    |   249 | 3800 | 3660 |
-| `xorshift` |    82 | 1820 | 2070 |
-| `select`   |    27 | 1140 | 1315 |
-| `dmix`     |   333 | 3720 | 3700 |
-| `blend`    |    79 | 3720 | 3570 |
-| `call`     |   150 | 1125 | 1250 |
+| `saxpy`    |   249 | 3680 | 3660 |
+| `xorshift` |    82 | 1835 | 2095 |
+| `select`   |    27 | 1455 | 1315 |
+| `dmix`     |   333 | 3690 | 3680 |
+| `blend`    |    79 | 3705 | 3530 |
+| `call`     |   150 | 1245 | 1240 |
 
 "Before NEON codegen" lowered every vector operation lane by lane through
 memory. ccc now emits one NEON instruction per operation and keeps
 temporaries, local vector variables, vector parameters, initializers,
-constant vector literals and loop-invariant constant broadcasts in NEON
-registers; shifts by constants use the immediate forms. Vector arguments and
-return values use SIMD registers as AAPCS64 requires, and move between those
-and the registers holding the values without going through the stack.
+constant vector literals and loop-invariant constants and operations in NEON
+registers. Shifts by constants use the immediate forms; bitwise selects,
+shift-and-accumulates and (contracted) multiply-adds take one instruction.
+Vector arguments and return values use SIMD registers as AAPCS64 requires,
+and move between those and the registers holding the values without going
+through the stack. The remaining gap on `xorshift` is clang's use of the
+SHA3 extension's three-way `eor3`, which plain AArch64 does not have.

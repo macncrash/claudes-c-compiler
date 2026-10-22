@@ -34,6 +34,7 @@ use crate::ir::reexports::{
     IrCmpOp,
     IrConst,
     IrFunction,
+    IrUnaryOp,
     Operand,
 };
 use crate::common::types::IrType;
@@ -63,7 +64,7 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
             Instruction::BinOp { ty, .. } => {
                 matches!(ty, IrType::I64 | IrType::U64)
             }
-            Instruction::Cmp { ty, .. } => {
+            Instruction::Cmp { ty, .. } | Instruction::UnaryOp { ty, .. } => {
                 matches!(ty, IrType::I64 | IrType::U64)
             }
             _ => false,
@@ -113,6 +114,17 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
                         });
                     }
                 }
+            }
+        }
+    }
+
+    // Likewise I64 negations and complements (their low bits depend only on
+    // the operand's low bits).
+    let mut unop_map: Vec<Option<(IrUnaryOp, Operand)>> = vec![None; max_id + 1];
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::UnaryOp { dest, op: op @ (IrUnaryOp::Neg | IrUnaryOp::Not), src, ty: IrType::I64 | IrType::U64 } = inst {
+            if (dest.0 as usize) <= max_id {
+                unop_map[dest.0 as usize] = Some((*op, *src));
             }
         }
     }
@@ -174,7 +186,7 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
         }
     }
 
-    changes += narrow_binops_with_cast(func, &binop_map, &use_counts, &widen_map, &narrow_def_map, &mut narrowed_map);
+    changes += narrow_binops_with_cast(func, &binop_map, &unop_map, &use_counts, &widen_map, &narrow_def_map, &mut narrowed_map);
     changes += narrow_binops_without_cast(func, &use_counts, &widen_map, &mut narrowed_map);
     changes += narrow_cmps(func, &widen_map);
 
@@ -190,6 +202,7 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
 fn narrow_binops_with_cast(
     func: &mut IrFunction,
     binop_map: &[Option<BinOpDef>],
+    unop_map: &[Option<(IrUnaryOp, Operand)>],
     use_counts: &[u32],
     widen_map: &[Option<CastInfo>],
     narrow_def_map: &[Option<IrType>],
@@ -215,7 +228,20 @@ fn narrow_binops_with_cast(
 
                 let binop_info = match &binop_map[src_id] {
                     Some(info) => info.clone(),
-                    None => continue,
+                    None => {
+                        // trunc(neg x) = neg(trunc x), likewise for not.
+                        if let (Some((op, src)), 1) = (unop_map[src_id], use_counts[src_id]) {
+                            if let Some(narrow_src) = try_narrow_operand(&src, *to_ty, Some(narrow_def_map), widen_map, narrowed_map) {
+                                let (narrow_dest, narrow_ty) = (*dest, *to_ty);
+                                *inst = Instruction::UnaryOp { dest: narrow_dest, op, src: narrow_src, ty: narrow_ty };
+                                changes += 1;
+                                if (narrow_dest.0 as usize) <= max_id {
+                                    narrowed_map[narrow_dest.0 as usize] = Some(narrow_ty);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 };
 
                 // Shl is safe (shifting left only affects higher bits).

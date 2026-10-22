@@ -27,6 +27,7 @@ impl ArmCodegen {
         self.vec_fresh_stores = fresh;
         self.vec_spills = spills;
         Self::fold_vec_temp_copies(func, &mut temp_regs, &var_regs, &lanes);
+        Self::fold_vec_temps_into_v0(func, &mut temp_regs);
         self.vec_regs = var_regs.into_iter().chain(temp_regs).collect();
         self.vec_vars = vars.into_iter().map(|(reg, size)| (reg, size, 0)).collect();
         self.vec_param_loads = func.param_alloca_values.iter()
@@ -38,6 +39,7 @@ impl ArmCodegen {
             .collect();
         self.vec_lanes = lanes;
         self.vec_not_folds = Self::fold_vec_nots(func, &self.vec_regs, &self.vec_lanes);
+        (self.vec_selects, self.vec_select_parts) = Self::fold_vec_selects(func, &self.vec_regs, &self.vec_lanes, &self.vec_not_folds);
         self.vec_shift_adds = Self::fold_vec_shift_adds(func, &self.vec_regs, &self.vec_lanes);
         let free: Vec<u8> = super::emit::ARM_VEC_VAR_REGS.iter().copied()
             .filter(|r| !self.vec_regs.values().any(|v| v == r))

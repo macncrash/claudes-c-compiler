@@ -83,7 +83,7 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
 /// so a variable initialized from such a literal follows it in a later round.
 fn hoist_constant_locals(func: &mut IrFunction, loops: &[NaturalLoop]) -> usize {
     let mut moved = 0;
-    for _ in 0..3 {
+    for _ in 0..4 {
         let n = hoist_constant_locals_once(func, loops);
         if n == 0 {
             break;
@@ -152,12 +152,13 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
                         escape(v.0);
                     }
                 }
-                // Vector ops read their operands through pointers.
-                Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr, .. } => {
-                    if let Some(p) = dest_ptr {
-                        escape(p.0);
-                    }
-                }
+                // Vector ops read their operands through pointers; one writing
+                // a whole local is a write of it.
+                Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr, .. } => match dest_ptr {
+                    Some(p) if derived.get(&p.0) == Some(&(p.0, 0)) => stores.entry(p.0).or_default().push((bi, ii)),
+                    Some(p) => escape(p.0),
+                    None => {}
+                },
                 Instruction::Memcpy { dest, src, .. } => match derived.get(&dest.0) {
                     Some(&(root, _)) if derived.get(&src.0).is_some_and(|s| s.0 == src.0) => {
                         stores.entry(root).or_default().push((bi, ii));
@@ -174,11 +175,12 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
         });
     }
 
-    // A local holding constants from the start: only constant stores, all in
-    // the entry block.
-    let constant_in_entry = |root: u32| !bad.contains(&root) && stores.get(&root).is_some_and(|sites| {
-        sites.iter().all(|&(b, i)| b == 0 && matches!(func.blocks[b].instructions[i], Instruction::Store { .. }))
-    });
+    // A local that keeps one value in every loop: all its writes are in the
+    // entry block, which runs once before any loop.
+    let constant_in_entry = |root: u32| !bad.contains(&root)
+        && stores.get(&root).is_some_and(|sites| sites.iter().all(|&(b, _)| b == 0));
+    let in_entry: FxHashSet<u32> = func.blocks[0].instructions.iter().filter_map(|i| i.dest()).map(|d| d.0)
+        .collect();
     // All writes in one loop block (not the entry), writing disjoint bytes,
     // copies only from such constant locals.
     let in_loop = |b: usize| loops.iter().any(|l| l.body.contains(&b));
@@ -188,8 +190,17 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
         if bad.contains(&root) || block == 0 || !in_loop(block) || sites.iter().any(|s| s.0 != block) {
             continue;
         }
+        // Copies only from locals constant from the entry; a vector op only as
+        // the one write, of operands that are constants, entry values or
+        // pointers into such locals.
+        let invariant_arg = |a: &Operand| match a {
+            Operand::Const(_) => true,
+            Operand::Value(v) => in_entry.contains(&v.0)
+                && derived.get(&v.0).is_none_or(|&(s, _)| s != root && constant_in_entry(s)),
+        };
         let copies_constant = sites.iter().all(|&(b, i)| match &func.blocks[b].instructions[i] {
             Instruction::Memcpy { src, .. } => src.0 != root && constant_in_entry(src.0),
+            Instruction::Intrinsic { args, .. } => sites.len() == 1 && args.iter().all(invariant_arg),
             _ => true,
         });
         if !copies_constant {
@@ -204,6 +215,7 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
                 let off = derived[&dest.0].1;
                 Some((off, off + *size as i64))
             }
+            Instruction::Intrinsic { op: IntrinsicOp::VecOp { bytes, .. }, .. } => Some((0, *bytes as i64)),
             _ => None,
         }).collect();
         ranges.sort_unstable();
@@ -226,7 +238,8 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
                 let take = match &blk.instructions[k] {
                     Instruction::Alloca { dest, .. } => dest.0 == root && b != 0,
                     Instruction::GetElementPtr { dest, .. } => derived.get(&dest.0).is_some_and(|d| d.0 == root),
-                    Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } =>
+                    Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. }
+                    | Instruction::Intrinsic { dest_ptr: Some(ptr), .. } =>
                         b == block && derived.get(&ptr.0).is_some_and(|d| d.0 == root),
                     _ => false,
                 };
@@ -258,7 +271,8 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
             while k < rest.len() {
                 let ready = match &rest[k].0 {
                     Instruction::GetElementPtr { base, .. } => placed.contains(&base.0),
-                    Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } => placed.contains(&ptr.0),
+                    Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. }
+                    | Instruction::Intrinsic { dest_ptr: Some(ptr), .. } => placed.contains(&ptr.0),
                     _ => true,
                 };
                 if ready {

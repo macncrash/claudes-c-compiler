@@ -219,13 +219,16 @@ impl ArmCodegen {
         let slot_adjust = if self.state.has_dyn_alloca { 0 } else { total_sp_adjust };
         let needs_adjusted_load = total_sp_adjust > 0;
 
-        // Scalar register args only: no source can live in x0-x7 (functions
-        // with calls never allocate them), so load each GP arg straight into
-        // its register, after the FP args (which use x0 as scratch) and in
+        // Register args only (scalars, HFAs, a skipped HFA result pointer):
+        // no source can live in x0-x7 (functions with calls never allocate
+        // them), so load each GP arg straight into its register, after the
+        // HFAs (through x17) and the FP args (which use x0 as scratch) and in
         // descending order (constants go through x0). Unlike staging through
         // x9-x16, this leaves the caller-saved pool intact, which
         // liveness::is_reg_args_only_call relies on.
-        if arg_classes.iter().all(|c| matches!(c, CallArgClass::IntReg { .. } | CallArgClass::FloatReg { .. })) {
+        if arg_classes.iter().all(|c| matches!(c, CallArgClass::IntReg { .. } | CallArgClass::FloatReg { .. }
+            | CallArgClass::StructHfaReg { .. } | CallArgClass::ZeroSizeSkip)) {
+            self.emit_call_struct_byval_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
             self.emit_call_fp_reg_args(args, arg_classes, arg_types, slot_adjust, needs_adjusted_load);
             let gp_args: Vec<usize> = (0..args.len())
                 .filter(|&i| matches!(arg_classes[i], CallArgClass::IntReg { .. }))

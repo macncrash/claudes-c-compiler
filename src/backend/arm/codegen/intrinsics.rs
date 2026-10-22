@@ -556,6 +556,87 @@ impl ArmCodegen {
         folds
     }
 
+    /// Bitwise selects `(x & m) | (y & ~m)`: an Or of two Ands, read only by
+    /// it, one with m and one folded with ~m (fold_vec_nots), in either
+    /// order. The Or then selects in one instruction (bsl/bit/bif) and the
+    /// Ands emit nothing. x, y and m must be unchanged from the first And to
+    /// the Or: in registers only vector ops writing other registers may come
+    /// between, in memory only vector ops with register results. Returns Or
+    /// result -> (x, y, m), and the Ands' results.
+    pub(super) fn fold_vec_selects(func: &IrFunction, regs: &FxHashMap<u32, u8>, lanes: &FxHashMap<u32, (u8, i64)>,
+                                   not_folds: &FxHashMap<u32, u32>) -> (FxHashMap<u32, (u32, u32, u32)>, FxHashSet<u32>) {
+        let mut selects = FxHashMap::default();
+        let mut parts = FxHashSet::default();
+        let mut use_count: FxHashMap<u32, usize> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|id| *use_count.entry(id).or_default() += 1);
+            }
+            block.terminator.for_each_used_value(|id| *use_count.entry(id).or_default() += 2);
+        }
+        let reg_of = |id: u32| regs.get(&id).copied().or_else(|| lanes.get(&id).filter(|l| l.1 == 0).map(|l| l.0));
+        let vec_op = |i: &Instruction| match i {
+            Instruction::Intrinsic { op: IntrinsicOp::VecOp { op, bytes, splat: 0, .. }, dest_ptr: Some(d), args, .. } =>
+                Some((*op, *bytes, d.0, args.clone())),
+            _ => None,
+        };
+        for block in &func.blocks {
+            let insts = &block.instructions;
+            let def_at = |v: u32, before: usize| (0..before).rev().find(|&k| matches!(&insts[k],
+                Instruction::Intrinsic { dest_ptr: Some(d), .. } if d.0 == v));
+            for (q, inst) in insts.iter().enumerate() {
+                let Some((VecOpKind::Or, bytes, dest, args)) = vec_op(inst) else { continue };
+                let [Operand::Value(t1), Operand::Value(t2)] = args[..] else { continue };
+                if reg_of(dest).is_none() || t1 == t2 {
+                    continue;
+                }
+                // Each And: (position, operand, mask) with the mask under ~ or not.
+                let and_parts = |t: Value| -> Option<(usize, u32, u32, bool)> {
+                    if use_count.get(&t.0) != Some(&2) || !regs.contains_key(&t.0) {
+                        return None;
+                    }
+                    let p = def_at(t.0, q)?;
+                    let (VecOpKind::And, b, _, a) = vec_op(&insts[p])? else { return None };
+                    let [Operand::Value(u), Operand::Value(w)] = a[..] else { return None };
+                    if b != bytes {
+                        return None;
+                    }
+                    match (not_folds.get(&u.0), not_folds.get(&w.0)) {
+                        (Some(&m), None) => Some((p, w.0, m, true)),
+                        (None, Some(&m)) => Some((p, u.0, m, true)),
+                        (None, None) => Some((p, u.0, w.0, false)),
+                        _ => None,
+                    }
+                };
+                let (Some(a1), Some(a2)) = (and_parts(t1), and_parts(t2)) else { continue };
+                // One And is x & m (either order), the other y & ~m.
+                let (plain, negated) = match (a1.3, a2.3) {
+                    (false, true) => (a1, a2),
+                    (true, false) => (a2, a1),
+                    _ => continue,
+                };
+                let m = negated.2;
+                let x = if plain.2 == m { plain.1 } else if plain.1 == m { plain.2 } else { continue };
+                let y = negated.1;
+                let first = plain.0.min(negated.0);
+                let watched: Vec<Option<u8>> = [x, y, m].iter().map(|&v| reg_of(v)).collect();
+                let untouched = (first + 1..q).filter(|&k| k != plain.0 && k != negated.0).all(|k| match &insts[k] {
+                    Instruction::Intrinsic { op: IntrinsicOp::VecOp { op: VecOpKind::Not, .. }, dest_ptr: Some(d), .. }
+                        if not_folds.contains_key(&d.0) => true,
+                    Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr: Some(w), .. } =>
+                        reg_of(w.0).is_some_and(|r| !watched.contains(&Some(r))),
+                    _ => false,
+                });
+                if untouched {
+                    selects.insert(dest, (x, y, m));
+                    parts.insert(t1.0);
+                    parts.insert(t2.0);
+                }
+            }
+        }
+        (selects, parts)
+    }
+
     /// Integer right shifts by a constant whose result one Add reads and
     /// nothing else, where the Add's result goes to the register holding its
     /// other operand: the Add becomes a shift-and-accumulate (usra/ssra) of
@@ -600,6 +681,38 @@ impl ArmCodegen {
             }
         }
         folds
+    }
+
+    /// A temporary in a temp register whose producer (a vector op, or a call
+    /// returning it in v0) is followed only by its one whole copy, with no
+    /// more than GPR loads between, can stay in v0, the scratch register its
+    /// result is computed in or returned in: the copy then stores v0 (or
+    /// returns it) directly, with no move.
+    pub(super) fn fold_vec_temps_into_v0(func: &IrFunction, temps: &mut FxHashMap<u32, u8>) {
+        for block in &func.blocks {
+            let insts = &block.instructions;
+            for (p, inst) in insts.iter().enumerate() {
+                let t = match inst {
+                    Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr: Some(t), .. } => t.0,
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => match Self::vec_ret_buffer(info) {
+                        Some((t, _)) => t,
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                if !temps.get(&t).is_some_and(|r| ARM_VEC_TEMP_REGS.contains(r)) {
+                    continue;
+                }
+                let gpr_load = |i: &Instruction| matches!(i, Instruction::Load { ty, .. } if !ty.is_float() && !ty.is_128bit());
+                let Some(q) = (p + 1..insts.len()).find(|&q| !gpr_load(&insts[q])) else { continue };
+                let copy_of_t = matches!(&insts[q], Instruction::Memcpy { src, dest, .. } if src.0 == t && dest.0 != t);
+                let only_use = func.blocks.iter().flat_map(|b| &b.instructions).filter(|i| i.used_values().contains(&t)).count() == 2
+                    && func.blocks.iter().all(|b| !b.terminator.used_values().contains(&t));
+                if copy_of_t && only_use {
+                    temps.insert(t, 0);
+                }
+            }
+        }
     }
 
     pub(super) fn assign_vec_temp_regs(func: &IrFunction) -> FxHashMap<u32, u8> {
@@ -838,13 +951,31 @@ impl ArmCodegen {
     /// Materialize the hoisted constant broadcasts in their registers.
     pub(super) fn emit_vec_consts(&mut self) {
         for (c, elem, bytes, reg) in self.vec_consts.clone() {
-            self.operand_to_x0(&Operand::Const(c));
-            let gpr = if elem.size() == 8 { "x0" } else { "w0" };
-            self.state.emit_fmt(format_args!("    dup v{}.{}, {}", reg, Self::vec_arrangement(elem, bytes), gpr));
+            self.emit_vec_splat(&Operand::Const(c), elem, bytes, reg);
         }
         if !self.vec_consts.is_empty() {
             self.state.reg_cache.invalidate_acc();
         }
+    }
+
+    /// Broadcast a scalar into every lane of vN: one movi for zero or a
+    /// small integer lane value, else through x0 and dup.
+    fn emit_vec_splat(&mut self, op: &Operand, elem: VecElem, bytes: u8, reg: u8) {
+        let arr = Self::vec_arrangement(elem, bytes);
+        if let Some(bits) = match op { Operand::Const(c) => Self::splat_bits(c, elem), _ => None } {
+            if bits == 0 {
+                let all = if bytes == 16 { "16b" } else { "8b" };
+                self.state.emit_fmt(format_args!("    movi v{reg}.{all}, #0"));
+                return;
+            }
+            if !elem.is_float() && elem.size() <= 4 && bits <= 0xff {
+                self.state.emit_fmt(format_args!("    movi v{reg}.{arr}, #{bits}"));
+                return;
+            }
+        }
+        self.operand_to_x0(op);
+        let gpr = if elem.size() == 8 { "x0" } else { "w0" };
+        self.state.emit_fmt(format_args!("    dup v{reg}.{arr}, {gpr}"));
     }
 
     /// Emit an IntrinsicOp::VecOp: operands go to v0 (and v1), loaded through
@@ -855,10 +986,21 @@ impl ArmCodegen {
         // becomes bic with the Not's source (fold_vec_nots).
         // Likewise a shift folded into the Add after it (usra/ssra,
         // fold_vec_shift_adds).
+        // And the Ands of a bitwise select, done by the Or (fold_vec_selects).
         if matches!(op, VecOpKind::Not) && self.vec_not_folds.contains_key(&dest_ptr.0)
-            || matches!(op, VecOpKind::Shr) && self.vec_shift_adds.contains_key(&dest_ptr.0) {
+            || matches!(op, VecOpKind::Shr) && self.vec_shift_adds.contains_key(&dest_ptr.0)
+            || matches!(op, VecOpKind::And) && self.vec_select_parts.contains(&dest_ptr.0) {
             return;
         }
+        let select = self.vec_selects.get(&dest_ptr.0).copied().filter(|_| matches!(op, VecOpKind::Or));
+        let select_args;
+        let args = match select {
+            Some((x, y, m)) => {
+                select_args = [Operand::Value(Value(x)), Operand::Value(Value(y)), Operand::Value(Value(m))];
+                &select_args[..]
+            }
+            None => args,
+        };
         let folded_from = |folds: &FxHashMap<u32, u32>| args.iter().position(|a| matches!(a, Operand::Value(v) if folds.contains_key(&v.0)));
         let folded = match op {
             VecOpKind::And => folded_from(&self.vec_not_folds),
@@ -903,9 +1045,7 @@ impl ArmCodegen {
             if let Some(reg) = self.vec_const_reg(arg, elem, bytes).filter(|_| splat & (1 << i) != 0) {
                 src[i] = format!("v{reg}");
             } else if splat & (1 << i) != 0 {
-                self.operand_to_x0(arg);
-                let gpr = if elem.size() == 8 { "x0" } else { "w0" };
-                self.state.emit_fmt(format_args!("    dup v{}.{}, {}", i, arr, gpr));
+                self.emit_vec_splat(arg, elem, bytes, i as u8);
                 held[i] = None;
             } else if let Operand::Value(v) = arg {
                 if let Some(&reg) = self.vec_regs.get(&v.0) {
@@ -967,6 +1107,19 @@ impl ArmCodegen {
             VecOpKind::Mul => vec![bin(if f { "fmul" } else { "mul" })],
             VecOpKind::Div => vec![bin("fdiv")],
             VecOpKind::And => vec![bitwise(if folded.is_some() { "bic" } else { "and" })],
+            // (a & c) | (b & ~c), into the register already holding one of them.
+            VecOpKind::Or if select.is_some() => {
+                if d == *a {
+                    vec![format!("    bif {d}.{bits}, {b}.{bits}, {c}.{bits}")]
+                } else if d == *b {
+                    vec![format!("    bit {d}.{bits}, {a}.{bits}, {c}.{bits}")]
+                } else if d == *c {
+                    vec![format!("    bsl {d}.{bits}, {a}.{bits}, {b}.{bits}")]
+                } else {
+                    vec![format!("    orr {d}.{bits}, {c}.{bits}, {c}.{bits}"),
+                         format!("    bsl {d}.{bits}, {a}.{bits}, {b}.{bits}")]
+                }
+            }
             VecOpKind::Or => vec![bitwise("orr")],
             VecOpKind::Xor => vec![bitwise("eor")],
             // ushl/sshl shift left by a signed per-lane amount; right shifts
@@ -1002,11 +1155,15 @@ impl ArmCodegen {
             self.vec_mem_access("str", &format!("{mem}0"), dest_ptr);
         }
         self.state.reg_cache.invalidate_acc();
-        // The result went to v0 and memory, or a register right shift
-        // negated its count into v1.
+        // The result went to v0 and memory, or to a scratch register (a
+        // temporary kept in v0), or a register right shift negated its count
+        // into v1.
         if dest_reg.is_none() {
             held = [None; 3];
-        } else if matches!(op, VecOpKind::Shr) && imm_shift.is_none() {
+        } else if let Some(r @ 0..=2) = dest_reg {
+            held[r as usize] = None;
+        }
+        if matches!(op, VecOpKind::Shr) && imm_shift.is_none() {
             held[1] = None;
         }
         self.vec_scratch = (self.state.out.buf.len(), held);

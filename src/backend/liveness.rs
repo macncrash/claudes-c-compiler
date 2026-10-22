@@ -1117,9 +1117,10 @@ pub(crate) fn terminator_targets(term: &Terminator) -> Vec<u32> {
 }
 
 /// Return true if the instruction is a call to setjmp, _setjmp, sigsetjmp, or __sigsetjmp.
-/// A call whose arguments are all scalars (integers, pointers, f32/f64) that
-/// fit in argument registers, with a scalar or void result: no struct, i128,
-/// or f128 values, no variadic or sret handling, no stack arguments. A
+/// A call whose arguments are all scalars (integers, pointers, f32/f64) or
+/// AArch64 HFAs that fit in argument registers, with a scalar, void or HFA
+/// result: no other struct, i128, or f128 values, no variadic or other sret
+/// handling, no stack arguments. A
 /// backend may let values read only as such a call's arguments, or defined
 /// only by its result, use caller-saved registers
 /// (`RegAllocConfig::caller_saved_at_call_boundaries`).
@@ -1127,13 +1128,23 @@ pub fn is_reg_args_only_call(info: &crate::ir::reexports::CallInfo) -> bool {
     let scalar = |ty: &IrType| matches!(ty,
         IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
         | IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F32 | IrType::F64);
+    // AArch64 HFAs (float structs, short vectors) are also register
+    // arguments, in FP registers loaded through x17; an HFA result comes back
+    // in FP registers without a pointer.
+    let hfa = |i: usize| match info.struct_arg_riscv_float_classes.get(i) {
+        Some(Some(crate::common::types::RiscvFloatClass::Hfa { count, .. })) => Some(*count),
+        _ => None,
+    };
+    let struct_ok = info.struct_arg_sizes.iter().enumerate().all(|(i, s)| s.is_none() || hfa(i).is_some());
+    let hfa_return = info.is_sret && hfa(0).is_some();
+    let hfa_regs: usize = (0..info.args.len()).filter(|&i| !(hfa_return && i == 0)).filter_map(hfa).sum();
     let floats = info.arg_types.iter().filter(|t| t.is_float()).count();
     !info.is_variadic
-        && !info.is_sret
-        && info.struct_arg_sizes.iter().all(Option::is_none)
+        && (!info.is_sret || hfa_return)
+        && struct_ok
         && info.arg_types.len() == info.args.len()
         && info.arg_types.iter().all(scalar)
-        && floats <= 8
+        && floats + hfa_regs <= 8
         && info.args.len() - floats <= 8
         && (info.return_type == IrType::Void || scalar(&info.return_type))
 }

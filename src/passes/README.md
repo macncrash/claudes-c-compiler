@@ -635,7 +635,10 @@ insertion into the preheader to ensure def-before-use ordering.
 block, and whose address is only loaded from, read by vector ops or copied
 from (a vector literal such as `(double2){ 0.5, 1.5 }` or a constant table in
 a loop body), holds the same bytes every iteration: its alloca, the addresses
-into it and the stores move to the end of the entry block.
+into it and the stores move to the end of the entry block. A local whose writes
+are all in the entry block is invariant in every loop, so in later rounds a
+whole copy of one, or a single vector op reading only such locals, constants
+and entry values (e.g. `-lim` of a hoisted literal), moves there too.
 
 ### iv_strength_reduce -- Induction Variable Strength Reduction
 

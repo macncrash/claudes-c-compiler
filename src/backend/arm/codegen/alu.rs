@@ -18,12 +18,14 @@ impl ArmCodegen {
         }
     }
 
-    pub(super) fn emit_int_neg_impl(&mut self, _ty: IrType) {
-        self.state.emit("    neg x0, x0");
+    // Unsigned 32-bit results stay zero-extended (w forms); signed ones stay
+    // sign-extended (x forms of a sign-extended operand).
+    pub(super) fn emit_int_neg_impl(&mut self, ty: IrType) {
+        self.state.emit(if ty == IrType::U32 { "    neg w0, w0" } else { "    neg x0, x0" });
     }
 
-    pub(super) fn emit_int_not_impl(&mut self, _ty: IrType) {
-        self.state.emit("    mvn x0, x0");
+    pub(super) fn emit_int_not_impl(&mut self, ty: IrType) {
+        self.state.emit(if ty == IrType::U32 { "    mvn w0, w0" } else { "    mvn x0, x0" });
     }
 
     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {

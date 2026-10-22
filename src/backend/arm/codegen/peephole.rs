@@ -1198,7 +1198,11 @@ fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> b
         if j >= n {
             continue;
         }
-        let LineKind::Move { dst: r, src, is_32bit: false } = kinds[j] else { continue };
+        // (A w move after a w write copies the same zero-extended value.)
+        let LineKind::Move { dst: r, src, is_32bit } = kinds[j] else { continue };
+        if is_32bit != dest.starts_with('w') {
+            continue;
+        }
         if src != s || r > 28 || r == s || (live[j] & (1 << s) != 0 && !reg_dead_after(lines, kinds, j + 1, n, s)) {
             continue;
         }
@@ -2517,6 +2521,17 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("ldr d0, [x4, x3]") && result.contains("ldr d1, [x5, x3]"), "{}", result);
         assert!(!result.contains("add x11"), "{}", result);
+    }
+
+    #[test]
+    fn test_w_result_retargeted_into_w_move() {
+        // A w write then a w move of it (dead afterwards): compute in place.
+        let input = ".type f, %function\nf:\n    and w10, w10, #7\n    mov w0, w10\n    bl g\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("and w0, w10, #7") && !result.contains("mov w0"), "{}", result);
+        // An x write then a w move truncates: kept.
+        let input = ".type f, %function\nf:\n    add x10, x11, x12\n    mov w0, w10\n    bl g\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("mov w0, w10"));
     }
 
     #[test]

@@ -43,7 +43,9 @@ impl ArmCodegen {
                 self.emit_store_to_sp(&format!("{width}{reg}"), buf_offset, "str");
                 return;
             }
-            self.state.emit_fmt(format_args!("    orr v0.16b, v{reg}.16b, v{reg}.16b"));
+            if reg != 0 {
+                self.state.emit_fmt(format_args!("    orr v0.16b, v{reg}.16b, v{reg}.16b"));
+            }
         } else {
             let prefix = Self::hfa_reg_prefix(elem_size);
             let slot = match self.state.resolve_slot_addr(src.0) {
