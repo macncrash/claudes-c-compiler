@@ -478,7 +478,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_dead_writes(&lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_writes_global(&lines, &mut kinds, n));
             changed2 |= pass!(fuse_branch_over_branch(&mut lines, &mut kinds, n));
+            changed2 |= pass!(thread_jumps(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_unreferenced_labels(&lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_unreachable_after_jumps(&lines, &mut kinds, n));
             rounds2 += 1;
         }
     }
@@ -821,6 +823,76 @@ fn invert_branch(line: &str, target: &str) -> Option<String> {
 }
 
 /// Target label of `b.cc`, `cbz`, or `cbnz`.
+/// A branch (`b`, `b.cc`, `cbz`, `cbnz`) to a label whose block is only
+/// `b .L2` goes to .L2 directly (a lowered phi whose copies all coalesced
+/// leaves such blocks on the edges it split).
+fn thread_jumps(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut label_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for i in 0..n {
+        if kinds[i] == LineKind::Label {
+            if let Some(name) = label_name(&lines[i]) {
+                label_at.insert(name.to_string(), i);
+            }
+        }
+    }
+    // The target of the jump that is a label's first instruction, if any.
+    let jump_of = |label: &str, kinds: &[LineKind], lines: &[String]| -> Option<String> {
+        let mut k = *label_at.get(label)? + 1;
+        while k < n && matches!(kinds[k], LineKind::Nop | LineKind::Label) {
+            k += 1;
+        }
+        (k < n && kinds[k] == LineKind::Branch).then(|| branch_target(&lines[k]).map(str::to_string)).flatten()
+    };
+    let mut changed = false;
+    for i in 0..n {
+        let target = match kinds[i] {
+            LineKind::Branch => branch_target(&lines[i]),
+            LineKind::CondBranch | LineKind::CmpBranch => cond_target(&lines[i]),
+            _ => None,
+        };
+        let Some(target) = target.map(str::to_string) else { continue };
+        let mut t = target.clone();
+        for _ in 0..4 {
+            match jump_of(&t, kinds, lines) {
+                Some(next) if next != t && next != target => t = next,
+                _ => break,
+            }
+        }
+        if t != target {
+            let at = lines[i].rfind(target.as_str()).expect("branch names its target");
+            lines[i].replace_range(at..at + target.len(), &t);
+            kinds[i] = classify_line(&lines[i]);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Instructions after an unconditional branch or return, up to the next
+/// label (or directive), can never run.
+fn eliminate_unreachable_after_jumps(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        let jump = (kinds[i] == LineKind::Branch && branch_target(&lines[i]).is_some()) || kinds[i] == LineKind::Ret;
+        i += 1;
+        if !jump {
+            continue;
+        }
+        while i < n && kinds[i] != LineKind::Label {
+            if kinds[i] != LineKind::Nop {
+                if lines[i].trim_start().starts_with('.') {
+                    break;
+                }
+                kinds[i] = LineKind::Nop;
+                changed = true;
+            }
+            i += 1;
+        }
+    }
+    changed
+}
+
 fn cond_target(line: &str) -> Option<&str> {
     if let Some((_, t)) = cond_branch_parts(line) {
         return Some(t);

@@ -287,6 +287,18 @@ pub fn allocate_registers(
         folded.get(&v).is_some_and(|b| assignments.contains_key(b))
     };
 
+    // Copy groups: values joined by Copy instructions (a lowered phi and its
+    // incoming values) whose live pieces only meet at those copies. Phase 2
+    // first tries to give a whole group one register, so every copy in it
+    // becomes a no-op; assigning members one at a time lets an unrelated value
+    // take the register in a gap between them.
+    let groups = copy_groups(func, &liveness, &eligible, &folded, call_points, boundary_ok, &handoff);
+    let interval_of: FxHashMap<u32, &LiveInterval> = if groups.is_empty() {
+        FxHashMap::default()
+    } else {
+        liveness.intervals.iter().map(|iv| (iv.value_id, iv)).collect()
+    };
+
     // Phase 1: Callee-saved registers for call-spanning values.
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(true)) {
         let segs = liveness.segments_of(interval);
@@ -315,8 +327,28 @@ pub fn allocate_registers(
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(false)) {
         let segs = liveness.segments_of(interval);
         let v = interval.value_id;
-        if is_folded(v, &assignments) {
+        if is_folded(v, &assignments) || assignments.contains_key(&v) {
             continue;
+        }
+        if let Some(members) = groups.get(&v) {
+            let pieces: Vec<(u32, Vec<(u32, u32)>)> = members.iter()
+                .filter_map(|m| interval_of.get(m).map(|iv| (*m, liveness.segments_of(iv))))
+                .collect();
+            let fits_all = |busy: &[(u32, u32, u32)]| pieces.iter().all(|(m, sg)| fits(busy, sg, *m));
+            let pick = (0..caller.len()).find(|&i| fits_all(&caller_busy[i])).map(|i| (true, i))
+                .or_else(|| (0..callee.len()).find(|&i| !callee_busy[i].is_empty() && fits_all(&callee_busy[i])).map(|i| (false, i)));
+            if let Some((is_caller, i)) = pick {
+                for (m, sg) in &pieces {
+                    if is_caller {
+                        occupy(&mut caller_busy[i], sg, *m);
+                        assignments.insert(*m, caller[i]);
+                    } else {
+                        occupy(&mut callee_busy[i], sg, *m);
+                        assignments.insert(*m, callee[i]);
+                    }
+                }
+                continue;
+            }
         }
         // A partner's register first (the handoff saves a move), but a
         // callee-saved one only when it is already saved; then any free
@@ -397,6 +429,74 @@ fn dest_reuse_points(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<u32>)> {
         point += 1;
     }
     points
+}
+
+/// Copy groups (see allocate_registers): for each member, all members of its
+/// group of two or more. Only non-call-spanning register candidates join, and
+/// two groups merge only when no piece of one overlaps a piece of the other,
+/// except where one value hands its register to the next (the copy itself, or
+/// an operation feeding it).
+fn copy_groups(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    eligible: &FxHashSet<u32>,
+    folded: &FxHashMap<u32, u32>,
+    call_points: &[u32],
+    boundary_ok: &[(u32, Option<u32>)],
+    handoff: &dyn Fn(u32, u32, u32) -> bool,
+) -> FxHashMap<u32, Vec<u32>> {
+    /// Largest group: bounds the pairwise overlap checks.
+    const MAX_GROUP: usize = 16;
+    let pieces: FxHashMap<u32, Vec<(u32, u32)>> = liveness.intervals.iter()
+        .filter(|iv| iv.end > iv.start && eligible.contains(&iv.value_id) && !folded.contains_key(&iv.value_id)
+            && !spans_clobbering_call(liveness, iv, call_points, boundary_ok))
+        .map(|iv| (iv.value_id, liveness.segments_of(iv)))
+        .collect();
+    let compatible = |a: u32, b: u32| {
+        pieces[&a].iter().all(|&(lo1, hi1)| pieces[&b].iter().all(|&(lo2, hi2)| {
+            hi1 < lo2 || hi2 < lo1 || (hi1 == lo2 && handoff(a, b, hi1)) || (hi2 == lo1 && handoff(b, a, hi2))
+        }))
+    };
+    let mut root: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut members: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    fn find(root: &FxHashMap<u32, u32>, mut v: u32) -> u32 {
+        while let Some(&r) = root.get(&v) {
+            if r == v {
+                break;
+            }
+            v = r;
+        }
+        v
+    }
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        let Instruction::Copy { dest, src: Operand::Value(src) } = inst else { continue };
+        let (d, s) = (dest.0, src.0);
+        if d == s || !pieces.contains_key(&d) || !pieces.contains_key(&s) {
+            continue;
+        }
+        let (rd, rs) = (find(&root, d), find(&root, s));
+        if rd == rs {
+            continue;
+        }
+        let md = members.get(&rd).cloned().unwrap_or_else(|| vec![rd]);
+        let ms = members.get(&rs).cloned().unwrap_or_else(|| vec![rs]);
+        if md.len() + ms.len() > MAX_GROUP || !md.iter().all(|&a| ms.iter().all(|&b| compatible(a, b))) {
+            continue;
+        }
+        root.insert(rs, rd);
+        root.entry(rd).or_insert(rd);
+        let mut all = md;
+        all.extend(ms);
+        members.remove(&rs);
+        members.insert(rd, all);
+    }
+    let mut groups = FxHashMap::default();
+    for list in members.into_values().filter(|l| l.len() > 1) {
+        for &m in &list {
+            groups.insert(m, list.clone());
+        }
+    }
+    groups
 }
 
 /// Constant-offset GEPs that codegen folds into the loads and stores using

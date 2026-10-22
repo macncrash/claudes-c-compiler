@@ -738,6 +738,12 @@ Removes `str` instructions to stack slots that are overwritten before being read
   extension folded in (`add xC, xD, wB, sxtw #s`, `[xD, wB, sxtw #s]`,
   `smaddl` for a `madd` by a 32-bit constant, or a 32-bit read) goes away.
 
+**10. Jump Threading** (local cleanup)
+
+A branch to a label whose block is only `b .L2` goes to `.L2` directly, and
+instructions after an unconditional branch or return, up to the next label,
+are removed as unreachable.
+
 ---
 
 ## Codegen Options

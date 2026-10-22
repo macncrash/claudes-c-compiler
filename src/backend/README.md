@@ -510,6 +510,15 @@ and gets no register once its base has one, since codegen then folds it
 into each access and never computes it. Such weightless values never take
 a callee-saved register that is not already saved.
 
+### Copy Groups
+
+Values joined by `Copy` instructions (a lowered phi and its incoming values)
+whose live pieces meet only where one hands its register to the next form a
+group. When the first member comes up, the allocator tries to give the whole
+group one register, so the copies become no-ops and a split edge holding only
+a copy becomes a jump the peephole threads away. Assigned one at a time, an
+unrelated value could take the register in a gap between members.
+
 ### Eligibility Filtering
 
 The allocator uses a whitelist approach: only values produced by simple,
@@ -565,7 +574,9 @@ The analysis proceeds in three steps:
 3. **Interval construction**: Build intervals by taking the union of
    definition/use points and live-through blocks. A value live into a block
    but not out of it ends at its last use there, and one defined in a block
-   it is live out of starts at its definition, not the block start.
+   it is live out of starts at its definition, not the block start. The
+   live pieces (one per run of blocks) end the same way, at the last read in
+   the block, counting the reads the GEP-folding extension adds.
 
 ### Auxiliary Results
 

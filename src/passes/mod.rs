@@ -583,6 +583,7 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     if !disabled.contains("gep_reassoc") {
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             if gep_reassoc::reassociate_function(func) > 0 {
+                copy_prop::propagate_copies(func);
                 dce::eliminate_dead_code(func);
             }
         }

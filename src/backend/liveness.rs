@@ -195,11 +195,11 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let mut ps = assign_program_points(func, num_blocks, num_values, &alloca_set, &id_to_dense);
 
     // Phase 1b: Extend liveness of GEP base values for GEP folding.
-    extend_gep_base_liveness(func, &alloca_set, &id_to_dense,
+    let gep_base_uses = extend_gep_base_liveness(func, &alloca_set, &id_to_dense,
         &mut ps.last_use_points, &mut ps.block_gen);
 
     // Phase 1c: Extend liveness for F128 source pointers.
-    extend_f128_source_liveness(func, &alloca_set, &id_to_dense,
+    let f128_ptrs = extend_f128_source_liveness(func, &alloca_set, &id_to_dense,
         &mut ps.last_use_points, &mut ps.block_gen);
 
     // Phase 2: Build successor lists for the CFG.
@@ -232,7 +232,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     // Phase 6: Live segments. setjmp functions keep whole intervals, since a
     // longjmp can return to any point after the setjmp.
     let segments = if ps.setjmp_block_indices.is_empty() {
-        build_live_segments(func, &value_ids, &ps, &live_in, &live_out, &alloca_set, &id_to_dense)
+        build_live_segments(func, &value_ids, &ps, &live_in, &live_out, &alloca_set, &id_to_dense, &gep_base_uses, &f128_ptrs)
     } else {
         FxHashMap::default()
     };
@@ -262,8 +262,13 @@ fn build_live_segments(
     live_out: &[BitSet],
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
+    gep_base_uses: &[(usize, usize, u32)],
+    f128_ptrs: &FxHashSet<usize>,
 ) -> FxHashMap<u32, Vec<(u32, u32)>> {
     let num_values = value_ids.len();
+    // Last read of each value in the current block (u32::MAX: none yet).
+    let mut last_read: Vec<u32> = vec![u32::MAX; num_values];
+    let mut read_touched: Vec<usize> = Vec::new();
     let mut segs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); num_values];
     let mut first_seen: Vec<u32> = vec![u32::MAX; num_values];
     let mut touched: Vec<usize> = Vec::new();
@@ -290,6 +295,27 @@ fn build_live_segments(
         };
         for (i, inst) in block.instructions.iter().enumerate() {
             let point = block_start + i as u32;
+            {
+                let mut read = |vid: u32| {
+                    if let Some(&d) = id_to_dense.get(&vid) {
+                        if last_read[d] == u32::MAX {
+                            read_touched.push(d);
+                        }
+                        last_read[d] = point;
+                    }
+                };
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        read(v.0);
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| read(v.0));
+                if let Instruction::InlineAsm { outputs, .. } = inst {
+                    for (_, out_val, _) in outputs {
+                        read(out_val.0);
+                    }
+                }
+            }
             let mut used_here = |vid: u32, redef: &mut [(u32, u32)]| {
                 if let Some(&dense) = id_to_dense.get(&vid) {
                     if redef[dense].0 == u32::MAX {
@@ -331,8 +357,24 @@ fn build_live_segments(
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
                 note(v.0, block_end, &mut first_seen, &mut touched);
+                if let Some(&d) = id_to_dense.get(&v.0) {
+                    if last_read[d] == u32::MAX {
+                        read_touched.push(d);
+                    }
+                    last_read[d] = block_end;
+                }
             }
         });
+        // Reads the GEP extension adds (a folded GEP's base at its loads and
+        // stores).
+        for &(b, d, point) in gep_base_uses {
+            if b == bi && (last_read[d] == u32::MAX || point > last_read[d]) {
+                if last_read[d] == u32::MAX {
+                    read_touched.push(d);
+                }
+                last_read[d] = point;
+            }
+        }
 
         let mut add = |dense: usize, lo: u32, cap: u32, apart: bool| {
             let iv_start = ps.def_points[dense];
@@ -342,7 +384,16 @@ fn build_live_segments(
             let last = ps.last_use_points[dense];
             let iv_end = if last == u32::MAX { iv_start } else { last.max(iv_start) };
             let lo = lo.max(iv_start);
-            let hi = if live_out[bi].contains(dense) { block_end } else { block_end.min(iv_end) }.min(cap);
+            // Not live out: the piece ends at the value's last read in the
+            // block (an F128 load's pointer, extended to the loaded value's
+            // last use without a read here, keeps the interval's end).
+            let hi = if live_out[bi].contains(dense) {
+                block_end
+            } else if last_read[dense] != u32::MAX && !f128_ptrs.contains(&dense) {
+                last_read[dense].max(lo)
+            } else {
+                block_end.min(iv_end)
+            }.min(cap);
             if hi < lo {
                 return;
             }
@@ -375,6 +426,9 @@ fn build_live_segments(
             first_seen[dense] = u32::MAX;
         }
         touched.clear();
+        for d in read_touched.drain(..) {
+            last_read[d] = u32::MAX;
+        }
     }
 
     let mut result = FxHashMap::default();
@@ -784,7 +838,9 @@ fn extend_gep_base_liveness(
     id_to_dense: &FxHashMap<u32, usize>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
-) {
+) -> Vec<(usize, usize, u32)> {
+    // The reads added: (block, value, point).
+    let mut added: Vec<(usize, usize, u32)> = Vec::new();
     // Phase A: Identify foldable GEPs with non-alloca bases.
     // Same criteria as build_gep_fold_map in generation.rs.
     let mut gep_info: FxHashMap<u32, (u32, i64)> = FxHashMap::default(); // gep_dest_id -> (base_id, offset)
@@ -811,7 +867,7 @@ fn extend_gep_base_liveness(
     }
 
     if gep_info.is_empty() {
-        return;
+        return added;
     }
 
     // Phase B: Verify each GEP dest is only used as Load/Store ptr operand.
@@ -871,7 +927,7 @@ fn extend_gep_base_liveness(
     }
 
     if gep_info.is_empty() {
-        return;
+        return added;
     }
 
     // Phase C: Extend base liveness to Load/Store points that use foldable GEP results.
@@ -895,6 +951,7 @@ fn extend_gep_base_liveness(
                                 if *entry == u32::MAX || block_point > *entry {
                                     *entry = block_point;
                                 }
+                                added.push((bi, dense, block_point));
                                 // Also add to block's gen set (the base is "used"
                                 // here), unless this block defines it first.
                                 if !defined_here.contains(&base_id) {
@@ -914,6 +971,7 @@ fn extend_gep_base_liveness(
         // Account for terminator point
         block_point += 1;
     }
+    added
 }
 
 /// Extend liveness for F128 load source pointers.
@@ -935,7 +993,7 @@ fn extend_f128_source_liveness(
     id_to_dense: &FxHashMap<u32, usize>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
-) {
+) -> FxHashSet<usize> {
     // Collect (ptr_id, dest_id) pairs for F128 loads with non-alloca pointers.
     let mut f128_loads: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
@@ -949,7 +1007,7 @@ fn extend_f128_source_liveness(
     }
 
     if f128_loads.is_empty() {
-        return;
+        return FxHashSet::default();
     }
 
     // Extend each pointer's last_use_point to match its dest's last_use_point.
@@ -1001,6 +1059,8 @@ fn extend_f128_source_liveness(
             }
         });
     }
+    // The pointers extended, for build_live_segments.
+    f128_loads.iter().filter_map(|(ptr, _)| id_to_dense.get(ptr).copied()).collect()
 }
 
 /// Record uses of operands in an instruction (dense index version).

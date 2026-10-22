@@ -750,7 +750,8 @@ last).
 Runs once after pressure_hoist. `gep(gep(p, C), i)` whose only uses are load and
 store addresses becomes `gep(gep(p, i), C)`: the backend folds the constant
 into each access (`[t, #120]`) instead of keeping the field address `p + 120`
-in a register for every `p->board[sq]`.
+in a register for every `p->board[sq]`. GVN has already run, so a GEP equal to
+one in a dominating block (the `rays + sq` of each ray) then becomes a copy of it.
 
 ### loop_rotate -- Loop Rotation
 

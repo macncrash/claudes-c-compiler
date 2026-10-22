@@ -17,6 +17,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
+use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
 
 pub(crate) fn reassociate_function(func: &mut IrFunction) -> usize {
@@ -75,5 +76,40 @@ pub(crate) fn reassociate_function(func: &mut IrFunction) -> usize {
         }
     }
     func.next_value_id = next_id;
+    if changes > 0 {
+        merge_dominated_geps(func);
+    }
     changes
+}
+
+/// The rewrite makes one `gep %p, %i` per access (`rays[d][sq]` for each
+/// ray d), and GVN has already run, so a GEP with the same base and offset
+/// as one in a dominating block (or earlier in its own) becomes a copy of it.
+fn merge_dominated_geps(func: &mut IrFunction) {
+    let cfg = CfgAnalysis::build(func);
+    // Depth-first over the dominator tree, with the GEPs seen on the path.
+    let mut seen: FxHashMap<(u32, u32), Value> = FxHashMap::default();
+    let mut stack: Vec<(usize, bool)> = vec![(0, false)];
+    let mut added: Vec<Vec<(u32, u32)>> = vec![Vec::new(); func.blocks.len()];
+    while let Some((b, leaving)) = stack.pop() {
+        if leaving {
+            for key in added[b].drain(..) {
+                seen.remove(&key);
+            }
+            continue;
+        }
+        for inst in &mut func.blocks[b].instructions {
+            let Instruction::GetElementPtr { dest, base, offset: Operand::Value(offset), .. } = *inst else { continue };
+            let key = (base.0, offset.0);
+            match seen.get(&key) {
+                Some(&first) => *inst = Instruction::Copy { dest, src: Operand::Value(first) },
+                None => {
+                    seen.insert(key, dest);
+                    added[b].push(key);
+                }
+            }
+        }
+        stack.push((b, true));
+        stack.extend(cfg.dom_children[b].iter().map(|&c| (c, false)));
+    }
 }
