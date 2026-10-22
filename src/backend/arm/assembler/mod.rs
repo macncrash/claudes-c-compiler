@@ -445,6 +445,85 @@ mod tests {
         }
     }
 
+    /// Forms added by the later AArch64 optimizations: fused multiply-adds
+    /// (scalar and vector), bitwise selects, shift-and-accumulate and
+    /// immediate shifts, movi broadcasts, bic/mvn/fneg, w-register neg/mvn,
+    /// register-offset q/d accesses, compares with shifted 12-bit immediates
+    /// and lane inserts, checked against encodings from clang/LLVM.
+    #[test]
+    fn test_optimized_instruction_forms_match_llvm() {
+        let cases = [
+            ("fmla v28.4s, v27.4s, v1.4s", 0x4e21cf7cu32),
+            ("fmla v28.2d, v0.2d, v27.2d", 0x4e7bcc1c),
+            ("fmls v3.4s, v2.4s, v1.4s", 0x4ea1cc43),
+            ("fmls v24.2d, v25.2d, v26.2d", 0x4efacf38),
+            ("fmadd d16, d0, d1, d2", 0x1f410810),
+            ("fmsub d16, d0, d1, d2", 0x1f418810),
+            ("fnmsub d16, d0, d1, d2", 0x1f618810),
+            ("fnmadd d16, d0, d1, d2", 0x1f610810),
+            ("fmadd s17, s0, s1, s16", 0x1f014011),
+            ("fnmsub s5, s6, s7, s8", 0x1f27a0c5),
+            ("bsl v24.16b, v27.16b, v26.16b", 0x6e7a1f78),
+            ("bit v20.16b, v21.16b, v22.16b", 0x6eb61eb4),
+            ("bif v23.8b, v24.8b, v25.8b", 0x2ef91f17),
+            ("usra v28.8b, v0.8b, #2", 0x2f0e141c),
+            ("usra v28.4s, v1.4s, #17", 0x6f2f143c),
+            ("ssra v20.8h, v21.8h, #15", 0x4f1116b4),
+            ("ssra v19.2d, v18.2d, #63", 0x4f411653),
+            ("ushr v28.8b, v0.8b, #1", 0x2f0f041c),
+            ("sshr v2.4s, v3.4s, #31", 0x4f210462),
+            ("ushr v4.2d, v5.2d, #63", 0x6f4104a4),
+            ("shl v28.4s, v27.4s, #13", 0x4f2d577c),
+            ("shl v6.16b, v7.16b, #7", 0x4f0f54e6),
+            ("shl v8.2d, v9.2d, #32", 0x4f605528),
+            ("sshr v10.8h, v11.8h, #4", 0x4f1c056a),
+            ("movi v1.2s, #3", 0x0f000461),
+            ("movi v1.4s, #250", 0x4f070741),
+            ("movi v2.16b, #0", 0x4f00e402),
+            ("movi v3.8b, #255", 0x0f07e7e3),
+            ("movi v4.4h, #200", 0x0f068504),
+            ("movi v5.8h, #7", 0x4f0084e5),
+            ("bic v29.16b, v26.16b, v25.16b", 0x4e791f5d),
+            ("bic v28.8b, v24.8b, v28.8b", 0x0e7c1f1c),
+            ("mvn v28.16b, v28.16b", 0x6e205b9c),
+            ("fneg v29.4s, v21.4s", 0x6ea0fabd),
+            ("fneg v28.2d, v28.2d", 0x6ee0fb9c),
+            ("neg w0, w10", 0x4b0a03e0),
+            ("mvn w0, w0", 0x2a2003e0),
+            ("ldr q1, [x21, x20]", 0x3cf46aa1),
+            ("ldr d0, [x22, x10]", 0xfc6a6ac0),
+            ("str q28, [x21, x20]", 0x3cb46abc),
+            ("str d28, [x23, x20]", 0xfc346afc),
+            ("ldr q1, [x22, x20, lsl #4]", 0x3cf47ac1),
+            ("ldr d1, [x21, x20, lsl #3]", 0xfc747aa1),
+            ("cmp x20, #65536", 0xf140429f),
+            ("cmp x10, #32768", 0xf140215f),
+            ("cmp w20, #4096", 0x7140069f),
+            ("cmp x10, x21", 0xeb15015f),
+            ("fcmgt v25.4s, v27.4s, v26.4s", 0x6ebae779),
+            ("fcmgt v22.4s, v17.4s, v24.4s", 0x6eb8e636),
+            ("ins v27.s[1], w0", 0x4e0c1c1b),
+            ("dup v27.4s, w10", 0x4e040d5b),
+            ("and w0, w10, #7", 0x12000940),
+        ];
+        let mut failures = Vec::new();
+        for (text, expected) in cases {
+            let stmts = parse_asm(text).unwrap_or_else(|e| panic!("{}: {}", text, e));
+            let Some(AsmStatement::Instruction { mnemonic, operands, raw_operands }) =
+                stmts.into_iter().find(|s| matches!(s, AsmStatement::Instruction { .. }))
+            else {
+                panic!("{}: not parsed as an instruction", text)
+            };
+            match encode_instruction(&mnemonic, &operands, &raw_operands) {
+                Ok(EncodeResult::Word(w)) if w == expected => {}
+                Ok(EncodeResult::Word(w)) => failures.push(format!("{text}: got {w:#010x}, want {expected:#010x}")),
+                Ok(_) => failures.push(format!("{text}: not a single word")),
+                Err(e) => failures.push(format!("{text}: {e}")),
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
     /// NEON forms the vector-extension codegen emits (whole-vector ops on
     /// every arrangement, dup from a GPR, lane moves, q/d loads and stores),
     /// checked against encodings from clang/LLVM.
