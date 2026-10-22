@@ -30,6 +30,7 @@ pub(crate) mod loop_rotate;
 pub(crate) mod mod_ref;
 pub(crate) mod narrow;
 mod pressure_hoist;
+mod remat;
 mod resolve_asm;
 pub(crate) mod simplify;
 
@@ -585,6 +586,18 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             if gep_reassoc::reassociate_function(func) > 0 {
                 copy_prop::propagate_copies(func);
                 dce::eliminate_dead_code(func);
+            }
+        }
+    }
+
+    // Phase 10f: Recompute cheap values in blocks of leaf functions where
+    // more values are live than the caller-saved registers hold (AArch64).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("remat") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if let Some(budget) = remat::aarch64_leaf_budget(func) {
+                if remat::remat_function(func, budget) > 0 {
+                    dce::eliminate_dead_code(func);
+                }
             }
         }
     }

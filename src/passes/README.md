@@ -79,6 +79,10 @@ The optimizer executes in four sequential phases:
      gep_reassoc
          |
          v
+ Phase 10f: Leaf Rematerialization (AArch64)
+     remat
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
          |
@@ -753,6 +757,22 @@ into each access (`[t, #120]`) instead of keeping the field address `p + 120`
 in a register for every `p->board[sq]`. GVN has already run, so a GEP equal to
 one in a dominating block (the `rays + sq` of each ray) then becomes a copy of it.
 
+### remat -- Leaf Rematerialization
+
+Runs once after gep_reassoc, on AArch64 leaf functions (no calls, nothing
+that shrinks the backend's leaf register pool). Where a block outside any
+loop has more values live than the caller-saved registers a leaf allocates
+(x10-x15 and x3-x8 above the arguments), a value live through the peak only
+to be read later in the block, and computed by at most four cheap
+instructions from values still live at that read, is recomputed right before
+it (`p + us * 48` in make_move's castling block, merged by GVN with the
+same address in an earlier inlined helper). The pressure count follows the
+allocator: a constant-offset GEP used only as an address holds its base's
+register, operands dying at an instruction still hold theirs, except that a
+simple instruction's result may take one. All or nothing: the changes stay
+only if every block then fits, since otherwise the function saves a
+callee-saved register (and builds a frame) anyway.
+
 ### loop_rotate -- Loop Rotation
 
 Runs after phi elimination, just before codegen. A latch that branches back
@@ -973,7 +993,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`iv_widen`, `lftr`, `pressure_hoist`, `gep_reassoc`, `loop_rotate`.
+`iv_widen`, `lftr`, `pressure_hoist`, `gep_reassoc`, `remat`, `loop_rotate`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1013,5 +1033,6 @@ behavior across iterations.
 | `loop_rotate.rs`         | Header duplication into latches (bottom-tested loops)  |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
 | `pressure_hoist.rs`      | Instructions hoisted to end several live ranges early  |
+| `remat.rs`               | Cheap values recomputed where a leaf runs out of registers |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |
