@@ -62,6 +62,23 @@ impl ArmCodegen {
         true_label: &str,
         false_label: &str,
     ) {
+        // x == 0 / x != 0 on a value in a register: cbnz/cbz past the branch
+        // to the true block, without a compare.
+        let is_zero = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64() == Some(0));
+        let tested = if is_zero(rhs) { Some(lhs) } else if is_zero(lhs) { Some(rhs) } else { None };
+        if let (Some(Operand::Value(v)), IrCmpOp::Eq | IrCmpOp::Ne) = (tested, op) {
+            if let Some((x, w)) = self.value_reg_name(v).filter(|_| ty.size() <= 8) {
+                let reg = if ty.size() <= 4 { w } else { x };
+                let skip = self.state.fresh_label("skip");
+                let not_taken = if op == IrCmpOp::Ne { "cbz" } else { "cbnz" };
+                self.state.emit_fmt(format_args!("    {} {}, {}", not_taken, reg, skip));
+                self.state.emit_fmt(format_args!("    b {}", true_label));
+                self.state.emit_fmt(format_args!("{}:", skip));
+                self.state.emit_fmt(format_args!("    b {}", false_label));
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+        }
         self.emit_int_cmp_insn(lhs, rhs, ty);
         let cc = arm_int_cond_code(op);
         let inv_cc = arm_invert_cond_code(cc);

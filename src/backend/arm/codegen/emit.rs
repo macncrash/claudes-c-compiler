@@ -716,7 +716,7 @@ impl ArmCodegen {
 
     /// Get the register name for a Value if it has a register assignment.
     /// Returns (64-bit name, 32-bit name) pair.
-    fn value_reg_name(&self, v: &Value) -> Option<(&'static str, &'static str)> {
+    pub(super) fn value_reg_name(&self, v: &Value) -> Option<(&'static str, &'static str)> {
         self.reg_assignments.get(&v.0).map(|&reg| {
             (callee_saved_name(reg), callee_saved_name_32(reg))
         })

@@ -120,7 +120,14 @@ impl ArmCodegen {
             self.prestore_regs.extend_from_slice(&leaf_extra);
         }
         let prestore_regs = self.prestore_regs.clone();
-        let mut space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
+        // The callee-saved registers go right above the frame record, below
+        // the locals, so their stp/ldp offsets stay small (stp reaches 504)
+        // however large the frame is.
+        self.callee_save_offset = 16;
+        self.fp_callee_save_offset = (16 + self.used_callee_saved.len() as i64 * 8 + 7) & !7;
+        let saves_end = self.fp_callee_save_offset + (self.used_fp_callee_saved.len() as i64 + 1) / 2 * 16;
+        let locals_start = (saves_end + 15) & !15;
+        let mut space = calculate_stack_space_common(&mut self.state, func, locals_start, |space, alloc_size, align| {
             let effective_align = if align > 0 { align.max(8) } else { 8 };
             let slot = (space + effective_align - 1) & !(effective_align - 1);
             let new_space = slot + ((alloc_size + 7) & !7).max(8);
@@ -211,20 +218,6 @@ impl ArmCodegen {
                     self.used_callee_saved.retain(|x| *x != r);
                 }
             }
-        }
-
-        let save_count = self.used_callee_saved.len() as i64;
-        if save_count > 0 {
-            space = (space + 7) & !7;
-            self.callee_save_offset = space;
-            space += save_count * 8;
-        }
-
-        let fp_save_count = self.used_fp_callee_saved.len() as i64;
-        if fp_save_count > 0 {
-            space = (space + 7) & !7;
-            self.fp_callee_save_offset = space;
-            space += (fp_save_count + 1) / 2 * 16;
         }
 
         space

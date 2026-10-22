@@ -81,8 +81,63 @@ pub fn run(module: &mut IrModule) -> usize {
     module.for_each_function(simplify_function)
 }
 
+/// `B-1 - clz(x)` (the index of the highest set bit, B the operand width) as
+/// `clz(x) ^ (B-1)`: clz of a valid (nonzero) operand is below B, where the
+/// two agree. When the result is then sign-extended, the whole is the same
+/// xor at the wider type (one eor, no sxtw).
+fn simplify_msb(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize;
+    // clz results: value -> operand width in bits.
+    let mut clz_width: Vec<Option<i64>> = vec![None; max_id + 1];
+    // Values defined as width-1 - clz: value -> (clz value, width - 1).
+    let mut msb_of: Vec<Option<(Value, i64)>> = vec![None; max_id + 1];
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::UnaryOp { dest, op: IrUnaryOp::Clz, ty, .. } = inst {
+            if matches!(ty, IrType::I64 | IrType::U64 | IrType::I32 | IrType::U32) {
+                set_def(&mut clz_width, dest.0, 8 * ty.size() as i64);
+            }
+        }
+    }
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::BinOp { dest, op: IrBinOp::Sub, lhs: Operand::Const(k), rhs: Operand::Value(c), .. } = inst {
+            if let Some(Some(width)) = clz_width.get(c.0 as usize) {
+                if k.to_i64() == Some(width - 1) {
+                    set_def(&mut msb_of, dest.0, (*c, width - 1));
+                }
+            }
+        }
+    }
+    let mut changes = 0;
+    for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+        match inst {
+            Instruction::Cast { dest, src: Operand::Value(s), from_ty: IrType::I32, to_ty: IrType::I64 | IrType::U64 } => {
+                if let Some(Some((c, mask))) = msb_of.get(s.0 as usize).copied() {
+                    *inst = Instruction::BinOp {
+                        dest: *dest, op: IrBinOp::Xor, lhs: Operand::Value(c),
+                        rhs: Operand::Const(IrConst::I64(mask)), ty: IrType::I64,
+                    };
+                    changes += 1;
+                }
+            }
+            Instruction::BinOp { dest, op: op @ IrBinOp::Sub, lhs, rhs, ty } => {
+                if let Some(Some((c, mask))) = msb_of.get(dest.0 as usize).copied() {
+                    *op = IrBinOp::Xor;
+                    *lhs = Operand::Value(c);
+                    *rhs = Operand::Const(match ty {
+                        IrType::I64 | IrType::U64 => IrConst::I64(mask),
+                        _ => IrConst::I32(mask as i32),
+                    });
+                    changes += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    changes
+}
+
 pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
-    let mut total = 0;
+    let mut total = simplify_msb(func);
 
     // Build def maps for chain optimizations: Value -> defining instruction
     // We use flat Vecs indexed by Value ID for O(1) lookup.

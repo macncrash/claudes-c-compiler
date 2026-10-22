@@ -286,8 +286,13 @@ pub fn allocate_registers(
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(true)) {
         let segs = liveness.segments_of(interval);
         let v = interval.value_id;
+        // A value never read from its register (a constant-offset address
+        // folded into every access) may share a register already saved, but
+        // is not worth saving another one for.
+        let weightless = use_count.get(&v).copied().unwrap_or(0) == 0;
         let pick = partner_reg(v, &assignments, callee, &callee_busy, &segs)
-            .or_else(|| pick_callee(&callee_busy, &segs, v));
+            .or_else(|| pick_callee(&callee_busy, &segs, v))
+            .filter(|&i| !weightless || !callee_busy[i].is_empty());
         if let Some(i) = pick {
             occupy(&mut callee_busy[i], &segs, v);
             assignments.insert(v, callee[i]);

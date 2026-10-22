@@ -429,29 +429,32 @@ impl ArmCodegen {
     /// Copy `size` bytes from [x10] to [x9] in 16-byte ldp/stp chunks, then an
     /// 8/4/2/1-byte tail. Uses only GPRs (safe under -mgeneral-regs-only);
     /// x11-x13 are free because Memcpy is a liveness call point.
+    /// Copy `size` bytes from [x10] to [x9]: 32-byte chunks through q0/q1
+    /// (codegen scratch; this runs only for IR Memcpy, between instructions),
+    /// then smaller tails.
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
-        const MAX_UNROLLED_CHUNKS: usize = 16; // stp offsets reach 504
-        let chunks = size / 16;
+        const MAX_UNROLLED_CHUNKS: usize = 16; // q-pair offsets reach 1008
+        let chunks = size / 32;
         let mut offset = 0usize;
         if chunks > MAX_UNROLLED_CHUNKS {
             let label_id = self.state.next_label_id();
             let loop_label = format!(".Lmemcpy_loop_{}", label_id);
             self.load_large_imm("x11", chunks as i64);
             self.state.emit_fmt(format_args!("{}:", loop_label));
-            self.state.emit("    ldp x12, x13, [x10], #16");
-            self.state.emit("    stp x12, x13, [x9], #16");
+            self.state.emit("    ldp q0, q1, [x10], #32");
+            self.state.emit("    stp q0, q1, [x9], #32");
             self.state.emit("    subs x11, x11, #1");
             self.state.emit_fmt(format_args!("    b.ne {}", loop_label));
         } else {
             for _ in 0..chunks {
-                self.state.emit_fmt(format_args!("    ldp x12, x13, [x10, #{}]", offset));
-                self.state.emit_fmt(format_args!("    stp x12, x13, [x9, #{}]", offset));
-                offset += 16;
+                self.state.emit_fmt(format_args!("    ldp q0, q1, [x10, #{}]", offset));
+                self.state.emit_fmt(format_args!("    stp q0, q1, [x9, #{}]", offset));
+                offset += 32;
             }
         }
-        let mut tail = size % 16;
+        let mut tail = size % 32;
         for (width, reg, load, store) in [
-            (8, "x12", "ldr", "str"), (4, "w12", "ldr", "str"),
+            (16, "q0", "ldr", "str"), (8, "x12", "ldr", "str"), (4, "w12", "ldr", "str"),
             (2, "w12", "ldrh", "strh"), (1, "w12", "ldrb", "strb"),
         ] {
             if tail >= width {

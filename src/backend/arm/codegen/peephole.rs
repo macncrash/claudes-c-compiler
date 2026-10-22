@@ -460,6 +460,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_self_moves(&mut kinds, n));
             changed2 |= pass!(eliminate_move_chains(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_redundant_sxtw(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_redundant_narrow_extends(&mut lines, &mut kinds, n));
             changed2 |= pass!(propagate_w_copies(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_low_half_only_extends(&lines, &mut kinds, n));
             changed2 |= pass!(fold_shift_into_operand(&mut lines, &mut kinds, n));
@@ -468,6 +469,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fuse_cset_into_csel(&mut lines, &mut kinds, n));
             changed2 |= pass!(forward_copy_propagation(&mut lines, &mut kinds, n));
             changed2 |= pass!(retarget_results(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_and_into_tst(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_writes(&lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_writes_global(&lines, &mut kinds, n));
             changed2 |= pass!(fuse_branch_over_branch(&mut lines, &mut kinds, n));
@@ -1198,9 +1201,10 @@ fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> b
         if j >= n {
             continue;
         }
-        // (A w move after a w write copies the same zero-extended value.)
+        // (A w write is zero-extended, so a w or x move of it copies the same
+        // value; a w move of an x write truncates.)
         let LineKind::Move { dst: r, src, is_32bit } = kinds[j] else { continue };
-        if is_32bit != dest.starts_with('w') {
+        if is_32bit && !dest.starts_with('w') {
             continue;
         }
         if src != s || r > 28 || r == s || (live[j] & (1 << s) != 0 && !reg_dead_after(lines, kinds, j + 1, n, s)) {
@@ -1210,6 +1214,113 @@ fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> b
         lines[i] = format!("    {} {},{}", mnemonic, new_dest, srcs);
         kinds[i] = classify_line(&lines[i]);
         kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// Whether the flags may be read starting at line `k` (following labels and
+/// straight-line code) before anything sets them again.
+fn flags_read_from(lines: &[String], kinds: &[LineKind], mut k: usize, n: usize) -> bool {
+    let mut seen = 0;
+    while k < n && seen < 8 {
+        if matches!(kinds[k], LineKind::Nop | LineKind::Label) || lines[k].trim_start().starts_with('.') {
+            k += 1;
+            continue;
+        }
+        let Some((m, _)) = split_insn(&lines[k]) else { return true };
+        if m.starts_with("b.") || reads_flags(m) {
+            return true;
+        }
+        if sets_flags(m) || matches!(m, "b" | "ret" | "bl" | "blr" | "br") {
+            return false;
+        }
+        seen += 1;
+        k += 1;
+    }
+    true
+}
+
+/// `and D, A, B` then `cmp D, #0` and `b.eq`/`b.ne` (D dead afterwards):
+/// `tst A, B`. (cmp #0 sets C and tst clears it, so only zero tests qualify,
+/// and neither path may read the flags further.)
+fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for k in 0..n {
+        if kinds[k] == LineKind::Label {
+            if let Some(name) = label_name(&lines[k]) {
+                labels.insert(name.to_string(), k);
+            }
+        }
+    }
+    let next = |kinds: &[LineKind], mut k: usize| {
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
+    for i in 0..n {
+        let Some(("and", ops)) = split_insn(&lines[i]) else { continue };
+        let (dest, srcs) = first_and_rest(ops);
+        let Some(d) = gpr_operand(dest) else { continue };
+        let j = next(kinds, i + 1);
+        let b = next(kinds, j + 1);
+        if b >= n || lines[j].trim() != format!("cmp {}, #0", dest) {
+            continue;
+        }
+        let Some(("b.eq" | "b.ne", target)) = split_insn(&lines[b]) else { continue };
+        let target_line = labels.get(target.trim()).copied();
+        if live[j] & (1 << d) != 0 || flags_read_from(lines, kinds, b + 1, n)
+            || target_line.is_none_or(|t| flags_read_from(lines, kinds, t + 1, n)) {
+            continue;
+        }
+        lines[i] = format!("    tst {}", srcs.trim());
+        kinds[i] = classify_line(&lines[i]);
+        kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `mul T, A, B` then `add D, C, T` (either order) or `sub D, C, T`, with T
+/// dead afterwards: `madd D, A, B, C` / `msub D, A, B, C`.
+fn fuse_mul_into_madd(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        let Some(("mul", ops)) = split_insn(&lines[i]) else { continue };
+        let m: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [t, a, b] = m[..] else { continue };
+        let Some(tr) = gpr_operand(t) else { continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((op @ ("add" | "sub"), aops)) = split_insn(&lines[j]) else { continue };
+        let s: Vec<&str> = aops.split(',').map(str::trim).collect();
+        let [d, x, y] = s[..] else { continue };
+        // Same register width throughout, plain registers only.
+        let w = t.starts_with('w');
+        if [d, x, y, a, b].iter().any(|r| r.starts_with('w') != w || gpr_operand(r).is_none()) {
+            continue;
+        }
+        let c = match (op, x == t, y == t) {
+            ("add", true, false) => y,
+            ("add", false, true) | ("sub", false, true) => x,
+            _ => continue,
+        };
+        if live[j] & (1 << tr) != 0 && gpr_operand(d) != Some(tr) {
+            continue;
+        }
+        let fused = if op == "add" { "madd" } else { "msub" };
+        lines[j] = format!("    {} {}, {}, {}, {}", fused, d, a, b, c);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
         changed = true;
     }
     changed
@@ -1289,6 +1400,54 @@ fn writes_sign_extended(mnemonic: &str, dest: &str, srcs: &str, sext: &[bool; 29
         }
         _ => false,
     }
+}
+
+/// `sxtb xD, wS` / `sxth xD, wS` where S's last write in this straight-line
+/// run already sign-extended a byte (halfword) to 64 bits (`ldrsb xS`,
+/// `sxtb xS`; for halfwords also `ldrsh xS`, `sxth xS`): a move, or nothing.
+fn eliminate_redundant_narrow_extends(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    // Per register: the width (1 or 2 bytes) its value is known to be
+    // sign-extended from, as a 64-bit value.
+    let mut ext: [Option<u8>; 29] = [None; 29];
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        if matches!(kinds[i], LineKind::Label) || classify_access(&lines[i], kinds[i]) == Access::Barrier {
+            ext = [None; 29];
+            continue;
+        }
+        let Some((m, ops)) = split_insn(&lines[i]) else { continue };
+        let (dest, srcs) = first_and_rest(ops);
+        let width = match m { "sxtb" | "ldrsb" => Some(1u8), "sxth" | "ldrsh" => Some(2), _ => None };
+        if let (Some(w), "sxtb" | "sxth", Some(d), Some(s)) = (width, m, gpr_operand(dest), gpr_operand(srcs.trim())) {
+            if dest.starts_with('x') && ext[s as usize].is_some_and(|known| known <= w) {
+                if d == s {
+                    kinds[i] = LineKind::Nop;
+                } else {
+                    lines[i] = format!("    mov {}, {}", xreg_name(d), xreg_name(s));
+                    kinds[i] = classify_line(&lines[i]);
+                }
+                changed = true;
+                ext[d as usize] = ext[s as usize];
+                continue;
+            }
+        }
+        // Record what this line leaves in the registers it writes.
+        let info = line_info(&lines[i], kinds[i], &|_| None);
+        for r in 0..29 {
+            if info.defs & (1 << r) != 0 {
+                ext[r] = None;
+            }
+        }
+        if let (Some(w), Some(d)) = (width, gpr_operand(dest)) {
+            if dest.starts_with('x') {
+                ext[d as usize] = Some(w);
+            }
+        }
+    }
+    changed
 }
 
 fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
@@ -2521,6 +2680,28 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("ldr d0, [x4, x3]") && result.contains("ldr d1, [x5, x3]"), "{}", result);
         assert!(!result.contains("add x11"), "{}", result);
+    }
+
+    #[test]
+    fn test_and_compare_zero_becomes_tst() {
+        let body = |br: &str, after: &str| format!(".type f, %function\nf:\n    and x11, x11, x12\n    cmp x11, #0\n    {br} .LBB2\n    ldr x11, [x0]\n{after}    ret\n.LBB2:\n    mov x0, #1\n    ret\n.size f, .-f\n");
+        let result = peephole_optimize(body("b.ne", ""));
+        assert!(result.contains("tst x11, x12") && !result.contains("cmp x11"), "{}", result);
+        // Not for a carry test, nor when the flags are read again.
+        assert!(peephole_optimize(body("b.hs", "")).contains("cmp x11, #0"));
+        assert!(peephole_optimize(body("b.ne", "    cset x0, hi\n")).contains("cmp x11, #0"));
+    }
+
+    #[test]
+    fn test_mul_add_becomes_madd() {
+        let input = ".type f, %function\nf:\n    mov x0, #48\n    mul x12, x12, x0\n    add x14, x15, x12\n    str x14, [x1]\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("madd x14, x12, x0, x15") && !result.contains("mul x12"), "{}", result);
+        let input = ".type f, %function\nf:\n    mul w3, w1, w2\n    sub w0, w4, w3\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("msub w0, w1, w2, w4"));
+        // Not when the product is used again.
+        let input = ".type f, %function\nf:\n    mul x3, x1, x2\n    add x0, x4, x3\n    add x0, x0, x3\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("mul x3, x1, x2"));
     }
 
     #[test]

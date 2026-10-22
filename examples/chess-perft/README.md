@@ -24,12 +24,15 @@ make bench           # ccc and clang builds; results must be identical
 ```
 
 `make check` and `./perft --deep` pass with ccc on arm64 macOS. At the time
-of writing, the ccc build does about 52 M nodes/s and clang -O2 about
-82 M nodes/s. Earlier milestones: 7.7 M nodes/s before struct copies were
+of writing, the ccc build does about 66 M nodes/s and clang -O2 about
+85 M nodes/s. Earlier milestones: 7.7 M nodes/s before struct copies were
 compiled to 16-byte `ldp`/`stp` chunks instead of a byte loop, 24 M
 nodes/s before register-addressed loads/stores, gap-aware register
 allocation, and function-wide dead-code cleanup in the peephole optimizer,
 36 M nodes/s before boolean-phi threading and AArch64 addressing folds,
-and 43 M nodes/s before the inliner sized constant-argument calls after
+43 M nodes/s before the inliner sized constant-argument calls after
 folding and the register allocator stopped treating values as live in blocks
-they skip.
+they skip, and 55 M nodes/s before the inliner measured every callee after
+cleanup (so helpers like `put`, `take` and the slider attacks are inlined as
+clang does), callee-saved registers moved next to the frame record, and
+struct copies went to 32-byte `q` pairs.

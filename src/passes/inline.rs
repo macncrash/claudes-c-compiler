@@ -16,6 +16,7 @@ use crate::ir::reexports::{
 use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::types::{IrType, AddressSpace};
 use std::collections::HashMap;
+use crate::common::fx_hash::FxHashSet;
 
 /// Maximum number of IR instructions (across all blocks) in a callee for it
 /// to be eligible for inlining. This handles constant-returning helpers
@@ -95,6 +96,14 @@ const MAX_SMALL_INLINE_BLOCKS: usize = 3;
 /// a helper like `ray_att(DIR, sq, occ)` that indexes a table by its constant
 /// argument looks several times larger than the code it actually becomes.
 const MAX_SPECIALIZED_INLINE_INSTRUCTIONS: usize = 20;
+
+/// A callee whose cleaned-up size (mem2reg, folding, GVN, with the call
+/// site's constant arguments) is at most this many instructions, in at most
+/// MAX_INLINE_BLOCKS blocks, is inlined regardless of the caller's size, as
+/// long as it fits the caller's inlining budget. Close to clang's default -O2
+/// threshold; a function written as a helper usually is about this small
+/// once its parameters and locals live in registers.
+const MAX_CLEANED_INLINE_INSTRUCTIONS: usize = 40;
 
 /// Upper bound on the small callees inlined into a specialized copy while
 /// measuring it.
@@ -244,9 +253,7 @@ fn select_inline_site(
     let budget_exhausted = always_inline_budget_remaining == 0;
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
-        let callee_inst_count: usize = callee_data.blocks.iter()
-            .map(|b| b.instructions.len())
-            .sum();
+        let callee_inst_count: usize = effective_size(&callee_data.blocks);
         let is_tiny = callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS
             && callee_data.blocks.len() <= 1;
         let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
@@ -263,30 +270,41 @@ fn select_inline_site(
         // For recursive callers, only inline tiny callees and always_inline callees.
         // Inlining larger callees into recursive functions multiplies the stack frame
         // increase by the recursion depth, easily causing stack overflow.
-        if caller_is_recursive && !is_tiny && !callee_data.is_always_inline {
+        // A callee that cleans up small (after mem2reg and folding, with this
+        // site's constant arguments) is small, measured as it will be: up to
+        // MAX_CLEANED_INLINE_INSTRUCTIONS (within the caller's budget), or
+        // MAX_SPECIALIZED_INLINE_INSTRUCTIONS in a recursive caller, where
+        // anything larger would multiply its stack frame by the recursion depth.
+        let (max_insts, max_blocks) = if caller_is_recursive {
+            (MAX_SPECIALIZED_INLINE_INSTRUCTIONS, MAX_SMALL_INLINE_BLOCKS)
+        } else {
+            (MAX_CLEANED_INLINE_INSTRUCTIONS, MAX_INLINE_BLOCKS)
+        };
+        let cleaned = (!is_tiny && !budget_exhausted)
+            .then(|| specialized_size_cached(spec_cache, callee_map, &site.callee_name, &site.const_args))
+            .flatten()
+            .filter(|&(insts, blocks)| insts <= max_insts && blocks <= max_blocks
+                && (insts <= MAX_SPECIALIZED_INLINE_INSTRUCTIONS || insts <= budget_remaining));
+        if (caller_is_recursive || callee_data.cleaned_only) && !is_tiny && !callee_data.is_always_inline
+            && cleaned.is_none() {
             continue;
         }
-        let specialized_small = !is_tiny && !is_small && !is_static_inline_eligible
-            && !budget_exhausted
-            && specialized_size_cached(spec_cache, callee_map, &site.callee_name, &site.const_args)
-                .is_some_and(|(insts, blocks)| insts <= MAX_SPECIALIZED_INLINE_INSTRUCTIONS
-                    && blocks <= MAX_SMALL_INLINE_BLOCKS);
         if is_tiny || (is_small && (!budget_exhausted || callee_data.is_always_inline)) || is_static_inline_eligible
-            || specialized_small {
+            || cleaned.is_some() {
             let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
-            return Some((site.clone(), callee_inst_count, use_relaxed));
+            let cost = cleaned.map_or(callee_inst_count, |c| c.0);
+            return Some((site.clone(), cost, use_relaxed));
         }
     }
 
     // Second pass: use the first eligible normal callee.
     for site in call_sites {
         let callee_data = &callee_map[&site.callee_name];
-        let callee_inst_count: usize = callee_data.blocks.iter()
-            .map(|b| b.instructions.len())
-            .sum();
+        let callee_inst_count: usize = effective_size(&callee_data.blocks);
         // For recursive callers, skip non-tiny, non-always_inline callees.
-        // (Tiny callees were handled in the first pass.)
-        if caller_is_recursive && !callee_data.is_always_inline {
+        // (Tiny callees were handled in the first pass, as were cleaned-only
+        // ones that qualify.)
+        if (caller_is_recursive || callee_data.cleaned_only) && !callee_data.is_always_inline {
             continue;
         }
         // When the caller has a section attribute (e.g., .init.text),
@@ -354,7 +372,7 @@ pub fn run(module: &mut IrModule) -> usize {
     if debug_inline {
         eprintln!("[INLINE] Callee map has {} eligible functions:", callee_map.len());
         for (name, data) in &callee_map {
-            let ic: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+            let ic: usize = effective_size(&data.blocks);
             eprintln!("[INLINE]   '{}': {} blocks, {} instructions, {} params",
                 name, data.blocks.len(), ic, data.num_params);
         }
@@ -407,8 +425,7 @@ pub fn run(module: &mut IrModule) -> usize {
             // too many instructions will have massive stack frames. Stop normal
             // inlining once the caller exceeds the threshold; always_inline
             // callees are still inlined (required by C semantics).
-            let caller_inst_count: usize = module.functions[func_idx].blocks.iter()
-                .map(|b| b.instructions.len()).sum();
+            let caller_inst_count: usize = effective_size(&module.functions[func_idx].blocks);
             let caller_too_large = caller_inst_count > MAX_CALLER_INSTRUCTIONS_AFTER_INLINE;
             let caller_at_hard_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_HARD_CAP;
             let caller_at_absolute_cap = caller_inst_count > MAX_CALLER_INSTRUCTIONS_ABSOLUTE_CAP;
@@ -532,9 +549,7 @@ pub fn run(module: &mut IrModule) -> usize {
                 if !callee_data.is_always_inline {
                     continue;
                 }
-                let callee_inst_count: usize = callee_data.blocks.iter()
-                    .map(|b| b.instructions.len())
-                    .sum();
+                let callee_inst_count: usize = effective_size(&callee_data.blocks);
                 let is_tiny = callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS
                     && callee_data.blocks.len() <= 1;
                 let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
@@ -946,6 +961,10 @@ struct CalleeData {
     /// same to match GCC behavior and enable critical optimizations (e.g.,
     /// constant propagation of shift amounts in ror32 used by blake2s).
     is_static_inline: bool,
+    /// A static function over the raw size limits (measured before mem2reg),
+    /// admitted only to be inlined where its cleaned-up size qualifies
+    /// (see `select_inline_site`), never by the general rules.
+    cleaned_only: bool,
     /// The callee's parameters, for building a specialized copy when sizing
     /// call sites that pass constants (see `specialized_size`).
     params: Vec<IrParam>,
@@ -1015,15 +1034,42 @@ fn constant_values(func: &IrFunction) -> HashMap<u32, ConstArg> {
 }
 
 /// `specialized_size`, memoized by callee and argument constants.
+/// The instructions of a function body that are expected to survive mem2reg:
+/// allocas, ParamRefs and copies, and the loads and stores of promotable
+/// scalar locals (allocas only ever loaded from and stored to), are not
+/// counted. Bodies are measured before mem2reg, where a parameter alone costs
+/// an alloca, a store and a load per use, so the raw count overstates a
+/// small helper several times over.
+fn effective_size(blocks: &[BasicBlock]) -> usize {
+    let mut promotable: FxHashSet<u32> = FxHashSet::default();
+    for inst in blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Alloca { dest, volatile: false, .. } = inst {
+            promotable.insert(dest.0);
+        }
+    }
+    for inst in blocks.iter().flat_map(|b| &b.instructions) {
+        match inst {
+            Instruction::Load { .. } => {}
+            Instruction::Store { val: Operand::Value(v), .. } => {
+                promotable.remove(&v.0);
+            }
+            Instruction::Store { .. } => {}
+            _ => inst.for_each_used_value(|v| { promotable.remove(&v); }),
+        }
+    }
+    blocks.iter().flat_map(|b| &b.instructions).filter(|inst| !match inst {
+        Instruction::Alloca { .. } | Instruction::ParamRef { .. } | Instruction::Copy { .. } => true,
+        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => promotable.contains(&ptr.0),
+        _ => false,
+    }).count()
+}
+
 fn specialized_size_cached(
     cache: &mut HashMap<String, Option<(usize, usize)>>,
     callee_map: &HashMap<String, CalleeData>,
     callee_name: &str,
     const_args: &[Option<ConstArg>],
 ) -> Option<(usize, usize)> {
-    if const_args.iter().all(|a| a.is_none()) {
-        return None;
-    }
     let mut key = callee_name.to_string();
     for arg in const_args {
         match arg {
@@ -1056,7 +1102,6 @@ fn specialized_size(
     func.is_static = true;
     func.next_value_id = callee.next_value_id;
     func.blocks = callee.blocks.clone();
-    let mut specialized = false;
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
             if let Instruction::ParamRef { dest, param_idx, .. } = *inst {
@@ -1068,13 +1113,9 @@ fn specialized_size(
                         },
                         None => Instruction::Copy { dest, src: Operand::Const(arg.value) },
                     };
-                    specialized = true;
                 }
             }
         }
-    }
-    if !specialized {
-        return None;
     }
     // Block IDs only need to be unique within the scratch copy.
     let mut max_block_id = callee.max_block_id;
@@ -1082,7 +1123,7 @@ fn specialized_size(
         let sites = find_inline_call_sites(&func, callee_map, &[], false);
         let small_site = sites.into_iter().find(|site| {
             let data = &callee_map[&site.callee_name];
-            let insts: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+            let insts: usize = effective_size(&data.blocks);
             site.callee_name != callee_name
                 && insts <= MAX_SMALL_INLINE_INSTRUCTIONS
                 && data.blocks.len() <= MAX_SMALL_INLINE_BLOCKS
@@ -1099,6 +1140,7 @@ fn specialized_size(
     for _ in 0..4 {
         let changes = super::constant_fold::fold_function(func)
             + super::copy_prop::propagate_copies(func)
+            + super::gvn::run_gvn_function(func)
             + super::simplify::simplify_function(func)
             + super::cfg_simplify::run_function(func)
             + super::dce::eliminate_dead_code(func);
@@ -1184,7 +1226,7 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // Check if this is a small static (non-inline) function eligible for inlining.
         // GCC at -O2 inlines small static functions even without the `inline` keyword.
         // This prevents linker errors from undefined references in dead code paths.
-        let inst_count_for_static: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
+        let inst_count_for_static: usize = effective_size(&func.blocks);
         let is_small_static = func.is_static && !func.is_inline
             && inst_count_for_static <= MAX_STATIC_NONINLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_STATIC_NONINLINE_BLOCKS;
@@ -1201,16 +1243,21 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             && !is_small_static
             && inst_count_for_static <= MAX_INLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_INLINE_BLOCKS;
-        if !is_always_inline && !is_trivially_empty && !is_small_static && !is_medium_static
+        // Larger static functions (often small loops, whose blocks inflate the
+        // raw count) are considered only by their cleaned-up size.
+        let cleaned_only = func.is_static && !func.is_inline && !is_always_inline
+            && !is_trivially_empty && !is_small_static && !is_medium_static
+            && inst_count_for_static <= 2 * MAX_INLINE_INSTRUCTIONS && func.blocks.len() <= 2 * MAX_INLINE_BLOCKS;
+        if !is_always_inline && !is_trivially_empty && !is_small_static && !is_medium_static && !cleaned_only
             && (!func.is_static || !func.is_inline) {
                 if debug_callee {
-                    eprintln!("[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, is_declaration={}",
-                        func.name, func.is_static, func.is_inline, func.is_declaration);
+                    eprintln!("[INLINE_DEBUG] {} skipped: is_static={}, is_inline={}, is_declaration={}, blocks={}, inst_count={}",
+                        func.name, func.is_static, func.is_inline, func.is_declaration, func.blocks.len(), inst_count_for_static);
                 }
                 continue;
             }
         if debug_callee {
-            let ic: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
+            let ic: usize = effective_size(&func.blocks);
             eprintln!("[INLINE_DEBUG] {} candidate: blocks={}, inst_count={}, is_variadic={}, params={}",
                 func.name, func.blocks.len(), ic, func.is_variadic, func.params.len());
         }
@@ -1225,10 +1272,10 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // normal limits but fit within always_inline limits. These "exceeds_normal_limits"
         // callees will only be inlined when the caller has a custom section attribute
         // (e.g., .head.text, .noinstr.text), where cross-section calls are dangerous.
-        let inst_count: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
+        let inst_count: usize = effective_size(&func.blocks);
         let fits_normal = inst_count <= MAX_INLINE_INSTRUCTIONS && func.blocks.len() <= MAX_INLINE_BLOCKS;
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
-        let exceeds_normal = !is_always_inline && !fits_normal;
+        let exceeds_normal = !is_always_inline && !fits_normal && !cleaned_only;
         if is_always_inline {
             if !fits_relaxed {
                 continue;
@@ -1306,6 +1353,7 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             is_always_inline,
             exceeds_normal_limits: exceeds_normal,
             is_static_inline: func.is_static && func.is_inline,
+            cleaned_only,
             params: func.params.clone(),
         });
     }
