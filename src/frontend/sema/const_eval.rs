@@ -18,8 +18,7 @@
 //! - Pointer arithmetic on global addresses
 //!   These remain in the lowerer since they require IR-level state.
 
-use crate::common::types::{CType, builtin_types_compatible, has_pointer_level};
-use crate::common::types::AddressSpace;
+use crate::common::types::{AccessQuals, CType, builtin_types_compatible, has_pointer_level};
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
 use crate::ir::reexports::IrConst;
@@ -1073,6 +1072,7 @@ impl<'a> SemaConstEval<'a> {
                 bit_width,
                 alignment: field_alignment,
                 is_packed: f.is_packed,
+                is_volatile: f.is_volatile,
             }
         }).collect()
     }
@@ -1176,7 +1176,7 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         }
         TypeSpecifier::TypeofType(inner) => ctype_from_type_spec(inner, types),
         TypeSpecifier::FunctionPointer(_, _, _) => {
-            CType::Pointer(Box::new(CType::Void), AddressSpace::Default) // function pointers are pointer-sized
+            CType::Pointer(Box::new(CType::Void), AccessQuals::NONE) // function pointers are pointer-sized
         }
         TypeSpecifier::Vector(inner, total_bytes) => {
             let elem_ctype = ctype_from_type_spec(inner, types);
@@ -1198,8 +1198,8 @@ fn ctype_from_type_spec_with_derived(
     }
     for d in derived {
         match d {
-            DerivedDeclarator::Pointer => {
-                ty = CType::Pointer(Box::new(ty), AddressSpace::Default);
+            DerivedDeclarator::Pointer(_) => {
+                ty = CType::Pointer(Box::new(ty), AccessQuals::NONE);
             }
             DerivedDeclarator::Array(Some(size_expr)) => {
                 let expr: &Expr = size_expr;
@@ -1214,7 +1214,7 @@ fn ctype_from_type_spec_with_derived(
                 ty = CType::Array(Box::new(ty), None);
             }
             DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _) => {
-                ty = CType::Pointer(Box::new(CType::Void), AddressSpace::Default); // function -> pointer
+                ty = CType::Pointer(Box::new(CType::Void), AccessQuals::NONE); // function -> pointer
             }
         }
     }

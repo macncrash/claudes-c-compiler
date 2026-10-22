@@ -155,7 +155,7 @@ impl Lowerer {
                     Operand::Value(ptr)
                 } else {
                     let cur_val = self.fresh_value();
-                    self.emit(Instruction::Load { dest: cur_val, ptr, ty: out_ty, seg_override: out_seg });
+                    self.emit(Instruction::Load { dest: cur_val, ptr, ty: out_ty, seg_override: out_seg, volatile: false });
                     Operand::Value(cur_val)
                 };
                 ir_inputs.push((constraint.replace('+', "").to_string(), input_operand, name.clone()));
@@ -261,7 +261,7 @@ impl Lowerer {
                     if let Some(alloca) = self.get_local_alloca(var_name) {
                         if self.get_asm_register(var_name).is_some() {
                             let dest = self.fresh_value();
-                            self.emit(Instruction::Load { dest, ptr: alloca, ty: inp_ty, seg_override: inp_seg });
+                            self.emit(Instruction::Load { dest, ptr: alloca, ty: inp_ty, seg_override: inp_seg, volatile: false });
                             Operand::Value(dest)
                         } else {
                             self.lower_expr(&inp.expr)
@@ -622,7 +622,7 @@ impl Lowerer {
     /// returns the address space from the pointer type in the deref.
     fn get_asm_operand_addr_space(&self, expr: &Expr) -> AddressSpace {
         match expr {
-            Expr::Deref(inner, _) => self.get_addr_space_of_ptr_expr(inner),
+            Expr::Deref(inner, _) => self.pointee_quals(inner).space,
             _ => AddressSpace::Default,
         }
     }

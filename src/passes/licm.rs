@@ -131,6 +131,12 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
                 }
             };
             match inst {
+                // A local accessed as volatile keeps its accesses in place.
+                Instruction::Load { ptr, volatile: true, .. } => escape(ptr.0),
+                Instruction::Store { ptr, volatile: true, .. } => {
+                    escape(ptr.0);
+                    inst.for_each_used_value(&mut escape);
+                }
                 Instruction::Alloca { .. } | Instruction::Load { .. } => {}
                 Instruction::Store { val, ptr, .. } => {
                     if let Operand::Value(v) = val {
@@ -976,7 +982,7 @@ fn hoist_loop_invariants(
                         }
                     }
                     all_invariant
-                } else if let Instruction::Load { ptr, .. } = inst {
+                } else if let Instruction::Load { ptr, volatile: false, .. } = inst {
                     is_load_hoistable(ptr, alloca_info, &loop_mem,
                                              &loop_defined, &invariant,
                                              &global_addr_values)
@@ -1329,7 +1335,7 @@ mod tests {
                     volatile: false,
                 },
                 Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                seg_override: AddressSpace::Default, volatile: false },
                 Instruction::Copy {
                     dest: Value(1),
                     src: Operand::Const(IrConst::I32(0)),
@@ -1352,7 +1358,7 @@ mod tests {
                     ],
                 },
                 Instruction::Load { dest: Value(3), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                seg_override: AddressSpace::Default, volatile: false },
                 Instruction::Cmp {
                     dest: Value(4),
                     op: IrCmpOp::Slt,
@@ -1431,7 +1437,7 @@ mod tests {
                     volatile: false,
                 },
                 Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                seg_override: AddressSpace::Default, volatile: false },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1442,7 +1448,7 @@ mod tests {
             label: BlockId(1),
             instructions: vec![
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                seg_override: AddressSpace::Default, volatile: false },
                 Instruction::Cmp {
                     dest: Value(2),
                     op: IrCmpOp::Slt,
@@ -1471,7 +1477,7 @@ mod tests {
                     ty: IrType::I32,
                 },
                 Instruction::Store { val: Operand::Value(Value(3)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                seg_override: AddressSpace::Default, volatile: false },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1563,7 +1569,7 @@ mod tests {
             label: BlockId(2),
             instructions: vec![
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default },
+                seg_override: AddressSpace::Default, volatile: false },
                 Instruction::Cmp {
                     dest: Value(2),
                     op: IrCmpOp::Eq,
@@ -1752,20 +1758,20 @@ mod tests {
         // counter (left alone).
         let mut func = make_loop_func();
         let alloca = |dest: u32| Instruction::Alloca { dest: Value(dest), ty: IrType::Ptr, size: 8, align: 4, volatile: false };
-        let store = |val: Operand, ptr: u32| Instruction::Store { val, ptr: Value(ptr), ty: IrType::I32, seg_override: AddressSpace::Default };
+        let store = |val: Operand, ptr: u32| Instruction::Store { val, ptr: Value(ptr), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false };
         let body = vec![
             alloca(6),
             Instruction::GetElementPtr { dest: Value(7), base: Value(6), offset: Operand::Const(IrConst::I64(4)), ty: IrType::I32 },
             store(Operand::Const(IrConst::I32(5)), 6),
             store(Operand::Const(IrConst::I32(9)), 7),
-            Instruction::Load { dest: Value(8), ptr: Value(7), ty: IrType::I32, seg_override: AddressSpace::Default },
+            Instruction::Load { dest: Value(8), ptr: Value(7), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
             alloca(9),
             store(Operand::Value(Value(2)), 9),
-            Instruction::Load { dest: Value(10), ptr: Value(9), ty: IrType::I32, seg_override: AddressSpace::Default },
+            Instruction::Load { dest: Value(10), ptr: Value(9), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
             // A copy of the constant local: follows it in a second round.
             alloca(11),
             Instruction::Memcpy { dest: Value(11), src: Value(6), size: 8 },
-            Instruction::Load { dest: Value(12), ptr: Value(11), ty: IrType::I32, seg_override: AddressSpace::Default },
+            Instruction::Load { dest: Value(12), ptr: Value(11), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
         ];
         func.blocks[2].instructions.splice(0..0, body);
         func.next_value_id = 13;

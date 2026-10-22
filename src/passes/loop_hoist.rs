@@ -202,7 +202,7 @@ fn hoist_loop(
                     continue;
                 }
                 let ok = match inst {
-                    Instruction::Load { ptr, ty, seg_override: AddressSpace::Default, .. } => {
+                    Instruction::Load { ptr, ty, seg_override: AddressSpace::Default, volatile: false, .. } => {
                         let root = model.root(ptr.0);
                         !writes.iter().any(|&w| model.may_alias(w, root))
                             && (in_bounds_local(ptr.0, ty.size())

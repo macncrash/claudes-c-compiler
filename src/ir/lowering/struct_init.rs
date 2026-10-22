@@ -26,7 +26,7 @@ use crate::ir::reexports::{
     Operand,
     Value,
 };
-use crate::common::types::{AddressSpace, IrType, CType, StructLayout, StructFieldLayout, InitFieldResolution};
+use crate::common::types::{AccessQuals, AddressSpace, IrType, CType, StructLayout, StructFieldLayout, InitFieldResolution};
 use super::lower::Lowerer;
 
 impl Lowerer {
@@ -912,9 +912,9 @@ impl Lowerer {
         };
         let addr = self.emit_gep_offset(base_alloca, field_offset, field_ty);
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-            self.store_bitfield(addr, field_ty, bit_offset, bit_width, val);
+            self.store_bitfield(addr, field_ty, bit_offset, bit_width, val, AccessQuals::NONE);
         } else {
-            self.emit(Instruction::Store { val, ptr: addr, ty: field_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val, ptr: addr, ty: field_ty , seg_override: AddressSpace::Default, volatile: false });
         }
     }
 }

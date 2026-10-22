@@ -16,7 +16,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::rc::Rc;
-use crate::common::types::{AddressSpace, StructLayout, RcLayout, CType};
+use crate::common::types::{AccessQuals, StructLayout, RcLayout, CType};
 use crate::frontend::parser::ast::{TypeSpecifier, ParamDecl, DerivedDeclarator};
 
 /// Information about a function typedef (e.g., `typedef int func_t(int, int);`).
@@ -50,12 +50,12 @@ pub fn extract_fptr_typedef_info(
     })?;
     let ptr_count_before_fptr = derived.iter()
         .take_while(|d| !matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
-        .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+        .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
         .count();
     let ret_ptr_count = ptr_count_before_fptr.saturating_sub(1);
     let mut return_type = base_type.clone();
     for _ in 0..ret_ptr_count {
-        return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+        return_type = TypeSpecifier::Pointer(Box::new(return_type), AccessQuals::NONE);
     }
     Some(FunctionTypedefInfo {
         return_type,
@@ -259,7 +259,7 @@ impl TypeContext {
             // <time.h>
             ("time_t", long_s.clone()),
             ("clock_t", long_s.clone()),
-            ("timer_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("timer_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             ("clockid_t", CType::Int),
             // <sys/types.h>
             ("off_t", long_s.clone()),
@@ -285,24 +285,24 @@ impl TypeContext {
             ("__s32", CType::Int),
             ("__s64", i64_type.clone()),
             // <locale.h>
-            ("locale_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("locale_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             // <pthread.h>
             ("pthread_t", size_type),
-            ("pthread_mutex_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("pthread_cond_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("pthread_mutex_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
+            ("pthread_cond_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             ("pthread_key_t", CType::UInt),
-            ("pthread_attr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("pthread_attr_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             ("pthread_once_t", CType::Int),
-            ("pthread_mutexattr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("pthread_condattr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("pthread_mutexattr_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
+            ("pthread_condattr_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             // <setjmp.h>
-            ("jmp_buf", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("sigjmp_buf", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("jmp_buf", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
+            ("sigjmp_buf", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             // <stdio.h>
-            ("FILE", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("FILE", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             ("fpos_t", ssize_type),
             // <dirent.h>
-            ("DIR", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("DIR", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             // POSIX internal names
             ("__u_char", CType::UChar),
             ("__u_short", CType::UShort),
@@ -320,9 +320,9 @@ impl TypeContext {
             // <stdarg.h> - va_list and related types.
             // Sema uses a pointer approximation; the IR lowerer (types_seed.rs)
             // applies the target-specific concrete ABI type.
-            ("va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("__builtin_va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("__gnuc_va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("va_list", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
+            ("__builtin_va_list", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
+            ("__gnuc_va_list", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
         ];
         for (name, ct) in builtins {
             self.typedefs.insert(name.to_string(), ct.clone());

@@ -19,7 +19,7 @@ use crate::common::error::DiagnosticEngine;
 use crate::common::source::Span;
 use crate::common::symbol_table::{Symbol, SymbolTable};
 use crate::common::type_builder;
-use crate::common::types::{AddressSpace, CType, FunctionType, StructLayout};
+use crate::common::types::{AccessQuals, CType, FunctionType, StructLayout};
 use crate::frontend::parser::ast::{
     BinOp,
     BlockItem,
@@ -337,11 +337,11 @@ impl SemanticAnalyzer {
                         declarator.derived.iter().find(|d| matches!(d, DerivedDeclarator::Function(_, _)))
                     {
                         let ptr_count = declarator.derived.iter()
-                            .take_while(|d| matches!(d, DerivedDeclarator::Pointer))
+                            .take_while(|d| matches!(d, DerivedDeclarator::Pointer(_)))
                             .count();
                         let mut return_type = decl.type_spec.clone();
                         for _ in 0..ptr_count {
-                            return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                            return_type = TypeSpecifier::Pointer(Box::new(return_type), AccessQuals::NONE);
                         }
                         self.result.type_context.function_typedefs.insert(
                             declarator.name.clone(),
@@ -360,12 +360,12 @@ impl SemanticAnalyzer {
                         matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
                     {
                         let ptr_count = declarator.derived.iter()
-                            .take_while(|d| matches!(d, DerivedDeclarator::Pointer))
+                            .take_while(|d| matches!(d, DerivedDeclarator::Pointer(_)))
                             .count();
                         let ret_ptr_count = if ptr_count > 0 { ptr_count - 1 } else { 0 };
                         let mut return_type = decl.type_spec.clone();
                         for _ in 0..ret_ptr_count {
-                            return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                            return_type = TypeSpecifier::Pointer(Box::new(return_type), AccessQuals::NONE);
                         }
                         self.result.type_context.func_ptr_typedefs.insert(declarator.name.clone());
                         self.result.type_context.func_ptr_typedef_info.insert(
@@ -1834,6 +1834,7 @@ impl SemanticAnalyzer {
                 bit_width,
                 alignment: field_alignment,
                 is_packed: f.is_packed,
+                is_volatile: f.is_volatile,
             }
         }).collect()
     }
@@ -1882,19 +1883,19 @@ impl SemanticAnalyzer {
             ("puts", CType::Int, false),
             ("putchar", CType::Int, false),
             ("getchar", CType::Int, false),
-            ("malloc", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
-            ("calloc", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
-            ("realloc", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
+            ("malloc", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE), false),
+            ("calloc", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE), false),
+            ("realloc", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE), false),
             ("free", CType::Void, false),
             ("exit", CType::Void, false),
             ("abort", CType::Void, false),
-            ("memcpy", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
-            ("memmove", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
-            ("memset", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
+            ("memcpy", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE), false),
+            ("memmove", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE), false),
+            ("memset", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE), false),
             ("memcmp", CType::Int, false),
             ("strlen", CType::ULong, false),
             ("strcmp", CType::Int, false),
-            ("strcpy", CType::Pointer(Box::new(CType::Char), AddressSpace::Default), false),
+            ("strcpy", CType::Pointer(Box::new(CType::Char), AccessQuals::NONE), false),
             ("atoi", CType::Int, false),
             ("atol", CType::Long, false),
             ("abs", CType::Int, false),

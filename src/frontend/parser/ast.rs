@@ -1,5 +1,5 @@
 use crate::common::source::Span;
-use crate::common::types::AddressSpace;
+use crate::common::types::{AccessQuals, AddressSpace};
 
 /// A complete translation unit (one C source file).
 #[derive(Debug)]
@@ -158,6 +158,9 @@ pub struct ParamDecl {
     /// Whether this parameter's base type has a `const` qualifier.
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`.
     pub is_const: bool,
+    /// Whether the parameter itself is volatile (`volatile int n`, not
+    /// `volatile int *p`, whose pointer type is marked instead).
+    pub is_volatile: bool,
     /// VLA size expressions from the outermost array dimension that was decayed to pointer.
     /// E.g., for `void foo(int a, int b[a++])`, the expression `a++` is stored here
     /// so its side effects can be evaluated at function entry during IR lowering.
@@ -195,6 +198,8 @@ pub mod decl_flag {
     /// Used to implement C99 6.7.4p7: a function provides an external definition
     /// only if not ALL file-scope declarations include `inline`.
     pub const INLINE: u16            = 1 << 8;
+    /// `volatile` after a `*` in some declarator (`int *volatile p`).
+    pub const PTR_VOLATILE: u16      = 1 << 9;
 }
 
 /// A variable/type declaration.
@@ -240,6 +245,7 @@ impl Declaration {
     #[inline] pub fn is_typedef(&self) -> bool             { self.flags & decl_flag::TYPEDEF != 0 }
     #[inline] pub fn is_const(&self) -> bool              { self.flags & decl_flag::CONST != 0 }
     #[inline] pub fn is_volatile(&self) -> bool           { self.flags & decl_flag::VOLATILE != 0 }
+    #[inline] pub fn is_ptr_volatile(&self) -> bool       { self.flags & decl_flag::PTR_VOLATILE != 0 }
     #[inline] pub fn is_common(&self) -> bool             { self.flags & decl_flag::COMMON != 0 }
     #[inline] pub fn is_thread_local(&self) -> bool       { self.flags & decl_flag::THREAD_LOCAL != 0 }
     #[inline] pub fn is_transparent_union(&self) -> bool  { self.flags & decl_flag::TRANSPARENT_UNION != 0 }
@@ -252,6 +258,7 @@ impl Declaration {
     #[inline] pub fn set_typedef(&mut self, v: bool)             { self.set_flag(decl_flag::TYPEDEF, v) }
     #[inline] pub fn set_const(&mut self, v: bool)              { self.set_flag(decl_flag::CONST, v) }
     #[inline] pub fn set_volatile(&mut self, v: bool)           { self.set_flag(decl_flag::VOLATILE, v) }
+    #[inline] pub fn set_ptr_volatile(&mut self, v: bool)       { self.set_flag(decl_flag::PTR_VOLATILE, v) }
     #[inline] pub fn set_common(&mut self, v: bool)             { self.set_flag(decl_flag::COMMON, v) }
     #[inline] pub fn set_thread_local(&mut self, v: bool)       { self.set_flag(decl_flag::THREAD_LOCAL, v) }
     #[inline] pub fn set_transparent_union(&mut self, v: bool)  { self.set_flag(decl_flag::TRANSPARENT_UNION, v) }
@@ -446,7 +453,8 @@ pub struct InitDeclarator {
 /// Derived parts of a declarator (pointers, arrays, function params).
 #[derive(Debug, Clone)]
 pub enum DerivedDeclarator {
-    Pointer,
+    /// The qualifiers are the pointed-to type's.
+    Pointer(AccessQuals),
     Array(Option<Box<Expr>>),
     Function(Vec<ParamDecl>, bool), // params, variadic
     /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
@@ -510,7 +518,8 @@ pub enum TypeSpecifier {
     /// Enum: (name, variants, is_packed)
     Enum(Option<String>, Option<Vec<EnumVariant>>, bool),
     TypedefName(String),
-    Pointer(Box<TypeSpecifier>, AddressSpace),
+    /// The qualifiers are the pointed-to type's.
+    Pointer(Box<TypeSpecifier>, AccessQuals),
     Array(Box<TypeSpecifier>, Option<Box<Expr>>),
     /// Function pointer type from cast/sizeof: return_type, params, variadic
     /// E.g., `(jv (*)(void*, jv))` produces FunctionPointer(jv, [void*, jv], false)
@@ -547,6 +556,61 @@ pub struct StructFieldDecl {
     pub alignment: Option<usize>,
     /// Per-field __attribute__((packed)) - forces this field's alignment to 1.
     pub is_packed: bool,
+    /// Whether the field itself is volatile (`volatile int n`, not
+    /// `volatile int *p`, whose pointer type is marked instead).
+    pub is_volatile: bool,
+}
+
+impl ParamDecl {
+    /// The qualifiers of the parameter object itself.
+    pub fn object_quals(&self) -> AccessQuals {
+        if self.is_volatile { AccessQuals::VOLATILE } else { AccessQuals::NONE }
+    }
+}
+
+impl TypeSpecifier {
+    /// Mark every pointer level reachable through pointers and arrays as
+    /// pointing to volatile: the conservative reading of a `volatile`
+    /// written anywhere in a type name or declaration.
+    pub fn mark_volatile_pointers(&mut self) {
+        match self {
+            TypeSpecifier::Pointer(inner, quals) => {
+                quals.volatile = true;
+                inner.mark_volatile_pointers();
+            }
+            TypeSpecifier::Array(inner, _) | TypeSpecifier::TypeofType(inner) => inner.mark_volatile_pointers(),
+            _ => {}
+        }
+    }
+}
+
+/// Mark every pointer declarator as pointing to volatile, as
+/// `TypeSpecifier::mark_volatile_pointers` does for a type.
+pub fn mark_volatile_pointers(derived: &mut [DerivedDeclarator]) {
+    for d in derived {
+        if let DerivedDeclarator::Pointer(quals) = d {
+            quals.volatile = true;
+        }
+    }
+}
+
+impl Declaration {
+    /// The qualifiers of the object one declarator declares. It is volatile
+    /// for `volatile int x` and `int *volatile p`, not `volatile int *p`.
+    pub fn object_quals(&self, declarator: &InitDeclarator) -> AccessQuals {
+        let has_pointer = matches!(self.type_spec, TypeSpecifier::Pointer(..))
+            || declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+        let volatile = self.is_ptr_volatile() || (self.is_volatile() && !has_pointer);
+        AccessQuals { space: self.address_space, volatile }
+    }
+
+    /// Apply `mark_volatile_pointers` to the type and every declarator.
+    pub fn mark_volatile_pointers(&mut self) {
+        self.type_spec.mark_volatile_pointers();
+        for d in &mut self.declarators {
+            mark_volatile_pointers(&mut d.derived);
+        }
+    }
 }
 
 /// An enum variant.

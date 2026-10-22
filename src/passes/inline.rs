@@ -1540,6 +1540,7 @@ fn inline_call_site(
                 ptr: param_alloca_info[i].0,
                 ty: store_ty,
                 seg_override: AddressSpace::Default,
+                volatile: false,
             });
             if has_spans {
                 entry_block.source_spans.insert(insert_pos, crate::common::source::Span::dummy());
@@ -1747,17 +1748,19 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             size: remap_operand(size, vo),
             align: *align,
         },
-        Instruction::Store { val, ptr, ty, seg_override } => Instruction::Store {
+        Instruction::Store { val, ptr, ty, seg_override, volatile } => Instruction::Store {
             val: remap_operand(val, vo),
             ptr: remap_value(*ptr, vo),
             ty: *ty,
             seg_override: *seg_override,
+            volatile: *volatile,
         },
-        Instruction::Load { dest, ptr, ty, seg_override } => Instruction::Load {
+        Instruction::Load { dest, ptr, ty, seg_override, volatile } => Instruction::Load {
             dest: remap_value(*dest, vo),
             ptr: remap_value(*ptr, vo),
             ty: *ty,
             seg_override: *seg_override,
+            volatile: *volatile,
         },
         Instruction::BinOp { dest, op, lhs, rhs, ty } => Instruction::BinOp {
             dest: remap_value(*dest, vo),
@@ -1982,11 +1985,13 @@ fn format_instruction(inst: &Instruction) -> String {
         Instruction::Alloca { dest, ty, size, align, .. } => {
             format!("v{} = alloca {:?} size={} align={}", dest.0, ty, size, align)
         }
-        Instruction::Store { val, ptr, ty, .. } => {
-            format!("store {:?} {} -> v{}", ty, format_operand(val), ptr.0)
+        Instruction::Store { val, ptr, ty, volatile, .. } => {
+            let v = if *volatile { "volatile " } else { "" };
+            format!("store {}{:?} {} -> v{}", v, ty, format_operand(val), ptr.0)
         }
-        Instruction::Load { dest, ptr, ty, .. } => {
-            format!("v{} = load {:?} v{}", dest.0, ty, ptr.0)
+        Instruction::Load { dest, ptr, ty, volatile, .. } => {
+            let v = if *volatile { "volatile " } else { "" };
+            format!("v{} = load {}{:?} v{}", dest.0, v, ty, ptr.0)
         }
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
             format!("v{} = {:?} {:?} {}, {}", dest.0, op, ty, format_operand(lhs), format_operand(rhs))

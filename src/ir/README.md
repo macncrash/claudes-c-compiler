@@ -139,6 +139,16 @@ carries no pointee type information.
 
 On non-x86 targets this is always `Default`.
 
+### Volatile accesses
+
+Lowering marks a `Load` or `Store` `volatile` when the object it accesses is
+volatile, as tracked by `AccessQuals` (`common/types`): a volatile variable,
+field or parameter, or anything reached through a pointer to volatile. Passes
+leave such accesses where they are: DCE keeps unused volatile loads, GVN
+neither merges them nor forwards stores into or out of them, LICM and
+loop_hoist do not hoist them, and mem2reg does not promote an alloca accessed
+that way.
+
 ---
 
 ## IrModule
@@ -243,8 +253,8 @@ categories.
 |---------|--------|-------------|
 | `Alloca` | `dest, ty, size, align, volatile` | Static stack slot allocation. The `volatile` flag prevents `mem2reg` from promoting the alloca (needed for `volatile`-qualified locals that must survive `setjmp`/`longjmp`). |
 | `DynAlloca` | `dest, size, align` | Dynamic stack allocation (`__builtin_alloca`); adjusts stack pointer at runtime. |
-| `Load` | `dest, ptr, ty, seg_override` | Load from memory. `seg_override` is an `AddressSpace` for x86 segment register prefixes (`%gs:`, `%fs:`). |
-| `Store` | `val, ptr, ty, seg_override` | Store to memory. Same `seg_override` semantics as `Load`. |
+| `Load` | `dest, ptr, ty, seg_override, volatile` | Load from memory. `seg_override` is an `AddressSpace` for x86 segment register prefixes (`%gs:`, `%fs:`). A `volatile` load is never removed, merged with another, moved, or replaced by a stored value. |
+| `Store` | `val, ptr, ty, seg_override, volatile` | Store to memory. Same `seg_override` and `volatile` semantics as `Load`. |
 | `Memcpy` | `dest, src, size` | Block memory copy. |
 | `GetElementPtr` | `dest, base, offset, ty` | Pointer arithmetic (array/struct element access). |
 | `GlobalAddr` | `dest, name` | Load the address of a global symbol. |

@@ -5,7 +5,7 @@
 // (e.g., "long unsigned int" == "unsigned long int"), so we collect flags
 // and resolve them at the end.
 
-use crate::common::types::AddressSpace;
+use crate::common::types::{AccessQuals, AddressSpace};
 use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::{ModeKind, Parser};
@@ -431,6 +431,9 @@ impl Parser {
         } else if has_typeof {
             self.parse_typeof_specifier()
         } else if let Some(ref name) = typedef_name {
+            if self.volatile_typedefs.contains(name) {
+                self.attrs.set_volatile(true);
+            }
             TypeSpecifier::TypedefName(name.clone())
         } else if has_char {
             if has_unsigned { TypeSpecifier::UnsignedChar } else { TypeSpecifier::Char }
@@ -534,7 +537,10 @@ impl Parser {
         // Try parsing as a type first
         if self.is_type_specifier() {
             if let Some(ts) = self.parse_type_specifier() {
-                let result_type = self.parse_abstract_declarator_suffix(ts);
+                let mut result_type = self.parse_abstract_declarator_suffix(ts);
+                if self.attrs.parsing_volatile() {
+                    result_type.mark_volatile_pointers();
+                }
                 if matches!(self.peek(), TokenKind::RParen) {
                     self.advance();
                     self.attrs.flags = saved_flags;
@@ -615,6 +621,8 @@ impl Parser {
     /// Parse struct or union field declarations inside braces.
     pub(super) fn parse_struct_fields(&mut self) -> Vec<StructFieldDecl> {
         let mut fields = Vec::new();
+        // Each field's volatile is its own, not the enclosing declaration's.
+        let saved_volatile = self.attrs.take_volatile();
         let open = self.peek_span();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
@@ -628,13 +636,24 @@ impl Parser {
                 self.parse_static_assert();
                 continue;
             }
+            self.attrs.take_volatile();
+            let first = fields.len();
             if let Some(type_spec) = self.parse_type_specifier() {
                 if matches!(self.peek(), TokenKind::Semicolon) {
                     // Anonymous field (e.g., anonymous struct/union)
                     let alignment = self.attrs.parsed_alignas.take();
-                    fields.push(StructFieldDecl { type_spec, name: None, bit_width: None, derived: Vec::new(), alignment, is_packed: false });
+                    fields.push(StructFieldDecl { type_spec, name: None, bit_width: None, derived: Vec::new(), alignment, is_packed: false, is_volatile: false });
                 } else {
                     self.parse_struct_field_declarators(&type_spec, &mut fields);
+                }
+                if self.attrs.parsing_volatile() {
+                    for f in &mut fields[first..] {
+                        let has_pointer = matches!(f.type_spec, TypeSpecifier::Pointer(..))
+                            || f.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+                        f.is_volatile = self.attrs.object_volatile(has_pointer);
+                        f.type_spec.mark_volatile_pointers();
+                        mark_volatile_pointers(&mut f.derived);
+                    }
                 }
                 self.skip_gcc_extensions();
                 self.expect_after(&TokenKind::Semicolon, "after struct field declaration");
@@ -643,6 +662,7 @@ impl Parser {
             }
         }
         self.expect_closing(&TokenKind::RBrace, open);
+        self.attrs.restore_volatile(saved_volatile);
         fields
     }
 
@@ -676,6 +696,7 @@ impl Parser {
                     derived: Vec::new(),
                     alignment: alignas_from_type,
                     is_packed: false,
+                    is_volatile: false,
                 });
                 if !self.consume_if(&TokenKind::Comma) { break; }
                 continue;
@@ -716,6 +737,7 @@ impl Parser {
                 derived: field_derived,
                 alignment,
                 is_packed,
+                is_volatile: false,
             });
 
             if !self.consume_if(&TokenKind::Comma) { break; }
@@ -727,8 +749,12 @@ impl Parser {
     fn consume_struct_field_qualifiers(&mut self, alignas: &mut Option<usize>) {
         loop {
             match self.peek() {
-                TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                TokenKind::Const | TokenKind::Restrict => {
                     self.advance();
+                }
+                TokenKind::Volatile => {
+                    self.advance();
+                    self.attrs.set_volatile(true);
                 }
                 TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
                 TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
@@ -772,8 +798,8 @@ impl Parser {
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer => {
-                    result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
+                DerivedDeclarator::Pointer(_) => {
+                    result = TypeSpecifier::Pointer(Box::new(result), AccessQuals::NONE);
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {
@@ -870,7 +896,7 @@ impl Parser {
             let mut result_type = type_spec;
             // Parse pointer declarators
             while self.consume_if(&TokenKind::Star) {
-                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
                 self.skip_cv_qualifiers();
             }
             // Handle function pointer: type (*)(args)
@@ -885,7 +911,7 @@ impl Parser {
                     if matches!(self.peek(), TokenKind::LParen) {
                         self.skip_balanced_parens();
                     }
-                    result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                    result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
                 } else {
                     self.pos = save2;
                 }
@@ -925,7 +951,7 @@ impl Parser {
             // Capture any address space qualifier that preceded the '*'
             // (e.g., __seg_gs in "typeof(var) __seg_gs *")
             let addr_space = std::mem::take(&mut self.attrs.parsing_address_space);
-            result_type = TypeSpecifier::Pointer(Box::new(result_type), addr_space);
+            result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::in_space(addr_space));
             self.skip_cv_qualifiers();
         }
         // Handle parenthesized abstract declarators: (*), (*)(params), (*)[N], (*[3][4])
@@ -942,7 +968,7 @@ impl Parser {
                             result_type = TypeSpecifier::FunctionPointer(Box::new(result_type), params, variadic);
                             // Extra pointer levels for multi-indirection (e.g., ** means ptr-to-func-ptr)
                             for _ in 0..ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
                             }
                             // Wrap with inner array dims (for array of function pointers)
                             for dim in inner_array_dims.into_iter().rev() {
@@ -966,14 +992,14 @@ impl Parser {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
                             for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
                             }
                             for dim in inner_array_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
                         } else {
                             for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
                             }
                         }
                     }
@@ -992,7 +1018,7 @@ impl Parser {
                             let (outer_params, outer_variadic) = self.parse_param_list();
                             // Build the return type: function pointer returning base type
                             for _ in 0..inner_ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
                             }
                             let return_fn_type = TypeSpecifier::FunctionPointer(
                                 Box::new(result_type), outer_params, outer_variadic
@@ -1003,13 +1029,13 @@ impl Parser {
                             );
                             // Apply extra outer pointer levels (for outer_ptr_depth > 1)
                             for _ in 0..outer_ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
                             }
                         } else {
                             // No outer params - treat as simple pointer
                             let total = outer_ptr_depth + inner_ptr_depth;
                             for _ in 0..total {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
                             }
                         }
                     }

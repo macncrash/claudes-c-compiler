@@ -14,7 +14,7 @@
 //! The `ExprTypeChecker` operates on immutable references and does not modify
 //! any state. It is designed to be called from `SemanticAnalyzer::analyze_expr`.
 
-use crate::common::types::{AddressSpace, CType, FunctionType};
+use crate::common::types::{AccessQuals, CType, FunctionType};
 use crate::common::symbol_table::SymbolTable;
 use crate::common::fx_hash::FxHashMap;
 use crate::frontend::parser::ast::{
@@ -142,14 +142,14 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::ImaginaryLiteral(_, _) => Some(CType::ComplexDouble),
             Expr::ImaginaryLiteralF32(_, _) => Some(CType::ComplexFloat),
             Expr::ImaginaryLiteralLongDouble(_, _, _) => Some(CType::ComplexLongDouble),
-            Expr::StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default)),
-            Expr::WideStringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default)),
-            Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::UShort), AddressSpace::Default)),
+            Expr::StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Char), AccessQuals::NONE)),
+            Expr::WideStringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Int), AccessQuals::NONE)),
+            Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::UShort), AccessQuals::NONE)),
 
             // Identifiers: look up in symbol table or enum constants
             Expr::Identifier(name, _) => {
                 if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
-                    return Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default));
+                    return Some(CType::Pointer(Box::new(CType::Char), AccessQuals::NONE));
                 }
                 if let Some(&val) = self.types.enum_constants.get(name) {
                     return Some(enum_constant_type(val));
@@ -180,10 +180,10 @@ impl<'a> ExprTypeChecker<'a> {
             // Address-of wraps in Pointer
             Expr::AddressOf(inner, _) => {
                 if let Some(inner_ct) = self.infer_expr_ctype(inner) {
-                    Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default))
+                    Some(CType::Pointer(Box::new(inner_ct), AccessQuals::NONE))
                 } else {
                     // Even if inner type unknown, result is some pointer
-                    Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+                    Some(CType::Pointer(Box::new(CType::Void), AccessQuals::NONE))
                 }
             }
 
@@ -336,7 +336,7 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Label address: void*
-            Expr::LabelAddr(_, _) => Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            Expr::LabelAddr(_, _) => Some(CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
 
             // __builtin_types_compatible_p: int
             Expr::BuiltinTypesCompatibleP(..) => Some(CType::Int),
@@ -398,7 +398,7 @@ impl<'a> ExprTypeChecker<'a> {
                                 }
                             }
                         }
-                        return Some(CType::Pointer(elem.clone(), AddressSpace::Default));
+                        return Some(CType::Pointer(elem.clone(), AccessQuals::NONE));
                     }
                     _ => {}
                 }
@@ -408,7 +408,7 @@ impl<'a> ExprTypeChecker<'a> {
                 if let Some(ref r) = rct {
                     match r {
                         CType::Pointer(_, _) => return rct,
-                        CType::Array(elem, _) => return Some(CType::Pointer(elem.clone(), AddressSpace::Default)),
+                        CType::Array(elem, _) => return Some(CType::Pointer(elem.clone(), AccessQuals::NONE)),
                         _ => {}
                     }
                 }
@@ -691,7 +691,7 @@ impl<'a> ExprTypeChecker<'a> {
                     return_type: ret_ct,
                     params: param_cts,
                     variadic: *variadic,
-                }))), AddressSpace::Default)
+                }))), AccessQuals::NONE)
             }
             // TODO: handle remaining TypeSpecifier variants
             _ => CType::Int,
@@ -741,6 +741,7 @@ impl<'a> ExprTypeChecker<'a> {
                 }),
                 alignment: f.alignment,
                 is_packed: f.is_packed,
+                is_volatile: f.is_volatile,
             }
         }).collect();
 
@@ -775,8 +776,8 @@ impl<'a> ExprTypeChecker<'a> {
         let mut ctype = self.resolve_type_spec(&f.type_spec);
         for derived in &f.derived {
             match derived {
-                DerivedDeclarator::Pointer => {
-                    ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                DerivedDeclarator::Pointer(_) => {
+                    ctype = CType::Pointer(Box::new(ctype), AccessQuals::NONE);
                 }
                 DerivedDeclarator::Array(Some(size_expr)) => {
                     let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
@@ -855,7 +856,7 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_alloca" | "__builtin_alloca_with_align"
             | "__builtin_frame_address" | "__builtin_return_address"
             | "__builtin_thread_pointer" => {
-                Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+                Some(CType::Pointer(Box::new(CType::Void), AccessQuals::NONE))
             }
 
             // Void-returning builtins
@@ -892,8 +893,8 @@ impl<'a> ExprTypeChecker<'a> {
                     let mut ctype = self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
                     for derived in &declarator.derived {
                         match derived {
-                            DerivedDeclarator::Pointer => {
-                                ctype = CType::Pointer(Box::new(ctype), AddressSpace::Default);
+                            DerivedDeclarator::Pointer(_) => {
+                                ctype = CType::Pointer(Box::new(ctype), AccessQuals::NONE);
                             }
                             DerivedDeclarator::Array(Some(size_expr)) => {
                                 let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
@@ -959,7 +960,7 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::AddressOf(inner, _) => {
                 let inner_ct = self.infer_expr_ctype(inner)
                     .or_else(|| self.infer_expr_ctype_with_scope(inner, scope))?;
-                Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default))
+                Some(CType::Pointer(Box::new(inner_ct), AccessQuals::NONE))
             }
             _ => None,
         }

@@ -6,7 +6,7 @@
 // pointer to a function returning int, read from the name outward. This module
 // handles the recursive parsing needed for this grammar.
 
-use crate::common::types::AddressSpace;
+use crate::common::types::AccessQuals;
 use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::{ModeKind, Parser};
@@ -53,7 +53,7 @@ impl Parser {
 
         // Parse pointer(s) with optional qualifiers and attributes
         while self.consume_if(&TokenKind::Star) {
-            derived.push(DerivedDeclarator::Pointer);
+            derived.push(DerivedDeclarator::Pointer(AccessQuals::NONE));
             self.skip_cv_qualifiers();
             self.skip_gcc_extensions();
         }
@@ -175,8 +175,8 @@ impl Parser {
 
         // Check for function pointer: inner has Pointer(s), outer starts with Function
         let inner_only_ptr_and_array = inner_derived.iter().all(|d|
-            matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)));
-        let inner_has_pointer = inner_derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
+            matches!(d, DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)));
+        let inner_has_pointer = inner_derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let outer_starts_with_function = matches!(outer_suffixes.first(), Some(DerivedDeclarator::Function(_, _)));
 
         if inner_only_ptr_and_array && inner_has_pointer && outer_starts_with_function
@@ -207,19 +207,19 @@ impl Parser {
             // Count inner pointers. The last one is the function pointer syntax marker.
             // All others are extra indirection levels placed AFTER the FunctionPointer.
             let inner_ptr_count = inner_derived.iter()
-                .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+                .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
                 .count();
             let extra_indirection_ptrs = if inner_ptr_count > 0 { inner_ptr_count - 1 } else { 0 };
 
             // Emit the function pointer syntax marker + FunctionPointer
-            result.push(DerivedDeclarator::Pointer);
+            result.push(DerivedDeclarator::Pointer(AccessQuals::NONE));
             if let Some(DerivedDeclarator::Function(params, variadic)) = outer_suffixes.into_iter().next() {
                 result.push(DerivedDeclarator::FunctionPointer(params, variadic));
             }
 
             // Emit extra indirection Pointers (beyond the syntax marker)
             for _ in 0..extra_indirection_ptrs {
-                result.push(DerivedDeclarator::Pointer);
+                result.push(DerivedDeclarator::Pointer(AccessQuals::NONE));
             }
 
             // Emit inner arrays (for array of function pointers, e.g., `int (*fps[10])(int)`)
@@ -251,7 +251,7 @@ impl Parser {
             // Split inner_derived at the last Pointer:
             // - pre_ptr_arrays: arrays before the last pointer (part of pointee type)
             // - post_ptr_arrays: arrays after the last pointer (variable's own array dimensions)
-            let last_ptr_idx = inner_derived.iter().rposition(|d| matches!(d, DerivedDeclarator::Pointer))
+            let last_ptr_idx = inner_derived.iter().rposition(|d| matches!(d, DerivedDeclarator::Pointer(_)))
                 .expect("inner_has_pointer is true, so a Pointer must exist");
             let mut result = outer_pointers;
             // 1. Arrays from inner that come before the pointer (pointee array dimensions)
@@ -264,7 +264,7 @@ impl Parser {
             result.extend(outer_suffixes);
             // 3. Pointer(s)
             for d in &inner_derived[..=last_ptr_idx] {
-                if matches!(d, DerivedDeclarator::Pointer) {
+                if matches!(d, DerivedDeclarator::Pointer(_)) {
                     result.push(d.clone());
                 }
             }
@@ -285,7 +285,7 @@ impl Parser {
         //
         // This does NOT match function definitions returning function pointers like
         // `int (*g(int))(int)`, where inner has Function (not FunctionPointer).
-        let inner_starts_with_pointer = matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer));
+        let inner_starts_with_pointer = matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer(_)));
         let inner_has_fptr = inner_derived.iter().any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
         if inner_starts_with_pointer && inner_has_fptr && outer_starts_with_function {
             let mut result = outer_pointers;
@@ -294,7 +294,7 @@ impl Parser {
             for suffix in outer_suffixes {
                 match suffix {
                     DerivedDeclarator::Function(params, variadic) => {
-                        result.push(DerivedDeclarator::Pointer);
+                        result.push(DerivedDeclarator::Pointer(AccessQuals::NONE));
                         result.push(DerivedDeclarator::FunctionPointer(params, variadic));
                     }
                     other => result.push(other),
@@ -355,6 +355,7 @@ impl Parser {
             // Save and reset parsing_const to detect if this parameter's base type is const.
             let saved_const = self.attrs.parsing_const();
             self.attrs.set_const(false);
+            let saved_volatile = self.attrs.take_volatile();
             self.attrs.set_noreturn(saved_noreturn);
             if let Some(mut type_spec) = self.parse_type_specifier() {
                 // Capture whether the base type (before pointer declarators) was const.
@@ -366,7 +367,7 @@ impl Parser {
 
                 // Apply pointer levels
                 for _ in 0..pointer_depth {
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AccessQuals::NONE);
                 }
 
                 // Pointer-to-array: int (*p)[N][M]
@@ -374,7 +375,7 @@ impl Parser {
                     for dim in ptr_to_array_dims.iter().rev() {
                         type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
                     }
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AccessQuals::NONE);
                 }
 
                 // Array params: outermost dimension decays to pointer.
@@ -388,19 +389,26 @@ impl Parser {
                     for dim in array_dims.iter().skip(1).rev() {
                         type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
                     }
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AccessQuals::NONE);
                 }
 
                 // Function pointers decay to pointer
                 if is_func_ptr {
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AccessQuals::NONE);
                 }
 
+                if self.attrs.parsing_volatile() {
+                    type_spec.mark_volatile_pointers();
+                }
+                let param_is_volatile = self.attrs.object_volatile(
+                    matches!(type_spec, TypeSpecifier::Pointer(..) | TypeSpecifier::FunctionPointer(..)));
                 self.attrs.set_const(saved_const);
+                self.attrs.restore_volatile(saved_volatile);
                 self.attrs.set_noreturn(saved_noreturn);
-                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
+                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, is_volatile: param_is_volatile, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
             } else {
                 self.attrs.set_const(saved_const);
+                self.attrs.restore_volatile(saved_volatile);
                 self.attrs.set_noreturn(saved_noreturn);
                 break;
             }
@@ -425,6 +433,7 @@ impl Parser {
                 name: Some(n),
                 fptr_params: None,
                 is_const: false,
+                is_volatile: false,
                 vla_size_exprs: Vec::new(),
                 fptr_inner_ptr_depth: 0,
             });

@@ -386,6 +386,15 @@ Storage-class specifiers (`static`, `extern`, `typedef`, `inline`,
 accumulated into the `ParsedDeclAttrs` buffer during the same loop, rather
 than being part of the returned `TypeSpecifier`.
 
+`volatile` is then recorded conservatively. A declaration, parameter, field
+or type name containing it anywhere has every pointer level in its type marked
+as pointing to volatile (the `AccessQuals` on `TypeSpecifier::Pointer` and
+`DerivedDeclarator::Pointer`), and the declared object itself is volatile when
+the qualifier came after a `*` or the type has no pointer. A typedef of a
+volatile object type is remembered, so using its name counts as writing
+`volatile`. Nested parses (casts, parameter lists, struct bodies) save and
+restore the flags so they do not leak into the enclosing declaration.
+
 The method also handles:
 
 - **`struct`/`union`/`enum`** definitions and forward declarations, including
@@ -617,7 +626,8 @@ A large enum covering all C type forms:
 - **Complex types:** `ComplexFloat`, `ComplexDouble`, `ComplexLongDouble`
 - **Aggregate types:** `Struct(name, fields, packed, pragma_pack, aligned)`,
   `Union(...)`, `Enum(name, variants, packed)`
-- **Derived types:** `Pointer(inner, address_space)`, `Array(inner, size)`,
+- **Derived types:** `Pointer(inner, quals)` (the pointee's address space and
+  volatility), `Array(inner, size)`,
   `FunctionPointer(ret, params, variadic)`, `BareFunction(ret, params, variadic)`
 - **Name-based:** `TypedefName(String)`
 - **Deferred:** `Typeof(Expr)`, `TypeofType(TypeSpecifier)`, `AutoType`
@@ -719,9 +729,9 @@ boolean flags instead of individual `bool` fields:
 | Struct | Flag type | Booleans stored |
 |---|---|---|
 | `FunctionAttributes` | `u16` (13 bits) | static, inline, extern, gnu_inline, always_inline, noinline, constructor, destructor, weak, used, fastcall, naked, noreturn |
-| `Declaration` | `u16` (9 bits) | static, extern, typedef, const, volatile, common, thread_local, transparent_union, inline |
+| `Declaration` | `u16` (10 bits) | static, extern, typedef, const, volatile, common, thread_local, transparent_union, inline, ptr_volatile |
 | `DeclAttributes` | `u16` (8 bits) | constructor, destructor, weak, error_attr, noreturn, used, fastcall, naked |
-| `ParsedDeclAttrs` | `u32` (19 bits) | typedef, static, extern, thread_local, inline, const, volatile, constructor, destructor, weak, used, gnu_inline, always_inline, noinline, noreturn, error_attr, transparent_union, fastcall, naked |
+| `ParsedDeclAttrs` | `u32` (20 bits) | typedef, static, extern, thread_local, inline, const, volatile, constructor, destructor, weak, used, gnu_inline, always_inline, noinline, noreturn, error_attr, transparent_union, fastcall, naked, ptr_volatile |
 
 Each flag is a named constant (power of two) in a companion module
 (e.g., `func_attr_flag::STATIC = 1 << 0`).  Getters use `flags & MASK != 0`

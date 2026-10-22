@@ -242,7 +242,7 @@ impl Lowerer {
         });
         // Load the result from the alloca
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: tmp_alloca, ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { dest: result, ptr: tmp_alloca, ty , seg_override: AddressSpace::Default, volatile: false });
         Operand::Value(result)
     }
 
@@ -263,7 +263,7 @@ impl Lowerer {
             }
         }
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.address_space });
+        self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.quals.space, volatile: ginfo.quals.volatile });
         Operand::Value(dest)
     }
 
@@ -288,6 +288,7 @@ impl Lowerer {
             let static_global_name = info.static_global_name.clone();
             let asm_register = info.asm_register.clone();
             let asm_register_has_init = info.asm_register_has_init;
+            let quals = info.quals;
 
             // Local register variable WITHOUT initializer AND not yet written by
             // inline asm: read the hardware register directly via inline asm.
@@ -313,7 +314,7 @@ impl Lowerer {
                     return Operand::Value(addr);
                 }
                 let dest = self.fresh_value();
-                self.emit(Instruction::Load { dest, ptr: addr, ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Load { dest, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile });
                 return Operand::Value(dest);
             }
             if is_array || is_struct {
@@ -323,7 +324,7 @@ impl Lowerer {
                 return Operand::Value(alloca);
             }
             let dest = self.fresh_value();
-            self.emit(Instruction::Load { dest, ptr: alloca, ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { dest, ptr: alloca, ty, seg_override: quals.space, volatile: quals.volatile });
             return Operand::Value(dest);
         }
 

@@ -17,7 +17,7 @@ use crate::frontend::parser::ast::{
     UnaryOp,
 };
 use crate::ir::reexports::IrConst;
-use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type};
+use crate::common::types::{AccessQuals, CType, IrType, target_int_ir_type};
 use super::lower::Lowerer;
 
 /// Promote small integer types to I32, matching C integer promotion rules.
@@ -608,8 +608,8 @@ impl Lowerer {
         // Per C11 6.5.1.1p2, lvalue conversion includes array-to-pointer and
         // function-to-pointer decay.
         let controlling_ctype = controlling_ctype.map(|ct| match ct {
-            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
-            CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default),
+            CType::Array(elem, _) => CType::Pointer(elem, AccessQuals::NONE),
+            CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), AccessQuals::NONE),
             other => other,
         });
         // Lvalue conversion also strips top-level qualifiers.
@@ -937,7 +937,7 @@ impl Lowerer {
                                 }
                             }
                         }
-                        return Some(CType::Pointer(elem.clone(), AddressSpace::Default));
+                        return Some(CType::Pointer(elem.clone(), AccessQuals::NONE));
                     }
                     _ => {}
                 }
@@ -947,7 +947,7 @@ impl Lowerer {
                 if let Some(rct) = self.get_expr_ctype(rhs) {
                     match rct {
                         CType::Pointer(_, _) => return Some(rct),
-                        CType::Array(elem, _) => return Some(CType::Pointer(elem, AddressSpace::Default)),
+                        CType::Array(elem, _) => return Some(CType::Pointer(elem, AccessQuals::NONE)),
                         _ => {}
                     }
                 }
@@ -1177,7 +1177,7 @@ impl Lowerer {
             Expr::AddressOf(inner, _) => {
                 // Address-of wraps in Pointer
                 if let Some(inner_ct) = self.get_expr_ctype(inner) {
-                    return Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default));
+                    return Some(CType::Pointer(Box::new(inner_ct), AccessQuals::NONE));
                 }
                 None
             }
@@ -1251,7 +1251,7 @@ impl Lowerer {
             Expr::Comma(_, last, _) => self.get_expr_ctype(last),
             Expr::StringLiteral(_, _) => {
                 // String literals have type char[] which decays to char*
-                Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default))
+                Some(CType::Pointer(Box::new(CType::Char), AccessQuals::NONE))
             }
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 self.get_binop_ctype(op, lhs, rhs)
@@ -1296,9 +1296,9 @@ impl Lowerer {
             Expr::FloatLiteralF32(_, _) => Some(CType::Float),
             Expr::FloatLiteralLongDouble(_, _, _) => Some(CType::LongDouble),
             // Wide string literal L"..." has type wchar_t* (which is int* on all targets)
-            Expr::WideStringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default)),
+            Expr::WideStringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Int), AccessQuals::NONE)),
             // char16_t string literal u"..." has type char16_t* (which is unsigned short*)
-            Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::UShort), AddressSpace::Default)),
+            Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::UShort), AccessQuals::NONE)),
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
@@ -1512,7 +1512,7 @@ impl Lowerer {
                 if let Some(inner_ct) = self.get_expr_ctype(inner)
                     .or_else(|| self.get_expr_ctype_with_scope(inner, scope))
                 {
-                    return Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default));
+                    return Some(CType::Pointer(Box::new(inner_ct), AccessQuals::NONE));
                 }
                 None
             }

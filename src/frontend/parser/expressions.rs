@@ -184,12 +184,16 @@ impl Parser {
             let save = self.pos;
             let save_typedef = self.attrs.parsing_typedef();
             let save_const = self.attrs.parsing_const();
+            let save_volatile = self.attrs.take_volatile();
             let save_vector_size = self.attrs.parsing_vector_size.take();
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
                 if let Some(type_spec) = self.parse_type_specifier() {
                     let mut result_type = self.parse_abstract_declarator_suffix(type_spec);
+                    if self.attrs.parsing_volatile() {
+                        result_type.mark_volatile_pointers();
+                    }
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
                     if matches!(self.peek(), TokenKind::RParen) {
@@ -200,6 +204,7 @@ impl Parser {
                             let init = self.parse_initializer();
                             let lit = Expr::CompoundLiteral(result_type, Box::new(init), span);
                             self.attrs.set_const(save_const);
+                            self.attrs.restore_volatile(save_volatile);
                             // Restore outer vector attrs so the enclosing declaration can use them
                             self.attrs.parsing_vector_size = save_vector_size;
                             self.attrs.parsing_ext_vector_nelem = save_ext_vector;
@@ -207,6 +212,7 @@ impl Parser {
                         }
                         let expr = self.parse_cast_expr();
                         self.attrs.set_const(save_const);
+                        self.attrs.restore_volatile(save_volatile);
                         // Restore outer vector attrs so the enclosing declaration can use them
                         self.attrs.parsing_vector_size = save_vector_size;
                         self.attrs.parsing_ext_vector_nelem = save_ext_vector;
@@ -217,6 +223,7 @@ impl Parser {
             self.pos = save;
             self.attrs.set_typedef(save_typedef);
             self.attrs.set_const(save_const);
+            self.attrs.restore_volatile(save_volatile);
             self.attrs.parsing_vector_size = save_vector_size;
             self.attrs.parsing_ext_vector_nelem = save_ext_vector;
         }

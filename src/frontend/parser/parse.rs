@@ -95,6 +95,9 @@ pub(super) mod parsed_attr_flag {
     pub const FASTCALL: u32         = 1 << 17;
     /// `__attribute__((naked))` encountered — emit no prologue/epilogue.
     pub const NAKED: u32            = 1 << 18;
+    /// `volatile` after a `*` (`int *volatile p`): the pointer itself is
+    /// volatile. Always set together with VOLATILE.
+    pub const PTR_VOLATILE: u32     = 1 << 19;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -154,6 +157,7 @@ impl ParsedDeclAttrs {
     #[inline] pub fn parsing_inline(&self) -> bool           { self.flags & parsed_attr_flag::INLINE != 0 }
     #[inline] pub fn parsing_const(&self) -> bool            { self.flags & parsed_attr_flag::CONST != 0 }
     #[inline] pub fn parsing_volatile(&self) -> bool         { self.flags & parsed_attr_flag::VOLATILE != 0 }
+    #[inline] pub fn parsing_ptr_volatile(&self) -> bool     { self.flags & parsed_attr_flag::PTR_VOLATILE != 0 }
     #[inline] pub fn parsing_constructor(&self) -> bool      { self.flags & parsed_attr_flag::CONSTRUCTOR != 0 }
     #[inline] pub fn parsing_destructor(&self) -> bool       { self.flags & parsed_attr_flag::DESTRUCTOR != 0 }
     #[inline] pub fn parsing_weak(&self) -> bool             { self.flags & parsed_attr_flag::WEAK != 0 }
@@ -176,6 +180,28 @@ impl ParsedDeclAttrs {
     #[inline] pub fn set_inline(&mut self, v: bool)           { self.set_flag(parsed_attr_flag::INLINE, v) }
     #[inline] pub fn set_const(&mut self, v: bool)            { self.set_flag(parsed_attr_flag::CONST, v) }
     #[inline] pub fn set_volatile(&mut self, v: bool)         { self.set_flag(parsed_attr_flag::VOLATILE, v) }
+    #[inline] pub fn set_ptr_volatile(&mut self, v: bool)     { self.set_flag(parsed_attr_flag::PTR_VOLATILE, v) }
+
+    /// Clear the volatile flags for a nested declaration or type name,
+    /// returning them for `restore_volatile`.
+    pub fn take_volatile(&mut self) -> u32 {
+        let mask = parsed_attr_flag::VOLATILE | parsed_attr_flag::PTR_VOLATILE;
+        let saved = self.flags & mask;
+        self.flags &= !mask;
+        saved
+    }
+
+    pub fn restore_volatile(&mut self, saved: u32) {
+        let mask = parsed_attr_flag::VOLATILE | parsed_attr_flag::PTR_VOLATILE;
+        self.flags = (self.flags & !mask) | saved;
+    }
+
+    /// Whether an object declared under these flags is itself volatile:
+    /// `volatile` after a `*`, or anywhere when its type has no pointer
+    /// (`volatile int x`, but not `volatile int *p`).
+    pub fn object_volatile(&self, has_pointer: bool) -> bool {
+        self.parsing_ptr_volatile() || (self.parsing_volatile() && !has_pointer)
+    }
     #[inline] pub fn set_constructor(&mut self, v: bool)      { self.set_flag(parsed_attr_flag::CONSTRUCTOR, v) }
     #[inline] pub fn set_destructor(&mut self, v: bool)       { self.set_flag(parsed_attr_flag::DESTRUCTOR, v) }
     #[inline] pub fn set_weak(&mut self, v: bool)             { self.set_flag(parsed_attr_flag::WEAK, v) }
@@ -249,6 +275,9 @@ pub struct Parser {
     pub(super) tokens: Vec<Token>,
     pub(super) pos: usize,
     pub(super) typedefs: FxHashSet<String>,
+    /// Typedef names for volatile object types (`typedef volatile int vint;`):
+    /// a declaration or type name using one is volatile as if written so.
+    pub(super) volatile_typedefs: FxHashSet<String>,
     /// Typedef names shadowed by local variable declarations in the current scope.
     pub(super) shadowed_typedefs: FxHashSet<String>,
     /// Accumulated declaration attributes from the current parse_type_specifier pass.
@@ -291,6 +320,7 @@ impl Parser {
             tokens,
             pos: 0,
             typedefs: Self::builtin_typedefs(),
+            volatile_typedefs: FxHashSet::default(),
             shadowed_typedefs: FxHashSet::default(),
             attrs: ParsedDeclAttrs::default(),
             pragma_pack_stack: Vec::new(),
@@ -578,6 +608,7 @@ impl Parser {
                     // `T *volatile p` marks `p` as volatile (preventing
                     // mem2reg from promoting it to a register).
                     self.attrs.set_volatile(true);
+                    self.attrs.set_ptr_volatile(true);
                 }
                 TokenKind::SegGs => {
                     self.advance();

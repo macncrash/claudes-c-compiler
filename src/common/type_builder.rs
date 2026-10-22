@@ -9,7 +9,7 @@
 //! (typedef names, struct/union, enum, typeof), so implementors provide just those
 //! via required trait methods. This ensures primitive type mapping can never diverge.
 
-use crate::common::types::{AddressSpace, CType, FunctionType};
+use crate::common::types::{AccessQuals, CType, FunctionType};
 use crate::frontend::parser::ast::{
     DerivedDeclarator, EnumVariant, Expr, ParamDecl, StructFieldDecl, TypeSpecifier,
 };
@@ -100,7 +100,7 @@ pub trait TypeConvertContext {
                     return_type: ret_ctype,
                     params: param_ctypes,
                     variadic: *variadic,
-                }))), AddressSpace::Default)
+                }))), AccessQuals::NONE)
             }
             TypeSpecifier::BareFunction(return_type, params, variadic) => {
                 // Bare function type (no pointer wrapper) — produced by typeof on
@@ -149,7 +149,7 @@ pub trait TypeConvertContext {
 fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
     for i in 0..derived.len() {
         // Look for Pointer followed by FunctionPointer
-        if matches!(&derived[i], DerivedDeclarator::Pointer)
+        if matches!(&derived[i], DerivedDeclarator::Pointer(_))
             && i + 1 < derived.len()
                 && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(_, _))
             {
@@ -227,8 +227,8 @@ pub fn build_full_ctype_with_base(
         // We fold prefix Pointer declarators into the base to form the return type.
         let mut result = base;
         for d in &derived[..fp_start] {
-            if matches!(d, DerivedDeclarator::Pointer) {
-                result = CType::Pointer(Box::new(result), AddressSpace::Default);
+            if matches!(d, DerivedDeclarator::Pointer(_)) {
+                result = CType::Pointer(Box::new(result), AccessQuals::NONE);
             }
             // Array declarators in prefix are outer wrappers, handled after the core.
         }
@@ -238,7 +238,7 @@ pub fn build_full_ctype_with_base(
         let mut i = fp_start;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer => {
+                DerivedDeclarator::Pointer(_) => {
                     // `Pointer, FunctionPointer` is one pointer-to-function layer.
                     // A Pointer before a plain Function wraps the type built so
                     // far, and the Function is an outer layer: for
@@ -258,10 +258,10 @@ pub fn build_full_ctype_with_base(
                             params: param_types,
                             variadic,
                         }));
-                        result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
+                        result = CType::Pointer(Box::new(func_type), AccessQuals::NONE);
                         i += 2;
                     } else {
-                        result = CType::Pointer(Box::new(result), AddressSpace::Default);
+                        result = CType::Pointer(Box::new(result), AccessQuals::NONE);
                         i += 1;
                     }
                 }
@@ -272,7 +272,7 @@ pub fn build_full_ctype_with_base(
                         params: param_types,
                         variadic: *variadic,
                     }));
-                    result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
+                    result = CType::Pointer(Box::new(func_type), AccessQuals::NONE);
                     i += 1;
                 }
                 DerivedDeclarator::Function(params, variadic) => {
@@ -320,8 +320,8 @@ pub fn build_full_ctype_with_base(
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer => {
-                    result = CType::Pointer(Box::new(result), AddressSpace::Default);
+                DerivedDeclarator::Pointer(_) => {
+                    result = CType::Pointer(Box::new(result), AccessQuals::NONE);
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {

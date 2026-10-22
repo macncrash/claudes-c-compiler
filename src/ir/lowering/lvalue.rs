@@ -6,7 +6,7 @@ use crate::ir::reexports::{
     Operand,
     Value,
 };
-use crate::common::types::{AddressSpace, IrType, CType};
+use crate::common::types::{AccessQuals, AddressSpace, IrType, CType};
 use super::lower::Lowerer;
 use super::definitions::LValue;
 
@@ -21,6 +21,7 @@ impl Lowerer {
                 // (which includes StructLayout, CType, and Vecs).
                 if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
                     let alloca = info.alloca;
+                    let quals = info.quals;
                     let static_global_name = info.static_global_name.clone();
                     // Local register variables (e.g., `register void *tos asm("r11")`)
                     // always have backing allocas that support assignment. Even when declared
@@ -37,15 +38,19 @@ impl Lowerer {
                     if let Some(global_name) = static_global_name {
                         let addr = self.fresh_value();
                         self.emit(Instruction::GlobalAddr { dest: addr, name: global_name });
-                        return Some(LValue::Address(addr, AddressSpace::Default));
+                        return Some(LValue::Address(addr, quals));
+                    }
+                    if quals != AccessQuals::NONE {
+                        return Some(LValue::Address(alloca, quals));
                     }
                     return Some(LValue::Variable(alloca));
                 }
                 // Static local variables: resolve through mangled name
                 if let Some(mangled) = self.func_state.as_ref().and_then(|fs| fs.static_local_names.get(name).cloned()) {
+                    let quals = self.globals.get(&mangled).map_or(AccessQuals::NONE, |g| g.quals);
                     let addr = self.fresh_value();
                     self.emit(Instruction::GlobalAddr { dest: addr, name: mangled });
-                    return Some(LValue::Address(addr, AddressSpace::Default));
+                    return Some(LValue::Address(addr, quals));
                 }
                 if let Some(ginfo) = self.globals.get(name) {
                     // Global register variables have no storage, so they are not
@@ -55,37 +60,38 @@ impl Lowerer {
                     if ginfo.asm_register.is_some() {
                         return None;
                     }
-                    let addr_space = ginfo.address_space;
+                    let quals = ginfo.quals;
                     // Global variable: emit GlobalAddr to get its address
                     let addr = self.fresh_value();
                     self.emit(Instruction::GlobalAddr { dest: addr, name: name.clone() });
-                    Some(LValue::Address(addr, addr_space))
+                    Some(LValue::Address(addr, quals))
                 } else {
                     None
                 }
             }
             Expr::Deref(inner, _) => {
                 // *ptr -> the address is the value of ptr
-                let addr_space = self.get_addr_space_of_ptr_expr(inner);
+                let quals = self.pointee_quals(inner);
                 let ptr_val = self.lower_expr(inner);
                 match ptr_val {
-                    Operand::Value(v) => Some(LValue::Address(v, addr_space)),
+                    Operand::Value(v) => Some(LValue::Address(v, quals)),
                     Operand::Const(_) => {
                         // Constant address - copy to a value
                         let dest = self.fresh_value();
                         self.emit(Instruction::Copy { dest, src: ptr_val });
-                        Some(LValue::Address(dest, addr_space))
+                        Some(LValue::Address(dest, quals))
                     }
                 }
             }
             Expr::ArraySubscript(base, index, _) => {
                 // base[index] -> compute address of element
+                let quals = self.object_quals(expr);
                 let addr = self.compute_array_element_addr(base, index);
-                Some(LValue::Address(addr, AddressSpace::Default))
+                Some(LValue::Address(addr, quals))
             }
             Expr::MemberAccess(base_expr, field_name, _) => {
                 // s.field as lvalue -> compute address of the field
-                let addr_space = self.get_addr_space_of_struct_expr(base_expr);
+                let quals = self.object_quals(expr);
                 let (field_offset, _field_ty) = self.resolve_member_access(base_expr, field_name);
                 let base_addr = self.get_struct_base_addr(base_expr);
                 let field_addr = self.fresh_value();
@@ -95,11 +101,11 @@ impl Lowerer {
                     offset: Operand::Const(IrConst::ptr_int(field_offset as i64)),
                     ty: IrType::Ptr,
                 });
-                Some(LValue::Address(field_addr, addr_space))
+                Some(LValue::Address(field_addr, quals))
             }
             Expr::PointerMemberAccess(base_expr, field_name, _) => {
                 // p->field as lvalue -> load pointer, compute field address
-                let addr_space = self.get_addr_space_of_ptr_expr(base_expr);
+                let quals = self.object_quals(expr);
                 let ptr_val = self.lower_expr(base_expr);
                 let base_addr = match ptr_val {
                     Operand::Value(v) => v,
@@ -117,13 +123,13 @@ impl Lowerer {
                     offset: Operand::Const(IrConst::ptr_int(field_offset as i64)),
                     ty: IrType::Ptr,
                 });
-                Some(LValue::Address(field_addr, addr_space))
+                Some(LValue::Address(field_addr, quals))
             }
             Expr::UnaryOp(UnaryOp::RealPart, inner, _) => {
                 // __real__ z as lvalue -> address of real part (offset 0 from complex base)
                 if let Some(lv) = self.lower_lvalue(inner) {
                     let addr = self.lvalue_addr(&lv);
-                    Some(LValue::Address(addr, AddressSpace::Default))
+                    Some(LValue::Address(addr, self.lvalue_quals(&lv)))
                 } else {
                     None
                 }
@@ -132,6 +138,7 @@ impl Lowerer {
                 // __imag__ z as lvalue -> address of imag part (offset = sizeof(component))
                 if let Some(lv) = self.lower_lvalue(inner) {
                     let addr = self.lvalue_addr(&lv);
+                    let quals = self.lvalue_quals(&lv);
                     let inner_ct = self.expr_ctype(inner);
                     let comp_size = Self::complex_component_size(&inner_ct) as i64;
                     let imag_addr = self.fresh_value();
@@ -141,7 +148,7 @@ impl Lowerer {
                         offset: Operand::Const(IrConst::I64(comp_size)),
                         ty: IrType::I8,
                     });
-                    Some(LValue::Address(imag_addr, AddressSpace::Default))
+                    Some(LValue::Address(imag_addr, quals))
                 } else {
                     None
                 }
@@ -165,28 +172,28 @@ impl Lowerer {
         }
     }
 
-    /// Get the address space from an LValue.
-    pub(super) fn lvalue_addr_space(&self, lv: &LValue) -> AddressSpace {
+    /// Get the object's qualifiers from an LValue.
+    pub(super) fn lvalue_quals(&self, lv: &LValue) -> AccessQuals {
         match lv {
-            LValue::Variable(_) => AddressSpace::Default,
-            LValue::Address(_, seg) => *seg,
+            LValue::Variable(_) => AccessQuals::NONE,
+            LValue::Address(_, quals) => *quals,
         }
     }
 
     /// Load the value from an lvalue with a specific type.
     pub(super) fn load_lvalue_typed(&mut self, lv: &LValue, ty: IrType) -> Operand {
         let addr = self.lvalue_addr(lv);
-        let seg_override = self.lvalue_addr_space(lv);
+        let quals = self.lvalue_quals(lv);
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { dest, ptr: addr, ty , seg_override });
+        self.emit(Instruction::Load { dest, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile });
         Operand::Value(dest)
     }
 
     /// Store a value to an lvalue with a specific type.
     pub(super) fn store_lvalue_typed(&mut self, lv: &LValue, val: Operand, ty: IrType) {
         let addr = self.lvalue_addr(lv);
-        let seg_override = self.lvalue_addr_space(lv);
-        self.emit(Instruction::Store { val, ptr: addr, ty , seg_override });
+        let quals = self.lvalue_quals(lv);
+        self.emit(Instruction::Store { val, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile });
     }
 
     /// Compute the address of an array element: base_addr + index * elem_size.
@@ -287,7 +294,7 @@ impl Lowerer {
                             return Operand::Value(addr);
                         } else {
                             let loaded = self.fresh_value();
-                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
                             return Operand::Value(loaded);
                         }
                     }
@@ -296,7 +303,7 @@ impl Lowerer {
                         return Operand::Value(info.alloca);
                     } else {
                         let loaded = self.fresh_value();
-                        self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
                         return Operand::Value(loaded);
                     }
                 }
@@ -310,7 +317,7 @@ impl Lowerer {
                             return Operand::Value(addr);
                         } else {
                             let loaded = self.fresh_value();
-                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
                             return Operand::Value(loaded);
                         }
                     }
@@ -323,7 +330,7 @@ impl Lowerer {
                         return Operand::Value(addr);
                     } else {
                         let loaded = self.fresh_value();
-                        self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
                         return Operand::Value(loaded);
                     }
                 }

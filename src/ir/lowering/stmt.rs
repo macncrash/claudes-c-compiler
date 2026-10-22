@@ -21,7 +21,7 @@ use crate::ir::reexports::{
     Terminator,
     Value,
 };
-use crate::common::types::{AddressSpace, IrType, CType, StructLayout, target_int_ir_type};
+use crate::common::types::{AccessQuals, AddressSpace, IrType, CType, StructLayout, target_int_ir_type};
 use super::lower::Lowerer;
 use super::definitions::{LocalInfo, GlobalInfo, DeclAnalysis, FuncSig};
 use crate::frontend::sema::type_context::extract_fptr_typedef_info;
@@ -141,7 +141,7 @@ impl Lowerer {
                     if da.is_array || da.is_struct || is_complex { IrType::Ptr } else { da.var_ty },
                     da.actual_alloc_size,
                     alloca_align,
-                    decl.is_volatile(),
+                    decl.object_quals(declarator).volatile,
                 )
             };
 
@@ -309,7 +309,7 @@ impl Lowerer {
         explicit_align: usize, vla_size: Option<Value>,
     ) {
         let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
-        local_info.var.address_space = decl.address_space;
+        local_info.var.quals = decl.object_quals(declarator);
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
         }
@@ -339,7 +339,7 @@ impl Lowerer {
                 // syntax marker (1) plus any return-type pointer indirections.
                 // If there are return-type pointers, the return type is a pointer.
                 let ptr_count_before = declarator.derived[..i].iter()
-                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)))
+                    .filter(|d| matches!(d, DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)))
                     .count();
                 // Subtract 1 for the syntax marker pointer
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
@@ -396,7 +396,8 @@ impl Lowerer {
         // self-referential initializers (e.g., static struct work w = { .entry = { &w.entry, &w.entry } })
         // can resolve &w.entry via resolve_chained_member_access -> self.globals.get().
         // This mirrors the same pattern used in lower_global_decl().
-        let ginfo = GlobalInfo::from_analysis(da);
+        let mut ginfo = GlobalInfo::from_analysis(da);
+        ginfo.var.quals = decl.object_quals(declarator);
         self.globals.insert(static_name.clone(), ginfo);
 
         // Determine initializer (evaluated at compile time for static locals)
@@ -488,6 +489,7 @@ impl Lowerer {
         // Store type info in locals (with static_global_name set so each use site
         // emits a fresh GlobalAddr in its own basic block, avoiding unreachable-block issues).
         let mut local_info = LocalInfo::for_static(da, static_name, decl.is_const());
+        local_info.var.quals = decl.object_quals(declarator);
         if let Some(ea) = explicit_align {
             local_info.var.explicit_alignment = Some(ea);
         }
@@ -500,7 +502,7 @@ impl Lowerer {
         for (i, d) in declarator.derived.iter().enumerate() {
             if let DerivedDeclarator::FunctionPointer(params, _) = d {
                 let ptr_count_before = declarator.derived[..i].iter()
-                    .filter(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)))
+                    .filter(|d| matches!(d, DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)))
                     .count();
                 let return_type_ptrs = ptr_count_before.saturating_sub(1);
                 let ret_ty = if return_type_ptrs > 0 {
@@ -564,11 +566,11 @@ impl Lowerer {
                 let val = self.lower_expr(e);
                 let expr_ty = self.get_expr_type(e);
                 let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                self.emit(Instruction::Store { val, ptr: dest_addr, ty: comp_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { val, ptr: dest_addr, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
             }
         } else {
             let zero = Self::complex_zero(comp_ty);
-            self.emit(Instruction::Store { val: zero, ptr: dest_addr, ty: comp_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val: zero, ptr: dest_addr, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
         }
         // Store imag part
         let imag_ptr = self.emit_gep_offset(dest_addr, comp_size, IrType::I8);
@@ -577,11 +579,11 @@ impl Lowerer {
                 let val = self.lower_expr(e);
                 let expr_ty = self.get_expr_type(e);
                 let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                self.emit(Instruction::Store { val, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { val, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
             }
         } else {
             let zero = Self::complex_zero(comp_ty);
-            self.emit(Instruction::Store { val: zero, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val: zero, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
         }
     }
 
@@ -749,7 +751,7 @@ impl Lowerer {
                             } else {
                                 let val = self.lower_and_cast_init_expr(e, field_ty);
                                 let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
-                                self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty , seg_override: AddressSpace::Default });
+                                self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty , seg_override: AddressSpace::Default, volatile: false });
                             }
                         } else if let CType::Struct(ref key) | CType::Union(ref key) = **elem_ty {
                             // Array-of-structs field with flat expression initializer:
@@ -782,7 +784,7 @@ impl Lowerer {
                             let elem_is_bool = **elem_ty == CType::Bool;
                             let val = self.lower_init_expr_bool_aware(e, elem_ir_ty, elem_is_bool);
                             let field_addr = self.emit_gep_offset(base, field_offset, elem_ir_ty);
-                            self.emit(Instruction::Store { val, ptr: field_addr, ty: elem_ir_ty , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Store { val, ptr: field_addr, ty: elem_ir_ty , seg_override: AddressSpace::Default, volatile: false });
                             // Consume additional items for remaining array elements
                             let mut arr_idx = 1usize;
                             while arr_idx < arr_size && item_idx + 1 < items.len() {
@@ -801,7 +803,7 @@ impl Lowerer {
                                     let next_val = self.lower_init_expr_bool_aware(next_e, elem_ir_ty, elem_is_bool);
                                     let offset = field_offset + arr_idx * elem_size;
                                     let elem_addr = self.emit_gep_offset(base, offset, elem_ir_ty);
-                                    self.emit(Instruction::Store { val: next_val, ptr: elem_addr, ty: elem_ir_ty , seg_override: AddressSpace::Default });
+                                    self.emit(Instruction::Store { val: next_val, ptr: elem_addr, ty: elem_ir_ty , seg_override: AddressSpace::Default, volatile: false });
                                 }
                                 arr_idx += 1;
                             }
@@ -810,9 +812,9 @@ impl Lowerer {
                         let val = self.lower_init_expr_bool_aware(e, field_ty, field.ty == CType::Bool);
                         let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
                         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-                            self.store_bitfield(field_addr, field_ty, bit_offset, bit_width, val);
+                            self.store_bitfield(field_addr, field_ty, bit_offset, bit_width, val, AccessQuals::NONE);
                         } else {
-                            self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Store { val, ptr: field_addr, ty: field_ty , seg_override: AddressSpace::Default, volatile: false });
                         }
                     }
                 }
@@ -895,7 +897,7 @@ impl Lowerer {
                     if let Initializer::Expr(e) = &first.init {
                         let field_ir_ty = IrType::from_ctype(field_ctype);
                         let val = self.lower_init_expr_bool_aware(e, field_ir_ty, *field_ctype == CType::Bool);
-                        self.emit(Instruction::Store { val, ptr: base, ty: field_ir_ty , seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Store { val, ptr: base, ty: field_ir_ty , seg_override: AddressSpace::Default, volatile: false });
                     }
                 }
             }
@@ -1335,7 +1337,7 @@ impl Lowerer {
     /// If the outermost (last) derivation is an Array and there's a Pointer
     /// before it, the array elements are pointers (8 bytes on 64-bit).
     fn vla_base_element_size(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> usize {
-        let has_pointer = derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
+        let has_pointer = derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let has_func_ptr = derived.iter().any(|d| matches!(d,
             DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)));
         let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));

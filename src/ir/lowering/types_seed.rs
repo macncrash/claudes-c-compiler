@@ -4,7 +4,7 @@
 //! sys/types.h, etc.) and registers known libc math function signatures
 //! for correct calling convention.
 
-use crate::common::types::{AddressSpace, IrType, CType};
+use crate::common::types::{AccessQuals, IrType, CType};
 use super::lower::Lowerer;
 use super::definitions::FuncSig;
 
@@ -75,7 +75,7 @@ impl Lowerer {
             // <time.h>
             ("time_t", long_s.clone()),
             ("clock_t", long_s.clone()),
-            ("timer_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("timer_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             ("clockid_t", CType::Int),
             // <sys/types.h>
             ("off_t", long_s.clone()),
@@ -101,24 +101,24 @@ impl Lowerer {
             ("__s32", CType::Int),
             ("__s64", i64_type),
             // <locale.h>
-            ("locale_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("locale_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             // <pthread.h> - opaque types, treat as unsigned long or pointer
             ("pthread_t", size_type),
-            ("pthread_mutex_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("pthread_cond_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("pthread_mutex_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
+            ("pthread_cond_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             ("pthread_key_t", CType::UInt),
-            ("pthread_attr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("pthread_attr_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             ("pthread_once_t", CType::Int),
-            ("pthread_mutexattr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("pthread_condattr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("pthread_mutexattr_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
+            ("pthread_condattr_t", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             // <setjmp.h>
-            ("jmp_buf", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("sigjmp_buf", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("jmp_buf", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
+            ("sigjmp_buf", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             // <stdio.h>
-            ("FILE", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("FILE", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
             ("fpos_t", ssize_type),
             // <dirent.h>
-            ("DIR", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            ("DIR", CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)),
         ];
         for (name, ct) in builtins {
             self.types.typedefs.insert(name.to_string(), ct.clone());
@@ -128,11 +128,11 @@ impl Lowerer {
         let va_list_type = match self.target {
             Target::Riscv64 => {
                 // RISC-V: va_list = void * (8 bytes, passed by value)
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
+                CType::Pointer(Box::new(CType::Void), AccessQuals::NONE)
             }
             Target::Aarch64 if self.target.is_darwin() => {
                 // Apple arm64: va_list = char * (walks 8-byte stack slots)
-                CType::Pointer(Box::new(CType::Char), AddressSpace::Default)
+                CType::Pointer(Box::new(CType::Char), AccessQuals::NONE)
             }
             Target::Aarch64 => {
                 // AArch64: va_list is a 32-byte struct, represented as char[32]
@@ -144,7 +144,7 @@ impl Lowerer {
             }
             Target::I686 => {
                 // i686 cdecl: va_list = char* (simple pointer to stack args)
-                CType::Pointer(Box::new(CType::Char), AddressSpace::Default)
+                CType::Pointer(Box::new(CType::Char), AccessQuals::NONE)
             }
         };
         self.types.typedefs.insert("va_list".to_string(), va_list_type.clone());

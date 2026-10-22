@@ -94,7 +94,7 @@ impl Lowerer {
                 _ => {
                     // Scalar source: store the value directly at offset 0
                     let store_ty = self.get_expr_type(inner);
-                    self.emit(Instruction::Store { val: src, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { val: src, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default, volatile: false });
                 }
             }
 
@@ -117,7 +117,7 @@ impl Lowerer {
             let ptr = self.operand_to_value(src);
             let to_ty = self.type_spec_to_ir(target_type);
             let dest = self.fresh_value();
-            self.emit(Instruction::Load { dest, ptr, ty: to_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { dest, ptr, ty: to_ty, seg_override: AddressSpace::Default, volatile: false });
             return Operand::Value(dest);
         }
 
@@ -134,7 +134,7 @@ impl Lowerer {
             // Zero-initialize in case source is smaller than vector
             self.zero_init_alloca(alloca, vec_size);
             // Store scalar at offset 0 (bitwise reinterpretation)
-            self.emit(Instruction::Store { val: src, ptr: alloca, ty: from_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val: src, ptr: alloca, ty: from_ty, seg_override: AddressSpace::Default, volatile: false });
             return Operand::Value(alloca);
         }
 
@@ -247,7 +247,7 @@ impl Lowerer {
         let is_scalar = struct_layout.is_none() && !matches!(ctype, CType::Array(_, _)) && !ctype.is_vector();
         if is_scalar {
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { dest: loaded, ptr: alloca, ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load { dest: loaded, ptr: alloca, ty , seg_override: AddressSpace::Default, volatile: false });
             Operand::Value(loaded)
         } else {
             Operand::Value(alloca)
@@ -329,7 +329,7 @@ impl Lowerer {
                             val
                         };
                         if current_idx == 0 && items.len() == 1 && elem_size == size {
-                            self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default, volatile: false });
                         } else {
                             let offset_val = Operand::Const(IrConst::ptr_int(elem_offset as i64));
                             let elem_ptr = self.fresh_value();
@@ -337,7 +337,7 @@ impl Lowerer {
                                 dest: elem_ptr, base: alloca, offset: offset_val, ty,
                             });
                             let store_ty = vector_elem_ir_ty.unwrap_or_else(|| Self::ir_type_for_size(elem_size));
-                            self.emit(Instruction::Store { val, ptr: elem_ptr, ty: store_ty , seg_override: AddressSpace::Default });
+                            self.emit(Instruction::Store { val, ptr: elem_ptr, ty: store_ty , seg_override: AddressSpace::Default, volatile: false });
                         }
                     }
                 }
@@ -382,7 +382,7 @@ impl Lowerer {
                                         dest: elem_ptr, base: alloca, offset: offset_val, ty,
                                     });
                                     let store_ty = Self::ir_type_for_size(elem_size);
-                                    self.emit(Instruction::Store { val, ptr: elem_ptr, ty: store_ty , seg_override: AddressSpace::Default });
+                                    self.emit(Instruction::Store { val, ptr: elem_ptr, ty: store_ty , seg_override: AddressSpace::Default, volatile: false });
                                 }
                             }
                         }
@@ -579,11 +579,11 @@ impl Lowerer {
                         self.emit_string_to_alloca(alloca, s, 0, size);
                     } else {
                         let val = self.lower_expr(expr);
-                        self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default, volatile: false });
                     }
                 } else {
                     let val = self.lower_expr(expr);
-                    self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default, volatile: false });
                 }
             }
             Initializer::List(items) => {
@@ -797,12 +797,12 @@ impl Lowerer {
             }
         }
 
-        let addr_space = self.get_addr_space_of_ptr_expr(inner);
+        let quals = self.pointee_quals(inner);
         let ptr = self.lower_expr(inner);
         let dest = self.fresh_value();
         let deref_ty = self.get_pointee_type_of_expr(inner).unwrap_or(crate::common::types::target_int_ir_type());
         let ptr_val = self.operand_to_value(ptr);
-        self.emit(Instruction::Load { dest, ptr: ptr_val, ty: deref_ty, seg_override: addr_space });
+        self.emit(Instruction::Load { dest, ptr: ptr_val, ty: deref_ty, seg_override: quals.space, volatile: quals.volatile });
         Operand::Value(dest)
     }
 
@@ -822,11 +822,11 @@ impl Lowerer {
                 return Operand::Value(addr);
             }
         }
-        let addr_space = self.get_addr_space_of_ptr_expr(base);
+        let quals = self.object_quals(expr);
         let elem_ty = self.get_expr_type(expr);
         let addr = self.compute_array_element_addr(base, index);
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { dest, ptr: addr, ty: elem_ty, seg_override: addr_space });
+        self.emit(Instruction::Load { dest, ptr: addr, ty: elem_ty, seg_override: quals.space, volatile: quals.volatile });
         Operand::Value(dest)
     }
 
@@ -840,13 +840,13 @@ impl Lowerer {
         } else {
             self.resolve_member_access_with_ctype(base_expr, field_name)
         };
-        // Extract address space: for p->field from the pointer type,
-        // for s.field from the struct variable's address space qualifier.
-        let addr_space = if is_pointer {
-            self.get_addr_space_of_ptr_expr(base_expr)
+        // The field's qualifiers: for p->field from the pointer type,
+        // for s.field from the struct object's, and the field's own.
+        let quals = if is_pointer {
+            self.pointee_quals(base_expr)
         } else {
-            self.get_addr_space_of_struct_expr(base_expr)
-        };
+            self.object_quals(base_expr)
+        }.union(self.field_quals(base_expr, field_name, is_pointer));
 
         let base_addr = if is_pointer {
             let ptr_val = self.lower_expr(base_expr);
@@ -880,11 +880,11 @@ impl Lowerer {
         // For bitfields, use extract_bitfield_from_addr which handles split loads
         // (packed bitfields that span storage unit boundaries).
         if let Some((bit_offset, bit_width)) = bitfield {
-            return self.extract_bitfield_from_addr(field_addr, field_ty, bit_offset, bit_width);
+            return self.extract_bitfield_from_addr(field_addr, field_ty, bit_offset, bit_width, quals);
         }
 
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { dest, ptr: field_addr, ty: field_ty, seg_override: addr_space });
+        self.emit(Instruction::Load { dest, ptr: field_addr, ty: field_ty, seg_override: quals.space, volatile: quals.volatile });
         Operand::Value(dest)
     }
 
@@ -1171,6 +1171,7 @@ impl Lowerer {
                 ptr: va_list_ptr,
                 ty: IrType::Ptr,
                 seg_override: AddressSpace::Default,
+                volatile: false,
             });
             let align_val = struct_align as i64;
             let added = self.emit_binop_val(
@@ -1190,6 +1191,7 @@ impl Lowerer {
                 ptr: va_list_ptr,
                 ty: IrType::Ptr,
                 seg_override: AddressSpace::Default,
+                volatile: false,
             });
         }
 
@@ -1208,6 +1210,7 @@ impl Lowerer {
                     ptr: alloca,
                     ty: default_slot_ty,
                     seg_override: AddressSpace::Default,
+                    volatile: false,
                 });
             } else {
                 // Store at offset i * slot_size
@@ -1225,6 +1228,7 @@ impl Lowerer {
                     ptr: offset_ptr,
                     ty: default_slot_ty,
                     seg_override: AddressSpace::Default,
+                    volatile: false,
                 });
             }
         }
@@ -1275,12 +1279,12 @@ impl Lowerer {
                 volatile: false,
             });
             self.emit(Instruction::Store { val: Operand::Value(packed), ptr: tmp_alloca, ty: read_ty,
-             seg_override: AddressSpace::Default });
+             seg_override: AddressSpace::Default, volatile: false });
 
             // Load real part (first F32 at offset 0)
             let real_dest = self.fresh_value();
             self.emit(Instruction::Load { dest: real_dest, ptr: tmp_alloca, ty: IrType::F32,
-             seg_override: AddressSpace::Default });
+             seg_override: AddressSpace::Default, volatile: false });
 
             // Load imag part (second F32 at offset +4)
             let imag_ptr = self.fresh_value();
@@ -1294,7 +1298,7 @@ impl Lowerer {
             });
             let imag_dest = self.fresh_value();
             self.emit(Instruction::Load { dest: imag_dest, ptr: imag_ptr, ty: IrType::F32,
-             seg_override: AddressSpace::Default });
+             seg_override: AddressSpace::Default, volatile: false });
 
             // Allocate and store the complex float value
             let alloca = self.alloca_complex(ctype);

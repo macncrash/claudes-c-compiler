@@ -11,7 +11,7 @@ use crate::frontend::parser::ast::{
     TypeSpecifier,
     UnaryOp,
 };
-use crate::common::types::{AddressSpace, IrType, RcLayout, CType, target_ptr_size};
+use crate::common::types::{AccessQuals, IrType, RcLayout, CType, target_ptr_size};
 use super::lower::Lowerer;
 
 impl Lowerer {
@@ -65,7 +65,7 @@ impl Lowerer {
     /// For `int a[10]` (type_spec=Int, derived=[Array(10)]): returns Some(I32)
     pub(super) fn compute_pointee_type(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> Option<IrType> {
         // Count pointer and array levels
-        let ptr_count = derived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer)).count();
+        let ptr_count = derived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer(_))).count();
         let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
 
         if ptr_count > 1 {
@@ -469,44 +469,48 @@ impl Lowerer {
         }
     }
 
-    /// Get the address space of a pointer expression (e.g., `__seg_gs` from a
-    /// `typeof(x) __seg_gs *` cast). Returns `AddressSpace::Default` if unknown
-    /// or the expression is not a pointer with a named address space.
-    pub(super) fn get_addr_space_of_ptr_expr(&self, expr: &Expr) -> AddressSpace {
-        // Try CType-based resolution first
-        if let Some(CType::Pointer(_, addr_space)) = self.get_expr_ctype(expr) {
-            return addr_space;
+    /// The qualifiers of what a pointer or array expression points to:
+    /// `__seg_gs` from a `typeof(x) __seg_gs *` cast, `volatile` from a
+    /// `volatile int *` pointer, or an array's own qualifiers.
+    pub(super) fn pointee_quals(&self, expr: &Expr) -> AccessQuals {
+        match self.get_expr_ctype(expr) {
+            Some(CType::Pointer(_, quals)) => return quals,
+            Some(CType::Array(..)) => return self.object_quals(expr),
+            _ => {}
         }
         // For cast expressions, check the target type directly
-        if let Expr::Cast(TypeSpecifier::Pointer(_, addr_space), _, _) = expr {
-            return *addr_space;
+        if let Expr::Cast(TypeSpecifier::Pointer(_, quals), _, _) = expr {
+            return *quals;
         }
-        AddressSpace::Default
+        AccessQuals::NONE
     }
 
-    /// Get the address space of a struct/union variable expression (for `.` member access).
-    /// Walks through the expression to find the underlying variable and returns its
-    /// address space qualifier (e.g., SegGs for `__seg_gs` per-CPU variables).
-    pub(super) fn get_addr_space_of_struct_expr(&self, expr: &Expr) -> AddressSpace {
+    /// The qualifiers of the object an lvalue expression designates: those
+    /// of its variable or of the pointer it is reached through, and of the
+    /// struct fields on the way (e.g. SegGs for `__seg_gs` per-CPU variables).
+    pub(super) fn object_quals(&self, expr: &Expr) -> AccessQuals {
         match expr {
             Expr::Identifier(name, _) => {
-                if let Some(info) = self.lookup_var_info(name) {
-                    return info.address_space;
-                }
-                AddressSpace::Default
+                self.lookup_var_info(name).map_or(AccessQuals::NONE, |info| info.quals)
             }
-            // Nested member access: s.inner.field — propagate from outermost base
-            Expr::MemberAccess(base, _, _) => self.get_addr_space_of_struct_expr(base),
-            // Dereference of a __seg_gs pointer: (*p).field
-            Expr::Deref(inner, _) => self.get_addr_space_of_ptr_expr(inner),
+            Expr::MemberAccess(base, field, _) => {
+                self.object_quals(base).union(self.field_quals(base, field, false))
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                self.pointee_quals(base).union(self.field_quals(base, field, true))
+            }
+            Expr::Deref(inner, _) => self.pointee_quals(inner),
+            // Either operand may be the pointer: 3[arr] is arr[3].
+            Expr::ArraySubscript(base, index, _) => {
+                if matches!(self.get_expr_ctype(index), Some(CType::Pointer(..) | CType::Array(..))) {
+                    self.pointee_quals(index)
+                } else {
+                    self.pointee_quals(base)
+                }
+            }
             // Cast expression: check if the cast target has an address space
-            Expr::Cast(type_spec, _, _) => {
-                if let TypeSpecifier::Pointer(_, addr_space) = type_spec {
-                    return *addr_space;
-                }
-                AddressSpace::Default
-            }
-            _ => AddressSpace::Default,
+            Expr::Cast(TypeSpecifier::Pointer(_, quals), _, _) => *quals,
+            _ => AccessQuals::NONE,
         }
     }
 }

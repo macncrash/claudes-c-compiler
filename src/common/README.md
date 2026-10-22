@@ -120,7 +120,7 @@ CType::Void, Bool,
        Long, ULong, LongLong, ULongLong, Int128, UInt128,
        Float, Double, LongDouble,
        ComplexFloat, ComplexDouble, ComplexLongDouble,
-       Pointer(Box<CType>, AddressSpace),
+       Pointer(Box<CType>, AccessQuals),
        Array(Box<CType>, Option<usize>),
        Function(Box<FunctionType>),
        Struct(RcStr), Union(RcStr), Enum(EnumType),
@@ -306,6 +306,10 @@ variadic flag.
     integer's size.
 - `AddressSpace` -- GCC named address space extension for x86 segment-relative
   addressing: `Default`, `SegGs` (`__seg_gs`), `SegFs` (`__seg_fs`).
+- `AccessQuals` -- the qualifiers that change how an object is accessed: its
+  `AddressSpace` and `volatile`. On a pointer type they qualify the pointee.
+  Volatility is tracked conservatively (a `volatile` anywhere in a declaration
+  marks every pointer level in it).
 
 **StructLayoutProvider trait** -- Abstraction that lets CType methods compute
 sizes and alignments for struct types without depending on the lowering module.

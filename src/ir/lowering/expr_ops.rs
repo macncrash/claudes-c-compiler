@@ -606,7 +606,7 @@ impl Lowerer {
                     // load the packed data to match the other packed-data branch
                     if let Operand::Value(ptr) = then_val {
                         let loaded = s.fresh_value();
-                        s.emit(Instruction::Load { dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default });
+                        s.emit(Instruction::Load { dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default, volatile: false });
                         Operand::Value(loaded)
                     } else {
                         then_val
@@ -622,7 +622,7 @@ impl Lowerer {
                     // load the packed data to match the other packed-data branch
                     if let Operand::Value(ptr) = else_val {
                         let loaded = s.fresh_value();
-                        s.emit(Instruction::Load { dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default });
+                        s.emit(Instruction::Load { dest: loaded, ptr, ty: effective_ty, seg_override: AddressSpace::Default, volatile: false });
                         Operand::Value(loaded)
                     } else {
                         else_val
@@ -722,17 +722,17 @@ impl Lowerer {
 
         self.start_block(then_label);
         let then_val = then_fn(self);
-        self.emit(Instruction::Store { val: then_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { val: then_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default, volatile: false });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(else_label);
         let else_val = else_fn(self);
-        self.emit(Instruction::Store { val: else_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { val: else_val, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default, volatile: false });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: alloca_ty, seg_override: AddressSpace::Default, volatile: false });
         Operand::Value(result)
     }
 
@@ -808,7 +808,7 @@ impl Lowerer {
 
         let default_val = if is_and { 0 } else { 1 };
         self.emit(Instruction::Store { val: Operand::Const(make_int_const(default_val)), ptr: result_alloca, ty: int_ty,
-         seg_override: AddressSpace::Default });
+         seg_override: AddressSpace::Default, volatile: false });
 
         let (true_label, false_label) = if is_and {
             (rhs_label, end_label)
@@ -820,12 +820,12 @@ impl Lowerer {
         self.start_block(rhs_label);
         let rhs_val = self.lower_condition_expr(rhs);
         let rhs_bool = self.emit_cmp_val(IrCmpOp::Ne, rhs_val, Operand::Const(make_int_const(0)), int_ty);
-        self.emit(Instruction::Store { val: Operand::Value(rhs_bool), ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { val: Operand::Value(rhs_bool), ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default, volatile: false });
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load { dest: result, ptr: result_alloca, ty: int_ty, seg_override: AddressSpace::Default, volatile: false });
         Operand::Value(result)
     }
 
@@ -873,16 +873,16 @@ impl Lowerer {
     }
 
     fn try_lower_bitfield_inc_dec(&mut self, inner: &Expr, is_inc: bool, return_new: bool) -> Option<Operand> {
-        let (field_addr, storage_ty, bit_offset, bit_width) = self.resolve_bitfield_lvalue(inner)?;
+        let (field_addr, storage_ty, bit_offset, bit_width, quals) = self.resolve_bitfield_lvalue(inner)?;
 
-        let current_val = self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width);
+        let current_val = self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, quals);
 
         let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
         let wt = widened_op_type(IrType::I32);
         let one = if wt == IrType::I32 { IrConst::I32(1) } else { IrConst::I64(1) };
         let result = self.emit_binop_val(ir_op, current_val, Operand::Const(one), wt);
 
-        self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, Operand::Value(result));
+        self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, Operand::Value(result), quals);
 
         let ret_val = if return_new { Operand::Value(result) } else { current_val };
         Some(self.truncate_to_bitfield_value(ret_val, bit_width, storage_ty.is_signed()))

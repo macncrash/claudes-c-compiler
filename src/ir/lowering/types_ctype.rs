@@ -13,7 +13,7 @@ use crate::frontend::parser::ast::{
     StructFieldDecl,
     TypeSpecifier,
 };
-use crate::common::types::{AddressSpace, StructField, StructLayout, CType};
+use crate::common::types::{AccessQuals, StructField, StructLayout, CType};
 use super::lower::Lowerer;
 
 impl Lowerer {
@@ -40,7 +40,7 @@ impl Lowerer {
             CType::ComplexFloat => TypeSpecifier::ComplexFloat,
             CType::ComplexDouble => TypeSpecifier::ComplexDouble,
             CType::ComplexLongDouble => TypeSpecifier::ComplexLongDouble,
-            CType::Pointer(inner, _) => {
+            CType::Pointer(inner, quals) => {
                 // Special case: Pointer(Function(...)) -> FunctionPointer TypeSpecifier
                 // This preserves function pointer type info through the CType -> TypeSpecifier
                 // roundtrip, which is critical for typeof on function pointer variables.
@@ -54,13 +54,14 @@ impl Lowerer {
                             name: name.clone(),
                             fptr_params: None,
                             is_const: false,
+                            is_volatile: false,
                             vla_size_exprs: Vec::new(),
                             fptr_inner_ptr_depth: 0,
                         }
                     }).collect();
                     TypeSpecifier::FunctionPointer(Box::new(ret_ts), param_decls, ft.variadic)
                 } else {
-                    TypeSpecifier::Pointer(Box::new(Self::ctype_to_type_spec(inner)), AddressSpace::Default)
+                    TypeSpecifier::Pointer(Box::new(Self::ctype_to_type_spec(inner)), *quals)
                 }
             }
             CType::Array(elem, size) => TypeSpecifier::Array(
@@ -101,6 +102,7 @@ impl Lowerer {
                         name: name.clone(),
                         fptr_params: None,
                         is_const: false,
+                        is_volatile: false,
                         vla_size_exprs: Vec::new(),
                         fptr_inner_ptr_depth: 0,
                     }
@@ -153,7 +155,7 @@ impl Lowerer {
                 params: param_types,
                 variadic: false,
             }));
-            let result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
+            let result = CType::Pointer(Box::new(func_type), AccessQuals::NONE);
             return result;
         }
 
@@ -181,7 +183,7 @@ impl Lowerer {
                     params: param_types,
                     variadic: fti.variadic,
                 }));
-                return CType::Pointer(Box::new(func_type), AddressSpace::Default);
+                return CType::Pointer(Box::new(func_type), AccessQuals::NONE);
             }
         }
 
@@ -191,7 +193,8 @@ impl Lowerer {
         // adjusted to 'qualified pointer to type'". This handles typedef'd array types
         // like `typedef struct S name[1]` used as function parameters.
         if let CType::Array(elem, _) = ctype {
-            return CType::Pointer(elem, AddressSpace::Default);
+            let quals = if param.is_volatile { AccessQuals::VOLATILE } else { AccessQuals::NONE };
+            return CType::Pointer(elem, quals);
         }
         ctype
     }
@@ -228,7 +231,7 @@ impl Lowerer {
                 params: param_types,
                 variadic: fti.variadic,
             }));
-            return Some(CType::Pointer(Box::new(func_type), AddressSpace::Default));
+            return Some(CType::Pointer(Box::new(func_type), AccessQuals::NONE));
         }
         None
     }
@@ -297,6 +300,7 @@ impl Lowerer {
                     bit_width,
                     alignment: f.alignment,
                     is_packed: f.is_packed,
+                    is_volatile: f.is_volatile,
                 }
             }).collect();
             let mut layout = if is_union {

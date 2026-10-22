@@ -13,7 +13,7 @@ use crate::ir::reexports::{
     Value,
 };
 use std::rc::Rc;
-use crate::common::types::{AddressSpace, IrType, StructLayout, RcLayout, CType};
+use crate::common::types::{AccessQuals, AddressSpace, IrType, StructLayout, RcLayout, CType};
 use super::lower::Lowerer;
 
 impl Lowerer {
@@ -368,7 +368,7 @@ impl Lowerer {
                     }
                     // It's a pointer to struct: load the pointer
                     let loaded = self.fresh_value();
-                    self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
                     return loaded;
                 }
                 if self.globals.contains_key(name) {
@@ -486,7 +486,7 @@ impl Lowerer {
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let store_ty = Self::packed_store_type(alloc_size);
                     self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false });
-                    self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default, volatile: false });
                     alloca
                 }
             }
@@ -502,7 +502,7 @@ impl Lowerer {
                         let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                         let store_ty = Self::packed_store_type(alloc_size);
                         self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false });
-                        self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default, volatile: false });
                         alloca
                     } else {
                         // Struct returned by address: copy to a fresh temporary
@@ -536,7 +536,7 @@ impl Lowerer {
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let store_ty = Self::packed_store_type(alloc_size);
                     self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false });
-                    self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default, volatile: false });
                     alloca
                 } else {
                     let val = self.lower_expr(expr);
@@ -611,6 +611,14 @@ impl Lowerer {
         } else {
             self.get_layout_for_expr(base_expr)
         }
+    }
+
+    /// The qualifiers a field was declared with (volatile; a field has no
+    /// address space of its own).
+    pub(super) fn field_quals(&self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> AccessQuals {
+        let volatile = self.get_member_layout(base_expr, is_pointer)
+            .is_some_and(|layout| layout.field_is_volatile(field_name, &*self.types.borrow_struct_layouts()));
+        if volatile { AccessQuals::VOLATILE } else { AccessQuals::NONE }
     }
 
     /// Resolve member access: returns (byte_offset, ir_type_of_field).

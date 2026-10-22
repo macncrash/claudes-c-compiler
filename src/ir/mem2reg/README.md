@@ -45,8 +45,8 @@ An alloca is promotable if and only if **all three** conditions hold:
    argument, as the *value* operand of a `Store`, as a `GEP` base, as an `InlineAsm` input,
    or in a terminator -- its address has escaped and the alloca must remain in memory.
 
-3. **Not volatile.** Allocas marked `volatile: true` (corresponding to C `volatile` locals)
-   are never promoted. Volatile locals must reside in memory so their values survive
+3. **Not volatile.** Allocas marked `volatile: true` (corresponding to C `volatile` locals),
+   and allocas accessed by a volatile load or store, are never promoted. Volatile locals must reside in memory so their values survive
    `setjmp`/`longjmp` and are not cached in registers that `longjmp` would restore to stale
    values.
 

@@ -315,6 +315,8 @@ fn has_side_effects(inst: &Instruction) -> bool {
         // DynAlloca modifies the stack pointer at runtime - always has side effects
         Instruction::DynAlloca { .. } |
         Instruction::Store { .. } |
+        // A volatile read is an access in its own right, used or not.
+        Instruction::Load { volatile: true, .. } |
         Instruction::Call { .. } |
         Instruction::CallIndirect { .. } |
         Instruction::Memcpy { .. } |
@@ -362,8 +364,8 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(4)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
-                Instruction::Load { dest: Value(2), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
+                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Load { dest: Value(2), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),

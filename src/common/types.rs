@@ -202,6 +202,36 @@ pub enum AddressSpace {
     SegFs,
 }
 
+/// The type qualifiers that change how an object is accessed: its named
+/// address space and `volatile`. On a pointer type they qualify the
+/// pointed-to type; on an lvalue, the object itself.
+///
+/// `volatile` is tracked conservatively: a `volatile` anywhere in a
+/// declaration or type name marks every pointer level in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct AccessQuals {
+    pub space: AddressSpace,
+    pub volatile: bool,
+}
+
+impl AccessQuals {
+    pub const NONE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: false };
+    pub const VOLATILE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: true };
+
+    pub fn in_space(space: AddressSpace) -> Self {
+        AccessQuals { space, volatile: false }
+    }
+
+    /// The qualifiers of an object reached through both `self` and `other`,
+    /// e.g. a volatile field of a struct in a named address space.
+    pub fn union(self, other: AccessQuals) -> AccessQuals {
+        AccessQuals {
+            space: if self.space == AddressSpace::Default { other.space } else { self.space },
+            volatile: self.volatile || other.volatile,
+        }
+    }
+}
+
 /// Represents C types in the compiler.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CType {
@@ -228,7 +258,8 @@ pub enum CType {
     ComplexDouble,
     /// C99 _Complex long double: two f128 values (real, imag) - uses F128 storage per component
     ComplexLongDouble,
-    Pointer(Box<CType>, AddressSpace),
+    /// The qualifiers are the pointed-to type's.
+    Pointer(Box<CType>, AccessQuals),
     Array(Box<CType>, Option<usize>),
     Function(Box<FunctionType>),
     /// Struct type, identified by key (e.g., "struct.Foo" or "__anon_struct_7").
@@ -267,6 +298,8 @@ pub struct StructField {
     pub alignment: Option<usize>,
     /// Per-field __attribute__((packed)) - forces this field's alignment to 1.
     pub is_packed: bool,
+    /// Whether the field was declared volatile.
+    pub is_volatile: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -469,6 +502,7 @@ impl StructLayoutBuilder {
             ty: storage_ty,
             bit_offset: Some(bit_offset_in_storage),
             bit_width: Some(bw),
+            is_volatile: field.is_volatile,
         });
         self.bf_bit_pos += bw;
     }
@@ -521,6 +555,7 @@ impl StructLayoutBuilder {
             ty: field.ty.clone(),
             bit_offset: Some(field_bit_in_storage),
             bit_width: Some(bw),
+            is_volatile: field.is_volatile,
         });
 
         // Update bitfield tracking state
@@ -553,6 +588,7 @@ impl StructLayoutBuilder {
             ty: field.ty.clone(),
             bit_offset: None,
             bit_width: None,
+            is_volatile: field.is_volatile,
         });
 
         let is_flexible_array = matches!(&field.ty, CType::Array(_, None));
@@ -639,6 +675,8 @@ pub struct StructFieldLayout {
     pub bit_offset: Option<u32>,
     /// For bitfields: width in bits.
     pub bit_width: Option<u32>,
+    /// Whether the field was declared volatile.
+    pub is_volatile: bool,
 }
 
 impl StructLayout {
@@ -738,6 +776,7 @@ impl StructLayout {
                 ty: field.ty.clone(),
                 bit_offset: bf_offset,
                 bit_width: bf_width,
+                is_volatile: field.is_volatile,
             });
         }
 
@@ -1232,6 +1271,22 @@ impl StructLayout {
         None
     }
 
+    /// Whether a field, found as `field_offset` finds it, was declared
+    /// volatile or sits inside an anonymous member that was.
+    pub fn field_is_volatile(&self, name: &str, ctx: &dyn StructLayoutProvider) -> bool {
+        if let Some(f) = self.fields.iter().find(|f| f.name == name) {
+            return f.is_volatile;
+        }
+        for f in self.fields.iter().filter(|f| f.name.is_empty()) {
+            let (CType::Struct(key) | CType::Union(key)) = &f.ty else { continue };
+            let Some(anon) = ctx.get_struct_layout(key).cloned() else { continue };
+            if anon.field_offset(name, ctx).is_some() {
+                return f.is_volatile || anon.field_is_volatile(name, ctx);
+            }
+        }
+        false
+    }
+
     /// Look up a field by name, returning full layout info including bitfield details.
     pub fn field_layout(&self, name: &str) -> Option<&StructFieldLayout> {
         self.fields.iter().find(|f| f.name == name)
@@ -1309,8 +1364,8 @@ impl std::fmt::Display for CType {
             CType::ComplexFloat => write!(f, "_Complex float"),
             CType::ComplexDouble => write!(f, "_Complex double"),
             CType::ComplexLongDouble => write!(f, "_Complex long double"),
-            CType::Pointer(inner, addr_space) => {
-                let prefix = match addr_space {
+            CType::Pointer(inner, quals) => {
+                let prefix = match quals.space {
                     AddressSpace::Default => "",
                     AddressSpace::SegGs => "__seg_gs ",
                     AddressSpace::SegFs => "__seg_fs ",

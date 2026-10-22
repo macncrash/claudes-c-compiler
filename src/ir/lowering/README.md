@@ -140,7 +140,7 @@ Iterates over all `ExternalDecl` entries and lowers them:
 ### Key Types
 
 - **`VarInfo`** (`definitions.rs`) -- Shared type metadata (ty, elem_size, is_array,
-  struct_layout, c_type, address_space, explicit_alignment, etc.) embedded in both
+  struct_layout, c_type, quals, explicit_alignment, etc.) embedded in both
   `LocalInfo` and `GlobalInfo` via `Deref`. The `lookup_var_info(name)` helper returns
   `&VarInfo` for cases that only need these shared fields, eliminating the duplicated
   locals-then-globals lookup pattern.
@@ -175,7 +175,10 @@ Iterates over all `ExternalDecl` entries and lowers them:
   param list, per-original-parameter `ParamKind` mapping, and sret flag.
 
 - **`LValue`** (`definitions.rs`) -- L-value enum: `Variable(Value)` for direct allocas,
-  `Address(Value, AddressSpace)` for computed addresses with optional segment override.
+  `Address(Value, AccessQuals)` for computed addresses (and volatile locals), with the
+  object's segment override and volatility. `object_quals` and `pointee_quals`
+  (`pointer_analysis.rs`) compute these for an expression; loads and stores carry
+  them into the IR.
 
 - **`SwitchFrame`** (`definitions.rs`) -- Switch statement context: cases, GNU case
   ranges, default label, and expression type.

@@ -9,7 +9,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
-use crate::common::types::AddressSpace;
+use crate::common::types::{AccessQuals, AddressSpace};
 use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::{ModeKind, ParsedDeclAttrs, Parser};
@@ -129,6 +129,10 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
+            d.set_ptr_volatile(self.attrs.parsing_ptr_volatile());
+            if d.is_volatile() {
+                d.mark_volatile_pointers();
+            }
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(ExternalDecl::Declaration(d));
         }
@@ -215,11 +219,14 @@ impl Parser {
         &mut self,
         type_spec: TypeSpecifier,
         name: Option<String>,
-        derived: Vec<DerivedDeclarator>,
+        mut derived: Vec<DerivedDeclarator>,
         start: crate::common::source::Span,
         decl_attrs: DeclAttributes,
     ) -> Option<ExternalDecl> {
         self.attrs.set_typedef(false); // function defs are never typedefs
+        if self.attrs.parsing_volatile() {
+            mark_volatile_pointers(&mut derived);
+        }
         let (params, variadic) = if let Some(DerivedDeclarator::Function(p, v)) = derived.last() {
             (p.clone(), *v)
         } else {
@@ -312,8 +319,8 @@ impl Parser {
                             size_expr.clone(),
                         );
                     }
-                    DerivedDeclarator::Pointer => {
-                        return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                    DerivedDeclarator::Pointer(quals) => {
+                        return_type = TypeSpecifier::Pointer(Box::new(return_type), *quals);
                     }
                     _ => {}
                 }
@@ -321,8 +328,8 @@ impl Parser {
             // Apply pre-Function derivations
             for d in &derived[..fpos] {
                 match d {
-                    DerivedDeclarator::Pointer => {
-                        return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                    DerivedDeclarator::Pointer(quals) => {
+                        return_type = TypeSpecifier::Pointer(Box::new(return_type), *quals);
                     }
                     DerivedDeclarator::Array(size_expr) => {
                         return_type = TypeSpecifier::Array(
@@ -337,8 +344,8 @@ impl Parser {
             // No Function in derived - just apply pointer derivations
             for d in derived {
                 match d {
-                    DerivedDeclarator::Pointer => {
-                        return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                    DerivedDeclarator::Pointer(quals) => {
+                        return_type = TypeSpecifier::Pointer(Box::new(return_type), *quals);
                     }
                     _ => break,
                 }
@@ -367,7 +374,7 @@ impl Parser {
                                     DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _) => {
                                         found_fptr = true;
                                     }
-                                    DerivedDeclarator::Pointer if found_fptr => {
+                                    DerivedDeclarator::Pointer(_) if found_fptr => {
                                         ptrs_after += 1;
                                     }
                                     _ => {}
@@ -433,21 +440,21 @@ impl Parser {
             // For `int *(*fp)()`:
             //   pderived = [Pointer, Pointer, FunctionPointer([], false)]
             //   First Pointer is return-type pointer, second is syntax marker.
-            let ptr_count = pderived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer)).count();
+            let ptr_count = pderived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer(_))).count();
             // Apply all pointers except the syntax marker (last one)
             for _ in 0..ptr_count.saturating_sub(1) {
-                full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+                full_type = TypeSpecifier::Pointer(Box::new(full_type), AccessQuals::NONE);
             }
             // Apply one Pointer wrapping for the function-pointer-to-pointer decay
-            full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+            full_type = TypeSpecifier::Pointer(Box::new(full_type), AccessQuals::NONE);
             return (full_type, Some(fptr_params));
         }
 
         // Not a function pointer - apply all derivations normally.
         // Apply pointers
         for d in pderived {
-            if let DerivedDeclarator::Pointer = d {
-                full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+            if let DerivedDeclarator::Pointer(quals) = d {
+                full_type = TypeSpecifier::Pointer(Box::new(full_type), *quals);
             }
         }
         // Collect array dimensions
@@ -463,12 +470,12 @@ impl Parser {
             for dim in array_dims.iter().skip(1).rev() {
                 full_type = TypeSpecifier::Array(Box::new(full_type), dim.clone());
             }
-            full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+            full_type = TypeSpecifier::Pointer(Box::new(full_type), AccessQuals::NONE);
         }
         // Function params (bare function names) decay to pointers
         for d in pderived {
             if let DerivedDeclarator::Function(_, _) = d {
-                full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
+                full_type = TypeSpecifier::Pointer(Box::new(full_type), AccessQuals::NONE);
             }
         }
         (full_type, None)
@@ -637,6 +644,10 @@ impl Parser {
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
         d.set_volatile(self.attrs.parsing_volatile());
+        d.set_ptr_volatile(self.attrs.parsing_ptr_volatile());
+        if d.is_volatile() {
+            d.mark_volatile_pointers();
+        }
         d.set_common(ctx.is_common);
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
@@ -657,7 +668,7 @@ impl Parser {
         self.attrs.set_typedef(false);
         self.attrs.set_inline(false);
         self.attrs.set_const(false);
-        self.attrs.set_volatile(false);
+        self.attrs.take_volatile();
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
 
@@ -685,6 +696,10 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
+            d.set_ptr_volatile(self.attrs.parsing_ptr_volatile());
+            if d.is_volatile() {
+                d.mark_volatile_pointers();
+            }
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(d);
         }
@@ -756,6 +771,7 @@ impl Parser {
                 if !decl.name.is_empty() {
                     self.typedefs.insert(decl.name.clone());
                     self.shadowed_typedefs.remove(&decl.name);
+                    self.note_typedef_volatility(decl);
                 }
             }
             self.attrs.set_typedef(false);
@@ -791,6 +807,10 @@ impl Parser {
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
         d.set_volatile(self.attrs.parsing_volatile());
+        d.set_ptr_volatile(self.attrs.parsing_ptr_volatile());
+        if d.is_volatile() {
+            d.mark_volatile_pointers();
+        }
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
         Some(d)
@@ -1153,9 +1173,22 @@ impl Parser {
             for decl in declarators {
                 if !decl.name.is_empty() {
                     self.typedefs.insert(decl.name.clone());
+                    self.note_typedef_volatility(decl);
                 }
             }
             self.attrs.set_typedef(false);
+        }
+    }
+
+    /// Record whether a typedef being declared names a volatile object type.
+    /// A volatile pointer typedef needs no entry: its pointer types are
+    /// marked volatile like any declaration's.
+    fn note_typedef_volatility(&mut self, decl: &InitDeclarator) {
+        let has_pointer = decl.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+        if self.attrs.object_volatile(has_pointer) {
+            self.volatile_typedefs.insert(decl.name.clone());
+        } else {
+            self.volatile_typedefs.remove(&decl.name);
         }
     }
 

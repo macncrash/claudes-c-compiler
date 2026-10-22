@@ -94,6 +94,7 @@ impl Lowerer {
             ptr,
             ty: comp_ty,
             seg_override: AddressSpace::Default,
+            volatile: false,
         });
 
         // Store imag part at offset comp_size
@@ -105,7 +106,7 @@ impl Lowerer {
             ty: IrType::I8, // byte offset
         });
         self.emit(Instruction::Store { val: imag, ptr: imag_ptr, ty: comp_ty,
-         seg_override: AddressSpace::Default });
+         seg_override: AddressSpace::Default, volatile: false });
     }
 
     /// Load the real part of a complex value from a pointer.
@@ -117,6 +118,7 @@ impl Lowerer {
             ptr,
             ty: comp_ty,
             seg_override: AddressSpace::Default,
+            volatile: false,
         });
         Operand::Value(dest)
     }
@@ -138,6 +140,7 @@ impl Lowerer {
             ptr: imag_ptr,
             ty: comp_ty,
             seg_override: AddressSpace::Default,
+            volatile: false,
         });
         Operand::Value(dest)
     }
@@ -869,12 +872,12 @@ impl Lowerer {
                 let packed = self.fresh_value();
                 if packs_cf_variadic && is_variadic_arg && !uses_packed_cf {
                     // RISC-V variadic: load as I64 (two packed F32s in one GP register)
-                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 , seg_override: AddressSpace::Default, volatile: false });
                     new_vals.push(Operand::Value(packed));
                     new_types.push(IrType::I64);
                 } else {
                     // x86-64: load as F64 (two packed F32s in one XMM register)
-                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::F64 , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::F64 , seg_override: AddressSpace::Default, volatile: false });
                     new_vals.push(Operand::Value(packed));
                     new_types.push(IrType::F64);
                 }

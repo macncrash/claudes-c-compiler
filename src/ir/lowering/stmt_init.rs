@@ -21,7 +21,7 @@ use crate::ir::reexports::{
     Operand,
     Value,
 };
-use crate::common::types::{AddressSpace, IrType, CType};
+use crate::common::types::{AccessQuals, AddressSpace, IrType, CType};
 use super::lower::Lowerer;
 use super::definitions::{GlobalInfo, DeclAnalysis, FuncSig};
 
@@ -52,7 +52,9 @@ impl Lowerer {
             if let Some(vs) = decl.resolve_vector_size(elem_size) {
                 ext_da.apply_vector_size(vs);
             }
-            self.globals.insert(declarator.name.clone(), GlobalInfo::from_analysis(&ext_da));
+            let mut ginfo = GlobalInfo::from_analysis(&ext_da);
+            ginfo.var.quals = decl.object_quals(declarator);
+            self.globals.insert(declarator.name.clone(), ginfo);
         }
         true // Handled, caller should continue to next declarator
     }
@@ -175,7 +177,7 @@ impl Lowerer {
             let ret_ctype = if ptr_count > 0 {
                 let mut ct = base_ctype;
                 for _ in 0..ptr_count {
-                    ct = CType::Pointer(Box::new(ct), AddressSpace::Default);
+                    ct = CType::Pointer(Box::new(ct), AccessQuals::NONE);
                 }
                 ct
             } else {
@@ -389,7 +391,7 @@ impl Lowerer {
                     let tmp_alloca = self.fresh_value();
                     let store_ty = Self::packed_store_type(total_size);
                     self.emit(Instruction::Alloca { dest: tmp_alloca, size: total_size, ty: store_ty, align: 0, volatile: false });
-                    self.emit(Instruction::Store { val: Operand::Value(src_val), ptr: tmp_alloca, ty: store_ty, seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Store { val: Operand::Value(src_val), ptr: tmp_alloca, ty: store_ty, seg_override: AddressSpace::Default, volatile: false });
                     self.emit(Instruction::Memcpy { dest: alloca, src: tmp_alloca, size: total_size });
                 } else {
                     self.emit(Instruction::Memcpy { dest: alloca, src: src_val, size: total_size });
@@ -418,7 +420,7 @@ impl Lowerer {
             }
             _ => {
                 let val = self.lower_expr(expr);
-                self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default, volatile: false });
             }
         }
     }
@@ -432,7 +434,7 @@ impl Lowerer {
             }
             _ => {
                 let val = self.lower_expr(expr);
-                self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default, volatile: false });
             }
         }
     }
@@ -456,7 +458,7 @@ impl Lowerer {
             }
             _ => {
                 let val = self.lower_expr(expr);
-                self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty, seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty, seg_override: AddressSpace::Default, volatile: false });
             }
         }
     }
@@ -468,7 +470,7 @@ impl Lowerer {
         // IS the struct data, not an address. Store directly.
         if self.expr_produces_packed_struct_data(expr) && da.actual_alloc_size <= 8 {
             let val = self.lower_expr(expr);
-            self.emit(Instruction::Store { val, ptr: alloca, ty: Self::packed_store_type(da.actual_alloc_size) , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val, ptr: alloca, ty: Self::packed_store_type(da.actual_alloc_size) , seg_override: AddressSpace::Default, volatile: false });
         } else {
             let src_addr = self.get_struct_base_addr(expr);
             self.emit(Instruction::Memcpy {
@@ -528,7 +530,7 @@ impl Lowerer {
             let expr_ty = self.get_expr_type(expr);
             self.emit_implicit_cast(val, expr_ty, da.var_ty)
         };
-        self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default, volatile: false });
     }
 
     /// Lower `Initializer::List` for a local variable declaration.
@@ -572,11 +574,11 @@ impl Lowerer {
                 let val = self.lower_expr(expr);
                 let expr_ty = self.get_expr_type(expr);
                 let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                self.emit(Instruction::Store { val, ptr: alloca, ty: comp_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { val, ptr: alloca, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
             }
         } else {
             let zero = Self::complex_zero(comp_ty);
-            self.emit(Instruction::Store { val: zero, ptr: alloca, ty: comp_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val: zero, ptr: alloca, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
         }
         // Store imag part (second item) at offset
         let comp_size = Self::complex_component_size(&complex_ctype);
@@ -586,11 +588,11 @@ impl Lowerer {
                 let val = self.lower_expr(expr);
                 let expr_ty = self.get_expr_type(expr);
                 let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
-                self.emit(Instruction::Store { val, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Store { val, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
             }
         } else {
             let zero = Self::complex_zero(comp_ty);
-            self.emit(Instruction::Store { val: zero, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val: zero, ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
         }
     }
 
@@ -1130,7 +1132,7 @@ impl Lowerer {
             } else {
                 self.emit_implicit_cast(val, expr_ty, da.var_ty)
             };
-            self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store { val, ptr: alloca, ty: da.var_ty , seg_override: AddressSpace::Default, volatile: false });
         }
     }
 }
