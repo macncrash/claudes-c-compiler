@@ -303,7 +303,7 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
 /// Check if an instruction is safe to hoist (pure, no side effects, not a phi).
 /// Division and remainder can trap with SIGFPE on divide-by-zero, so they must
 /// not be speculatively hoisted past a guard condition.
-fn is_hoistable(inst: &Instruction) -> bool {
+pub(crate) fn is_hoistable(inst: &Instruction) -> bool {
     matches!(
         inst,
         Instruction::BinOp { op, .. } if !op.can_trap()

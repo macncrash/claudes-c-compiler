@@ -30,6 +30,7 @@ use crate::ir::reexports::{
     Value,
 };
 use crate::ir::analysis;
+use super::mod_ref::ModRef;
 
 /// A value number expression key. Two instructions with the same ExprKey
 /// compute the same value (assuming their operands are equivalent).
@@ -125,6 +126,9 @@ struct GvnState {
     /// parameter values from the alloca slot, which may be modified by
     /// stores through aliased pointers.
     escaped_param_allocas: FxHashSet<u32>,
+    /// Calls (block, instruction index) to functions that write no memory
+    /// the caller can see, which leave cached loads valid.
+    silent_calls: FxHashSet<(usize, usize)>,
 }
 
 impl GvnState {
@@ -145,6 +149,7 @@ impl GvnState {
             vn_log: Vec::new(),
             total_eliminated: 0,
             escaped_param_allocas,
+            silent_calls: FxHashSet::default(),
         }
     }
 
@@ -444,6 +449,12 @@ fn find_local_only_addresses(func: &IrFunction) -> FxHashSet<u32> {
 
 /// Run dominator-based GVN on a single function.
 pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
+    run_gvn_function_with(func, None)
+}
+
+/// GVN on one function, letting calls that write nothing visible (per
+/// `mr`) keep cached loads.
+pub(crate) fn run_gvn_function_with(func: &mut IrFunction, mr: Option<&ModRef>) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
         return 0;
@@ -454,17 +465,18 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     // Fast path for single-block functions: skip CFG/dominator computation.
     if num_blocks == 1 {
         let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
+        state.silent_calls = silent_calls(func, mr);
         return process_block(0, func, &mut state);
     }
 
     // Build CFG and dominator tree
     let cfg = analysis::CfgAnalysis::build(func);
-    run_gvn_with_analysis(func, &cfg)
+    run_gvn_with_analysis(func, &cfg, mr)
 }
 
 /// Run GVN using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
-pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnalysis) -> usize {
+pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnalysis, mr: Option<&ModRef>) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
         return 0;
@@ -475,15 +487,31 @@ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAn
     // Fast path for single-block functions.
     if num_blocks == 1 {
         let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
+        state.silent_calls = silent_calls(func, mr);
         return process_block(0, func, &mut state);
     }
 
     let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
+    state.silent_calls = silent_calls(func, mr);
 
     // DFS over the dominator tree
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
 
     state.total_eliminated
+}
+
+/// Positions of the calls in `func` that write no memory the caller can see.
+fn silent_calls(func: &IrFunction, mr: Option<&ModRef>) -> FxHashSet<(usize, usize)> {
+    let Some(mr) = mr else { return FxHashSet::default() };
+    let mut out = FxHashSet::default();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (k, inst) in block.instructions.iter().enumerate() {
+            if mr.writes_nothing(inst) {
+                out.insert((b, k));
+            }
+        }
+    }
+    out
 }
 
 /// Recursive DFS over the dominator tree for GVN.
@@ -583,12 +611,13 @@ fn process_block(
     // GVN replaces instructions 1:1 (original or Copy), so spans stay parallel
     let new_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
 
-    for inst in func.blocks[block_idx].instructions.drain(..) {
+    let instructions = std::mem::take(&mut func.blocks[block_idx].instructions);
+    for (k, inst) in instructions.into_iter().enumerate() {
         // Before processing the instruction, check if it clobbers memory.
         // If so, invalidate all cached Load CSE and store forwarding entries
         // by bumping the generation counter. This is O(1) instead of iterating
         // all keys.
-        if clobbers_memory(&inst) {
+        if clobbers_memory(&inst) && !state.silent_calls.contains(&(block_idx, k)) {
             state.load_generation += 1;
             if !matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }) {
                 state.local_generation += 1;

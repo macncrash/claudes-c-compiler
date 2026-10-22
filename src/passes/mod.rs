@@ -24,7 +24,9 @@ pub(crate) mod iv_widen;
 pub(crate) mod lftr;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_hoist;
 pub(crate) mod loop_rotate;
+pub(crate) mod mod_ref;
 pub(crate) mod narrow;
 mod resolve_asm;
 pub(crate) mod simplify;
@@ -86,6 +88,7 @@ fn run_gvn_licm_ivsr_shared(
     let mut gvn_total = 0usize;
     let mut licm_total = 0usize;
     let mut ivsr_total = 0usize;
+    let mr = mod_ref::ModRef::compute(module);
 
     for (i, func) in module.functions.iter_mut().enumerate() {
         if func.is_declaration {
@@ -102,7 +105,7 @@ fn run_gvn_licm_ivsr_shared(
         // GVN fast path: single-block functions don't need CFG analysis.
         if num_blocks == 1 {
             if run_gvn {
-                let n = gvn::run_gvn_function(func);
+                let n = gvn::run_gvn_function_with(func, Some(&mr));
                 if n > 0 {
                     gvn_total += n;
                     if i < changed.len() { changed[i] = true; }
@@ -118,7 +121,7 @@ fn run_gvn_licm_ivsr_shared(
         // Run GVN with shared analysis.
         if run_gvn {
             let t0 = if time_passes { Some(std::time::Instant::now()) } else { None };
-            let n = gvn::run_gvn_with_analysis(func, &cfg);
+            let n = gvn::run_gvn_with_analysis(func, &cfg, Some(&mr));
             if let Some(t0) = t0 {
                 eprintln!("[PASS] iter={} gvn (func {}): {:.4}s ({} changes)", iter, func.name, t0.elapsed().as_secs_f64(), n);
             }

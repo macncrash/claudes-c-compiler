@@ -1115,6 +1115,9 @@ impl Driver {
         eliminate_phis(&mut module);
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("loop_rotate")) {
             crate::passes::loop_rotate::rotate_loops(&mut module);
+            if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("loop_hoist")) {
+                crate::passes::loop_hoist::hoist_rotated_loops(&mut module);
+            }
         }
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 
