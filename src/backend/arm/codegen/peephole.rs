@@ -463,6 +463,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_redundant_narrow_extends(&mut lines, &mut kinds, n));
             changed2 |= pass!(propagate_w_copies(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_low_half_only_extends(&lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_dead_upper_extends(&lines, &mut kinds, n));
             changed2 |= pass!(fold_shift_into_operand(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_index_into_mem(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_offset_into_global_addr(&mut lines, &mut kinds, n));
@@ -1663,8 +1664,10 @@ fn flags_dead_after(lines: &[String], kinds: &[LineKind], start: usize, n: usize
         if sets_flags(m) {
             return true;
         }
+        // (movk is a barrier for register tracking, as it also reads its
+        // destination, but leaves the flags alone.)
         match classify_access(&lines[k], kinds[k]) {
-            Access::Barrier if kinds[k] != LineKind::CmpBranch => return false,
+            Access::Barrier if kinds[k] != LineKind::CmpBranch && m != "movk" => return false,
             _ => {}
         }
     }
@@ -1840,7 +1843,13 @@ fn eliminate_low_half_only_extends(lines: &[String], kinds: &mut [LineKind], n: 
             if access_is_transparent(&lines[k], kinds[k]) {
                 continue;
             }
-            let Some((dest, srcs, _)) = split_rw(&lines[k], kinds[k]) else { break };
+            let Some((dest, srcs, mnemonic)) = split_rw(&lines[k], kinds[k]) else { break };
+            // A register shift amount uses only its low 6 bits.
+            let srcs = match (mnemonic.as_str(), srcs.rsplit_once(',')) {
+                ("lsl" | "lsr" | "asr" | "ror", Some((value, amount))) if gpr_operand(amount.trim()).is_some() =>
+                    value.to_string(),
+                _ => srcs,
+            };
             if reads_x_form(&srcs, a) {
                 break;
             }
@@ -2200,6 +2209,15 @@ fn eliminate_dead_writes_global(lines: &[String], kinds: &mut [LineKind], n: usi
 /// deletable destination. None for functions the model does not cover
 /// (setjmp-like calls).
 fn function_liveness(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> Option<(Vec<RegSet>, Vec<Option<u8>>)> {
+    function_liveness_with(lines, kinds, start, end, false)
+}
+
+/// function_liveness, or with `upper` the liveness of the registers' upper
+/// 32 bits: ordinary instructions then use only the registers they read in
+/// x form (a w read, or a register shift amount, sees only the low half);
+/// calls, returns and unknown lines still read theirs whole.
+fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, end: usize, upper: bool)
+                          -> Option<(Vec<RegSet>, Vec<Option<u8>>)> {
     let body = start..end;
     if body.clone().any(|k| {
         kinds[k] == LineKind::Call
@@ -2226,6 +2244,13 @@ fn function_liveness(lines: &[String], kinds: &[LineKind], start: usize, end: us
     };
 
     let mut infos: Vec<LineInfo> = body.clone().map(|k| line_info(&lines[k], kinds[k], &label_index)).collect();
+    if upper {
+        for (info, k) in infos.iter_mut().zip(body.clone()) {
+            if let Some(x) = x_form_reads(&lines[k], kinds[k]) {
+                info.uses &= x;
+            }
+        }
+    }
     for info in infos.iter_mut().filter(|i| matches!(i.flow, Flow::Exit)) {
         info.uses &= ret_mask;
     }
@@ -2256,6 +2281,60 @@ fn function_liveness(lines: &[String], kinds: &[LineKind], start: usize, end: us
     }
     let live_out = (0..len).map(|idx| succ_live(&live_in, idx)).collect();
     Some((live_out, infos.iter().map(|i| i.deletable_dest).collect()))
+}
+
+/// The registers an ordinary instruction reads in x form (all 64 bits), or
+/// None for lines that keep their full uses (calls, branches other than
+/// cbz/cbnz, returns, and anything classify_access does not understand).
+fn x_form_reads(line: &str, kind: LineKind) -> Option<RegSet> {
+    let (mnemonic, ops) = split_insn(line)?;
+    let reads = match kind {
+        LineKind::CmpBranch if matches!(mnemonic, "cbz" | "cbnz") => first_and_rest(ops).0.to_string(),
+        LineKind::Nop | LineKind::Label => return Some(0),
+        LineKind::Call | LineKind::Ret | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => return None,
+        _ => match classify_access(line, kind) {
+            Access::Transparent => return Some(0),
+            Access::Barrier => return None,
+            Access::ReadOnly => ops.to_string(),
+            // Pair loads and stores, and writeback forms: their register
+            // lists are reads (stores) or writes (loads) of whole registers.
+            Access::Write { .. } if ops.contains('[') && matches!(mnemonic, "ldp" | "ldpsw") => {
+                ops[ops.find('[')?..].to_string()
+            }
+            Access::Write { .. } => first_and_rest(ops).1.to_string(),
+        },
+    };
+    // A register shift amount uses only its low 6 bits.
+    let reads = match (mnemonic, reads.rsplit_once(',')) {
+        ("lsl" | "lsr" | "asr" | "ror", Some((value, amount))) if gpr_operand(amount.trim()).is_some() =>
+            value.to_string(),
+        _ => reads,
+    };
+    Some(reads.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| tok.starts_with('x'))
+        .filter_map(gpr_operand)
+        .fold(0, |m, r| m | (1 << r)))
+}
+
+/// `sxtw xA, wA` (or `mov wA, wA`) whose upper half nothing reads before A
+/// is written again, on any path: the low half is all that is used.
+fn eliminate_dead_upper_extends(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for (start, end) in function_ranges(lines, n) {
+        let Some((upper_live, _)) = function_liveness_with(lines, kinds, start, end, true) else { continue };
+        for k in start..end {
+            let a = match kinds[k] {
+                LineKind::Sxtw { dst, src } if dst == src => dst,
+                LineKind::Move { dst, src, is_32bit: true } if dst == src => dst,
+                _ => continue,
+            };
+            if a <= 28 && upper_live[k - start] & (1 << a) == 0 {
+                kinds[k] = LineKind::Nop;
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// Function boundaries: (start, end) line ranges of each function body.
@@ -2680,6 +2759,21 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("ldr d0, [x4, x3]") && result.contains("ldr d1, [x5, x3]"), "{}", result);
         assert!(!result.contains("add x11"), "{}", result);
+    }
+
+    #[test]
+    fn test_sign_extension_with_dead_upper_half_removed() {
+        // Only w reads (a compare, a store, a shift amount) on every path.
+        let f = |tail: &str| format!(".type f, %function\nf:\n    add w12, w7, w12\n    sxtw x12, w12\n    cmp w12, #5\n    b.ne .LBB1\n    str w12, [x0]\n.LBB1:\n{tail}    ret\n.size f, .-f\n");
+        let result = peephole_optimize(f("    lsl x3, x4, x12\n    str x3, [x0]\n"));
+        assert!(!result.contains("sxtw"), "{}", result);
+        // An x read on one path keeps it: an index, or the value itself.
+        for tail in ["    ldr x1, [x2, x12, lsl #3]\n    str x1, [x0]\n", "    str x12, [x0]\n"] {
+            assert!(peephole_optimize(f(tail)).contains("sxtw x12, w12"), "{tail}");
+        }
+        // As does a call argument.
+        let input = ".type f, %function\nf:\n    add w1, w7, w1\n    sxtw x1, w1\n    bl g\n    ret\n.size f, .-f\n";
+        assert!(peephole_optimize(input.to_string()).contains("sxtw x1, w1"));
     }
 
     #[test]

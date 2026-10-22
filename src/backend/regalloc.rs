@@ -307,14 +307,23 @@ pub fn allocate_registers(
     for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(false)) {
         let segs = liveness.segments_of(interval);
         let v = interval.value_id;
-        if let Some(i) = partner_reg(v, &assignments, callee, &callee_busy, &segs) {
-            occupy(&mut callee_busy[i], &segs, v);
-            assignments.insert(v, callee[i]);
-        } else if let Some(i) = partner_reg(v, &assignments, caller, &caller_busy, &segs)
-            .or_else(|| (0..caller.len()).find(|&i| fits(&caller_busy[i], &segs, v)))
-        {
+        // A partner's register first (the handoff saves a move), but a
+        // callee-saved one only when it is already saved; then any free
+        // caller-saved register; a callee-saved register costs a save and
+        // restore, so it comes last.
+        let callee_partner = partner_reg(v, &assignments, callee, &callee_busy, &segs);
+        if let Some(i) = partner_reg(v, &assignments, caller, &caller_busy, &segs) {
             occupy(&mut caller_busy[i], &segs, v);
             assignments.insert(v, caller[i]);
+        } else if let Some(i) = callee_partner.filter(|&i| !callee_busy[i].is_empty()) {
+            occupy(&mut callee_busy[i], &segs, v);
+            assignments.insert(v, callee[i]);
+        } else if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], &segs, v)) {
+            occupy(&mut caller_busy[i], &segs, v);
+            assignments.insert(v, caller[i]);
+        } else if let Some(i) = callee_partner {
+            occupy(&mut callee_busy[i], &segs, v);
+            assignments.insert(v, callee[i]);
         } else if let Some(i) = pick_callee(&callee_busy, &segs, v) {
             occupy(&mut callee_busy[i], &segs, v);
             assignments.insert(v, callee[i]);
@@ -390,7 +399,11 @@ fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMa
         }
     }
     let add = |use_count: &mut FxHashMap<u32, u64>, v: u32, weight: u64| {
-        *use_count.entry(v).or_insert(0) += weight;
+        // A constant-offset GEP's uses read its base ([base, #off]); the GEP
+        // itself is not worth a register.
+        if !gep_base.contains_key(&v) {
+            *use_count.entry(v).or_insert(0) += weight;
+        }
         // Follow folded GEP chains a few levels.
         let mut cur = v;
         for _ in 0..4 {
@@ -411,12 +424,10 @@ fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMa
             3 => 1000,
             _ => 10_000, // cap at 10K for very deep nesting
         };
+        // Every read value counts, including the pointers and bases that are
+        // not Operands (loads, stores, GEPs, memcpy).
         for inst in &block.instructions {
-            for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    add(&mut use_count, v.0, weight);
-                }
-            });
+            inst.for_each_used_value(|v| add(&mut use_count, v, weight));
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
