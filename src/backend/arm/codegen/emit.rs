@@ -238,10 +238,10 @@ pub struct ArmCodegen {
     pub(super) vec_fresh_stores: FxHashSet<usize>,
     /// Variables to spill around each clobbering instruction (vec_vars_live_across).
     pub(super) vec_spills: FxHashMap<usize, u32>,
-    /// What scratch registers v0 and v1 hold after the last vector op: the
+    /// What scratch registers v0-v2 hold after the last vector op: the
     /// (pointer, size) each was loaded from, valid while the output is still
     /// the length it had then (nothing emitted since).
-    pub(super) vec_scratch: (usize, [Option<(u32, u8)>; 2]),
+    pub(super) vec_scratch: (usize, [Option<(u32, u8)>; 3]),
     /// Not results read only by one And, which emits `bic` on the Not's
     /// source instead (fold_vec_nots): temporary -> source.
     pub(super) vec_not_folds: FxHashMap<u32, u32>,
@@ -298,7 +298,7 @@ impl ArmCodegen {
             vec_param_loads: Vec::new(),
             vec_fresh_stores: FxHashSet::default(),
             vec_spills: FxHashMap::default(),
-            vec_scratch: (usize::MAX, [None; 2]),
+            vec_scratch: (usize::MAX, [None; 3]),
             vec_not_folds: FxHashMap::default(),
             vec_shift_adds: FxHashMap::default(),
             hfa_ret_copies: FxHashSet::default(),

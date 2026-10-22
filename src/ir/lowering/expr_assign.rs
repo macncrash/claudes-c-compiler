@@ -558,7 +558,11 @@ impl Lowerer {
                 rhs_val
             };
 
-            let result = self.emit_binop_val(ir_op, loaded_promoted, actual_rhs, op_ty);
+            // x += a * b and x -= a * b contract like x + a * b.
+            let result = match self.try_contract_fma(op, None, Some(rhs), loaded_promoted, actual_rhs, op_ty) {
+                Some(Operand::Value(fused)) => fused,
+                _ => self.emit_binop_val(ir_op, loaded_promoted, actual_rhs, op_ty),
+            };
 
             let store_val = self.narrow_from_op(Operand::Value(result), ty, lhs_ir_ty, op_ty);
             let store_val = if self.is_bool_lvalue(lhs) {
@@ -730,6 +734,83 @@ impl Lowerer {
         supported.then_some(IntrinsicOp::VecOp { op: kind, elem, bytes: total_size as u8, splat })
     }
 
+    /// The vector form of try_contract_fma: when one operand of a float
+    /// vector + or - is a vector product of the same type just computed into
+    /// a temporary nothing else reads, that multiply is replaced by one fused
+    /// op into `result` (the product's operands are read where the sum is,
+    /// a valid order for operands of +). Each side is (expression, operand,
+    /// is a broadcast scalar).
+    fn try_contract_vec_fma(&mut self, op: &BinOp, lhs: (&Expr, Operand, bool), rhs: (&Expr, Operand, bool),
+                            vec_ct: &CType, result: Value) -> bool {
+        if !self.fp_contract || self.target != Target::Aarch64 || !matches!(op, BinOp::Add | BinOp::Sub) {
+            return false;
+        }
+        let product_at = |this: &Self, side: &(&Expr, Operand, bool)| -> Option<usize> {
+            let (e, Operand::Value(v), false) = *side else { return None };
+            if !matches!(e, Expr::BinaryOp(BinOp::Mul, ..)) || this.expr_ctype(e) != *vec_ct {
+                return None;
+            }
+            let instrs = &this.func().instrs;
+            let k = instrs.iter().rposition(|i| matches!(i, Instruction::Intrinsic {
+                op: IntrinsicOp::VecOp { op: VecOpKind::Mul, elem, .. }, dest_ptr: Some(d), ..
+            } if *d == v && elem.is_float()))?;
+            let read_later = instrs[k + 1..].iter().any(|i| i.used_values().contains(&v.0));
+            (!read_later).then_some(k)
+        };
+        let sub = *op == BinOp::Sub;
+        let (k, addend, neg_product, neg_addend) = if let Some(k) = product_at(self, &lhs) {
+            (k, rhs, false, sub)
+        } else if let Some(k) = product_at(self, &rhs) {
+            (k, lhs, sub, false)
+        } else {
+            return false;
+        };
+        let func = self.func_mut();
+        let Instruction::Intrinsic { op: IntrinsicOp::VecOp { elem, bytes, splat, .. }, args, .. } = func.instrs.remove(k)
+            else { unreachable!() };
+        func.instr_spans.remove(k);
+        // a * b - x * K or a * b - x / K: negate the constant K instead of
+        // the addend (exact, as negation is), saving an fneg.
+        let mut neg_addend = neg_addend;
+        if let (true, Operand::Value(t), false) = (neg_addend, addend.1, addend.2) {
+            // (The scalar may still be a copy of the constant here.)
+            let constant = |instrs: &[Instruction], op: Operand| match op {
+                Operand::Value(v) => instrs.iter().rev().find_map(|i| match i {
+                    Instruction::Copy { dest, src: c @ Operand::Const(_) } if *dest == v => Some(*c),
+                    _ => None,
+                }),
+                c => Some(c),
+            };
+            let last_use = func.instrs.iter().rposition(|i| i.used_values().contains(&t.0));
+            let divisor = last_use.and_then(|j| match &func.instrs[j] {
+                Instruction::Intrinsic { args, .. } => args.get(1).and_then(|&a| constant(&func.instrs, a)),
+                _ => None,
+            });
+            if let Some(Instruction::Intrinsic {
+                op: IntrinsicOp::VecOp { op: VecOpKind::Mul | VecOpKind::Div, splat: 2, .. },
+                dest_ptr: Some(d), args: scaled, ..
+            }) = last_use.map(|j| &mut func.instrs[j]) {
+                let negated = match divisor {
+                    Some(Operand::Const(IrConst::F32(k))) => Some(IrConst::F32(-k)),
+                    Some(Operand::Const(IrConst::F64(k))) => Some(IrConst::F64(-k)),
+                    _ => None,
+                };
+                if let (true, Some(k)) = (*d == t, negated) {
+                    scaled[1] = Operand::Const(k);
+                    neg_addend = false;
+                }
+            }
+        }
+        let splat = (splat & 3) | (u8::from(addend.2) << 2);
+        self.emit(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::VecOp { op: VecOpKind::Fma { neg_product, neg_addend }, elem, bytes, splat },
+            dest_ptr: Some(result),
+            args: vec![args[0], args[1], addend.1],
+        });
+        true
+    }
+
     fn vec_op_kind(op: BinOp) -> Option<VecOpKind> {
         Some(match op {
             BinOp::Add => VecOpKind::Add,
@@ -847,10 +928,15 @@ impl Lowerer {
         };
 
         let splat = if rhs_is_vector { 0 } else { 2 };
+        let rhs_arg = rhs_scalar.unwrap_or(Operand::Value(rhs_val));
+        // x += a * b and x -= a * b contract like x + a * b.
+        if self.try_contract_vec_fma(op, (lhs, Operand::Value(lhs_ptr_val), false), (rhs, rhs_arg, rhs_scalar.is_some()),
+                                     lhs_ct, lhs_ptr_val) {
+            return Operand::Value(lhs_ptr_val);
+        }
         if let Some(vop) = Self::vec_op_kind(*op)
             .and_then(|kind| self.neon_vec_op(kind, &elem_ct, num_elems * elem_size, splat))
         {
-            let rhs_arg = rhs_scalar.unwrap_or(Operand::Value(rhs_val));
             self.emit(Instruction::Intrinsic {
                 dest: None, op: vop, dest_ptr: Some(lhs_ptr_val),
                 args: vec![Operand::Value(lhs_ptr_val), rhs_arg],
@@ -989,14 +1075,16 @@ impl Lowerer {
         };
 
         let splat = u8::from(lhs_scalar.is_some()) | (u8::from(rhs_scalar.is_some()) << 1);
+        let lhs_arg = lhs_scalar.unwrap_or(Operand::Value(lhs_val));
+        let rhs_arg = rhs_scalar.unwrap_or(Operand::Value(rhs_val));
+        if self.try_contract_vec_fma(op, (lhs, lhs_arg, lhs_scalar.is_some()), (rhs, rhs_arg, rhs_scalar.is_some()),
+                                     vec_ct, result_alloca) {
+            return Operand::Value(result_alloca);
+        }
         if let Some(vop) = Self::vec_op_kind(*op)
             .and_then(|kind| self.neon_vec_op(kind, &elem_ct, total_size, splat))
         {
-            let args = vec![
-                lhs_scalar.unwrap_or(Operand::Value(lhs_val)),
-                rhs_scalar.unwrap_or(Operand::Value(rhs_val)),
-            ];
-            self.emit(Instruction::Intrinsic { dest: None, op: vop, dest_ptr: Some(result_alloca), args });
+            self.emit(Instruction::Intrinsic { dest: None, op: vop, dest_ptr: Some(result_alloca), args: vec![lhs_arg, rhs_arg] });
             return Operand::Value(result_alloca);
         }
 

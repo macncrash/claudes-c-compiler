@@ -556,6 +556,10 @@ impl Driver {
                 "-fno-common" => self.fcommon = false,
                 "-fwrapv" => self.fwrapv = true,
                 "-fno-wrapv" => self.fwrapv = false,
+                // -ffp-contract=fast also contracts across statements in GCC; here
+                // it contracts within expressions, like on.
+                "-ffp-contract=off" => self.fp_contract = false,
+                "-ffp-contract=on" | "-ffp-contract=fast" => self.fp_contract = true,
                 "-fgnu89-inline" => self.gnu89_inline = true,
                 "-fno-gnu89-inline" => self.gnu89_inline = false,
                 // Diagnostic color: -fdiagnostics-color, -fdiagnostics-color={auto,always,never}

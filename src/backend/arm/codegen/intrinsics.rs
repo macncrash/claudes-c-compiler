@@ -892,9 +892,9 @@ impl ArmCodegen {
         let imm_shift = Self::vec_shift_imm(op, elem, splat, args);
         // What v0/v1 still hold from the previous vector op, if nothing has
         // been emitted since.
-        let mut held = if self.vec_scratch.0 == self.state.out.buf.len() { self.vec_scratch.1 } else { [None; 2] };
-        // Operand registers: a temporary's own register, else v0/v1.
-        let mut src = [String::new(), String::new()];
+        let mut held = if self.vec_scratch.0 == self.state.out.buf.len() { self.vec_scratch.1 } else { [None; 3] };
+        // Operand registers: a temporary's own register, else v0-v2.
+        let mut src = [String::new(), String::new(), String::new()];
         for (i, arg) in args.iter().enumerate() {
             src[i] = format!("v{i}");
             if i == 1 && imm_shift.is_some() {
@@ -912,8 +912,9 @@ impl ArmCodegen {
                     src[i] = format!("v{reg}");
                 } else if held[i] == Some((v.0, bytes)) {
                     // Already loaded.
-                } else if i == 1 && held[0] == Some((v.0, bytes)) {
-                    src[1] = "v0".to_string();
+                } else if let Some(j) = (0..i).find(|&j| held[j] == Some((v.0, bytes))) {
+                    // An earlier operand's register, already final for this op.
+                    src[i] = format!("v{j}");
                 } else {
                     self.vec_mem_access("ldr", &format!("{mem}{i}"), v);
                     held[i] = Some((v.0, bytes));
@@ -926,7 +927,7 @@ impl ArmCodegen {
         }
         let dest_reg = self.vec_regs.get(&dest_ptr.0).copied();
         let d = format!("v{}", dest_reg.unwrap_or(0));
-        let [a, b] = &src;
+        let [a, b, c] = &src;
         let (f, u) = (elem.is_float(), elem.is_unsigned());
         let bin = |name: &str| format!("    {name} {d}.{arr}, {a}.{arr}, {b}.{arr}");
         let swapped = |name: &str| format!("    {name} {d}.{arr}, {b}.{arr}, {a}.{arr}");
@@ -935,6 +936,23 @@ impl ArmCodegen {
         let ge = if f { "fcmge" } else if u { "cmhs" } else { "cmge" };
         let shl = if u { "ushl" } else { "sshl" };
         let lines = match op {
+            // acc = ±c, then acc ±= a * b in place (fmla/fmls), in the result
+            // register unless a factor is there (then v3, moved after).
+            VecOpKind::Fma { neg_product, neg_addend } => {
+                let acc = if d != *a && d != *b { d.clone() } else { "v3".to_string() };
+                let mut lines = Vec::new();
+                if *c != acc {
+                    lines.push(format!("    orr {acc}.{bits}, {c}.{bits}, {c}.{bits}"));
+                }
+                if neg_addend {
+                    lines.push(format!("    fneg {acc}.{arr}, {acc}.{arr}"));
+                }
+                lines.push(format!("    {} {acc}.{arr}, {a}.{arr}, {b}.{arr}", if neg_product { "fmls" } else { "fmla" }));
+                if acc != d {
+                    lines.push(format!("    orr {d}.{bits}, {acc}.{bits}, {acc}.{bits}"));
+                }
+                lines
+            }
             // d += b >> n, with d already holding the other operand (a).
             VecOpKind::Add if accumulate.is_some() => {
                 let mut lines = Vec::new();
@@ -987,7 +1005,7 @@ impl ArmCodegen {
         // The result went to v0 and memory, or a register right shift
         // negated its count into v1.
         if dest_reg.is_none() {
-            held = [None; 2];
+            held = [None; 3];
         } else if matches!(op, VecOpKind::Shr) && imm_shift.is_none() {
             held[1] = None;
         }
@@ -1211,6 +1229,24 @@ impl ArmCodegen {
                 // __builtin_thread_pointer(): read TLS base from tpidr_el0
                 self.state.emit("    mrs x0, tpidr_el0");
                 self.store_scalar_dest(dest, "x0");
+            }
+            IntrinsicOp::Fma { f64, neg_product, neg_addend } => {
+                let Some(dest) = dest else { return };
+                let ty = if *f64 { IrType::F64 } else { IrType::F32 };
+                let s = if *f64 { ["d0", "d1", "d2"] } else { ["s0", "s1", "s2"] };
+                let a = self.float_operand_to_fp_reg(&args[0], ty, s[0]);
+                let b = self.float_operand_to_fp_reg(&args[1], ty, s[1]);
+                let c = self.float_operand_to_fp_reg(&args[2], ty, s[2]);
+                let d = self.dest_fp_reg(dest).unwrap_or_else(|| s[0].to_string());
+                // fmadd: a*b + c; fmsub: c - a*b; fnmsub: a*b - c; fnmadd: -(a*b) - c.
+                let mnemonic = match (neg_product, neg_addend) {
+                    (false, false) => "fmadd",
+                    (true, false) => "fmsub",
+                    (false, true) => "fnmsub",
+                    (true, true) => "fnmadd",
+                };
+                self.state.emit_fmt(format_args!("    {mnemonic} {d}, {a}, {b}, {c}"));
+                self.finish_float_result(dest, &d, ty);
             }
             IntrinsicOp::SqrtF64 => self.emit_f64_unary_neon(dest, args, "fsqrt"),
             IntrinsicOp::SqrtF32 => self.emit_f32_unary_neon(dest, args, "fsqrt"),

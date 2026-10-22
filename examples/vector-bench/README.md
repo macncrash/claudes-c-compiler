@@ -37,7 +37,7 @@ after the first, which is consistently slower):
 | `saxpy`    |   249 | 3800 | 3660 |
 | `xorshift` |    82 | 1820 | 2070 |
 | `select`   |    27 | 1140 | 1315 |
-| `dmix`     |   333 | 3320 | 3700 |
+| `dmix`     |   333 | 3720 | 3700 |
 | `blend`    |    79 | 3720 | 3570 |
 | `call`     |   150 | 1125 | 1250 |
 

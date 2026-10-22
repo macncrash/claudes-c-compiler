@@ -69,6 +69,12 @@ pub enum IntrinsicOp {
     /// args[0] = input float value; dest = |x|
     FabsF32,
     FabsF64,
+    /// Fused multiply-add, rounded once: dest = (±(args[0] * args[1])) ±
+    /// args[2], the product negated when `neg_product` and the addend when
+    /// `neg_addend`; F64 lanes when `f64`, else F32. Emitted for contracted
+    /// `a * b + c` expressions (-ffp-contract=on), only for AArch64
+    /// (fmadd/fmsub/fnmsub/fnmadd).
+    Fma { f64: bool, neg_product: bool, neg_addend: bool },
     /// AES-NI: aesenc (single round encrypt)
     /// args[0] = state ptr, args[1] = round key ptr; dest_ptr = result ptr
     Aesenc128,
@@ -200,6 +206,9 @@ pub enum VecOpKind {
     Add, Sub, Mul, Div, And, Or, Xor, Shl, Shr,
     Eq, Ne, Lt, Le, Gt, Ge,
     Neg, Not,
+    /// Fused (±(args[0] * args[1])) ± args[2] on float lanes, as
+    /// IntrinsicOp::Fma; splat bit 4 broadcasts args[2].
+    Fma { neg_product: bool, neg_addend: bool },
 }
 
 /// The lane type of an [`IntrinsicOp::VecOp`].
@@ -234,6 +243,7 @@ impl IntrinsicOp {
         matches!(self,
             IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64 |
             IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 |
+            IntrinsicOp::Fma { .. } |
             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
             IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
             IntrinsicOp::Aesimc128 | IntrinsicOp::Aeskeygenassist128 |

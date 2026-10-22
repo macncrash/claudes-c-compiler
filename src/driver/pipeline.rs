@@ -221,6 +221,9 @@ pub struct Driver {
     /// Signed overflow wraps (-fwrapv), so optimizations may not assume it
     /// never happens (see passes::iv_widen).
     pub(super) fwrapv: bool,
+    /// Contract a * b + c into fused multiply-adds within an expression
+    /// (-ffp-contract=on, the default, as for clang; -ffp-contract=off).
+    pub(super) fp_contract: bool,
     /// Number of integer arguments to pass in registers for i686 (-mregparm=N).
     /// 0 = standard cdecl (all on stack), 1-3 = pass first N int args in EAX/EDX/ECX.
     pub(super) regparm: u8,
@@ -301,6 +304,7 @@ impl Driver {
             color_mode: ColorMode::Auto,
             fcommon: false,
             fwrapv: false,
+            fp_contract: true,
             regparm: 0,
             omit_frame_pointer: false,
             no_unwind_tables: false,
@@ -1034,7 +1038,7 @@ impl Driver {
         // Pass sema's TypeContext, function signatures, and expression type annotations
         // to the lowerer so it has pre-populated type info upfront.
         let t4 = std::time::Instant::now();
-        let lowerer = Lowerer::with_type_context(
+        let mut lowerer = Lowerer::with_type_context(
             self.target,
             sema_result.type_context,
             sema_result.functions,
@@ -1044,6 +1048,7 @@ impl Driver {
             diagnostics,
             self.gnu89_inline,
         );
+        lowerer.set_fp_contract(self.fp_contract);
         let (mut module, diagnostics) = lowerer.lower(&ast);
 
         // Apply #pragma weak directives from the preprocessor.

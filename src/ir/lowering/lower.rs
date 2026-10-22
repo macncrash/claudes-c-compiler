@@ -50,6 +50,9 @@ use crate::frontend::sema::type_context::TypeContext;
 pub struct Lowerer {
     /// Target architecture, used for ABI-specific lowering decisions
     pub(super) target: Target,
+    /// Contract a * b + c into one fused multiply-add within an expression
+    /// (-ffp-contract=on, the default; off with -ffp-contract=off).
+    pub(super) fp_contract: bool,
     pub(super) next_label: u32,
     pub(super) next_string: u32,
     pub(super) next_anon_struct: u32,
@@ -192,6 +195,7 @@ impl Lowerer {
 
         Self {
             target,
+            fp_contract: true,
             next_label: 0,
             next_string: 0,
             next_anon_struct: 0,
@@ -227,6 +231,11 @@ impl Lowerer {
 
     /// Access the current function build state (panics if not inside a function).
     #[inline]
+    /// Allow or forbid contracting a * b + c into a fused multiply-add.
+    pub fn set_fp_contract(&mut self, on: bool) {
+        self.fp_contract = on;
+    }
+
     pub(super) fn func(&self) -> &FunctionBuildState {
         self.func_state.as_ref().expect("not inside a function")
     }

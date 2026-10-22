@@ -484,6 +484,8 @@ pub fn allocate_fp_registers(
                 | Instruction::Select { dest, ty, .. } if is_fp(ty) => Some((*dest, *ty)),
                 Instruction::Cast { dest, from_ty, to_ty, .. }
                     if is_fp(to_ty) && !is_wide(from_ty) => Some((*dest, *to_ty)),
+                Instruction::Intrinsic { dest: Some(dest), op: IntrinsicOp::Fma { f64, .. }, .. } =>
+                    Some((*dest, if *f64 { IrType::F64 } else { IrType::F32 })),
                 _ => None,
             };
             match (float_def, inst) {
@@ -510,6 +512,8 @@ pub fn allocate_fp_registers(
                 Instruction::Cast { from_ty, to_ty, .. } => is_fp(from_ty) && !is_wide(to_ty),
                 Instruction::Store { ty, .. } | Instruction::Select { ty, .. } => !is_wide(ty),
                 Instruction::Copy { .. } => true,
+                // (Only AArch64 emits it, through float_operand_to_fp_reg.)
+                Instruction::Intrinsic { op: IntrinsicOp::Fma { .. }, .. } => true,
                 _ => false,
             };
             if !safe_use {
@@ -572,8 +576,9 @@ pub fn allocate_fp_registers(
     for block in &func.blocks {
         for inst in &block.instructions {
             let calls_helper = match inst {
-                // Whole-vector ops use only v0/v1 and the vector temp registers.
-                Instruction::Intrinsic { op, .. } => !matches!(op, IntrinsicOp::VecOp { .. }),
+                // Whole-vector ops use only v0-v3 and the vector temp registers;
+                // a fused multiply-add only d0-d2 and its operands' registers.
+                Instruction::Intrinsic { op, .. } => !matches!(op, IntrinsicOp::VecOp { .. } | IntrinsicOp::Fma { .. }),
                 Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
                 | Instruction::Cmp { ty, .. } | Instruction::Load { ty, .. }
                 | Instruction::Store { ty, .. } => *ty == IrType::F128,

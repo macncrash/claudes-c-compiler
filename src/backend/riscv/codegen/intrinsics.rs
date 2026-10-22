@@ -217,6 +217,7 @@ impl RiscvCodegen {
                     self.store_t0_to(d);
                 }
             }
+            IntrinsicOp::Fma { .. } => unreachable!("fused multiply-add is only emitted for AArch64"),
             IntrinsicOp::SqrtF64 => {
                 self.operand_to_t0(&args[0]);
                 self.state.emit("    fmv.d.x ft0, t0");

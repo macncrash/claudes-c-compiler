@@ -453,6 +453,7 @@ impl Instruction {
             Instruction::Intrinsic { op, .. } => match op {
                 IntrinsicOp::SqrtF32 | IntrinsicOp::FabsF32 => Some(IrType::F32),
                 IntrinsicOp::SqrtF64 | IntrinsicOp::FabsF64 => Some(IrType::F64),
+                IntrinsicOp::Fma { f64, .. } => Some(if *f64 { IrType::F64 } else { IrType::F32 }),
                 _ => None,
             },
             Instruction::GetReturnF128Second { .. } => Some(IrType::F128),

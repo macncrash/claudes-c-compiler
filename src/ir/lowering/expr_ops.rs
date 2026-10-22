@@ -245,6 +245,9 @@ impl Lowerer {
             }
             (lhs_val, rhs_val)
         };
+        if let Some(fused) = self.try_contract_fma(op, Some(lhs), Some(rhs), lhs_val, rhs_val, op_ty) {
+            return fused;
+        }
         let dest = self.fresh_value();
 
         match op {
@@ -259,6 +262,65 @@ impl Lowerer {
         }
 
         self.maybe_narrow_binop_result(dest, op, common_ty)
+    }
+
+    /// `a * b + c`, `c + a * b`, `a * b - c` or `c - a * b` (and the same
+    /// with `-(a * b)`) as one fused multiply-add, as clang does under
+    /// -ffp-contract=on (the default): the product must be an operand of the
+    /// same floating type, so no conversion comes between (a product in
+    /// another statement is a variable, not an operand). The product on the
+    /// left is fused first. An operand without an expression (the variable
+    /// of `x += a * b`) is never a product. AArch64 only.
+    pub(super) fn try_contract_fma(&mut self, op: &BinOp, lhs: Option<&Expr>, rhs: Option<&Expr>, lhs_val: Operand,
+                                   rhs_val: Operand, ty: IrType) -> Option<Operand> {
+        if !self.fp_contract || self.target != crate::backend::Target::Aarch64
+            || !matches!(ty, IrType::F32 | IrType::F64) || !matches!(op, BinOp::Add | BinOp::Sub) {
+            return None;
+        }
+        // The instruction defining `v`: emitted in this expression, so in the
+        // current block or (past a ?: or && inside it) an earlier one.
+        let def = |this: &Self, v: Value| -> Option<Instruction> {
+            let f = this.func();
+            f.instrs.iter().rev().chain(f.blocks.iter().rev().flat_map(|b| b.instructions.iter().rev()))
+                .find(|i| i.dest() == Some(v)).cloned()
+        };
+        // (a, b, negated) when `e` is a product of type `ty`, or its negation.
+        let product = |this: &Self, e: Option<&Expr>, v: Operand| -> Option<(Operand, Operand, bool)> {
+            let (Some(e), Operand::Value(v)) = (e, v) else { return None };
+            if this.get_expr_type(e) != ty {
+                return None;
+            }
+            match (e, def(this, v)?) {
+                (Expr::BinaryOp(BinOp::Mul, ..), Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, ty: t, .. }) if t == ty =>
+                    Some((lhs, rhs, false)),
+                (Expr::UnaryOp(UnaryOp::Neg, inner, _), Instruction::UnaryOp { op: IrUnaryOp::Neg, src, ty: t, .. })
+                    if t == ty && matches!(**inner, Expr::BinaryOp(BinOp::Mul, ..)) && this.get_expr_type(inner) == ty =>
+                {
+                    let Operand::Value(m) = src else { return None };
+                    match def(this, m)? {
+                        Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, ty: t, .. } if t == ty => Some((lhs, rhs, true)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        let sub = *op == BinOp::Sub;
+        let (a, b, c, neg_product, neg_addend) = if let Some((a, b, neg)) = product(self, lhs, lhs_val) {
+            (a, b, rhs_val, neg, sub)
+        } else if let Some((a, b, neg)) = product(self, rhs, rhs_val) {
+            (a, b, lhs_val, neg != sub, false)
+        } else {
+            return None;
+        };
+        let dest = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest),
+            op: crate::ir::reexports::IntrinsicOp::Fma { f64: ty == IrType::F64, neg_product, neg_addend },
+            dest_ptr: None,
+            args: vec![a, b, c],
+        });
+        Some(Operand::Value(dest))
     }
 
     /// Integer promotion: types narrower than int are promoted to int.

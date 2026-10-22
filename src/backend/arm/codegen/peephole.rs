@@ -1823,8 +1823,26 @@ fn fold_index_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
             continue;
         }
         let a = gpr_operand(p[0]).unwrap_or(255);
+        // The access may come a few lines later, past straight-line code that
+        // neither reads A nor writes A or the registers it was computed from.
+        let written = (1 << a) | p[1..3].iter().filter_map(|r| gpr_operand(r)).fold(0, |m, r| m | (1 << r));
         let mut j = i + 1;
-        while j < n && kinds[j] == LineKind::Nop {
+        let mut skipped = 0;
+        while j < n {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            if split_insn(&lines[j]).is_some_and(|(_, o)| first_and_rest(o).1.trim() == format!("[{}]", p[0])) {
+                break;
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            if skipped == 6 || !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call)
+                || info.uses & (1 << a) != 0 || info.defs & written != 0 {
+                j = n;
+                break;
+            }
+            skipped += 1;
             j += 1;
         }
         if j >= n {
@@ -2499,6 +2517,20 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("ldr d0, [x4, x3]") && result.contains("ldr d1, [x5, x3]"), "{}", result);
         assert!(!result.contains("add x11"), "{}", result);
+    }
+
+    #[test]
+    fn test_index_folded_into_later_access() {
+        // Other loads and NEON ops may come between the add and its access.
+        let input = ".type f, %function\nf:\n    add x11, x4, x3\n    ldr q0, [x5, x3]\n    fmul v28.4s, v0.4s, v26.4s\n    ldr q1, [x11]\n    fmla v28.4s, v27.4s, v1.4s\n    str q28, [x5, x3]\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr q1, [x4, x3]") && !result.contains("add x11"), "{}", result);
+        // Not past a write of the index, or a read of the address register.
+        for between in ["    add x3, x3, #16\n", "    str x11, [x6]\n"] {
+            let input = format!(".type f, %function\nf:\n    add x11, x4, x3\n{between}    ldr q1, [x11]\n    str q1, [x6]\n    str x3, [x7]\n    ret\n.size f, .-f\n");
+            let result = peephole_optimize(input);
+            assert!(result.contains("add x11, x4, x3"), "{between}{result}");
+        }
     }
 
     #[test]

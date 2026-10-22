@@ -266,6 +266,7 @@ impl X86Codegen {
                     self.store_rax_to(d);
                 }
             }
+            IntrinsicOp::Fma { .. } => unreachable!("fused multiply-add is only emitted for AArch64"),
             IntrinsicOp::FabsF64 => {
                 // Clear sign bit for double-precision absolute value
                 self.float_operand_to_xmm0(&args[0], false);

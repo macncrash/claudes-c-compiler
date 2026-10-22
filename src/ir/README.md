@@ -518,7 +518,7 @@ variants are organized by ISA extension:
 | AES-NI | 6 | `Aesenc128`, `Aesenclast128`, `Aesdec128`, `Aesdeclast128`, `Aesimc128`, `Aeskeygenassist128` |
 | CLMUL | 1 | `Pclmulqdq128` |
 | CRC32 | 4 | `Crc32_8`, `Crc32_16`, `Crc32_32`, `Crc32_64` |
-| Scalar math | 4 | `SqrtF32`, `SqrtF64`, `FabsF32`, `FabsF64` |
+| Scalar math | 5 | `SqrtF32`, `SqrtF64`, `FabsF32`, `FabsF64`, `Fma` (fused multiply-add from contracted `a * b + c`, AArch64 only) |
 | Frame/return address | 3 | `FrameAddress`, `ReturnAddress`, `ThreadPointer` |
 
 Each variant name maps directly to an x86 instruction mnemonic (e.g.,

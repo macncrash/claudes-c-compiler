@@ -150,6 +150,7 @@ impl I686Codegen {
             IntrinsicOp::FabsF64 => {
                 self.emit_f64_unary_x87(&args[0], "fabs", dest);
             }
+            IntrinsicOp::Fma { .. } => unreachable!("fused multiply-add is only emitted for AArch64"),
             IntrinsicOp::FabsF32 => {
                 self.emit_f32_load_to_x87(&args[0]);
                 self.state.emit("    fabs");
