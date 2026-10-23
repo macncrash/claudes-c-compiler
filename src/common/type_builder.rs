@@ -265,7 +265,7 @@ pub fn build_full_ctype_with_base(
                             params: param_types,
                             variadic,
                         }));
-                        result = CType::Pointer(Box::new(func_type), AccessQuals::NONE);
+                        result = CType::Pointer(Box::new(func_type), pointer_quals(quals));
                         i += 2;
                     } else {
                         result = CType::Pointer(Box::new(result), pointer_quals(quals));

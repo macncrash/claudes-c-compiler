@@ -59,7 +59,15 @@ impl Lowerer {
                             fptr_inner_ptr_depth: 0,
                         }
                     }).collect();
-                    TypeSpecifier::FunctionPointer(Box::new(ret_ts), param_decls, ft.variadic)
+                    if quals.pointer_const {
+                        // FunctionPointer has no qualifiers of its own; a const
+                        // one is a pointer to the bare function type.
+                        TypeSpecifier::Pointer(
+                            Box::new(TypeSpecifier::BareFunction(Box::new(ret_ts), param_decls, ft.variadic)),
+                            *quals)
+                    } else {
+                        TypeSpecifier::FunctionPointer(Box::new(ret_ts), param_decls, ft.variadic)
+                    }
                 } else {
                     TypeSpecifier::Pointer(Box::new(Self::ctype_to_type_spec(inner)), *quals)
                 }
@@ -141,11 +149,23 @@ impl Lowerer {
             //   int (*f)(...)           → Pointer(Int) → Int
             //   int *(*f)(...)          → Pointer(Pointer(Int)) → Pointer(Int)
             //   struct Node *(*f)(...) → Pointer(Pointer(Struct)) → Pointer(Struct)
-            let actual_return = if let CType::Pointer(inner, _) = return_ctype {
-                *inner
+            //
+            // For `int (**fpp)(...)` (fptr_inner_ptr_depth 2) the parser puts
+            // the extra `*` beneath that layer; it is a pointer to the function
+            // pointer, not part of the return type, so peel it too and wrap the
+            // function pointer in it. Each layer keeps whether it is itself
+            // const (`int (*const *fpp)(...)`).
+            let (mut actual_return, fptr_quals) = if let CType::Pointer(inner, quals) = return_ctype {
+                (*inner, AccessQuals { pointer_const: quals.pointer_const, ..AccessQuals::NONE })
             } else {
-                return_ctype
+                (return_ctype, AccessQuals::NONE)
             };
+            let mut extra_quals = Vec::new();
+            for _ in 1..param.fptr_inner_ptr_depth {
+                let CType::Pointer(inner, quals) = actual_return else { break };
+                extra_quals.push(AccessQuals { pointer_const: quals.pointer_const, ..AccessQuals::NONE });
+                actual_return = *inner;
+            }
 
             let param_types: Vec<(CType, Option<String>)> = fptr_params.iter()
                 .map(|p| (self.type_spec_to_ctype(&p.type_spec), p.name.clone()))
@@ -155,7 +175,10 @@ impl Lowerer {
                 params: param_types,
                 variadic: false,
             }));
-            let result = CType::Pointer(Box::new(func_type), AccessQuals::NONE);
+            let mut result = CType::Pointer(Box::new(func_type), fptr_quals);
+            for quals in extra_quals.into_iter().rev() {
+                result = CType::Pointer(Box::new(result), quals);
+            }
             return result;
         }
 
@@ -231,7 +254,12 @@ impl Lowerer {
                 params: param_types,
                 variadic: fti.variadic,
             }));
-            return Some(CType::Pointer(Box::new(func_type), AccessQuals::NONE));
+            // Keep whether the pointer is itself const
+            // (`typedef int (*const cfp_t)(int);`), which the typedef's
+            // resolved type records.
+            let pointer_const = matches!(self.types.typedefs.get(tname),
+                Some(CType::Pointer(_, quals)) if quals.pointer_const);
+            return Some(CType::Pointer(Box::new(func_type), AccessQuals { pointer_const, ..AccessQuals::NONE }));
         }
         None
     }

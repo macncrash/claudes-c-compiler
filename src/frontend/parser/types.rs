@@ -982,14 +982,28 @@ impl Parser {
             if let Some(paren_decl) = self.try_parse_paren_abstract_declarator() {
                 use super::declarators::ParenAbstractDecl;
                 match paren_decl {
-                    ParenAbstractDecl::Simple { ptr_depth, array_dims: inner_array_dims } => {
+                    ParenAbstractDecl::Simple { ptr_depth, ptr_consts, array_dims: inner_array_dims } => {
+                        // The qualifiers of the i-th pointer level from the base: whether
+                        // that pointer is itself const.
+                        let level_quals = |i: u32| AccessQuals {
+                            pointer_const: i < 32 && ptr_consts & (1 << i) != 0,
+                            ..AccessQuals::NONE
+                        };
                         if matches!(self.peek(), TokenKind::LParen) {
                             // Function pointer cast: (*)(params) or (**)(params)
                             let (params, variadic) = self.parse_param_list();
-                            result_type = TypeSpecifier::FunctionPointer(Box::new(result_type), params, variadic);
+                            result_type = if level_quals(0).pointer_const {
+                                // FunctionPointer has no qualifiers of its own; spell a
+                                // const one as a pointer to the bare function type.
+                                TypeSpecifier::Pointer(
+                                    Box::new(TypeSpecifier::BareFunction(Box::new(result_type), params, variadic)),
+                                    level_quals(0))
+                            } else {
+                                TypeSpecifier::FunctionPointer(Box::new(result_type), params, variadic)
+                            };
                             // Extra pointer levels for multi-indirection (e.g., ** means ptr-to-func-ptr)
-                            for _ in 0..ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
+                            for level in 1..ptr_depth {
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), level_quals(level));
                             }
                             // Wrap with inner array dims (for array of function pointers)
                             for dim in inner_array_dims.into_iter().rev() {
@@ -1012,15 +1026,15 @@ impl Parser {
                             for dim in outer_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
-                            for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
+                            for level in 0..ptr_depth {
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), level_quals(level));
                             }
                             for dim in inner_array_dims.into_iter().rev() {
                                 result_type = TypeSpecifier::Array(Box::new(result_type), dim);
                             }
                         } else {
-                            for _ in 0..ptr_depth {
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::NONE);
+                            for level in 0..ptr_depth {
+                                result_type = TypeSpecifier::Pointer(Box::new(result_type), level_quals(level));
                             }
                         }
                     }
