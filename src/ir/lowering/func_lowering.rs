@@ -337,7 +337,8 @@ impl Lowerer {
         let elem_size = if ty == IrType::Ptr { self.pointee_elem_size(&orig_param.type_spec) } else { 0 };
         let pointee_type = if ty == IrType::Ptr { self.pointee_ir_type(&orig_param.type_spec) } else { None };
         let struct_layout = if ty == IrType::Ptr { self.get_struct_layout_for_pointer_param(&orig_param.type_spec) } else { None };
-        let c_type = Some(self.param_ctype(orig_param));
+        let mut c_type = Some(self.param_ctype(orig_param));
+        self.mark_written_pointer_const(&mut c_type, &orig_param.type_spec, orig_param.is_const);
         let is_bool = self.is_type_bool(&orig_param.type_spec);
         let array_dim_strides = if ty == IrType::Ptr { self.compute_ptr_array_strides(&orig_param.type_spec) } else { vec![] };
 

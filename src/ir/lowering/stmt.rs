@@ -21,7 +21,7 @@ use crate::ir::reexports::{
     Terminator,
     Value,
 };
-use crate::common::types::{AccessQuals, AddressSpace, IrType, CType, StructLayout, target_int_ir_type};
+use crate::common::types::{AccessQuals, AddressSpace, IrType, CType, StructLayout, target_int_ir_type, const_reaches_base, mark_pointer_const};
 use super::lower::Lowerer;
 use super::definitions::{LocalInfo, GlobalInfo, DeclAnalysis, FuncSig};
 use crate::frontend::sema::type_context::extract_fptr_typedef_info;
@@ -311,9 +311,46 @@ impl Lowerer {
     /// int *cp`).
     pub(super) fn base_is_const(&self, type_spec: &TypeSpecifier, written_const: bool) -> bool {
         match type_spec {
-            TypeSpecifier::Typeof(e) => written_const || self.expr_is_const_qualified(e),
+            TypeSpecifier::Typeof(e) => {
+                // As for a typedef, `const typeof(p)` of a pointer makes the
+                // pointer const (see mark_written_pointer_const).
+                let reaches = self.get_expr_ctype(e).is_none_or(|ct| const_reaches_base(&ct));
+                self.expr_is_const_qualified(e) || (written_const && reaches)
+            }
             _ => self.types.type_spec_base_const(type_spec, written_const),
         }
+    }
+
+    /// `const` written on a typedef or `typeof` of pointer type (`const IP p`
+    /// for `typedef int *IP;`) makes that pointer itself const: mark it in
+    /// the declared type, beneath the pointers and arrays the declarator
+    /// adds.
+    pub(super) fn mark_written_pointer_const(&self, c_type: &mut Option<CType>, type_spec: &TypeSpecifier, written_const: bool) {
+        fn layers(ct: &CType) -> usize {
+            match ct {
+                CType::Pointer(inner, _) | CType::Array(inner, _) => 1 + layers(inner),
+                _ => 0,
+            }
+        }
+        if !written_const {
+            return;
+        }
+        let mut leaf = type_spec;
+        while let TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) = leaf {
+            leaf = inner;
+        }
+        if !matches!(leaf, TypeSpecifier::TypedefName(_) | TypeSpecifier::Typeof(_)) {
+            return;
+        }
+        let Some(mut node) = c_type.as_mut() else { return };
+        let leaf_layers = layers(&self.type_spec_to_ctype(leaf));
+        for _ in leaf_layers..layers(node) {
+            node = match node {
+                CType::Pointer(inner, _) | CType::Array(inner, _) => inner,
+                _ => return,
+            };
+        }
+        mark_pointer_const(node);
     }
 
     fn decl_is_const(&self, decl: &Declaration) -> bool {
@@ -326,6 +363,7 @@ impl Lowerer {
         explicit_align: usize, vla_size: Option<Value>,
     ) {
         let mut local_info = LocalInfo::from_analysis(da, alloca, self.decl_is_const(decl));
+        self.mark_written_pointer_const(&mut local_info.var.c_type, &decl.type_spec, decl.is_const());
         local_info.var.quals = decl.object_quals(declarator);
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
@@ -416,6 +454,7 @@ impl Lowerer {
         let mut ginfo = GlobalInfo::from_analysis(da);
         ginfo.var.quals = decl.object_quals(declarator);
         ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
+        self.mark_written_pointer_const(&mut ginfo.var.c_type, &decl.type_spec, decl.is_const());
         self.globals.insert(static_name.clone(), ginfo);
 
         // Determine initializer (evaluated at compile time for static locals)
@@ -507,6 +546,7 @@ impl Lowerer {
         // Store type info in locals (with static_global_name set so each use site
         // emits a fresh GlobalAddr in its own basic block, avoiding unreachable-block issues).
         let mut local_info = LocalInfo::for_static(da, static_name, self.decl_is_const(decl));
+        self.mark_written_pointer_const(&mut local_info.var.c_type, &decl.type_spec, decl.is_const());
         local_info.var.quals = decl.object_quals(declarator);
         if let Some(ea) = explicit_align {
             local_info.var.explicit_alignment = Some(ea);

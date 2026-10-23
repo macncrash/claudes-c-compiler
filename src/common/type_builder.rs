@@ -183,6 +183,13 @@ fn convert_param_decls_to_ctypes(
         .collect()
 }
 
+/// The qualifiers a pointer declarator gives its CType: only whether the
+/// pointer itself is const (`int *const p`). Its volatile and address space
+/// reach the type through the declaration instead.
+fn pointer_quals(quals: &AccessQuals) -> AccessQuals {
+    AccessQuals { pointer_const: quals.pointer_const, ..AccessQuals::NONE }
+}
+
 /// Build a full CType from a TypeSpecifier and DerivedDeclarator chain.
 ///
 /// The derived list is produced by the parser's declarator handling, which stores
@@ -227,8 +234,8 @@ pub fn build_full_ctype_with_base(
         // We fold prefix Pointer declarators into the base to form the return type.
         let mut result = base;
         for d in &derived[..fp_start] {
-            if matches!(d, DerivedDeclarator::Pointer(_)) {
-                result = CType::Pointer(Box::new(result), AccessQuals::NONE);
+            if let DerivedDeclarator::Pointer(quals) = d {
+                result = CType::Pointer(Box::new(result), pointer_quals(quals));
             }
             // Array declarators in prefix are outer wrappers, handled after the core.
         }
@@ -238,7 +245,7 @@ pub fn build_full_ctype_with_base(
         let mut i = fp_start;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
+                DerivedDeclarator::Pointer(quals) => {
                     // `Pointer, FunctionPointer` is one pointer-to-function layer.
                     // A Pointer before a plain Function wraps the type built so
                     // far, and the Function is an outer layer: for
@@ -261,7 +268,7 @@ pub fn build_full_ctype_with_base(
                         result = CType::Pointer(Box::new(func_type), AccessQuals::NONE);
                         i += 2;
                     } else {
-                        result = CType::Pointer(Box::new(result), AccessQuals::NONE);
+                        result = CType::Pointer(Box::new(result), pointer_quals(quals));
                         i += 1;
                     }
                 }
@@ -320,8 +327,8 @@ pub fn build_full_ctype_with_base(
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
-                    result = CType::Pointer(Box::new(result), AccessQuals::NONE);
+                DerivedDeclarator::Pointer(quals) => {
+                    result = CType::Pointer(Box::new(result), pointer_quals(quals));
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {

@@ -53,8 +53,8 @@ impl Parser {
 
         // Parse pointer(s) with optional qualifiers and attributes
         while self.consume_if(&TokenKind::Star) {
-            derived.push(DerivedDeclarator::Pointer(AccessQuals::NONE));
-            self.skip_cv_qualifiers();
+            let pointer_const = self.skip_cv_qualifiers();
+            derived.push(DerivedDeclarator::Pointer(AccessQuals { pointer_const, ..AccessQuals::NONE }));
             self.skip_gcc_extensions();
         }
 
@@ -361,13 +361,14 @@ impl Parser {
                 // Capture whether the base type (before pointer declarators) was const.
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
                 let param_is_const = self.attrs.parsing_const();
-                let (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_param_decls, inner_ptr_depth) =
+                let (name, pointer_depth, pointer_consts, array_dims, is_func_ptr, ptr_to_array_dims, fptr_param_decls, inner_ptr_depth) =
                     self.parse_param_declarator_full();
                 self.skip_gcc_extensions();
 
                 // Apply pointer levels
-                for _ in 0..pointer_depth {
-                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AccessQuals::NONE);
+                for level in 0..pointer_depth {
+                    let pointer_const = level < 32 && pointer_consts & (1 << level) != 0;
+                    type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AccessQuals { pointer_const, ..AccessQuals::NONE });
                 }
 
                 // Pointer-to-array: int (*p)[N][M]
@@ -446,12 +447,16 @@ impl Parser {
     }
 
     /// Parse a parameter declarator with full type information.
-    /// Returns (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth).
-    pub(super) fn parse_param_declarator_full(&mut self) -> (Option<String>, u32, Vec<Option<Box<Expr>>>, bool, Vec<Option<Box<Expr>>>, Option<Vec<ParamDecl>>, u32) {
+    /// Returns (name, pointer_depth, pointer_consts, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth),
+    /// where bit i of pointer_consts is set when the i-th leading `*` is followed by `const`.
+    pub(super) fn parse_param_declarator_full(&mut self) -> (Option<String>, u32, u32, Vec<Option<Box<Expr>>>, bool, Vec<Option<Box<Expr>>>, Option<Vec<ParamDecl>>, u32) {
+        let mut pointer_consts: u32 = 0;
         let mut pointer_depth: u32 = 0;
         while self.consume_if(&TokenKind::Star) {
+            if self.skip_cv_qualifiers() && pointer_depth < 32 {
+                pointer_consts |= 1 << pointer_depth;
+            }
             pointer_depth += 1;
-            self.skip_cv_qualifiers();
             // Also skip __attribute__(...) after pointer qualifiers.
             // E.g., `int * __attribute__((unused)) p` is valid GNU C.
             self.skip_gcc_extensions();
@@ -504,7 +509,7 @@ impl Parser {
             fptr_params = Some(fp_params);
         }
 
-        (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth)
+        (name, pointer_depth, pointer_consts, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth)
     }
 
     /// Parse a parenthesized parameter declarator: (*name)(params), (name), etc.

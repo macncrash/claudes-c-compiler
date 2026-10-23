@@ -208,18 +208,38 @@ pub enum AddressSpace {
 ///
 /// `volatile` is tracked conservatively: a `volatile` anywhere in a
 /// declaration or type name marks every pointer level in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+///
+/// `pointer_const` is different: on a pointer type it says the pointer
+/// itself is const (`int *const p`). Only `_Generic` and `__typeof__` look
+/// at it, so equality and hashing ignore it and types compare as before.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct AccessQuals {
     pub space: AddressSpace,
     pub volatile: bool,
+    pub pointer_const: bool,
+}
+
+impl PartialEq for AccessQuals {
+    fn eq(&self, other: &Self) -> bool {
+        self.space == other.space && self.volatile == other.volatile
+    }
+}
+
+impl Eq for AccessQuals {}
+
+impl std::hash::Hash for AccessQuals {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.space.hash(state);
+        self.volatile.hash(state);
+    }
 }
 
 impl AccessQuals {
-    pub const NONE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: false };
-    pub const VOLATILE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: true };
+    pub const NONE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: false, pointer_const: false };
+    pub const VOLATILE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: true, pointer_const: false };
 
     pub fn in_space(space: AddressSpace) -> Self {
-        AccessQuals { space, volatile: false }
+        AccessQuals { space, volatile: false, pointer_const: false }
     }
 
     /// The qualifiers of an object reached through both `self` and `other`,
@@ -228,6 +248,7 @@ impl AccessQuals {
         AccessQuals {
             space: if self.space == AddressSpace::Default { other.space } else { self.space },
             volatile: self.volatile || other.volatile,
+            pointer_const: self.pointer_const || other.pointer_const,
         }
     }
 }
@@ -337,6 +358,20 @@ pub fn has_pointer_level(t: &CType) -> bool {
         CType::Pointer(..) => true,
         CType::Array(elem, _) => has_pointer_level(elem),
         _ => false,
+    }
+}
+
+/// Make an object of this type const where that const is a pointer's own:
+/// mark the pointer (an array's element pointers) const. For other types
+/// the const reaches the base type (see const_reaches_base), which CType
+/// does not record.
+pub fn mark_pointer_const(ty: &mut CType) {
+    let mut ty = ty;
+    while let CType::Array(elem, _) = ty {
+        ty = elem;
+    }
+    if let CType::Pointer(_, quals) = ty {
+        quals.pointer_const = true;
     }
 }
 

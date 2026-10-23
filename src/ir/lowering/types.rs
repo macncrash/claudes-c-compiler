@@ -100,7 +100,7 @@ impl Lowerer {
                 let ctype = if let Expr::GenericSelection(controlling, associations, _) = expr.as_ref() {
                     self.resolve_generic_selection_ctype(controlling, associations)
                 } else {
-                    self.get_expr_ctype(expr)
+                    self.qualified_expr_ctype(expr)
                 };
                 if let Some(CType::Vector(elem, total_bytes)) = ctype {
                     // ctype_to_type_spec gives a vector's element type (for
@@ -199,7 +199,7 @@ impl Lowerer {
                 let ctype = if let Expr::GenericSelection(controlling, associations, _) = expr.as_ref() {
                     self.resolve_generic_selection_ctype(controlling, associations)
                 } else {
-                    self.get_expr_ctype(expr)
+                    self.qualified_expr_ctype(expr)
                 };
                 if let Some(ctype) = ctype {
                     IrType::from_ctype(&ctype)

@@ -64,6 +64,7 @@ impl Lowerer {
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.quals = decl.object_quals(declarator);
             ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
+            self.mark_written_pointer_const(&mut ginfo.var.c_type, &decl.type_spec, decl.is_const());
             self.globals.insert(declarator.name.clone(), ginfo);
 
             let init = self.lower_declarator_init(decl, declarator, &da);
@@ -187,6 +188,7 @@ impl Lowerer {
         ginfo.asm_register = Some(reg_name.clone());
         ginfo.var.quals = decl.object_quals(declarator);
         ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
+        self.mark_written_pointer_const(&mut ginfo.var.c_type, &decl.type_spec, decl.is_const());
         self.globals.insert(declarator.name.clone(), ginfo);
         true
     }
@@ -205,6 +207,7 @@ impl Lowerer {
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.quals = decl.object_quals(declarator);
             ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
+            self.mark_written_pointer_const(&mut ginfo.var.c_type, &decl.type_spec, decl.is_const());
             self.globals.insert(declarator.name.clone(), ginfo);
         }
         // For extern TLS variables, emit an IrGlobal so codegen uses TLS access patterns.

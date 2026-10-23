@@ -607,9 +607,12 @@ impl Lowerer {
         let controlling_ir_type = self.get_expr_type(controlling);
         // Per C11 6.5.1.1p2, lvalue conversion includes array-to-pointer and
         // function-to-pointer decay.
+        // Lvalue conversion also drops the top level's own const (`int *const
+        // p` selects `int *`).
         let controlling_ctype = controlling_ctype.map(|ct| match ct {
             CType::Array(elem, _) => CType::Pointer(elem, AccessQuals::NONE),
             CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), AccessQuals::NONE),
+            CType::Pointer(inner, quals) => CType::Pointer(inner, AccessQuals { pointer_const: false, ..quals }),
             other => other,
         });
         // Lvalue conversion also strips top-level qualifiers.
@@ -676,7 +679,7 @@ impl Lowerer {
                 (s, l) => s == l,
             }
         }
-        let lowered = self.get_expr_ctype_lowerer(controlling);
+        let lowered = self.get_expr_ctype_lowerer(controlling).map(|ct| self.with_member_const(controlling, ct));
         let sema = self.lookup_sema_expr_type(controlling);
         match (lowered, sema) {
             (Some(l), Some(s)) if s.contains_enum() && same_but_enum(&s, &l) => Some(s),

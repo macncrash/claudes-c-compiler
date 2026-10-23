@@ -596,10 +596,17 @@ impl Parser {
         }
     }
 
-    pub(super) fn skip_cv_qualifiers(&mut self) {
+    /// Returns whether a `const` was among them (after a `*`, the pointer
+    /// itself is const).
+    pub(super) fn skip_cv_qualifiers(&mut self) -> bool {
+        let mut is_const = false;
         loop {
             match self.peek() {
-                TokenKind::Const | TokenKind::Restrict => {
+                TokenKind::Const => {
+                    self.advance();
+                    is_const = true;
+                }
+                TokenKind::Restrict => {
                     self.advance();
                 }
                 TokenKind::Volatile => {
@@ -621,6 +628,7 @@ impl Parser {
                 _ => break,
             }
         }
+        is_const
     }
 
     /// Skip C99 type qualifiers and 'static' inside array brackets.

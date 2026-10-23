@@ -604,7 +604,7 @@ impl Declaration {
         let has_pointer = matches!(self.type_spec, TypeSpecifier::Pointer(..))
             || declarator.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let volatile = self.is_ptr_volatile() || (self.is_volatile() && !has_pointer);
-        AccessQuals { space: self.address_space, volatile }
+        AccessQuals { space: self.address_space, volatile, pointer_const: false }
     }
 
     /// Apply `mark_volatile_pointers` to the type and every declarator.

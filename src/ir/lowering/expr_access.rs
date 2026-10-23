@@ -25,7 +25,7 @@ use crate::ir::reexports::{
     Terminator,
     Value,
 };
-use crate::common::types::{AddressSpace, IrType, CType, const_reaches_base};
+use crate::common::types::{AddressSpace, IrType, CType, const_reaches_base, mark_pointer_const};
 use super::lower::Lowerer;
 
 impl Lowerer {
@@ -498,13 +498,14 @@ impl Lowerer {
     pub(super) fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
         // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue conversion,
         // which includes array-to-pointer decay.
-        // Const/volatile qualification is checked separately via is_const flags.
+        // The base type's const is checked separately via is_const flags;
+        // each pointer level's own const (`int *const *`) is compared here.
 
         // Exact structural match (same discriminant)
         if std::mem::discriminant(controlling) == std::mem::discriminant(assoc) {
             match (controlling, assoc) {
-                (CType::Pointer(a, _), CType::Pointer(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
+                (CType::Pointer(a, qa), CType::Pointer(b, qb)) => {
+                    return qa.pointer_const == qb.pointer_const && self.ctype_matches_generic(a, b);
                 }
                 (CType::Array(a, _), CType::Array(b, _)) => {
                     return self.ctype_matches_generic(a, b);
@@ -568,6 +569,44 @@ impl Lowerer {
             // Comma: const-ness comes from the right-hand operand.
             Expr::Comma(_, rhs, _) => {
                 self.expr_is_const_qualified(rhs)
+            }
+            _ => false,
+        }
+    }
+
+    /// An expression's type with each pointer level's own const as far as it
+    /// is known (for _Generic and typeof): get_expr_ctype's, plus the const
+    /// a pointer member takes from a const struct (`cs.p` is `int *const`
+    /// when `cs` is const), also through `&`.
+    pub(super) fn qualified_expr_ctype(&self, expr: &Expr) -> Option<CType> {
+        self.get_expr_ctype(expr).map(|ctype| self.with_member_const(expr, ctype))
+    }
+
+    /// Add to an expression's type the const its member takes from a const
+    /// struct (see qualified_expr_ctype).
+    pub(super) fn with_member_const(&self, expr: &Expr, mut ctype: CType) -> CType {
+        match expr {
+            Expr::AddressOf(inner, _) if self.object_is_const_member(inner) => {
+                if let CType::Pointer(pointee, _) = &mut ctype {
+                    mark_pointer_const(pointee);
+                }
+            }
+            _ if self.object_is_const_member(expr) => mark_pointer_const(&mut ctype),
+            _ => {}
+        }
+        ctype
+    }
+
+    /// Whether an lvalue is a member of a const struct (or an element of
+    /// one that is an array), so that the object itself is const.
+    fn object_is_const_member(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => {
+                self.expr_is_const_qualified(base)
+            }
+            Expr::ArraySubscript(inner, _, _) => {
+                matches!(self.get_expr_ctype(inner), Some(CType::Array(..)))
+                    && self.object_is_const_member(inner)
             }
             _ => false,
         }

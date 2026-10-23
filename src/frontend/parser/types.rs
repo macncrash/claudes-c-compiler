@@ -815,8 +815,11 @@ impl Parser {
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
-                    result = TypeSpecifier::Pointer(Box::new(result), AccessQuals::NONE);
+                DerivedDeclarator::Pointer(quals) => {
+                    // Keep only whether the pointer itself is const, as
+                    // build_full_ctype does.
+                    let pointer_const = quals.pointer_const;
+                    result = TypeSpecifier::Pointer(Box::new(result), AccessQuals { pointer_const, ..AccessQuals::NONE });
                     i += 1;
                 }
                 DerivedDeclarator::Array(_) => {
@@ -968,8 +971,9 @@ impl Parser {
             // Capture any address space qualifier that preceded the '*'
             // (e.g., __seg_gs in "typeof(var) __seg_gs *")
             let addr_space = std::mem::take(&mut self.attrs.parsing_address_space);
-            result_type = TypeSpecifier::Pointer(Box::new(result_type), AccessQuals::in_space(addr_space));
-            self.skip_cv_qualifiers();
+            let mut quals = AccessQuals::in_space(addr_space);
+            quals.pointer_const = self.skip_cv_qualifiers();
+            result_type = TypeSpecifier::Pointer(Box::new(result_type), quals);
         }
         // Handle parenthesized abstract declarators: (*), (*)(params), (*)[N], (*[3][4])
         // Also handles nested function pointers: (*(*)(params))(params)
