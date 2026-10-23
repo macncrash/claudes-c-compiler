@@ -259,6 +259,10 @@ pub trait ArchCodegen {
     /// handled it). Default: does nothing.
     fn after_instruction(&mut self, _inst: &Instruction) {}
 
+    /// Called at the start of each block but the entry block, after its
+    /// label. Default: does nothing.
+    fn block_start(&mut self, _label: BlockId) {}
+
     /// Emit a RIP-relative load from a global symbol (folded GlobalAddr + Load).
     /// Used to fold GlobalAddr + Load into a single `movl symbol(%rip), %eax`
     /// (or appropriate variant). Default: panics.

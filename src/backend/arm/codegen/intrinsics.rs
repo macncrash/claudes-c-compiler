@@ -3,13 +3,27 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use crate::ir::reexports::{CallInfo, Instruction, IntrinsicOp, IrConst, IrFunction, Operand, Terminator, Value, VecElem, VecOpKind};
+use crate::ir::reexports::{BlockId, CallInfo, Instruction, IntrinsicOp, IrConst, IrFunction, Operand, Value, VecElem, VecOpKind};
 use crate::backend::state::SlotAddr;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{IrType, RiscvFloatClass};
 use super::emit::{ARM_VEC_TEMP_REGS, ARM_VEC_VAR_REGS};
 use super::emit::ArmCodegen;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, classify_call_args};
+
+/// Where vector variables in registers are stored to their save slots and
+/// reloaded (vec_vars_live_across), as masks of `1 << reg`: around each
+/// instruction that may clobber them, (store, reload), keyed by
+/// Instruction address; stores after some writes to them; stores once the
+/// prologue has loaded the parameters; and reloads at the start of some
+/// blocks, keyed by label.
+#[derive(Default)]
+pub(super) struct VecSpillPlan {
+    pub(super) at_clobber: FxHashMap<usize, (u32, u32)>,
+    pub(super) after_write: FxHashMap<usize, u32>,
+    pub(super) on_entry: u32,
+    pub(super) at_block_start: FxHashMap<u32, u32>,
+}
 
 impl ArmCodegen {
     pub(super) fn emit_neon_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], neon_inst: &str) {
@@ -96,9 +110,9 @@ impl ArmCodegen {
     #[allow(clippy::type_complexity)]
     pub(super) fn assign_vec_var_regs(func: &IrFunction, temps: &FxHashMap<u32, u8>, config: &CallAbiConfig,
                                     const_count: usize)
-        -> (FxHashMap<u32, u8>, Vec<(u8, u8)>, FxHashMap<u32, (u8, i64)>, FxHashSet<usize>, FxHashMap<usize, u32>)
+        -> (FxHashMap<u32, u8>, Vec<(u8, u8)>, FxHashMap<u32, (u8, i64)>, FxHashSet<usize>, VecSpillPlan)
     {
-        let none = || (FxHashMap::default(), Vec::new(), FxHashMap::default(), FxHashSet::default(), FxHashMap::default());
+        let none = || (FxHashMap::default(), Vec::new(), FxHashMap::default(), FxHashSet::default(), VecSpillPlan::default());
         let insts = || func.blocks.iter().flat_map(|b| &b.instructions);
         if insts().any(|i| matches!(i, Instruction::InlineAsm { .. })) {
             return none();
@@ -273,14 +287,30 @@ impl ArmCodegen {
         (regs, var_list, lane_regs, fresh, spills)
     }
 
-    /// Which register variables are live after each instruction that may
-    /// clobber them, as a mask of `1 << reg`, keyed by Instruction address:
-    /// only those are spilled and reloaded around it (spill_vec_vars). A
-    /// whole write, or a fresh lane store, starts a new value; other lane
-    /// stores keep the remaining lanes, so they count as uses.
+    /// Where to store register variables to their save slots and reload
+    /// them, as masks of `1 << reg` (VecSpillPlan). Around an instruction
+    /// that may clobber them, a variable live after it is stored only if
+    /// it may have changed since its slot was last written, and reloaded
+    /// only if a use follows before the next clobber (a store there counts
+    /// as one); otherwise that clobber reloads it, or a loop exit whose
+    /// slot for it is current. To keep stores out of loops, a variable that
+    /// some clobber finds live is also stored after the last write to it
+    /// in each block outside any loop, and a parameter once loaded. A whole
+    /// write, or a fresh lane store, starts a new value; other lane stores
+    /// keep the remaining lanes, so they count as uses.
     fn vec_vars_live_across(func: &IrFunction, lanes: &FxHashMap<u32, (u32, i64)>,
-                            regs: &FxHashMap<u32, u8>, fresh: &FxHashSet<usize>) -> FxHashMap<usize, u32> {
+                            regs: &FxHashMap<u32, u8>, fresh: &FxHashSet<usize>) -> VecSpillPlan {
         let bit = |id: u32| lanes.get(&id).and_then(|l| regs.get(&l.0)).map_or(0u32, |&r| 1 << r);
+        let key = |inst: &Instruction| inst as *const Instruction as usize;
+        // The variables an instruction writes, in whole or in part.
+        let writes = |inst: &Instruction| -> u32 {
+            match inst {
+                Instruction::Store { ptr, .. } => bit(ptr.0),
+                Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr, .. } => dest_ptr.map_or(0, |d| bit(d.0)),
+                Instruction::Memcpy { dest, .. } => bit(dest.0),
+                _ => 0,
+            }
+        };
         // (uses, defs) of one instruction.
         let effect = |inst: &Instruction| -> (u32, u32) {
             match inst {
@@ -298,15 +328,175 @@ impl ArmCodegen {
                 _ => (0, 0),
             }
         };
-        Self::live_after_clobbers(func, effect).1
+        let live = Self::live_after_clobbers(func, effect, &[]).1;
+        let spilled = live.values().fold(0u32, |m, &l| m | l);
+        let mut plan = VecSpillPlan::default();
+        if spilled == 0 {
+            return plan;
+        }
+        plan.on_entry = func.param_alloca_values.iter().fold(0, |m, p| m | bit(p.0)) & spilled;
+        let (in_loop, exits) = Self::loop_blocks(func);
+        for (block, _) in func.blocks.iter().zip(&in_loop).filter(|(_, l)| !**l) {
+            // After the last write to each variable in the block.
+            let mut later = 0u32;
+            for inst in block.instructions.iter().rev() {
+                let w = writes(inst) & spilled & !later;
+                later |= writes(inst);
+                if w != 0 {
+                    plan.after_write.insert(key(inst), w);
+                }
+            }
+        }
+        // Variables that may differ from their save slot, forward.
+        let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
+        let succs: Vec<Vec<usize>> = func.blocks.iter()
+            .map(|b| crate::backend::liveness::terminator_targets(&b.terminator).iter()
+                .filter_map(|t| index.get(t).copied()).collect())
+            .collect();
+        let mut stores: FxHashMap<usize, u32> = FxHashMap::default();
+        let mut dirty_in = vec![0u32; func.blocks.len()];
+        if let Some(d) = dirty_in.first_mut() {
+            *d = !plan.on_entry;
+        }
+        loop {
+            let mut changed = false;
+            for (b, block) in func.blocks.iter().enumerate() {
+                let mut dirty = dirty_in[b];
+                for inst in &block.instructions {
+                    if let Some(&l) = live.get(&key(inst)) {
+                        stores.insert(key(inst), dirty & l);
+                        dirty &= !l;
+                    }
+                    dirty |= writes(inst);
+                    dirty &= !plan.after_write.get(&key(inst)).copied().unwrap_or(0);
+                }
+                for &s in &succs[b] {
+                    if dirty_in[s] | dirty != dirty_in[s] {
+                        dirty_in[s] |= dirty;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Registers read before the next clobber (or stored by it), backward:
+        // a clobber leaves nothing live in a register before it but its
+        // arguments and the variables it stores. Loop exits reload the
+        // variables whose slots are current there, so a clobber in the loop
+        // need not reload them for uses after it.
+        let reg_effect = |inst: &Instruction| -> (u32, u32) {
+            match stores.get(&key(inst)) {
+                Some(&s) => (effect(inst).0 | s, u32::MAX),
+                None => effect(inst),
+            }
+        };
+        let loaded: Vec<u32> = exits.iter().zip(&dirty_in).map(|(&e, &d)| if e { spilled & !d } else { 0 }).collect();
+        let (_, reloads, at_block) = Self::live_after_clobbers(func, reg_effect, &loaded);
+        let invalid = Self::invalid_at_starts(func, spilled, 0, &reloads, |i| effect(i).1, &at_block);
+        plan.at_block_start = Self::keep_needed_loads(at_block, &invalid);
+        plan.at_clobber = stores.into_iter().map(|(k, s)| (k, (s, reloads.get(&k).copied().unwrap_or(0)))).collect();
+        plan
+    }
+
+    /// Block-start loads of registers that may not hold their value there
+    /// (invalid_at_starts). Dropping the others changes nothing else: on
+    /// every path to the block, the register already holds the value.
+    fn keep_needed_loads(loads: FxHashMap<u32, u32>, invalid: &FxHashMap<u32, u32>) -> FxHashMap<u32, u32> {
+        loads.into_iter()
+            .map(|(label, m)| (label, m & invalid.get(&label).copied().unwrap_or(u32::MAX)))
+            .filter(|&(_, m)| m != 0)
+            .collect()
+    }
+
+    /// Whether each block may be in a loop (a block some later block
+    /// branches back to, or that branches back itself, and those between),
+    /// and whether it is the exit of a loop that may clobber v16-v31 (an
+    /// instruction in it does): a block branched to from inside such a
+    /// loop, not in it and not a loop header itself. Loads at a loop exit
+    /// run once per pass through the loop rather than once per iteration.
+    fn loop_blocks(func: &IrFunction) -> (Vec<bool>, Vec<bool>) {
+        let n = func.blocks.len();
+        let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
+        let succs: Vec<Vec<usize>> = func.blocks.iter()
+            .map(|b| crate::backend::liveness::terminator_targets(&b.terminator).iter()
+                .filter_map(|t| index.get(t).copied()).collect())
+            .collect();
+        // Clobbering blocks before each index.
+        let mut clobbers = vec![0usize; n + 1];
+        for (b, block) in func.blocks.iter().enumerate() {
+            clobbers[b + 1] = clobbers[b] + block.instructions.iter().any(Self::clobbers_vec_regs) as usize;
+        }
+        let mut in_loop = vec![false; n];
+        let mut header = vec![false; n];
+        let mut loops = Vec::new();
+        for (j, ss) in succs.iter().enumerate() {
+            for &k in ss.iter().filter(|&&k| k <= j) {
+                header[k] = true;
+                in_loop[k..=j].iter_mut().for_each(|b| *b = true);
+                if clobbers[j + 1] > clobbers[k] {
+                    loops.push((k, j));
+                }
+            }
+        }
+        let mut exit = vec![false; n];
+        for (p, ss) in succs.iter().enumerate() {
+            for &b in ss.iter().filter(|&&b| b != 0 && !header[b]) {
+                if loops.iter().any(|&(k, j)| (k..=j).contains(&p) && !(k..=j).contains(&b)) {
+                    exit[b] = true;
+                }
+            }
+        }
+        (in_loop, exit)
+    }
+
+    /// The registers among `tracked` that may not hold their value at
+    /// each block's start (by label), before its loads (`loads`, by label):
+    /// those not built on entry (`entry_invalid`), and those a clobbering
+    /// instruction does not reload (`reloads`, by Instruction address),
+    /// until written (`defs`) or loaded.
+    fn invalid_at_starts(func: &IrFunction, tracked: u32, entry_invalid: u32, reloads: &FxHashMap<usize, u32>,
+                         defs: impl Fn(&Instruction) -> u32, loads: &FxHashMap<u32, u32>) -> FxHashMap<u32, u32> {
+        let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
+        let mut start = vec![0u32; func.blocks.len()];
+        if let Some(s) = start.first_mut() {
+            *s = entry_invalid;
+        }
+        loop {
+            let mut changed = false;
+            for (b, block) in func.blocks.iter().enumerate() {
+                let mut invalid = start[b] & !loads.get(&block.label.0).copied().unwrap_or(0);
+                for inst in &block.instructions {
+                    if let Some(&r) = reloads.get(&(inst as *const Instruction as usize)) {
+                        invalid |= tracked & !r;
+                    }
+                    invalid &= !defs(inst);
+                }
+                for t in crate::backend::liveness::terminator_targets(&block.terminator) {
+                    if let Some(&s) = index.get(&t) {
+                        if start[s] | invalid != start[s] {
+                            start[s] |= invalid;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        func.blocks.iter().zip(start).map(|(b, s)| (b.label.0, s)).collect()
     }
 
     /// Backward liveness of register masks, given each instruction's (uses,
-    /// defs): the mask live on entry to the function, and the mask live
-    /// after each instruction that may clobber v16-v31, keyed by
-    /// Instruction address.
-    fn live_after_clobbers(func: &IrFunction, effect: impl Fn(&Instruction) -> (u32, u32))
-        -> (u32, FxHashMap<usize, u32>)
+    /// defs) and the registers loaded at each block's start (`loaded`, by
+    /// block index), which nothing before needs to keep: the mask live on
+    /// entry to the function, the mask live after each instruction that
+    /// may clobber v16-v31 (keyed by Instruction address), and of those
+    /// loaded at each block's start the ones read (by block label).
+    fn live_after_clobbers(func: &IrFunction, effect: impl Fn(&Instruction) -> (u32, u32), loaded: &[u32])
+        -> (u32, FxHashMap<usize, u32>, FxHashMap<u32, u32>)
     {
         let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
         let succs: Vec<Vec<usize>> = func.blocks.iter()
@@ -317,14 +507,16 @@ impl ArmCodegen {
             let (uses, defs) = effect(inst);
             (live & !defs) | uses
         };
-        let mut live_in = vec![0u32; func.blocks.len()];
+        let loaded_at = |b: usize| loaded.get(b).copied().unwrap_or(0);
+        // Live at each block's start, before its loads.
+        let mut start = vec![0u32; func.blocks.len()];
         loop {
             let mut changed = false;
             for (b, block) in func.blocks.iter().enumerate().rev() {
-                let out = succs[b].iter().fold(0, |m, &s| m | live_in[s]);
+                let out = succs[b].iter().fold(0, |m, &s| m | start[s] & !loaded_at(s));
                 let inn = block.instructions.iter().rev().fold(out, step);
-                if inn != live_in[b] {
-                    live_in[b] = inn;
+                if inn != start[b] {
+                    start[b] = inn;
                     changed = true;
                 }
             }
@@ -334,7 +526,7 @@ impl ArmCodegen {
         }
         let mut spills = FxHashMap::default();
         for (b, block) in func.blocks.iter().enumerate() {
-            let mut live = succs[b].iter().fold(0, |m, &s| m | live_in[s]);
+            let mut live = succs[b].iter().fold(0, |m, &s| m | start[s] & !loaded_at(s));
             for inst in block.instructions.iter().rev() {
                 if Self::clobbers_vec_regs(inst) {
                     spills.insert(inst as *const Instruction as usize, live);
@@ -342,17 +534,22 @@ impl ArmCodegen {
                 live = step(live, inst);
             }
         }
-        (live_in.first().copied().unwrap_or(0), spills)
+        let at_block = func.blocks.iter().enumerate()
+            .map(|(b, block)| (block.label.0, start[b] & loaded_at(b)))
+            .filter(|&(_, m)| m != 0)
+            .collect();
+        (start.first().copied().unwrap_or(0), spills, at_block)
     }
 
-    /// Which hoisted constant broadcasts (vec_consts) to build on entry
-    /// and after each instruction that may clobber them, as masks of
-    /// `1 << reg`: those some vector op reads before the next clobber, as
-    /// the others are rebuilt there if needed again. (A loop that calls a
-    /// function then rebuilds only the constants it uses itself, not those
-    /// of other loops in the function.)
+    /// Which hoisted constant broadcasts (vec_consts) to build on entry,
+    /// after each instruction that may clobber them (by Instruction
+    /// address) and at the start of each loop exit (by block label), as
+    /// masks of `1 << reg`: those some vector op reads before the next
+    /// clobber or loop exit, which rebuild the others if needed again. (A
+    /// loop that calls a function then rebuilds only the constants it uses
+    /// itself, not those of other loops in the function.)
     pub(super) fn vec_const_rebuilds(func: &IrFunction, consts: &[(IrConst, VecElem, u8, u8)])
-        -> (u32, FxHashMap<usize, u32>)
+        -> (u32, FxHashMap<usize, u32>, FxHashMap<u32, u32>)
     {
         let all = consts.iter().fold(0u32, |m, c| m | 1 << c.3);
         let effect = |inst: &Instruction| -> (u32, u32) {
@@ -371,7 +568,10 @@ impl ArmCodegen {
                 _ => (0, 0),
             }
         };
-        Self::live_after_clobbers(func, effect)
+        let loaded: Vec<u32> = Self::loop_blocks(func).1.iter().map(|&e| if e { all } else { 0 }).collect();
+        let (entry, rebuilds, at_block) = Self::live_after_clobbers(func, effect, &loaded);
+        let invalid = Self::invalid_at_starts(func, all, all & !entry, &rebuilds, |_| 0, &at_block);
+        (entry, rebuilds, Self::keep_needed_loads(at_block, &invalid))
     }
 
     /// The lane stores that start initializing a register variable: every
@@ -456,32 +656,57 @@ impl ArmCodegen {
                 } else {
                     self.state.emit_fmt(format_args!("    ins v{}.{}[{}], {}", reg, Self::lane_suffix(n), off / n, gpr));
                 }
+                self.store_written_vec_vars(inst);
                 true
             }
             _ => {
                 if Self::clobbers_vec_regs(inst) {
-                    self.spill_vec_vars(inst, "str");
+                    let (store, _) = self.vec_spill_masks(inst);
+                    self.spill_vec_vars(store, "str");
                 }
                 false
             }
         }
     }
 
-    /// After an instruction: reload the vector variables spilled before it.
+    /// After an instruction: reload the vector variables spilled before it,
+    /// or store those it wrote (VecSpillPlan).
     pub(super) fn vec_after_instruction(&mut self, inst: &Instruction) {
         if Self::clobbers_vec_regs(inst) {
-            self.spill_vec_vars(inst, "ldr");
+            let (_, reload) = self.vec_spill_masks(inst);
+            self.spill_vec_vars(reload, "ldr");
             let rebuild = self.vec_const_rebuilds.get(&(inst as *const Instruction as usize)).copied().unwrap_or(u32::MAX);
             self.emit_vec_consts(rebuild);
+        }
+        self.store_written_vec_vars(inst);
+    }
+
+    /// At a block's start: the reloads and constant rebuilds of a loop exit.
+    pub(super) fn vec_block_start(&mut self, label: BlockId) {
+        if let Some(&mask) = self.vec_spills.at_block_start.get(&label.0) {
+            self.spill_vec_vars(mask, "ldr");
+        }
+        if let Some(&mask) = self.vec_const_block_rebuilds.get(&label.0) {
+            self.emit_vec_consts(mask);
+        }
+    }
+
+    /// The (store, reload) masks around a clobbering instruction.
+    fn vec_spill_masks(&self, inst: &Instruction) -> (u32, u32) {
+        self.vec_spills.at_clobber.get(&(inst as *const Instruction as usize)).copied().unwrap_or((u32::MAX, u32::MAX))
+    }
+
+    fn store_written_vec_vars(&mut self, inst: &Instruction) {
+        if let Some(&mask) = self.vec_spills.after_write.get(&(inst as *const Instruction as usize)) {
+            self.spill_vec_vars(mask, "str");
         }
     }
 
     /// Store (`str`) or reload (`ldr`) the register of every vector
-    /// variable live after `inst` to or from its save slot.
-    fn spill_vec_vars(&mut self, inst: &Instruction, instr: &str) {
-        let live = self.vec_spills.get(&(inst as *const Instruction as usize)).copied().unwrap_or(u32::MAX);
+    /// variable in `mask` (`1 << reg`) to or from its save slot.
+    fn spill_vec_vars(&mut self, mask: u32, instr: &str) {
         for (reg, size, offset) in self.vec_vars.clone() {
-            if live & (1 << reg) == 0 {
+            if mask & (1 << reg) == 0 {
                 continue;
             }
             let width = if size == 16 { "q" } else { "d" };
@@ -933,28 +1158,7 @@ impl ArmCodegen {
     /// to, or that branches back itself), most used first, one per free
     /// register.
     pub(super) fn assign_vec_const_regs(func: &IrFunction, free_regs: &[u8]) -> Vec<(IrConst, VecElem, u8, u8)> {
-        let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
-        let mut in_loop = vec![false; func.blocks.len()];
-        for (j, block) in func.blocks.iter().enumerate() {
-            let mut targets = Vec::new();
-            match &block.terminator {
-                Terminator::Branch(l) => targets.push(*l),
-                Terminator::CondBranch { true_label, false_label, .. } => targets.extend([*true_label, *false_label]),
-                Terminator::Switch { cases, default, .. } => {
-                    targets.extend(cases.iter().map(|c| c.1));
-                    targets.push(*default);
-                }
-                Terminator::IndirectBranch { possible_targets, .. } => targets.extend(possible_targets.iter().copied()),
-                _ => {}
-            }
-            for t in targets {
-                if let Some(&k) = index.get(&t.0) {
-                    if k <= j {
-                        in_loop[k..=j].iter_mut().for_each(|b| *b = true);
-                    }
-                }
-            }
-        }
+        let in_loop = Self::loop_blocks(func).0;
         let mut counts: Vec<(IrConst, VecElem, u8, usize)> = Vec::new();
         for (_, block) in func.blocks.iter().enumerate().filter(|(i, _)| in_loop[*i]) {
             for inst in &block.instructions {
@@ -986,6 +1190,7 @@ impl ArmCodegen {
             let width = if size == 16 { "q" } else { "d" };
             self.vec_mem_access("ldr", &format!("{width}{reg}"), &param);
         }
+        self.spill_vec_vars(self.vec_spills.on_entry, "str");
     }
 
     /// Materialize the hoisted constant broadcasts whose registers are in

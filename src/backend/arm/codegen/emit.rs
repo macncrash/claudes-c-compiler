@@ -230,20 +230,23 @@ pub struct ArmCodegen {
     /// for the whole function: (constant, lane type, vector bytes, register).
     /// Built after the parameter stores and rebuilt after anything that may
     /// clobber v16-v31 (emit_vec_consts), each only where a vector op reads
-    /// it before the next clobber (vec_const_rebuilds).
+    /// it before the next clobber, or at a loop exit instead
+    /// (vec_const_rebuilds).
     pub(super) vec_consts: Vec<(IrConst, VecElem, u8, u8)>,
-    /// The registers of those to build after the parameter stores, and to
+    /// The registers of those to build after the parameter stores, to
     /// rebuild after each clobbering instruction (keyed by Instruction
-    /// address), as masks of `1 << reg`.
+    /// address) and at the start of loop exits (keyed by block label), as
+    /// masks of `1 << reg`.
     pub(super) vec_consts_on_entry: u32,
     pub(super) vec_const_rebuilds: FxHashMap<usize, u32>,
+    pub(super) vec_const_block_rebuilds: FxHashMap<u32, u32>,
     /// Vector parameters kept in a register: (parameter alloca, register,
     /// size). Loaded once the prologue has stored them (emit_vec_param_loads).
     pub(super) vec_param_loads: Vec<(Value, u8, u8)>,
     /// Lane stores that may write the whole register (fresh_lane_stores).
     pub(super) vec_fresh_stores: FxHashSet<usize>,
-    /// Variables to spill around each clobbering instruction (vec_vars_live_across).
-    pub(super) vec_spills: FxHashMap<usize, u32>,
+    /// Where to store and reload those variables (vec_vars_live_across).
+    pub(super) vec_spills: super::intrinsics::VecSpillPlan,
     /// What scratch registers v0-v2 hold after the last vector op: the
     /// (pointer, size) each was loaded from, valid while the output is still
     /// the length it had then (nothing emitted since).
@@ -307,9 +310,10 @@ impl ArmCodegen {
             vec_consts: Vec::new(),
             vec_consts_on_entry: 0,
             vec_const_rebuilds: FxHashMap::default(),
+            vec_const_block_rebuilds: FxHashMap::default(),
             vec_param_loads: Vec::new(),
             vec_fresh_stores: FxHashSet::default(),
-            vec_spills: FxHashMap::default(),
+            vec_spills: Default::default(),
             vec_scratch: (usize::MAX, [None; 3]),
             vec_not_folds: FxHashMap::default(),
             vec_shift_adds: FxHashMap::default(),
@@ -2000,6 +2004,10 @@ impl ArchCodegen for ArmCodegen {
 
     fn after_instruction(&mut self, inst: &Instruction) {
         self.vec_after_instruction(inst);
+    }
+
+    fn block_start(&mut self, label: BlockId) {
+        self.vec_block_start(label);
     }
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {

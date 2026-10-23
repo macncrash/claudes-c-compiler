@@ -945,6 +945,7 @@ fn generate_function(cg: &mut dyn ArchCodegen, func: &IrFunction, source_mgr: Op
             // if control arrives from a different predecessor.
             cg.state().reg_cache.invalidate_all();
             cg.state().out.emit_block_label(block.label.0);
+            cg.block_start(block.label);
         }
 
         // Check for compare-branch fusion opportunity:

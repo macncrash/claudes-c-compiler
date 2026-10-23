@@ -53,6 +53,9 @@ and move between those and the registers holding the values without going
 through the stack. (clang's `xorshift` also uses the SHA3 extension's
 three-way `eor3`, but there it saves no instructions; the gap it was once
 blamed for was the separate integer multiply and add.) Calls clobber the
-registers holding constants; after one, ccc rebuilds only the constants
-that a vector op uses before the next call, so `call`'s loop no longer
-rebuilds those of the other kernels on every iteration.
+registers holding constants and vector variables. Around one, ccc saves a
+variable only if it may have changed since it was last saved, and after
+one it rebuilds a constant or reloads a variable only if a vector op uses
+it before the next call, or else where the loop exits. So `call`'s loop no
+longer saves, reloads or rebuilds those of the other kernels on every
+iteration.
