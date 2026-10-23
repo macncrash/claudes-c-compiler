@@ -9,6 +9,7 @@
 //! another. We always run all passes to maximize test coverage of the
 //! optimizer and catch issues early.
 
+mod bound_hoist;
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
@@ -548,6 +549,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
         // Prepare dirty set for next iteration: only re-visit functions that changed.
         std::mem::swap(&mut dirty, &mut changed);
+    }
+
+    // Phase 10a: Move loads an exit test reads from memory the loop never
+    // writes out of the loop, so iv_widen and lftr see a loop-invariant bound.
+    if !disabled.contains("bound_hoist") {
+        let mr = mod_ref::ModRef::compute(module);
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            bound_hoist::hoist_function(func, &mr);
+        }
     }
 
     // Phase 10b: Widen signed 32-bit loop counters to 64 bits (after narrowing

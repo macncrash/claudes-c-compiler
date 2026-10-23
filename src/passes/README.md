@@ -63,6 +63,10 @@ The optimizer executes in four sequential phases:
    +-------------------------------------------------------+
          |
          v
+ Phase 10a: Loop Bound Hoisting
+     bound_hoist
+         |
+         v
  Phase 10b: Induction Variable Widening (64-bit targets, not with -fwrapv)
      iv_widen
          |
@@ -730,6 +734,19 @@ computations are removed by subsequent DCE.
 Runs only during the first iteration of the main loop. Uses shared CFG analysis
 with GVN and LICM.
 
+### bound_hoist -- Loop Bound Hoisting
+
+Runs once after the main loop, before iv_widen. iv_widen and lftr need a
+loop's bound computed outside the loop, but a bound read from memory every
+iteration (`for (i = 0; i < l.n; i++)`, with `&l` passed to a call before the
+loop) stays in the header when LICM cannot show nothing writes it, and
+loop_hoist moves such loads only after rotation. Here the instructions in the
+header that compute an operand of its exit test (casts, constant GEPs and
+loads, at most four) move to the preheader when each load reads memory nothing
+in the loop may write, as mod_ref and its alias model answer for calls and
+stores, and follows only instructions sure to continue. The header runs on
+every entry to the loop, so they then run on the same paths as before, once.
+
 ### iv_widen -- Induction Variable Widening
 
 Runs once after the main loop, on 64-bit targets. A signed `int` loop counter
@@ -1028,7 +1045,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`.
+`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1049,6 +1066,7 @@ behavior across iterations.
 | File                     | Description                                            |
 |--------------------------|--------------------------------------------------------|
 | `mod.rs`                 | Pipeline orchestration, dirty tracking, shared analysis |
+| `bound_hoist.rs`         | Invariant loads of loop exit-test bounds moved out     |
 | `cfg_simplify.rs`        | CFG simplification (branch folding, jump threading)    |
 | `constant_fold.rs`       | Constant expression evaluation at compile time         |
 | `copy_prop.rs`           | Copy propagation with path compression                 |
