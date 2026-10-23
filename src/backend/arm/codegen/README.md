@@ -746,6 +746,22 @@ A branch to a label whose block is only `b .L2` goes to `.L2` directly, and
 instructions after an unconditional branch or return, up to the next label,
 are removed as unreachable.
 
+**11. Vector Arguments Built in Place** (local cleanup)
+
+A vector argument held in v16-v31 is copied into its argument register just
+before the call (`orr v1.16b, v22.16b, v22.16b; ...; bl f`). The call
+clobbers v22, so the straight-line instructions since the last whole write
+of v22 write v1 instead and the copy goes, when nothing in that range uses
+v1 and nothing between the copy and the call uses v22:
+
+```asm
+    dup v1.4s, w10          // was: dup v22.4s, w10
+    neg w0, w10
+    ins v1.s[1], w0         // was: ins v22.s[1], w0
+    and w0, w10, #7         // (orr v1.16b, v22.16b, v22.16b removed)
+    bl step
+```
+
 ---
 
 ## Codegen Options

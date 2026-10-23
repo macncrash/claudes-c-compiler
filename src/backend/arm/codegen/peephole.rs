@@ -470,6 +470,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fuse_cset_into_csel(&mut lines, &mut kinds, n));
             changed2 |= pass!(forward_copy_propagation(&mut lines, &mut kinds, n));
             changed2 |= pass!(retarget_results(&mut lines, &mut kinds, n));
+            changed2 |= pass!(build_vec_args_in_place(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_and_into_tst(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
@@ -1308,6 +1309,141 @@ fn retarget_results(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> b
         lines[i] = format!("    {} {},{}", mnemonic, new_dest, srcs);
         kinds[i] = classify_line(&lines[i]);
         kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// An FP/SIMD register name (`vN`, `qN`, `dN`, `sN`, `hN`, `bN`): its
+/// number.
+fn fp_operand(tok: &str) -> Option<u8> {
+    let (first, rest) = tok.split_at_checked(1)?;
+    if !matches!(first, "v" | "q" | "d" | "s" | "h" | "b") || rest.is_empty() || !rest.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok().filter(|&r| r < 32)
+}
+
+/// The register-name tokens of a line: runs of letters, digits and `_`
+/// (so `_d2`, a symbol, is not `d2`). With their byte ranges.
+fn fp_tokens(text: &str) -> impl Iterator<Item = (usize, usize, Option<u8>)> + '_ {
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < bytes.len() && !word(bytes[i]) {
+            i += 1;
+        }
+        if i == bytes.len() {
+            return None;
+        }
+        let start = i;
+        while i < bytes.len() && word(bytes[i]) {
+            i += 1;
+        }
+        Some((start, i, fp_operand(&text[start..i])))
+    })
+}
+
+fn mentions_fp(text: &str, r: u8) -> bool {
+    fp_tokens(text).any(|t| t.2 == Some(r))
+}
+
+/// `text` with every name of FP register `from` naming `to` instead, at
+/// the same width.
+fn rename_fp(text: &str, from: u8, to: u8) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (start, end, r) in fp_tokens(text) {
+        if r == Some(from) {
+            out.push_str(&text[last..start + 1]);
+            out.push_str(&to.to_string());
+            last = end;
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+// ── Vector arguments built in place ──────────────────────────────────────────
+//
+// A vector argument held in v16-v31 is copied into its argument register
+// right before the call: `orr v1.16b, v22.16b, v22.16b; ...; bl f`. The
+// call clobbers v22, so nothing reads it after the call before writing it:
+// the instructions since the last whole write of v22 (one that does not
+// read it) can write v1 instead, and the copy goes. Within straight-line
+// code, when nothing in that range uses v1 or refers to a symbol (which
+// might be named like a register), and nothing between the copy and the
+// call uses v22.
+
+fn build_vec_args_in_place(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    /// Most lines searched back from the copy, and on to the call.
+    const MAX_BACK: usize = 16;
+    const MAX_AHEAD: usize = 8;
+    /// Instructions that write their whole first operand without reading it.
+    const WHOLE_WRITES: [&str; 22] = [
+        "dup", "movi", "mvni", "ldr", "ldur", "fmov", "orr", "and", "eor", "bic", "add", "sub",
+        "mul", "neg", "mvn", "not", "shl", "ushr", "sshr", "fadd", "fsub", "fmul",
+    ];
+    let straight = |k: LineKind| !matches!(k, LineKind::Label | LineKind::Branch | LineKind::CondBranch
+        | LineKind::CmpBranch | LineKind::Ret | LineKind::Call);
+    let symbolic = |line: &str| line.contains(':') || line.contains('@') || line.trim_start().starts_with("adr");
+    let mut changed = false;
+    for o in 0..n {
+        if kinds[o] == LineKind::Nop {
+            continue;
+        }
+        let Some(("orr", ops)) = split_insn(&lines[o]) else { continue };
+        let ops: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [dst, a, b] = ops[..] else { continue };
+        if !dst.ends_with(".16b") || a != b || !a.ends_with(".16b") {
+            continue;
+        }
+        let (Some(arg), Some(x)) = (fp_operand(&dst[..dst.len() - 4]), fp_operand(&a[..a.len() - 4])) else { continue };
+        if arg > 7 || x < 16 {
+            continue;
+        }
+        // On to the call: X unused.
+        let mut j = o + 1;
+        let mut seen = 0;
+        while j < n && seen < MAX_AHEAD && (kinds[j] == LineKind::Nop || straight(kinds[j]) && !mentions_fp(&lines[j], x)) {
+            seen += (kinds[j] != LineKind::Nop) as usize;
+            j += 1;
+        }
+        if j >= n || kinds[j] != LineKind::Call {
+            continue;
+        }
+        // Back to the whole write of X: no use of ARG, no symbols.
+        let mut s = o;
+        let mut seen = 0;
+        let start = loop {
+            if s == 0 || seen == MAX_BACK {
+                break None;
+            }
+            s -= 1;
+            if kinds[s] == LineKind::Nop {
+                continue;
+            }
+            seen += 1;
+            if !straight(kinds[s]) || mentions_fp(&lines[s], arg) || symbolic(&lines[s]) {
+                break None;
+            }
+            let Some((m, ops)) = split_insn(&lines[s]) else { continue };
+            let (dest, srcs) = first_and_rest(ops);
+            // (Not a lane: `fmov v22.d[1], x0`.)
+            let whole = !dest.contains('[') && fp_operand(dest.split('.').next().unwrap_or("")) == Some(x);
+            if whole && WHOLE_WRITES.contains(&m) && !mentions_fp(srcs, x) {
+                break Some(s);
+            }
+        };
+        let Some(s) = start else { continue };
+        for k in s..o {
+            if kinds[k] != LineKind::Nop && mentions_fp(&lines[k], x) {
+                lines[k] = rename_fp(&lines[k], x, arg);
+                kinds[k] = classify_line(&lines[k]);
+            }
+        }
+        kinds[o] = LineKind::Nop;
         changed = true;
     }
     changed
@@ -3165,6 +3301,28 @@ mod tests {
             let input = format!(".type f, %function\nf:\n    rbit x0, x10\n    clz x0, x0\n{between}    mov x1, x0\n    add x0, sp, #16\n    bl g\n    ret\n.size f, .-f\n");
             let result = peephole_optimize(input);
             assert!(result.contains("clz x0, x0"), "{between}{result}");
+        }
+    }
+
+    #[test]
+    fn test_vec_arg_built_in_place() {
+        let f = |body: &str| peephole_optimize(format!(".type f, %function\nf:\n{body}    ret\n.size f, .-f\n"));
+        let built = "    dup v22.4s, w10\n    neg w0, w10\n    ins v22.s[1], w0\n";
+        let result = f(&format!("{built}    ldr d0, [x23]\n    orr v1.16b, v22.16b, v22.16b\n    and w0, w10, #7\n    bl g\n"));
+        assert!(result.contains("dup v1.4s, w10") && result.contains("ins v1.s[1], w0")
+            && !result.contains("orr") && !result.contains("v22"), "{result}");
+        // Not when the range uses the argument register, the copy is not
+        // followed by a call, the source is read before the call, the first
+        // write reads the source or is a lane, or a symbol is in the range.
+        for body in [
+            format!("{built}    fmov s1, w3\n    orr v1.16b, v22.16b, v22.16b\n    bl g\n"),
+            format!("{built}    orr v1.16b, v22.16b, v22.16b\n    cbz x3, .L1\n    bl g\n.L1:\n"),
+            format!("{built}    orr v1.16b, v22.16b, v22.16b\n    str q22, [x5]\n    bl g\n"),
+            "    add v22.4s, v22.4s, v23.4s\n    orr v1.16b, v22.16b, v22.16b\n    bl g\n".to_string(),
+            "    fmov v22.d[1], x0\n    orr v1.16b, v22.16b, v22.16b\n    bl g\n".to_string(),
+            format!("{built}    adrp x1, d22\n    orr v1.16b, v22.16b, v22.16b\n    bl g\n"),
+        ] {
+            assert!(f(&body).contains("orr v1.16b, v22.16b, v22.16b"), "{body}");
         }
     }
 
