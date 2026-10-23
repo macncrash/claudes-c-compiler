@@ -291,6 +291,16 @@ Trampoline block labels are allocated from a module-wide counter to avoid collis
 functions. Trampoline creation is memoized per `(predecessor, target)` pair so that multiple
 phis targeting the same block through the same critical edge share a single trampoline.
 
+Where a trampoline goes in the block order matters for speed. At the end of the function it
+costs its path two jumps, out and back. Right before its target it falls through, costing that
+path one jump at most, but the block laid out before the target then has to jump if it used to
+fall through. So it is placed before its target on a loop's back edge (the block before the
+header runs once per loop), when the block before the target does not fall through into it, or
+when that block makes a call, whose cost dwarfs a jump; otherwise it stays at the end, where a
+trampoline whose copies coalesce away costs nothing. In chess-perft, `n += depth == 1 ? 1 :
+perft(...)` put the `depth == 1` path, taken at nearly every leaf, at the end; placing it before
+the add made the benchmark 1.6% faster.
+
 **Exception: `IndirectBranch`.** Indirect branches (computed gotos) cannot have their targets
 retargeted because the target is a runtime value. For these edges, copies are placed directly
 in the predecessor block. This is safe in practice because C computed gotos (`goto *ptr`)

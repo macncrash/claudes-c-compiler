@@ -504,16 +504,51 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
         );
     }
 
-    // Append trampoline blocks to the function
+    // A trampoline at the end of the function costs its path two jumps, out
+    // and back. Right before its target it falls through instead, costing
+    // that path one jump at most, but the block laid out before the target
+    // then jumps to it if it used to fall through. So it goes there when
+    // that costs nothing or is worth it: on a loop's back edge (the block
+    // before the header is entered once per loop), when that block does not
+    // fall through into the target, or when it makes a call, which costs
+    // far more than a jump. Otherwise it stays at the end, where a
+    // trampoline whose copies coalesce away is jumped over for free.
+    let index: FxHashMap<BlockId, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut before: FxHashMap<BlockId, Vec<BasicBlock>> = FxHashMap::default();
     for trampoline in std::mem::take(&mut ctx.trampolines) {
         let num_copies = trampoline.copies.len();
-        func.blocks.push(BasicBlock {
+        let block = BasicBlock {
             label: trampoline.label,
             instructions: trampoline.copies,
             source_spans: vec![crate::common::source::Span::dummy(); num_copies],
             terminator: Terminator::Branch(trampoline.branch_target),
+        };
+        let target = trampoline.branch_target;
+        let move_before = index.get(&target).is_some_and(|&t| {
+            let Some(prev) = t.checked_sub(1).map(|p| &func.blocks[p]) else { return false };
+            let falls_into = match &prev.terminator {
+                Terminator::Branch(l) => *l == target,
+                Terminator::CondBranch { true_label, false_label, .. } => *true_label == target || *false_label == target,
+                _ => false,
+            };
+            let calls = prev.instructions.iter().any(|i| matches!(i, Instruction::Call { .. } | Instruction::CallIndirect { .. }));
+            trampoline.pred_idx >= t || !falls_into || calls
         });
+        if move_before {
+            before.entry(target).or_default().push(block);
+        } else {
+            func.blocks.push(block);
+        }
     }
+    if before.is_empty() {
+        return;
+    }
+    let mut blocks = Vec::with_capacity(func.blocks.len() + before.len());
+    for block in std::mem::take(&mut func.blocks) {
+        blocks.extend(before.remove(&block.label).unwrap_or_default());
+        blocks.push(block);
+    }
+    func.blocks = blocks;
 }
 
 #[cfg(test)]
