@@ -298,6 +298,16 @@ impl ArmCodegen {
                 _ => (0, 0),
             }
         };
+        Self::live_after_clobbers(func, effect).1
+    }
+
+    /// Backward liveness of register masks, given each instruction's (uses,
+    /// defs): the mask live on entry to the function, and the mask live
+    /// after each instruction that may clobber v16-v31, keyed by
+    /// Instruction address.
+    fn live_after_clobbers(func: &IrFunction, effect: impl Fn(&Instruction) -> (u32, u32))
+        -> (u32, FxHashMap<usize, u32>)
+    {
         let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
         let succs: Vec<Vec<usize>> = func.blocks.iter()
             .map(|b| crate::backend::liveness::terminator_targets(&b.terminator).iter()
@@ -332,7 +342,36 @@ impl ArmCodegen {
                 live = step(live, inst);
             }
         }
-        spills
+        (live_in.first().copied().unwrap_or(0), spills)
+    }
+
+    /// Which hoisted constant broadcasts (vec_consts) to build on entry
+    /// and after each instruction that may clobber them, as masks of
+    /// `1 << reg`: those some vector op reads before the next clobber, as
+    /// the others are rebuilt there if needed again. (A loop that calls a
+    /// function then rebuilds only the constants it uses itself, not those
+    /// of other loops in the function.)
+    pub(super) fn vec_const_rebuilds(func: &IrFunction, consts: &[(IrConst, VecElem, u8, u8)])
+        -> (u32, FxHashMap<usize, u32>)
+    {
+        let all = consts.iter().fold(0u32, |m, c| m | 1 << c.3);
+        let effect = |inst: &Instruction| -> (u32, u32) {
+            match inst {
+                Instruction::Intrinsic { op: IntrinsicOp::VecOp { elem, bytes, .. }, args, .. } => {
+                    let uses = args.iter().fold(0, |m, a| {
+                        let Operand::Const(c) = a else { return m };
+                        let Some(bits) = Self::splat_bits(c, *elem) else { return m };
+                        consts.iter()
+                            .filter(|(k, e, b, _)| e == elem && b == bytes && Self::splat_bits(k, *e) == Some(bits))
+                            .fold(m, |m, c| m | 1 << c.3)
+                    });
+                    (uses, 0)
+                }
+                _ if Self::clobbers_vec_regs(inst) => (0, all),
+                _ => (0, 0),
+            }
+        };
+        Self::live_after_clobbers(func, effect)
     }
 
     /// The lane stores that start initializing a register variable: every
@@ -432,7 +471,8 @@ impl ArmCodegen {
     pub(super) fn vec_after_instruction(&mut self, inst: &Instruction) {
         if Self::clobbers_vec_regs(inst) {
             self.spill_vec_vars(inst, "ldr");
-            self.emit_vec_consts();
+            let rebuild = self.vec_const_rebuilds.get(&(inst as *const Instruction as usize)).copied().unwrap_or(u32::MAX);
+            self.emit_vec_consts(rebuild);
         }
     }
 
@@ -948,12 +988,15 @@ impl ArmCodegen {
         }
     }
 
-    /// Materialize the hoisted constant broadcasts in their registers.
-    pub(super) fn emit_vec_consts(&mut self) {
-        for (c, elem, bytes, reg) in self.vec_consts.clone() {
+    /// Materialize the hoisted constant broadcasts whose registers are in
+    /// `mask` (`1 << reg`).
+    pub(super) fn emit_vec_consts(&mut self, mask: u32) {
+        let consts: Vec<_> = self.vec_consts.iter().filter(|c| mask & (1 << c.3) != 0).cloned().collect();
+        let any = !consts.is_empty();
+        for (c, elem, bytes, reg) in consts {
             self.emit_vec_splat(&Operand::Const(c), elem, bytes, reg);
         }
-        if !self.vec_consts.is_empty() {
+        if any {
             self.state.reg_cache.invalidate_acc();
         }
     }

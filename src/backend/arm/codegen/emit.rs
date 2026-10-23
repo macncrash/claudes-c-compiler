@@ -229,8 +229,14 @@ pub struct ArmCodegen {
     /// Constant broadcasts used by vector ops in loops, kept in a register
     /// for the whole function: (constant, lane type, vector bytes, register).
     /// Built after the parameter stores and rebuilt after anything that may
-    /// clobber v16-v31 (emit_vec_consts).
+    /// clobber v16-v31 (emit_vec_consts), each only where a vector op reads
+    /// it before the next clobber (vec_const_rebuilds).
     pub(super) vec_consts: Vec<(IrConst, VecElem, u8, u8)>,
+    /// The registers of those to build after the parameter stores, and to
+    /// rebuild after each clobbering instruction (keyed by Instruction
+    /// address), as masks of `1 << reg`.
+    pub(super) vec_consts_on_entry: u32,
+    pub(super) vec_const_rebuilds: FxHashMap<usize, u32>,
     /// Vector parameters kept in a register: (parameter alloca, register,
     /// size). Loaded once the prologue has stored them (emit_vec_param_loads).
     pub(super) vec_param_loads: Vec<(Value, u8, u8)>,
@@ -299,6 +305,8 @@ impl ArmCodegen {
             vec_vars: Vec::new(),
             vec_lanes: FxHashMap::default(),
             vec_consts: Vec::new(),
+            vec_consts_on_entry: 0,
+            vec_const_rebuilds: FxHashMap::default(),
             vec_param_loads: Vec::new(),
             vec_fresh_stores: FxHashSet::default(),
             vec_spills: FxHashMap::default(),

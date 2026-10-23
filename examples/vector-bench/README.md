@@ -39,7 +39,7 @@ after the first, which is consistently slower):
 | `select`   |    27 | 1455 | 1320 |
 | `dmix`     |   333 | 3710 | 3705 |
 | `blend`    |    79 | 3705 | 3535 |
-| `call`     |   150 |  930 | 1240 |
+| `call`     |   150 | 1240 | 1240 |
 
 "Before NEON codegen" lowered every vector operation lane by lane through
 memory. ccc now emits one NEON instruction per operation and keeps
@@ -52,5 +52,7 @@ Vector arguments and return values use SIMD registers as AAPCS64 requires,
 and move between those and the registers holding the values without going
 through the stack. (clang's `xorshift` also uses the SHA3 extension's
 three-way `eor3`, but there it saves no instructions; the gap it was once
-blamed for was the separate integer multiply and add.) `call` still trails
-clang.
+blamed for was the separate integer multiply and add.) Calls clobber the
+registers holding constants; after one, ccc rebuilds only the constants
+that a vector op uses before the next call, so `call`'s loop no longer
+rebuilds those of the other kernels on every iteration.

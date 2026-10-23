@@ -45,6 +45,7 @@ impl ArmCodegen {
             .filter(|r| !self.vec_regs.values().any(|v| v == r))
             .collect();
         self.vec_consts = Self::assign_vec_const_regs(func, &free);
+        (self.vec_consts_on_entry, self.vec_const_rebuilds) = Self::vec_const_rebuilds(func, &self.vec_consts);
         let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
         let available_regs = crate::backend::generation::filter_available_regs(base_regs, &asm_clobbered_regs);
 
@@ -500,7 +501,7 @@ impl ArmCodegen {
         self.emit_store_fp_params(func, &param_classes);
         self.emit_store_stack_params(func, &param_classes);
         self.emit_vec_param_loads();
-        self.emit_vec_consts();
+        self.emit_vec_consts(self.vec_consts_on_entry);
     }
 
     // ---- emit_param_ref ----
