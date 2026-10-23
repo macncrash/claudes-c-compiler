@@ -1122,6 +1122,9 @@ impl Driver {
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("loop_layout")) {
             crate::passes::loop_layout::layout_loops(&mut module);
         }
+        if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("step_to_load")) {
+            crate::passes::step_to_load::step_to_loads(&mut module);
+        }
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 
         if let Ok(name) = std::env::var("CCC_DUMP_IR") {

@@ -100,7 +100,7 @@ The optimizer executes in four sequential phases:
          |
          v
  Phi elimination (src/ir/mem2reg), then:
-     loop_rotate, loop_hoist, loop_layout
+     loop_rotate, loop_hoist, loop_layout, step_to_load
 ```
 
 ## Phase Structure
@@ -846,6 +846,20 @@ Each path through the loop takes one jump less per iteration; the loop's entry
 and exit take one more each. This is the layout clang gives chess-perft's move
 loop, and made it 0.5% faster.
 
+### step_to_load -- Pointer Step After Its Load
+
+Runs after loop_layout. A pointer stepped by a constant in the latch
+(`%q = gep %p, c` or a constant add or sub, then `%p = copy %q`) and read in
+the loop only by one load in the header has its step moved to right after
+that load. The header may be the latch itself, if the load comes first. The AArch64 peephole then
+folds the load and the add into one post-indexed access
+(`ldr w1, [x20], #4`), so chess-perft's move loop takes three instructions per
+iteration, as clang's does. It applies only when nothing else reads %p or %q
+once the loop has started, except reads of %p after the copy in the latch,
+and when nothing else in the loop defines either. A one-block `while (p < e)
+s = s * 3 + *p++;` loop drops from eight instructions to six. Measured no
+speedup on chess-perft.
+
 ### if_convert -- If-Conversion
 
 Converts simple diamond and triangle branch-and-phi patterns into `Select`
@@ -1057,7 +1071,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`.
+`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1104,3 +1118,4 @@ behavior across iterations.
 | `ret_dup.rs`             | Return blocks copied into predecessors passing constants |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |
+| `step_to_load.rs`        | Loop pointer steps moved after their load (post-index) |

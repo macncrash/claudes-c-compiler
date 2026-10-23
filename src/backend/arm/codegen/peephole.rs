@@ -473,6 +473,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(build_vec_args_in_place(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_and_into_tst(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_extend_into_narrow_store(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_sxtw_into_users(&mut lines, &mut kinds, n));
@@ -1551,6 +1552,45 @@ fn fuse_mul_into_madd(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
         lines[j] = format!("    {} {}, {}, {}, {}", fused, d, a, b, c);
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// A load or store through a bare base register immediately followed by a
+/// step of that register (`ldr w1, [x20]` then `add x20, x20, #4`) becomes
+/// one post-indexed access (`ldr w1, [x20], #4`), which writes the stepped
+/// base back. Not when a loaded register is the base (unpredictable with
+/// writeback).
+fn fold_step_into_access(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let Some((mn @ ("ldr" | "ldrsw" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "str" | "strb" | "strh"), ops)) =
+            split_insn(&lines[i]) else { continue };
+        let (rt, mem) = first_and_rest(ops);
+        let Some(base) = mem.trim().strip_prefix('[').and_then(|m| m.strip_suffix(']')) else { continue };
+        let Some(b) = base.strip_prefix('x').and(gpr_operand(base)) else { continue };
+        if mn.starts_with("ldr") && gpr_operand(rt) == Some(b) {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((op @ ("add" | "sub"), sops)) = split_insn(&lines[j]) else { continue };
+        let s: Vec<&str> = sops.split(',').map(str::trim).collect();
+        let [d, x, k] = s[..] else { continue };
+        if d != base || x != base {
+            continue;
+        }
+        let Some(k) = parse_imm(k).filter(|&k| k <= 255) else { continue };
+        let step = if op == "add" { k as i64 } else { -(k as i64) };
+        lines[i] = format!("    {} {}, [{}], #{}", mn, rt, base, step);
+        kinds[i] = classify_line(&lines[i]);
+        kinds[j] = LineKind::Nop;
         changed = true;
     }
     changed
@@ -3734,5 +3774,23 @@ f:
         let input = "    mov x1, x22\n    add x0, x0, :lo12:x1\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(result.contains(":lo12:x1"), "{}", result);
+    }
+
+    #[test]
+    fn test_step_folded_into_access() {
+        let input = "L1:\n    ldrsw x13, [x10]\n    add x10, x10, #4\n    strb w13, [x11]\n    sub x11, x11, #1\n    cmp x10, x12\n    b.lo L1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldrsw x13, [x10], #4"), "{}", result);
+        assert!(result.contains("strb w13, [x11], #-1"), "{}", result);
+        assert!(!result.contains("add x10"), "{}", result);
+    }
+
+    #[test]
+    fn test_step_not_folded() {
+        // A load into its own base, and a step too large for the immediate.
+        let input = "L1:\n    ldr x10, [x10]\n    add x10, x10, #8\n    ldr x13, [x11]\n    add x11, x11, #256\n    str x13, [x9]\n    cmp x10, x12\n    b.lo L1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr x10, [x10]\n"), "{}", result);
+        assert!(result.contains("add x11, x11, #256"), "{}", result);
     }
 }
