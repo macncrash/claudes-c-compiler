@@ -977,6 +977,61 @@ impl ArmCodegen {
         folds
     }
 
+    /// 16-byte Xors whose result one other Xor reads and nothing else, on
+    /// Apple targets (every Apple silicon Mac has the SHA3 extension): the
+    /// reader computes `x ^ y ^ z` in one eor3 and the first Xor emits
+    /// nothing. x and y must be unchanged in between: only vector ops with
+    /// register results (none writing x's or y's register) and integer
+    /// address arithmetic may come between, so memory is not written. A Xor
+    /// that takes in one this way is not itself folded into a later one.
+    /// Returns first Xor result -> (x, y).
+    pub(super) fn fold_vec_xor3(func: &IrFunction, regs: &FxHashMap<u32, u8>,
+                                lanes: &FxHashMap<u32, (u8, i64)>) -> FxHashMap<u32, (u32, u32)> {
+        let mut folds = FxHashMap::default();
+        if !crate::common::types::target_is_darwin() {
+            return folds;
+        }
+        let mut use_count: FxHashMap<u32, usize> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|id| *use_count.entry(id).or_default() += 1);
+            }
+            block.terminator.for_each_used_value(|id| *use_count.entry(id).or_default() += 2);
+        }
+        let reg_of = |id: u32| regs.get(&id).copied().or_else(|| lanes.get(&id).filter(|l| l.1 == 0).map(|l| l.0));
+        let mut absorbing: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            let insts = &block.instructions;
+            for (p, inst) in insts.iter().enumerate() {
+                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { op: VecOpKind::Xor, bytes: 16, splat: 0, .. },
+                                             dest_ptr: Some(t), args, .. } = inst else { continue };
+                let [Operand::Value(x), Operand::Value(y)] = args[..] else { continue };
+                let (x_reg, y_reg) = (reg_of(x.0), reg_of(y.0));
+                if absorbing.contains(&t.0) || !regs.contains_key(&t.0) || use_count.get(&t.0) != Some(&2) {
+                    continue;
+                }
+                let Some(q) = (p + 1..insts.len()).find(|&q| insts[q].used_values().contains(&t.0)) else { continue };
+                let Instruction::Intrinsic { op: IntrinsicOp::VecOp { op: VecOpKind::Xor, bytes: 16, .. },
+                                             dest_ptr: Some(d), args: outer, .. } = &insts[q] else { continue };
+                let reads_t_once = outer.iter().filter(|a| matches!(a, Operand::Value(v) if v == t)).count() == 1;
+                let int = |ty: &IrType| ty.is_integer() && ty.size() <= 8 || *ty == IrType::Ptr;
+                let untouched = insts[p + 1..q].iter().all(|i| match i {
+                    Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr: Some(w), .. } =>
+                        reg_of(w.0).is_some_and(|r| Some(r) != x_reg && Some(r) != y_reg),
+                    Instruction::GetElementPtr { .. } => true,
+                    Instruction::BinOp { ty, .. } => int(ty),
+                    Instruction::Cast { from_ty, to_ty, .. } => int(from_ty) && int(to_ty),
+                    _ => false,
+                });
+                if reads_t_once && untouched {
+                    folds.insert(t.0, (x.0, y.0));
+                    absorbing.insert(d.0);
+                }
+            }
+        }
+        folds
+    }
+
     /// A temporary in a temp register whose producer (a vector op, or a call
     /// returning it in v0) is followed only by its one whole copy, with no
     /// more than GPR loads between, can stay in v0, the scratch register its
@@ -1263,20 +1318,33 @@ impl ArmCodegen {
         // becomes bic with the Not's source (fold_vec_nots).
         // Likewise a shift folded into the Add after it (usra/ssra,
         // fold_vec_shift_adds).
-        // And the Ands of a bitwise select, done by the Or (fold_vec_selects).
+        // And the Ands of a bitwise select, done by the Or (fold_vec_selects),
+        // and a Xor done by the eor3 of the Xor reading it (fold_vec_xor3).
         if matches!(op, VecOpKind::Not) && self.vec_not_folds.contains_key(&dest_ptr.0)
             || matches!(op, VecOpKind::Shr) && self.vec_shift_adds.contains_key(&dest_ptr.0)
-            || matches!(op, VecOpKind::And) && self.vec_select_parts.contains(&dest_ptr.0) {
+            || matches!(op, VecOpKind::And) && self.vec_select_parts.contains(&dest_ptr.0)
+            || matches!(op, VecOpKind::Xor) && self.vec_xor3.contains_key(&dest_ptr.0) {
             return;
         }
         let select = self.vec_selects.get(&dest_ptr.0).copied().filter(|_| matches!(op, VecOpKind::Or));
-        let select_args;
-        let args = match select {
-            Some((x, y, m)) => {
-                select_args = [Operand::Value(Value(x)), Operand::Value(Value(y)), Operand::Value(Value(m))];
-                &select_args[..]
+        // x ^ y ^ z: the folded Xor's operands, then the other one.
+        let xor3 = match op {
+            VecOpKind::Xor => args.iter().position(|a| matches!(a, Operand::Value(v) if self.vec_xor3.contains_key(&v.0))),
+            _ => None,
+        };
+        let three_args;
+        let (splat, args) = match (select, xor3) {
+            (Some((x, y, m)), _) => {
+                three_args = [Operand::Value(Value(x)), Operand::Value(Value(y)), Operand::Value(Value(m))];
+                (splat, &three_args[..])
             }
-            None => args,
+            (None, Some(i)) => {
+                let Operand::Value(t) = args[i] else { unreachable!() };
+                let (x, y) = self.vec_xor3[&t.0];
+                three_args = [Operand::Value(Value(x)), Operand::Value(Value(y)), args[1 - i]];
+                (((splat >> (1 - i)) & 1) << 2, &three_args[..])
+            }
+            (None, None) => (splat, args),
         };
         let folded_from = |folds: &FxHashMap<u32, u32>| args.iter().position(|a| matches!(a, Operand::Value(v) if folds.contains_key(&v.0)));
         let folded = match op {
@@ -1405,6 +1473,7 @@ impl ArmCodegen {
                 }
             }
             VecOpKind::Or => vec![bitwise("orr")],
+            VecOpKind::Xor if xor3.is_some() => vec![format!("    eor3 {d}.16b, {a}.16b, {b}.16b, {c}.16b")],
             VecOpKind::Xor => vec![bitwise("eor")],
             // ushl/sshl shift left by a signed per-lane amount; right shifts
             // shift left by the negated amount (logical for ushl, arithmetic

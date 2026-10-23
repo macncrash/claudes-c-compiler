@@ -257,6 +257,9 @@ pub struct ArmCodegen {
     /// Constant right shifts read only by one Add, which accumulates them
     /// (usra/ssra, fold_vec_shift_adds): shift result -> (source, count).
     pub(super) vec_shift_adds: FxHashMap<u32, (u32, u32)>,
+    /// Xors read only by one other Xor, which computes all three operands'
+    /// Xor in one eor3 (fold_vec_xor3): first Xor result -> its operands.
+    pub(super) vec_xor3: FxHashMap<u32, (u32, u32)>,
     /// Bitwise selects (fold_vec_selects): Or result -> (x, y, mask), and
     /// the results of the Ands they absorb.
     pub(super) vec_selects: FxHashMap<u32, (u32, u32, u32)>,
@@ -317,6 +320,7 @@ impl ArmCodegen {
             vec_scratch: (usize::MAX, [None; 3]),
             vec_not_folds: FxHashMap::default(),
             vec_shift_adds: FxHashMap::default(),
+            vec_xor3: FxHashMap::default(),
             vec_selects: FxHashMap::default(),
             vec_select_parts: FxHashSet::default(),
             hfa_ret_copies: FxHashSet::default(),
