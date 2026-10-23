@@ -63,6 +63,7 @@ impl Lowerer {
             // initializers (e.g., `struct Node n = {&n}`) can resolve.
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.quals = decl.object_quals(declarator);
+            ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
             self.globals.insert(declarator.name.clone(), ginfo);
 
             let init = self.lower_declarator_init(decl, declarator, &da);
@@ -124,6 +125,8 @@ impl Lowerer {
                 }
             }
             self.types.typedefs.insert(declarator.name.clone(), resolved_ctype);
+            let is_const = self.base_is_const(&decl.type_spec, decl.is_const());
+            self.types.set_typedef_const_scoped(&declarator.name, is_const);
             if is_enum_type && declarator.derived.is_empty() {
                 self.types.enum_typedefs.insert(declarator.name.clone());
             }
@@ -183,6 +186,7 @@ impl Lowerer {
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
         ginfo.var.quals = decl.object_quals(declarator);
+        ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
         self.globals.insert(declarator.name.clone(), ginfo);
         true
     }
@@ -200,6 +204,7 @@ impl Lowerer {
             }
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.quals = decl.object_quals(declarator);
+            ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
             self.globals.insert(declarator.name.clone(), ginfo);
         }
         // For extern TLS variables, emit an IrGlobal so codegen uses TLS access patterns.

@@ -54,6 +54,7 @@ impl Lowerer {
             }
             let mut ginfo = GlobalInfo::from_analysis(&ext_da);
             ginfo.var.quals = decl.object_quals(declarator);
+            ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
             self.globals.insert(declarator.name.clone(), ginfo);
         }
         true // Handled, caller should continue to next declarator

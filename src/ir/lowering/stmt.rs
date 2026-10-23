@@ -227,6 +227,8 @@ impl Lowerer {
                 }
             }
             self.types.insert_typedef_scoped(declarator.name.clone(), resolved_ctype);
+            let is_const = self.decl_is_const(decl);
+            self.types.set_typedef_const_scoped(&declarator.name, is_const);
 
             let effective_alignment = {
                 let mut align = decl.alignment;
@@ -303,11 +305,32 @@ impl Lowerer {
         alloca
     }
 
-    /// Whether a declaration's base type is const: written so, or taken by
-    /// `typeof(expr)` from a const expression (`typeof(cp)` for a `const
-    /// int *cp`).
+    /// Whether a declaration's base type is const: written so, or taken from
+    /// a const typedef (`typedef const int CI;`) or by `typeof(expr)` from a
+    /// const expression (`typeof(cp)` for a `const int *cp`). `const` written
+    /// on a pointer typedef (`const IP p` for `typedef int *IP;`) makes the
+    /// pointer itself const, not what it points to, so it doesn't count.
+    pub(super) fn base_is_const(&self, type_spec: &TypeSpecifier, written_const: bool) -> bool {
+        match type_spec {
+            TypeSpecifier::TypedefName(name) => {
+                let typedef_const = self.types.const_typedefs.contains(name);
+                if matches!(self.types.typedefs.get(name), Some(CType::Pointer(..))) {
+                    typedef_const
+                } else {
+                    written_const || typedef_const
+                }
+            }
+            TypeSpecifier::Typeof(e) => written_const || self.expr_is_const_qualified(e),
+            // Parameters carry their declarators in the type (`CI *p`).
+            TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) => {
+                self.base_is_const(inner, written_const)
+            }
+            _ => written_const,
+        }
+    }
+
     fn decl_is_const(&self, decl: &Declaration) -> bool {
-        decl.is_const() || matches!(&decl.type_spec, TypeSpecifier::Typeof(e) if self.expr_is_const_qualified(e))
+        self.base_is_const(&decl.type_spec, decl.is_const())
     }
 
     fn register_local_var(
@@ -405,6 +428,7 @@ impl Lowerer {
         // This mirrors the same pattern used in lower_global_decl().
         let mut ginfo = GlobalInfo::from_analysis(da);
         ginfo.var.quals = decl.object_quals(declarator);
+        ginfo.is_const = self.base_is_const(&decl.type_spec, decl.is_const());
         self.globals.insert(static_name.clone(), ginfo);
 
         // Determine initializer (evaluated at compile time for static locals)

@@ -174,6 +174,7 @@ continues to extend it (e.g., adding struct layouts discovered during lowering).
 | `enum_constant_types` | `FxHashMap<String, CType>` | Types of the enum constants that are not `int`: those whose value `int` cannot hold have their enum's underlying type (`enumerator_ctype`). |
 | `typedefs` | `FxHashMap<String, CType>` | Typedef name-to-resolved-CType mapping. |
 | `typedef_alignments` | `FxHashMap<String, usize>` | Per-typedef alignment overrides from `__attribute__((aligned(N)))`. |
+| `const_typedefs` | `FxHashSet<String>` | Typedef names whose base type is const (`typedef const int CI;`). Filled by lowering, which carries the const into declarations that use the typedef, since `CType` does not track const. |
 | `function_typedefs` | `FxHashMap<String, FunctionTypedefInfo>` | Bare function typedefs (e.g., `typedef int func_t(int, int)`). |
 | `func_ptr_typedefs` | `FxHashSet<String>` | Set of typedef names that are function pointer types. |
 | `func_ptr_typedef_info` | `FxHashMap<String, FunctionTypedefInfo>` | Function pointer typedef metadata. |
@@ -219,9 +220,9 @@ pushes a `TypeScopeFrame` that records:
 - **Shadowed keys** -- keys that existed before and were overwritten, along with
   their previous values (restored on pop).
 
-This gives O(changes-in-scope) cost for push/pop. The undo log tracks five
+This gives O(changes-in-scope) cost for push/pop. The undo log tracks six
 separate maps: `enum_constants`, `struct_layouts`, `ctype_cache`, `typedefs`,
-and `typedef_alignments`.
+`typedef_alignments` and `const_typedefs`.
 
 ```rust
 pub struct TypeScopeFrame {
@@ -234,6 +235,7 @@ pub struct TypeScopeFrame {
     pub typedefs_shadowed:          Vec<(String, CType)>,
     pub typedef_alignments_added:   Vec<String>,
     pub typedef_alignments_shadowed:Vec<(String, usize)>,
+    pub const_typedefs_changed:     Vec<(String, bool)>,
 }
 ```
 

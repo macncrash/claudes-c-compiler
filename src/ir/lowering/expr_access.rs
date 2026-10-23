@@ -534,7 +534,7 @@ impl Lowerer {
 
     /// Check if an expression's type is const-qualified (for _Generic matching
     /// and typeof), in the sense of a declaration's const: its base type is
-    /// const. Handles local variable identifiers, address-of, dereference,
+    /// const. Handles local and global identifiers, address-of, dereference,
     /// subscript and comma expressions.
     pub(super) fn expr_is_const_qualified(&self, expr: &Expr) -> bool {
         match expr {
@@ -544,7 +544,7 @@ impl Lowerer {
                         return info.is_const;
                     }
                 }
-                false
+                self.globals.get(name).is_some_and(|g| g.is_const)
             }
             // Address-of: &y where y is `const int` produces `const int *`.
             // And *p or p[i] where p is `const int *` is `const int`: taking

@@ -90,6 +90,9 @@ pub struct TypeScopeFrame {
     pub typedef_alignments_added: Vec<String>,
     /// Keys that were overwritten in `typedef_alignments`: (key, previous_value).
     pub typedef_alignments_shadowed: Vec<(String, usize)>,
+    /// Typedef names whose `const_typedefs` membership changed: (key,
+    /// previous membership).
+    pub const_typedefs_changed: Vec<(String, bool)>,
 }
 
 impl TypeScopeFrame {
@@ -104,6 +107,7 @@ impl TypeScopeFrame {
             typedefs_shadowed: Vec::new(),
             typedef_alignments_added: Vec::new(),
             typedef_alignments_shadowed: Vec::new(),
+            const_typedefs_changed: Vec::new(),
         }
     }
 }
@@ -134,6 +138,10 @@ pub struct TypeContext {
     /// stores `"aligned_S" -> 32`.  Consulted when computing field / variable alignment
     /// for declarations that use the typedef name.
     pub typedef_alignments: FxHashMap<String, usize>,
+    /// Typedef names whose base type is const (`typedef const int CI;`,
+    /// `typedef const char *CCP;`). CType does not track const, so lowering
+    /// keeps this to carry it into declarations that use the typedef.
+    pub const_typedefs: FxHashSet<String>,
     /// Function typedef info (bare function typedefs like `typedef int func_t(int)`)
     pub function_typedefs: FxHashMap<String, FunctionTypedefInfo>,
     /// Set of typedef names that are function pointer types
@@ -180,6 +188,7 @@ impl TypeContext {
             enum_constant_types: FxHashMap::default(),
             typedefs: FxHashMap::default(),
             typedef_alignments: FxHashMap::default(),
+            const_typedefs: FxHashSet::default(),
             function_typedefs: FxHashMap::default(),
             func_ptr_typedefs: FxHashSet::default(),
             func_ptr_typedef_info: FxHashMap::default(),
@@ -425,6 +434,30 @@ impl TypeContext {
             for (key, val) in frame.typedef_alignments_shadowed {
                 self.typedef_alignments.insert(key, val);
             }
+            for (key, was_const) in frame.const_typedefs_changed.into_iter().rev() {
+                if was_const {
+                    self.const_typedefs.insert(key);
+                } else {
+                    self.const_typedefs.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Record whether a typedef's base type is const, tracking the change in
+    /// the current scope frame so it can be undone on scope exit.
+    pub fn set_typedef_const_scoped(&mut self, name: &str, is_const: bool) {
+        let was_const = self.const_typedefs.contains(name);
+        if was_const == is_const {
+            return;
+        }
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            frame.const_typedefs_changed.push((name.to_string(), was_const));
+        }
+        if is_const {
+            self.const_typedefs.insert(name.to_string());
+        } else {
+            self.const_typedefs.remove(name);
         }
     }
 
