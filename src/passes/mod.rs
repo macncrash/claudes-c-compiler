@@ -28,6 +28,7 @@ pub(crate) mod lftr;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_hoist;
+pub(crate) mod loop_layout;
 pub(crate) mod loop_rotate;
 pub(crate) mod mod_ref;
 pub(crate) mod narrow;

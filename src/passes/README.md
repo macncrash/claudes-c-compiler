@@ -100,7 +100,7 @@ The optimizer executes in four sequential phases:
          |
          v
  Phi elimination (src/ir/mem2reg), then:
-     loop_rotate
+     loop_rotate, loop_hoist, loop_layout
 ```
 
 ## Phase Structure
@@ -834,6 +834,18 @@ conditional branch and the original header is left as the entry guard. Header
 values used outside the header become variables assigned by a Copy in both
 places, as lowered phis are.
 
+### loop_layout -- Loop Tail Placement
+
+Runs last, after loop_rotate and loop_hoist. A bottom-tested loop laid out
+header first ends with the latch's branch back to the header, taken every
+iteration. When the run of loop blocks ending at the latch (each falling into
+the next) begins with a block nothing falls into, as for a tail reached by
+`continue` or an `x ? a : b` arm the other side jumps past, that run moves in
+front of the header: the latch falls into the header and exits by a jump.
+Each path through the loop takes one jump less per iteration; the loop's entry
+and exit take one more each. This is the layout clang gives chess-perft's move
+loop, and made it 0.5% faster.
+
 ### if_convert -- If-Conversion
 
 Converts simple diamond and triangle branch-and-phi patterns into `Select`
@@ -1045,7 +1057,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`.
+`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1084,6 +1096,7 @@ behavior across iterations.
 | `lftr.rs`                | Exit tests moved off counters (one IV per loop)        |
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
+| `loop_layout.rs`         | Loop tails moved before the header (latch falls through) |
 | `loop_rotate.rs`         | Header duplication into latches (bottom-tested loops)  |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
 | `pressure_hoist.rs`      | Instructions hoisted to end several live ranges early  |
