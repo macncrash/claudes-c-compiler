@@ -559,6 +559,9 @@ pub struct StructFieldDecl {
     /// Whether the field itself is volatile (`volatile int n`, not
     /// `volatile int *p`, whose pointer type is marked instead).
     pub is_volatile: bool,
+    /// Whether the field's base type is written `const` (`const int x`, and
+    /// `const char *s`, whose pointee is const), as for ParamDecl::is_const.
+    pub is_const: bool,
 }
 
 impl ParamDecl {

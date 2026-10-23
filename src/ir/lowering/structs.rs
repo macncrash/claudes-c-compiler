@@ -605,7 +605,7 @@ impl Lowerer {
     /// Look up the struct layout for a member access expression.
     /// For direct access (s.field), gets the layout of the base expression.
     /// For pointer access (p->field), gets the layout that the pointer points to.
-    fn get_member_layout(&self, base_expr: &Expr, is_pointer_access: bool) -> Option<RcLayout> {
+    pub(super) fn get_member_layout(&self, base_expr: &Expr, is_pointer_access: bool) -> Option<RcLayout> {
         if is_pointer_access {
             self.get_pointed_struct_layout(base_expr)
         } else {

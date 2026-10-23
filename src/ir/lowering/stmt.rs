@@ -305,27 +305,14 @@ impl Lowerer {
         alloca
     }
 
-    /// Whether a declaration's base type is const: written so, or taken from
-    /// a const typedef (`typedef const int CI;`) or by `typeof(expr)` from a
-    /// const expression (`typeof(cp)` for a `const int *cp`). `const` written
-    /// on a pointer typedef (`const IP p` for `typedef int *IP;`) makes the
-    /// pointer itself const, not what it points to, so it doesn't count.
+    /// Whether a declaration's base type is const: written so, taken from a
+    /// const typedef (see TypeContext::type_spec_base_const), or taken by
+    /// `typeof(expr)` from a const expression (`typeof(cp)` for a `const
+    /// int *cp`).
     pub(super) fn base_is_const(&self, type_spec: &TypeSpecifier, written_const: bool) -> bool {
         match type_spec {
-            TypeSpecifier::TypedefName(name) => {
-                let typedef_const = self.types.const_typedefs.contains(name);
-                if matches!(self.types.typedefs.get(name), Some(CType::Pointer(..))) {
-                    typedef_const
-                } else {
-                    written_const || typedef_const
-                }
-            }
             TypeSpecifier::Typeof(e) => written_const || self.expr_is_const_qualified(e),
-            // Parameters carry their declarators in the type (`CI *p`).
-            TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) => {
-                self.base_is_const(inner, written_const)
-            }
-            _ => written_const,
+            _ => self.types.type_spec_base_const(type_spec, written_const),
         }
     }
 

@@ -300,6 +300,8 @@ pub struct StructField {
     pub is_packed: bool,
     /// Whether the field was declared volatile.
     pub is_volatile: bool,
+    /// Whether the field's base type is const (see StructFieldDecl::is_const).
+    pub is_const: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -336,6 +338,17 @@ pub fn has_pointer_level(t: &CType) -> bool {
         CType::Array(elem, _) => has_pointer_level(elem),
         _ => false,
     }
+}
+
+/// Whether `const` on an object of this type makes its base type const:
+/// yes unless it is a pointer (or an array of them), which the const
+/// qualifies itself, leaving what it points to as it was.
+pub fn const_reaches_base(ty: &CType) -> bool {
+    let mut ty = ty;
+    while let CType::Array(elem, _) = ty {
+        ty = elem;
+    }
+    !matches!(ty, CType::Pointer(..))
 }
 
 /// Whether a non-packed enum with these values needs 64 bits: some value
@@ -514,6 +527,7 @@ impl StructLayoutBuilder {
             bit_offset: Some(bit_offset_in_storage),
             bit_width: Some(bw),
             is_volatile: field.is_volatile,
+            is_const: field.is_const,
         });
         self.bf_bit_pos += bw;
     }
@@ -567,6 +581,7 @@ impl StructLayoutBuilder {
             bit_offset: Some(field_bit_in_storage),
             bit_width: Some(bw),
             is_volatile: field.is_volatile,
+            is_const: field.is_const,
         });
 
         // Update bitfield tracking state
@@ -600,6 +615,7 @@ impl StructLayoutBuilder {
             bit_offset: None,
             bit_width: None,
             is_volatile: field.is_volatile,
+            is_const: field.is_const,
         });
 
         let is_flexible_array = matches!(&field.ty, CType::Array(_, None));
@@ -688,6 +704,8 @@ pub struct StructFieldLayout {
     pub bit_width: Option<u32>,
     /// Whether the field was declared volatile.
     pub is_volatile: bool,
+    /// Whether the field's base type is const (see StructFieldDecl::is_const).
+    pub is_const: bool,
 }
 
 impl StructLayout {
@@ -788,6 +806,7 @@ impl StructLayout {
                 bit_offset: bf_offset,
                 bit_width: bf_width,
                 is_volatile: field.is_volatile,
+                is_const: field.is_const,
             });
         }
 
@@ -1280,6 +1299,23 @@ impl StructLayout {
             }
         }
         None
+    }
+
+    /// Whether a field's base type was declared const, found as
+    /// `field_offset` finds it. As in clang, `const` on an anonymous member
+    /// (`const struct { int x; };`) does not reach the fields inside it.
+    pub fn field_is_const(&self, name: &str, ctx: &dyn StructLayoutProvider) -> bool {
+        if let Some(f) = self.fields.iter().find(|f| f.name == name) {
+            return f.is_const;
+        }
+        for f in self.fields.iter().filter(|f| f.name.is_empty()) {
+            let (CType::Struct(key) | CType::Union(key)) = &f.ty else { continue };
+            let Some(anon) = ctx.get_struct_layout(key).cloned() else { continue };
+            if anon.field_offset(name, ctx).is_some() {
+                return anon.field_is_const(name, ctx);
+            }
+        }
+        false
     }
 
     /// Whether a field, found as `field_offset` finds it, was declared

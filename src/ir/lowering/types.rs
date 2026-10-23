@@ -331,6 +331,7 @@ impl Lowerer {
                 alignment: field_alignment,
                 is_packed: f.is_packed,
                 is_volatile: f.is_volatile,
+                is_const: self.types.type_spec_base_const(&f.type_spec, f.is_const),
             }
         }).collect();
         if is_union {

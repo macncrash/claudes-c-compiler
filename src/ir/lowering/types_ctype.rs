@@ -301,6 +301,7 @@ impl Lowerer {
                     alignment: f.alignment,
                     is_packed: f.is_packed,
                     is_volatile: f.is_volatile,
+                    is_const: self.types.type_spec_base_const(&f.type_spec, f.is_const),
                 }
             }).collect();
             let mut layout = if is_union {

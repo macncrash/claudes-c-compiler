@@ -388,6 +388,8 @@ impl SemanticAnalyzer {
                     type_builder::build_full_ctype_with_base(self, base_type.clone(), &declarator.derived)
                 };
                 self.result.type_context.typedefs.insert(declarator.name.clone(), resolved_ctype);
+                let is_const = self.result.type_context.type_spec_base_const(&decl.type_spec, decl.is_const());
+                self.result.type_context.set_typedef_const_scoped(&declarator.name, is_const);
 
                 // Preserve alignment override from __attribute__((aligned(N))) on the typedef.
                 // E.g. typedef struct S aligned_S __attribute__((aligned(32)));
@@ -1844,6 +1846,7 @@ impl SemanticAnalyzer {
                 alignment: field_alignment,
                 is_packed: f.is_packed,
                 is_volatile: f.is_volatile,
+                is_const: self.result.type_context.type_spec_base_const(&f.type_spec, f.is_const),
             }
         }).collect()
     }

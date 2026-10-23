@@ -629,6 +629,8 @@ impl Parser {
         let mut fields = Vec::new();
         // Each field's volatile is its own, not the enclosing declaration's.
         let saved_volatile = self.attrs.take_volatile();
+        // Likewise its const (`const struct { int x; } s` is restored after).
+        let saved_const = self.attrs.parsing_const();
         let open = self.peek_span();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
@@ -643,12 +645,13 @@ impl Parser {
                 continue;
             }
             self.attrs.take_volatile();
+            self.attrs.set_const(false);
             let first = fields.len();
             if let Some(type_spec) = self.parse_type_specifier() {
                 if matches!(self.peek(), TokenKind::Semicolon) {
                     // Anonymous field (e.g., anonymous struct/union)
                     let alignment = self.attrs.parsed_alignas.take();
-                    fields.push(StructFieldDecl { type_spec, name: None, bit_width: None, derived: Vec::new(), alignment, is_packed: false, is_volatile: false });
+                    fields.push(StructFieldDecl { type_spec, name: None, bit_width: None, derived: Vec::new(), alignment, is_packed: false, is_volatile: false, is_const: self.attrs.parsing_const() });
                 } else {
                     self.parse_struct_field_declarators(&type_spec, &mut fields);
                 }
@@ -669,6 +672,7 @@ impl Parser {
         }
         self.expect_closing(&TokenKind::RBrace, open);
         self.attrs.restore_volatile(saved_volatile);
+        self.attrs.set_const(saved_const);
         fields
     }
 
@@ -687,6 +691,7 @@ impl Parser {
         // Consume post-type qualifiers that may appear between type and declarator
         // in struct field declarations: e.g., "char _Alignas(32) c;"
         self.consume_struct_field_qualifiers(&mut alignas_from_type);
+        let base_const = self.attrs.parsing_const();
 
         loop {
             // Handle unnamed bitfield: `: constant-expr`
@@ -703,6 +708,7 @@ impl Parser {
                     alignment: alignas_from_type,
                     is_packed: false,
                     is_volatile: false,
+                    is_const: base_const,
                 });
                 if !self.consume_if(&TokenKind::Comma) { break; }
                 continue;
@@ -744,6 +750,7 @@ impl Parser {
                 alignment,
                 is_packed,
                 is_volatile: false,
+                is_const: base_const,
             });
 
             if !self.consume_if(&TokenKind::Comma) { break; }
@@ -755,7 +762,11 @@ impl Parser {
     fn consume_struct_field_qualifiers(&mut self, alignas: &mut Option<usize>) {
         loop {
             match self.peek() {
-                TokenKind::Const | TokenKind::Restrict => {
+                TokenKind::Const => {
+                    self.advance();
+                    self.attrs.set_const(true);
+                }
+                TokenKind::Restrict => {
                     self.advance();
                 }
                 TokenKind::Volatile => {

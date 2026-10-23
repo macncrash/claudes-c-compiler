@@ -25,7 +25,7 @@ use crate::ir::reexports::{
     Terminator,
     Value,
 };
-use crate::common::types::{AddressSpace, IrType, CType};
+use crate::common::types::{AddressSpace, IrType, CType, const_reaches_base};
 use super::lower::Lowerer;
 
 impl Lowerer {
@@ -535,7 +535,7 @@ impl Lowerer {
     /// Check if an expression's type is const-qualified (for _Generic matching
     /// and typeof), in the sense of a declaration's const: its base type is
     /// const. Handles local and global identifiers, address-of, dereference,
-    /// subscript and comma expressions.
+    /// subscript, member access and comma expressions.
     pub(super) fn expr_is_const_qualified(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Identifier(name, _) => {
@@ -551,6 +551,19 @@ impl Lowerer {
             // the address, dereferencing or subscripting keeps the base type.
             Expr::AddressOf(inner, _) | Expr::Deref(inner, _) | Expr::ArraySubscript(inner, _, _) => {
                 self.expr_is_const_qualified(inner)
+            }
+            // s.f and p->f: const if the field is, or if the struct is (s
+            // const, or p pointing to const) and the field isn't a pointer,
+            // whose own const that would be.
+            Expr::MemberAccess(base, field, _) | Expr::PointerMemberAccess(base, field, _) => {
+                let is_pointer = matches!(expr, Expr::PointerMemberAccess(..));
+                let Some(layout) = self.get_member_layout(base, is_pointer) else { return false };
+                let (field_const, reaches) = {
+                    let layouts = self.types.borrow_struct_layouts();
+                    (layout.field_is_const(field, &*layouts),
+                     layout.field_offset(field, &*layouts).is_some_and(|(_, ty)| const_reaches_base(&ty)))
+                };
+                field_const || (reaches && self.expr_is_const_qualified(base))
             }
             // Comma: const-ness comes from the right-hand operand.
             Expr::Comma(_, rhs, _) => {

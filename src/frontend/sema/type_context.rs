@@ -16,7 +16,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 use std::rc::Rc;
-use crate::common::types::{AccessQuals, StructLayout, RcLayout, CType};
+use crate::common::types::{AccessQuals, StructLayout, RcLayout, CType, const_reaches_base};
 use crate::frontend::parser::ast::{TypeSpecifier, ParamDecl, DerivedDeclarator};
 
 /// Information about a function typedef (e.g., `typedef int func_t(int, int);`).
@@ -441,6 +441,26 @@ impl TypeContext {
                     self.const_typedefs.remove(&key);
                 }
             }
+        }
+    }
+
+    /// Whether a declaration's base type is const: written so, or taken from
+    /// a const typedef (`typedef const int CI;`), through the pointers and
+    /// arrays a parameter or field folds into its type (`CI *p`). `const`
+    /// written on a pointer typedef (`const IP p` for `typedef int *IP;`)
+    /// makes the pointer itself const, not what it points to, so it doesn't
+    /// count.
+    pub fn type_spec_base_const(&self, type_spec: &TypeSpecifier, written_const: bool) -> bool {
+        match type_spec {
+            TypeSpecifier::TypedefName(name) => {
+                let typedef_const = self.const_typedefs.contains(name);
+                let reaches = self.typedefs.get(name).is_none_or(const_reaches_base);
+                typedef_const || (written_const && reaches)
+            }
+            TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) => {
+                self.type_spec_base_const(inner, written_const)
+            }
+            _ => written_const,
         }
     }
 
