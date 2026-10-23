@@ -736,17 +736,20 @@ impl Lowerer {
         supported.then_some(IntrinsicOp::VecOp { op: kind, elem, bytes: total_size as u8, splat })
     }
 
-    /// The vector form of try_contract_fma: when one operand of a float
-    /// vector + or - is a vector product of the same type just computed into
-    /// a temporary nothing else reads, that multiply is replaced by one fused
+    /// The vector form of try_contract_fma: when one operand of a vector +
+    /// or - is a vector product of the same type just computed into a
+    /// temporary nothing else reads, that multiply is replaced by one fused
     /// op into `result` (the product's operands are read where the sum is,
-    /// a valid order for operands of +). Each side is (expression, operand,
-    /// is a broadcast scalar).
+    /// a valid order for operands of +). Float lanes need fp-contract;
+    /// integer lanes always qualify, as mla/mls give the same wrapped
+    /// result as the separate multiply and add. Each side is (expression,
+    /// operand, is a broadcast scalar).
     fn try_contract_vec_fma(&mut self, op: &BinOp, lhs: (&Expr, Operand, bool), rhs: (&Expr, Operand, bool),
                             vec_ct: &CType, result: Value) -> bool {
-        if !self.fp_contract || self.target != Target::Aarch64 || !matches!(op, BinOp::Add | BinOp::Sub) {
+        if self.target != Target::Aarch64 || !matches!(op, BinOp::Add | BinOp::Sub) {
             return false;
         }
+        let fp_contract = self.fp_contract;
         let product_at = |this: &Self, side: &(&Expr, Operand, bool)| -> Option<usize> {
             let (e, Operand::Value(v), false) = *side else { return None };
             if !matches!(e, Expr::BinaryOp(BinOp::Mul, ..)) || this.expr_ctype(e) != *vec_ct {
@@ -755,17 +758,19 @@ impl Lowerer {
             let instrs = &this.func().instrs;
             let k = instrs.iter().rposition(|i| matches!(i, Instruction::Intrinsic {
                 op: IntrinsicOp::VecOp { op: VecOpKind::Mul, elem, .. }, dest_ptr: Some(d), ..
-            } if *d == v && elem.is_float()))?;
+            } if *d == v && (!elem.is_float() || fp_contract)))?;
             let read_later = instrs[k + 1..].iter().any(|i| i.used_values().contains(&v.0));
             (!read_later).then_some(k)
         };
         let sub = *op == BinOp::Sub;
-        let (k, addend, neg_product, neg_addend) = if let Some(k) = product_at(self, &lhs) {
-            (k, rhs, false, sub)
-        } else if let Some(k) = product_at(self, &rhs) {
-            (k, lhs, sub, false)
-        } else {
-            return false;
+        // An integer a * b - c stays a multiply and a subtract: negating c
+        // first gains nothing.
+        let float_at = |this: &Self, k: usize| matches!(this.func().instrs[k],
+            Instruction::Intrinsic { op: IntrinsicOp::VecOp { elem, .. }, .. } if elem.is_float());
+        let (k, addend, neg_product, neg_addend) = match (product_at(self, &lhs), product_at(self, &rhs)) {
+            (Some(k), _) if !sub || float_at(self, k) => (k, rhs, false, sub),
+            (_, Some(k)) => (k, lhs, sub, false),
+            _ => return false,
         };
         let func = self.func_mut();
         let Instruction::Intrinsic { op: IntrinsicOp::VecOp { elem, bytes, splat, .. }, args, .. } = func.instrs.remove(k)

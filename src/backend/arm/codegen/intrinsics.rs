@@ -1076,8 +1076,9 @@ impl ArmCodegen {
         let ge = if f { "fcmge" } else if u { "cmhs" } else { "cmge" };
         let shl = if u { "ushl" } else { "sshl" };
         let lines = match op {
-            // acc = ±c, then acc ±= a * b in place (fmla/fmls), in the result
-            // register unless a factor is there (then v3, moved after).
+            // acc = ±c, then acc ±= a * b in place (fmla/fmls, or mla/mls on
+            // integer lanes), in the result register unless a factor is
+            // there (then v3, moved after).
             VecOpKind::Fma { neg_product, neg_addend } => {
                 let acc = if d != *a && d != *b { d.clone() } else { "v3".to_string() };
                 let mut lines = Vec::new();
@@ -1085,9 +1086,15 @@ impl ArmCodegen {
                     lines.push(format!("    orr {acc}.{bits}, {c}.{bits}, {c}.{bits}"));
                 }
                 if neg_addend {
-                    lines.push(format!("    fneg {acc}.{arr}, {acc}.{arr}"));
+                    lines.push(format!("    {} {acc}.{arr}, {acc}.{arr}", if f { "fneg" } else { "neg" }));
                 }
-                lines.push(format!("    {} {acc}.{arr}, {a}.{arr}, {b}.{arr}", if neg_product { "fmls" } else { "fmla" }));
+                let fused = match (f, neg_product) {
+                    (true, false) => "fmla",
+                    (true, true) => "fmls",
+                    (false, false) => "mla",
+                    (false, true) => "mls",
+                };
+                lines.push(format!("    {fused} {acc}.{arr}, {a}.{arr}, {b}.{arr}"));
                 if acc != d {
                     lines.push(format!("    orr {d}.{bits}, {acc}.{bits}, {acc}.{bits}"));
                 }

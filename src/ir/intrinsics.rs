@@ -206,8 +206,9 @@ pub enum VecOpKind {
     Add, Sub, Mul, Div, And, Or, Xor, Shl, Shr,
     Eq, Ne, Lt, Le, Gt, Ge,
     Neg, Not,
-    /// Fused (±(args[0] * args[1])) ± args[2] on float lanes, as
-    /// IntrinsicOp::Fma; splat bit 4 broadcasts args[2].
+    /// Fused (±(args[0] * args[1])) ± args[2]: on float lanes as
+    /// IntrinsicOp::Fma, on integer lanes (8 to 32 bits) the exact
+    /// multiply-accumulate; splat bit 4 broadcasts args[2].
     Fma { neg_product: bool, neg_addend: bool },
 }
 
