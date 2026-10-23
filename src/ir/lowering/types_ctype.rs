@@ -430,10 +430,10 @@ impl type_builder::TypeConvertContext for Lowerer {
             .and_then(|n| self.types.packed_enum_types.get(n))
             .is_some();
         if !effective_packed {
-            // Non-packed enum: normally int (4 bytes), but if any variant
-            // value exceeds i32 range while fitting in u32, use unsigned int
-            // (`1U << 31`), and if some value needs more than 32 bits, long or
-            // unsigned long (GCC extension, matching EnumType::packed_size).
+            // Non-packed enum: unsigned int (4 bytes) unless some value is
+            // negative, then int, as in GCC and Clang; if the values need
+            // more than 32 bits, long or unsigned long (GCC extension,
+            // matching EnumType::packed_size). With no values known, int.
             // A tag reference uses the values sema recorded for the definition.
             let values: Vec<i64> = if let Some(vars) = variants {
                 let mut values = Vec::new();
@@ -457,10 +457,10 @@ impl type_builder::TypeConvertContext for Lowerer {
                     .unwrap_or_default()
             };
             let negative = values.iter().any(|v| *v < 0);
-            if values.iter().any(|v| *v > u32::MAX as i64 || *v < i32::MIN as i64) {
+            if crate::common::types::enum_needs_64_bits(values.iter().copied()) {
                 return if negative { CType::Long } else { CType::ULong };
             }
-            return if values.iter().any(|v| *v > i32::MAX as i64) { CType::UInt } else { CType::Int };
+            return if negative || values.is_empty() { CType::Int } else { CType::UInt };
         }
         // For packed enums, compute the minimum integer type from variant values
         let variant_values: Vec<i64> = if let Some(vars) = variants {

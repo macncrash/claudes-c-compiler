@@ -303,12 +303,19 @@ impl Lowerer {
         alloca
     }
 
+    /// Whether a declaration's base type is const: written so, or taken by
+    /// `typeof(expr)` from a const expression (`typeof(cp)` for a `const
+    /// int *cp`).
+    fn decl_is_const(&self, decl: &Declaration) -> bool {
+        decl.is_const() || matches!(&decl.type_spec, TypeSpecifier::Typeof(e) if self.expr_is_const_qualified(e))
+    }
+
     fn register_local_var(
         &mut self, decl: &Declaration, declarator: &InitDeclarator,
         type_spec: &TypeSpecifier, da: &DeclAnalysis, alloca: Value,
         explicit_align: usize, vla_size: Option<Value>,
     ) {
-        let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
+        let mut local_info = LocalInfo::from_analysis(da, alloca, self.decl_is_const(decl));
         local_info.var.quals = decl.object_quals(declarator);
         if explicit_align > 0 {
             local_info.var.explicit_alignment = Some(explicit_align);
@@ -488,7 +495,7 @@ impl Lowerer {
 
         // Store type info in locals (with static_global_name set so each use site
         // emits a fresh GlobalAddr in its own basic block, avoiding unreachable-block issues).
-        let mut local_info = LocalInfo::for_static(da, static_name, decl.is_const());
+        let mut local_info = LocalInfo::for_static(da, static_name, self.decl_is_const(decl));
         local_info.var.quals = decl.object_quals(declarator);
         if let Some(ea) = explicit_align {
             local_info.var.explicit_alignment = Some(ea);

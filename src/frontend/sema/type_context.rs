@@ -124,6 +124,9 @@ pub struct TypeContext {
     pub struct_layouts: RefCell<FxHashMap<String, RcLayout>>,
     /// Enum constant values
     pub enum_constants: FxHashMap<String, i64>,
+    /// The types of enum constants that are not int: those whose value int
+    /// cannot hold (see set_enumerator_types).
+    pub enum_constant_types: FxHashMap<String, CType>,
     /// Typedef mappings (name -> resolved CType)
     pub typedefs: FxHashMap<String, CType>,
     /// Per-typedef alignment overrides from `__attribute__((aligned(N)))` on typedef
@@ -174,6 +177,7 @@ impl TypeContext {
         let mut tc = Self {
             struct_layouts: RefCell::new(FxHashMap::default()),
             enum_constants: FxHashMap::default(),
+            enum_constant_types: FxHashMap::default(),
             typedefs: FxHashMap::default(),
             typedef_alignments: FxHashMap::default(),
             function_typedefs: FxHashMap::default(),
@@ -382,6 +386,7 @@ impl TypeContext {
         if let Some(frame) = self.scope_stack.get_mut().pop() {
             for key in frame.enums_added {
                 self.enum_constants.remove(&key);
+                self.enum_constant_types.remove(&key);
             }
             let layouts = self.struct_layouts.get_mut();
             for key in frame.struct_layouts_added {
@@ -432,6 +437,26 @@ impl TypeContext {
             }
         }
         self.enum_constants.insert(name, value);
+    }
+
+    /// Record the types of a completed enum's constants: int when the value
+    /// fits int, else the enum's type (EnumType::enumerator_type).
+    pub fn set_enumerator_types(&mut self, variants: &[(String, i64)], is_packed: bool) {
+        let et = crate::common::types::EnumType { name: None, variants: variants.to_vec(), is_packed };
+        for (name, v) in variants {
+            let ty = et.enumerator_type(*v);
+            if ty == CType::Int {
+                self.enum_constant_types.remove(name);
+            } else {
+                self.enum_constant_types.insert(name.clone(), ty.clone());
+            }
+        }
+    }
+
+    /// The type of enum constant `name`, if it is one.
+    pub fn enumerator_ctype(&self, name: &str) -> Option<CType> {
+        self.enum_constants.contains_key(name)
+            .then(|| self.enum_constant_types.get(name).cloned().unwrap_or(CType::Int))
     }
 
     /// Insert a struct layout, tracking the change in the current scope frame

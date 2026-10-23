@@ -827,17 +827,8 @@ impl Lowerer {
                 if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
                     return IrType::Ptr;
                 }
-                if let Some(&val) = self.types.enum_constants.get(name) {
-                    // Enum constants follow GCC promotion: int -> unsigned int -> long long
-                    if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-                        return IrType::I32;
-                    } else if val >= 0 && val <= u32::MAX as i64 {
-                        return IrType::U32;
-                    } else if val >= 0 {
-                        return IrType::U64;
-                    } else {
-                        return IrType::I64;
-                    }
+                if let Some(ty) = self.types.enumerator_ctype(name) {
+                    return IrType::from_ctype(&ty);
                 }
                 if let Some(vi) = self.lookup_var_info(name) {
                     if vi.is_array {
@@ -1157,9 +1148,9 @@ impl Lowerer {
                         variadic: func_info.variadic,
                     })));
                 }
-                // Enum constants have type int in C
-                if self.types.enum_constants.contains_key(name) {
-                    return Some(CType::Int);
+                // Enum constants: int unless their enum does not fit int.
+                if let Some(ty) = self.types.enumerator_ctype(name) {
+                    return Some(ty);
                 }
                 None
             }

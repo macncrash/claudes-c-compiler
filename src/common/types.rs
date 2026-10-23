@@ -338,7 +338,22 @@ pub fn has_pointer_level(t: &CType) -> bool {
     }
 }
 
+/// Whether a non-packed enum with these values needs 64 bits: some value
+/// fits neither int nor unsigned int, or the values need both a negative
+/// value and one above INT_MAX.
+pub fn enum_needs_64_bits(values: impl Iterator<Item = i64> + Clone) -> bool {
+    let negative = values.clone().any(|v| v < 0);
+    values.clone().any(|v| v > u32::MAX as i64 || v < i32::MIN as i64 || negative && v > i32::MAX as i64)
+}
+
 impl EnumType {
+    /// The type of an enumerator with value `v` once the enum is complete
+    /// (as Clang and GCC): int when the value fits int, else the enum's
+    /// underlying type.
+    pub fn enumerator_type(&self, v: i64) -> CType {
+        if i32::try_from(v).is_ok() { CType::Int } else { self.underlying_type() }
+    }
+
     /// The integer type the enum is compatible with (GCC/Clang): unsigned
     /// unless some value is negative, of the enum's size.
     pub fn underlying_type(&self) -> CType {
@@ -363,14 +378,10 @@ impl EnumType {
             // Non-packed enum: 4 bytes if all values fit in int or unsigned int,
             // otherwise 8 bytes (GCC extension for values exceeding 32-bit range).
             // Values like `1U << 31` (0x80000000) fit in unsigned int (u32) even
-            // though they exceed signed int (i32) range.
-            let exceeds_32bit = self.variants.iter().any(|(_, v)| {
-                *v > u32::MAX as i64 || *v < i32::MIN as i64
-            });
-            if exceeds_32bit {
-                return 8;
-            }
-            return 4;
+            // though they exceed signed int (i32) range, but not alongside a
+            // negative value.
+            let values = || self.variants.iter().map(|(_, v)| *v);
+            return if enum_needs_64_bits(values()) { 8 } else { 4 };
         }
         // Find the range of variant values to determine the minimum size
         if self.variants.is_empty() {
@@ -1634,6 +1645,8 @@ impl CType {
         match self {
             CType::Bool | CType::Char | CType::UChar
             | CType::Short | CType::UShort => CType::Int,
+            // An enum promotes as its underlying type.
+            CType::Enum(e) => e.underlying_type().integer_promoted(),
             other => other.clone(),
         }
     }
@@ -2048,12 +2061,12 @@ impl IrType {
                         }
                     }
                     _ => {
-                        // 4-byte enum: unsigned if any value exceeds i32 range
-                        // (e.g., 1U << 31 = 0x80000000 fits in u32 but not i32)
-                        if e.variants.iter().any(|(_, v)| *v > i32::MAX as i64) {
-                            IrType::U32
-                        } else {
+                        // 4-byte enum: unsigned unless some value is negative
+                        // (as underlying_type).
+                        if e.variants.iter().any(|(_, v)| *v < 0) || e.variants.is_empty() {
                             IrType::I32
+                        } else {
+                            IrType::U32
                         }
                     }
                 }

@@ -1276,6 +1276,7 @@ impl Lowerer {
                     variant_values.push((variant.name.clone(), next_val));
                     next_val += 1;
                 }
+                self.types.set_enumerator_types(&variant_values, *is_packed);
                 // Store packed enum info for forward-reference lookups
                 if *is_packed {
                     if let Some(tag) = name {

@@ -532,8 +532,10 @@ impl Lowerer {
         false
     }
 
-    /// Check if an expression's type is const-qualified (for _Generic matching).
-    /// Handles local variable identifiers, address-of, and comma expressions.
+    /// Check if an expression's type is const-qualified (for _Generic matching
+    /// and typeof), in the sense of a declaration's const: its base type is
+    /// const. Handles local variable identifiers, address-of, dereference,
+    /// subscript and comma expressions.
     pub(super) fn expr_is_const_qualified(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Identifier(name, _) => {
@@ -545,7 +547,9 @@ impl Lowerer {
                 false
             }
             // Address-of: &y where y is `const int` produces `const int *`.
-            Expr::AddressOf(inner, _) => {
+            // And *p or p[i] where p is `const int *` is `const int`: taking
+            // the address, dereferencing or subscripting keeps the base type.
+            Expr::AddressOf(inner, _) | Expr::Deref(inner, _) | Expr::ArraySubscript(inner, _, _) => {
                 self.expr_is_const_qualified(inner)
             }
             // Comma: const-ness comes from the right-hand operand.

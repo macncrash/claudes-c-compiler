@@ -537,6 +537,9 @@ impl Parser {
         // Try parsing as a type first
         if self.is_type_specifier() {
             if let Some(ts) = self.parse_type_specifier() {
+                // A const base type (`typeof(const int)`, `typeof(const int *)`)
+                // is the declaration's, as if written outside the typeof.
+                let base_const = self.attrs.parsing_const();
                 let mut result_type = self.parse_abstract_declarator_suffix(ts);
                 if self.attrs.parsing_volatile() {
                     result_type.mark_volatile_pointers();
@@ -544,6 +547,9 @@ impl Parser {
                 if matches!(self.peek(), TokenKind::RParen) {
                     self.advance();
                     self.attrs.flags = saved_flags;
+                    if base_const {
+                        self.attrs.set_const(true);
+                    }
                     return TypeSpecifier::TypeofType(Box::new(result_type));
                 }
             }

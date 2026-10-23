@@ -722,8 +722,9 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn process_enum_variants(&mut self, variants: &[EnumVariant]) {
+    fn process_enum_variants(&mut self, variants: &[EnumVariant], is_packed: bool) {
         self.enum_counter = 0;
+        let mut values = Vec::with_capacity(variants.len());
         for variant in variants {
             if let Some(val_expr) = &variant.value {
                 // Walk the enum value expression through analyze_expr first to
@@ -749,7 +750,15 @@ impl SemanticAnalyzer {
                 ty: sym_ty,
                 explicit_alignment: None,
             });
+            values.push((variant.name.clone(), self.enum_counter));
             self.enum_counter += 1;
+        }
+        // Once the enum is complete, constants int cannot hold have its type.
+        self.result.type_context.set_enumerator_types(&values, is_packed);
+        for (name, _) in &values {
+            if let Some(ty) = self.result.type_context.enumerator_ctype(name) {
+                self.symbol_table.declare(Symbol { name: name.clone(), ty, explicit_alignment: None });
+            }
         }
     }
 
@@ -760,7 +769,7 @@ impl SemanticAnalyzer {
     fn collect_enum_constants_from_type_spec(&mut self, ts: &TypeSpecifier) {
         match ts {
             TypeSpecifier::Enum(name, Some(variants), is_packed) => {
-                self.process_enum_variants(variants);
+                self.process_enum_variants(variants, *is_packed);
                 // Store the definition for later `enum tag` references; packed
                 // enums also go in packed_enum_types for their size.
                 if let Some(tag) = name {

@@ -171,6 +171,7 @@ continues to extend it (e.g., adding struct layouts discovered during lowering).
 |---|---|---|
 | `struct_layouts` | `RefCell<FxHashMap<String, RcLayout>>` | Struct/union field layouts indexed by tag name. Uses `Rc<StructLayout>` for cheap clone/lookup. |
 | `enum_constants` | `FxHashMap<String, i64>` | Enum constant name-to-value mapping. |
+| `enum_constant_types` | `FxHashMap<String, CType>` | Types of the enum constants that are not `int`: those whose value `int` cannot hold have their enum's underlying type (`enumerator_ctype`). |
 | `typedefs` | `FxHashMap<String, CType>` | Typedef name-to-resolved-CType mapping. |
 | `typedef_alignments` | `FxHashMap<String, usize>` | Per-typedef alignment overrides from `__attribute__((aligned(N)))`. |
 | `function_typedefs` | `FxHashMap<String, FunctionTypedefInfo>` | Bare function typedefs (e.g., `typedef int func_t(int, int)`). |
@@ -296,8 +297,9 @@ The checker handles all expression forms in the AST:
   Imaginary literal variants produce their complex type:
   `ImaginaryLiteral` -> `ComplexDouble`, `ImaginaryLiteralF32` -> `ComplexFloat`,
   `ImaginaryLiteralLongDouble` -> `ComplexLongDouble`.
-- **Identifiers**: symbol table lookup, enum constant lookup (with GCC promotion
-  rules: `int` -> `unsigned int` -> `long long` -> `unsigned long long`), function
+- **Identifiers**: symbol table lookup, enum constant lookup (`int` when the
+  value fits `int`, else the enum's underlying type: unsigned unless a value is
+  negative, of `unsigned int`, `long` or `unsigned long` size), function
   signature lookup.
 - **Unary operators**: `&` wraps in `Pointer`, `*` peels off `Pointer`/`Array`,
   arithmetic operators apply integer promotion, `!` produces `int`.

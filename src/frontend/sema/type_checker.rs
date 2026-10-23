@@ -151,8 +151,8 @@ impl<'a> ExprTypeChecker<'a> {
                 if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
                     return Some(CType::Pointer(Box::new(CType::Char), AccessQuals::NONE));
                 }
-                if let Some(&val) = self.types.enum_constants.get(name) {
-                    return Some(enum_constant_type(val));
+                if let Some(ty) = self.types.enumerator_ctype(name) {
+                    return Some(ty);
                 }
                 if let Some(sym) = self.symbols.lookup(name) {
                     return Some(sym.ty.clone());
