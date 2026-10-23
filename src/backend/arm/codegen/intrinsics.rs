@@ -293,9 +293,10 @@ impl ArmCodegen {
     /// it may have changed since its slot was last written, and reloaded
     /// only if a use follows before the next clobber (a store there counts
     /// as one); otherwise that clobber reloads it, or a loop exit whose
-    /// slot for it is current. To keep stores out of loops, a variable that
-    /// some clobber finds live is also stored after the last write to it
-    /// in each block outside any loop, and a parameter once loaded. A whole
+    /// slot for it is current. To keep stores out of loops, a variable is
+    /// also stored after the last write to it in each block outside any
+    /// loop, and a parameter once loaded, where a clobber that finds it
+    /// live may follow before it is written again. A whole
     /// write, or a fresh lane store, starts a new value; other lane stores
     /// keep the remaining lanes, so they count as uses.
     fn vec_vars_live_across(func: &IrFunction, lanes: &FxHashMap<u32, (u32, i64)>,
@@ -332,27 +333,55 @@ impl ArmCodegen {
         let spilled = live.values().fold(0u32, |m, &l| m | l);
         let mut plan = VecSpillPlan::default();
         if spilled == 0 {
+            // Nothing to store or reload around any clobber. (A clobber
+            // missing from at_clobber would store and reload everything.)
+            plan.at_clobber = live.keys().map(|&k| (k, (0, 0))).collect();
             return plan;
         }
-        plan.on_entry = func.param_alloca_values.iter().fold(0, |m, p| m | bit(p.0)) & spilled;
-        let (in_loop, exits) = Self::loop_blocks(func);
-        for (block, _) in func.blocks.iter().zip(&in_loop).filter(|(_, l)| !**l) {
-            // After the last write to each variable in the block.
-            let mut later = 0u32;
-            for inst in block.instructions.iter().rev() {
-                let w = writes(inst) & spilled & !later;
-                later |= writes(inst);
-                if w != 0 {
-                    plan.after_write.insert(key(inst), w);
-                }
-            }
-        }
-        // Variables that may differ from their save slot, forward.
         let index: FxHashMap<u32, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
         let succs: Vec<Vec<usize>> = func.blocks.iter()
             .map(|b| crate::backend::liveness::terminator_targets(&b.terminator).iter()
                 .filter_map(|t| index.get(t).copied()).collect())
             .collect();
+        // Variables some clobber that finds them live may be reached by
+        // before they are written again, at each block's start, backward:
+        // only then is storing one early of any use.
+        let wanted_before = |wanted: u32, inst: &Instruction| {
+            (wanted & !writes(inst)) | live.get(&key(inst)).copied().unwrap_or(0)
+        };
+        let mut wanted_in = vec![0u32; func.blocks.len()];
+        loop {
+            let mut changed = false;
+            for (b, block) in func.blocks.iter().enumerate().rev() {
+                let out = succs[b].iter().fold(0, |m, &s| m | wanted_in[s]);
+                let inn = block.instructions.iter().rev().fold(out, wanted_before);
+                if inn != wanted_in[b] {
+                    wanted_in[b] = inn;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        plan.on_entry = func.param_alloca_values.iter().fold(0, |m, p| m | bit(p.0))
+            & spilled & wanted_in.first().copied().unwrap_or(0);
+        let (in_loop, exits) = Self::loop_blocks(func);
+        for (b, block) in func.blocks.iter().enumerate().filter(|&(b, _)| !in_loop[b]) {
+            // After the last write to each variable in the block, if a
+            // clobber that finds it live may follow.
+            let mut later = 0u32;
+            let mut wanted = succs[b].iter().fold(0, |m, &s| m | wanted_in[s]);
+            for inst in block.instructions.iter().rev() {
+                let w = writes(inst) & spilled & !later & wanted;
+                later |= writes(inst);
+                if w != 0 {
+                    plan.after_write.insert(key(inst), w);
+                }
+                wanted = wanted_before(wanted, inst);
+            }
+        }
+        // Variables that may differ from their save slot, forward.
         let mut stores: FxHashMap<usize, u32> = FxHashMap::default();
         let mut dirty_in = vec![0u32; func.blocks.len()];
         if let Some(d) = dirty_in.first_mut() {
