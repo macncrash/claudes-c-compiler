@@ -71,6 +71,10 @@ The optimizer executes in four sequential phases:
      lftr
          |
          v
+ Phase 10c2: GEP Offset Cancellation
+     gep_linear
+         |
+         v
  Phase 10d: Pressure Hoisting
      pressure_hoist
          |
@@ -393,6 +397,10 @@ Supported transformations:
 - **Modulo** (`x % C`): rewritten as `x - (x / C) * C` using the optimized
   division from above. Power-of-2 unsigned modulo is handled separately by
   the simplify pass as `x & (C - 1)`.
+- **Small dividends**: an I64 dividend widened from an 8- or 16-bit integer,
+  or masked to 16 bits, uses the smallest multiplier that is exact over its
+  whole range (checked value by value), when that is below 2^16: one move
+  instead of two (`x * 43 >> 8` for a `signed char` divided by 6).
 
 **Only 32-bit operand values are currently optimized.** For native I32/U32
 types, the pass applies directly. For I64/U64 operations, the pass performs
@@ -753,6 +761,17 @@ run of that block. Its operands then die there instead of staying live down to
 it (`promo ? promo : type` computed in a move's first block instead of its
 last).
 
+### gep_linear -- GEP Offset Cancellation
+
+Runs once after lftr. The offsets of a GEP chain are summed as a linear
+combination of values, expanding I64 adds, subtracts, and multiplies and
+left shifts by constants (exact modulo 2^64; casts and everything else are
+opaque values). When fewer values are left than the chain reads, and at
+most one, the GEP is rebuilt from the chain's root as `gep root, v * k` plus
+a constant. `p->pieces[pc / 6][pc % 6]` over rows of six 8-byte elements is
+`48 q + 8 (pc - 6 q)` once the division is expanded, which is `8 pc`: the
+remainder and its multiply go away.
+
 ### gep_reassoc -- GEP Offset Reassociation
 
 Runs once after pressure_hoist. `gep(gep(p, C), i)` whose only uses are load and
@@ -1009,7 +1028,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`iv_widen`, `lftr`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`.
+`iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1036,6 +1055,7 @@ behavior across iterations.
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |
 | `dead_statics.rs`        | Dead static function/global elimination (BFS)          |
 | `div_by_const.rs`        | Division by constant strength reduction                |
+| `gep_linear.rs`          | GEP chain offsets summed and cancelled (`a[x / n][x % n]`) |
 | `gep_reassoc.rs`         | Constant GEP offsets moved into loads and stores       |
 | `gvn.rs`                 | Dominator-based GVN/CSE with load elimination          |
 | `if_convert.rs`          | Diamond/triangle to Select conversion                  |

@@ -15,6 +15,7 @@ pub(crate) mod copy_prop;
 pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
+mod gep_linear;
 mod gep_reassoc;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
@@ -567,6 +568,16 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             if lftr::lftr_function(func) > 0 {
                 copy_prop::propagate_copies(func);
+                dce::eliminate_dead_code(func);
+            }
+        }
+    }
+
+    // Phase 10c2: Cancel terms between the offsets of GEP chains
+    // (p->a[x / 6][x % 6] is p + 8 x).
+    if !disabled.contains("gep_linear") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if gep_linear::cancel_function(func) > 0 {
                 dce::eliminate_dead_code(func);
             }
         }

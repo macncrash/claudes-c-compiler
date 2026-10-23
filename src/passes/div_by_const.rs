@@ -22,6 +22,11 @@
 //! **Modulo by constant**:
 //!   `x % C` => `x - (x / C) * C`  (using the optimized division above)
 //!
+//! **Small dividends**: an I64 dividend widened from an 8- or 16-bit
+//! integer, or masked to 16 bits, gets the smallest multiplier exact over
+//! its whole range when that fits in 16 bits (one move to materialize):
+//!   `x / 6` for a signed char => `t = x * 43 >> 8; t + (t >>> 63)`
+//!
 //! All transformations produce correct results for the full range of inputs,
 //! including edge cases (0, 1, -1, INT_MIN, UINT_MAX, INT64_MIN, UINT64_MAX).
 //!
@@ -68,8 +73,26 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
     let max_id = func.max_value_id() as usize;
     let mut is_known_u32: Vec<bool> = vec![false; max_id + 1];
     let mut is_known_i32: Vec<bool> = vec![false; max_id + 1];
+    // Values widened from 8- or 16-bit integers, or masked to 16 bits: their
+    // range, for small_magic.
+    let mut small_range: Vec<Option<(i64, i64)>> = vec![None; max_id + 1];
     for block in &func.blocks {
         for inst in &block.instructions {
+            match inst {
+                Instruction::Cast { dest, from_ty, .. } if dest.0 as usize <= max_id => {
+                    small_range[dest.0 as usize] = match from_ty {
+                        IrType::I8 => Some((i8::MIN as i64, i8::MAX as i64)),
+                        IrType::U8 => Some((0, u8::MAX as i64)),
+                        IrType::I16 => Some((i16::MIN as i64, i16::MAX as i64)),
+                        IrType::U16 => Some((0, u16::MAX as i64)),
+                        _ => None,
+                    };
+                }
+                Instruction::BinOp { dest, op: IrBinOp::And, rhs: Operand::Const(c), .. } if dest.0 as usize <= max_id => {
+                    small_range[dest.0 as usize] = c.to_i64().filter(|&k| (0..=u16::MAX as i64).contains(&k)).map(|k| (0, k));
+                }
+                _ => {}
+            }
             match inst {
                 Instruction::ParamRef { dest, ty, .. } => {
                     // (d) Function parameter of <=32-bit integer type.
@@ -175,6 +198,11 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
         }
     };
 
+    let range_of = |op: &Operand| match op {
+        Operand::Value(v) => small_range.get(v.0 as usize).copied().flatten(),
+        Operand::Const(_) => None,
+    };
+
     // Helper: check if an operand is known to fit in signed 32 bits.
     let lhs_is_i32 = |op: &Operand| -> bool {
         match op {
@@ -235,7 +263,9 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                                         IrType::U32 => expand_udiv32(*dest, lhs, d32, *ty, &mut next_id),
                                         // Note: widened_op_type() maps U64 to I64, so UDiv on
                                         // unsigned long long uses I64 type. Match both.
-                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => expand_udiv32_in_i64(*dest, lhs, d32, &mut next_id),
+                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) =>
+                                            expand_small_div(*dest, lhs, udivisor as i64, range_of(lhs), false, false, &mut next_id)
+                                                .or_else(|| expand_udiv32_in_i64(*dest, lhs, d32, &mut next_id)),
                                         IrType::I64 | IrType::U64 => expand_udiv64(*dest, lhs, udivisor, *ty, &mut next_id),
                                         _ => None,
                                     }
@@ -252,7 +282,9 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                                 if divisor > 1 && divisor <= i32::MAX as i64 {
                                     match *ty {
                                         IrType::I32 => expand_sdiv32(*dest, lhs, divisor as i32, *ty, &mut next_id),
-                                        IrType::I64 if lhs_is_i32(lhs) => expand_sdiv32_in_i64(*dest, lhs, divisor as i32, &mut next_id),
+                                        IrType::I64 if lhs_is_i32(lhs) =>
+                                            expand_small_div(*dest, lhs, divisor, range_of(lhs), true, false, &mut next_id)
+                                                .or_else(|| expand_sdiv32_in_i64(*dest, lhs, divisor as i32, &mut next_id)),
                                         IrType::I64 => expand_sdiv64(*dest, lhs, divisor, &mut next_id),
                                         _ => None,
                                     }
@@ -300,7 +332,9 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                                     let d32 = udivisor as u32;
                                     match *ty {
                                         IrType::U32 => expand_urem32(*dest, lhs, d32, *ty, &mut next_id),
-                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => expand_urem32_in_i64(*dest, lhs, d32, &mut next_id),
+                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) =>
+                                            expand_small_div(*dest, lhs, udivisor as i64, range_of(lhs), false, true, &mut next_id)
+                                                .or_else(|| expand_urem32_in_i64(*dest, lhs, d32, &mut next_id)),
                                         IrType::I64 | IrType::U64 => expand_urem64(*dest, lhs, udivisor, *ty, &mut next_id),
                                         _ => None,
                                     }
@@ -317,7 +351,9 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                                 if divisor > 1 && divisor <= i32::MAX as i64 {
                                     match *ty {
                                         IrType::I32 => expand_srem32(*dest, lhs, divisor as i32, *ty, &mut next_id),
-                                        IrType::I64 if lhs_is_i32(lhs) => expand_srem32_in_i64(*dest, lhs, divisor as i32, &mut next_id),
+                                        IrType::I64 if lhs_is_i32(lhs) =>
+                                            expand_small_div(*dest, lhs, divisor, range_of(lhs), true, true, &mut next_id)
+                                                .or_else(|| expand_srem32_in_i64(*dest, lhs, divisor as i32, &mut next_id)),
                                         IrType::I64 => expand_srem64(*dest, lhs, divisor, &mut next_id),
                                         _ => None,
                                     }
@@ -388,6 +424,64 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
         func.next_value_id = next_id;
     }
     changes
+}
+
+/// Largest dividend range checked exhaustively by small_magic.
+const MAX_SMALL_RANGE: i64 = 1 << 16;
+
+/// For a dividend known to lie in [lo, hi] (a widened 8- or 16-bit value),
+/// a multiplier below 2^16 (one move to materialize) and a shift with
+///   unsigned: q = (x * m) >> s
+///   signed:   t = (x * m) >> s; q = t + (t >>> 63)
+/// equal to x / d for every x in the range, checked exhaustively; the
+/// smallest such shift. The usual 32-bit magic needs two moves.
+fn small_magic(d: i64, lo: i64, hi: i64, signed: bool) -> Option<(i64, u32)> {
+    if d < 2 || (d as u64).is_power_of_two() || hi - lo > MAX_SMALL_RANGE || (!signed && lo < 0) {
+        return None;
+    }
+    for s in 0..40u32 {
+        let m = ((1i64 << s) + d - 1) / d;
+        if m >= 1 << 16 {
+            return None;
+        }
+        let ok = (lo..=hi).all(|x| {
+            let t = (x * m) >> s;
+            let q = if signed && t < 0 { t + 1 } else { t };
+            q == x / d
+        });
+        if ok {
+            return Some((m, s));
+        }
+    }
+    None
+}
+
+/// `dest = x / d` (or `x % d`) in I64 by small_magic, for a dividend in
+/// [lo, hi]; None when no small multiplier works.
+fn expand_small_div(dest: Value, x: &Operand, d: i64, range: Option<(i64, i64)>, signed: bool, rem: bool,
+                    next_id: &mut u32) -> Option<Vec<Instruction>> {
+    let (lo, hi) = range?;
+    let (m, s) = small_magic(d, lo, hi, signed)?;
+    let mut insts = Vec::new();
+    let product = fresh_value(next_id);
+    insts.push(Instruction::BinOp { dest: product, op: IrBinOp::Mul, lhs: *x, rhs: Operand::Const(IrConst::I64(m)), ty: IrType::I64 });
+    let q = if rem { fresh_value(next_id) } else { dest };
+    let op = if signed { IrBinOp::AShr } else { IrBinOp::LShr };
+    if signed {
+        let t = fresh_value(next_id);
+        let sign = fresh_value(next_id);
+        insts.push(Instruction::BinOp { dest: t, op, lhs: Operand::Value(product), rhs: Operand::Const(IrConst::I64(s as i64)), ty: IrType::I64 });
+        insts.push(Instruction::BinOp { dest: sign, op: IrBinOp::LShr, lhs: Operand::Value(t), rhs: Operand::Const(IrConst::I64(63)), ty: IrType::I64 });
+        insts.push(Instruction::BinOp { dest: q, op: IrBinOp::Add, lhs: Operand::Value(t), rhs: Operand::Value(sign), ty: IrType::I64 });
+    } else {
+        insts.push(Instruction::BinOp { dest: q, op, lhs: Operand::Value(product), rhs: Operand::Const(IrConst::I64(s as i64)), ty: IrType::I64 });
+    }
+    if rem {
+        let prod = fresh_value(next_id);
+        insts.push(Instruction::BinOp { dest: prod, op: IrBinOp::Mul, lhs: Operand::Value(q), rhs: Operand::Const(IrConst::I64(d)), ty: IrType::I64 });
+        insts.push(Instruction::BinOp { dest, op: IrBinOp::Sub, lhs: *x, rhs: Operand::Value(prod), ty: IrType::I64 });
+    }
+    Some(insts)
 }
 
 /// Allocate a fresh Value ID.
@@ -1664,6 +1758,32 @@ fn expand_srem32_in_i64(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Small multipliers exist for 8- and 16-bit dividends and common
+    /// divisors, and are right across the whole range.
+    #[test]
+    fn test_small_magic() {
+        let ranges = [(-128i64, 127i64, true), (0, 255, false), (-32768, 32767, true), (0, 65535, false), (0, 4095, false)];
+        for &(lo, hi, signed) in &ranges {
+            for d in [3i64, 5, 6, 7, 9, 10, 12, 100, 255, 641] {
+                let Some((m, s)) = small_magic(d, lo, hi, signed) else {
+                    assert!(hi - lo > 255, "no small magic for {d} over [{lo}, {hi}]");
+                    continue;
+                };
+                assert!(m < 1 << 16);
+                for x in lo..=hi {
+                    let t = (x * m) >> s;
+                    let q = if signed { t + ((t as u64) >> 63) as i64 } else { t };
+                    assert_eq!(q, x / d, "{x} / {d} with m={m}, s={s}");
+                }
+            }
+        }
+        assert_eq!(small_magic(6, -128, 127, true), Some((43, 8)));
+        // Powers of two, and unsigned division of a value that may be
+        // negative, are left to the other expansions.
+        assert_eq!(small_magic(8, -128, 127, true), None);
+        assert_eq!(small_magic(6, -128, 127, false), None);
+    }
 
     #[test]
     fn test_unsigned_magic_7() {
