@@ -2094,7 +2094,18 @@ impl ArchCodegen for ArmCodegen {
         let (table, min_val, range) = build_jump_table(cases, default);
         let table_label = self.state.fresh_label("jt");
         let default_label = default.as_label();
-        self.operand_to_x0(val);
+        // Index from the value's own register when nothing needs subtracting.
+        let in_reg = match val {
+            Operand::Value(v) if min_val == 0 => self.reg_assignments.get(&v.0).map(|&r| callee_saved_name(r)),
+            _ => None,
+        };
+        let idx = match in_reg {
+            Some(r) => r,
+            None => {
+                self.operand_to_x0(val);
+                "x0"
+            }
+        };
         if min_val != 0 {
             if min_val > 0 && min_val <= 4095 {
                 self.state.emit_fmt(format_args!("    sub x0, x0, #{}", min_val));
@@ -2106,29 +2117,28 @@ impl ArchCodegen for ArmCodegen {
             }
         }
         if range <= 4095 {
-            self.state.emit_fmt(format_args!("    cmp x0, #{}", range));
+            self.state.emit_fmt(format_args!("    cmp {}, #{}", idx, range));
         } else {
             self.load_large_imm("x17", range as i64);
-            self.state.emit("    cmp x0, x17");
+            self.state.emit_fmt(format_args!("    cmp {}, x17", idx));
         }
         let range_skip = self.state.fresh_label("range_ok");
         self.state.emit_fmt(format_args!("    b.lo {}", range_skip));
         self.state.emit_fmt(format_args!("    b {}", default_label));
         self.state.emit_fmt(format_args!("{}:", range_skip));
-        self.state.emit_fmt(format_args!("    adrp x17, {}", table_label));
-        self.state.emit_fmt(format_args!("    add x17, x17, :lo12:{}", table_label));
-        self.state.emit("    ldr w16, [x17, x0, lsl #2]");
+        // The table sits in the text section right after the `br`, where one
+        // `adr` reaches it (an `adrp` + `add` pair into .rodata cost an extra
+        // instruction on every dispatch).
+        self.state.emit_fmt(format_args!("    adr x17, {}", table_label));
+        self.state.emit_fmt(format_args!("    ldr w16, [x17, {}, lsl #2]", idx));
         self.state.emit("    add x17, x17, w16, sxtw");
         self.state.emit("    br x17");
-        self.state.emit(".section .rodata");
-        self.state.emit(".align 2");
+        self.state.emit(".p2align 2");
         self.state.emit_fmt(format_args!("{}:", table_label));
         for target in &table {
             let target_label = target.as_label();
             self.state.emit_fmt(format_args!("    .word {} - {}", target_label, table_label));
         }
-        let sect = self.state.current_text_section.clone();
-        self.state.emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
         self.state.reg_cache.invalidate_all();
     }
 

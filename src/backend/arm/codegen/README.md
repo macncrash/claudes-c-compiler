@@ -762,6 +762,36 @@ v1 and nothing between the copy and the call uses v22:
     bl step
 ```
 
+**12. Indexed Accesses** (local cleanup)
+
+- `and D, S, #0xff` / `#0xffff` / `#0xffffffff` (and `uxtb`/`uxth`) of a
+  register already below that bound in this straight-line run (`ldrb`, `ldrh`,
+  the same masks, any w-register write) becomes a move: codegen zero-extends
+  every unsigned narrow cast, including those of values just loaded.
+- A repeated `add xA, sp, #k` (or `x29`), with nothing between writing xA,
+  sp or x29, is removed: codegen recomputes a stack array's address for every
+  access through it.
+- `lsl T, S, #k` folds into a later `add|sub|orr|and|eor D, X, T` past up to
+  four unrelated lines, so that `fold_index_into_mem` can then make
+  `[X, S, lsl #k]` of the access through D.
+- In the liveness of registers' upper halves, `mov xD, xS` reads S's upper
+  half only where D's is live afterwards, so an `sxtw` of an `int` that is
+  only copied and then read as a w register goes away.
+
+**13. Switch Dispatch Duplication** (after the local cleanup)
+
+A `switch` with a jump table ends in `adr x17, .Ljt; ldr w16, [x17, idx,
+lsl #2]; add x17, x17, w16, sxtw; br x17`, with the table right after the
+`br` in the text section. Liveness reads the table, so the `br` goes only to
+its cases and reads only x17. When a loop jumps back from its cases to the
+dispatch block (the straight-line code from a label to that `br`: at most 16
+instructions, no calls, returns or CFI), each backward `b` into it becomes a
+copy of the block, so that every case ends in its own indirect branch. A
+single shared dispatch branch has to predict every transition and on Apple
+M-series cores mispredicts most of them; scalar-bench's bytecode interpreter
+ran twice as fast with copies (1.6x clang -O2, which keeps one shared
+branch). At most 64 copies are made per function.
+
 ---
 
 ## Codegen Options

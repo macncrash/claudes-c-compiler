@@ -461,6 +461,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_move_chains(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_redundant_sxtw(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_redundant_narrow_extends(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_redundant_zero_extends(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_repeated_frame_addrs(&lines, &mut kinds, n));
             changed2 |= pass!(propagate_w_copies(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_low_half_only_extends(&lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_upper_extends(&lines, &mut kinds, n));
@@ -496,6 +498,14 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
+    // Phase 5: copy switch dispatches into the loop branches that reach them.
+    let (lines, kinds) = if skip.contains(&"duplicate_switch_dispatch") {
+        (lines, kinds)
+    } else {
+        duplicate_switch_dispatch(lines, kinds)
+    };
+    let n = lines.len();
+
     // Build result, filtering out Nop lines
     let align = small_loop_alignment(&lines, &kinds, n);
     let mut result = String::with_capacity(asm.len());
@@ -511,6 +521,113 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
     result
+}
+
+// ── Switch dispatch duplication ──────────────────────────────────────────────
+//
+// A loop around a switch (a bytecode interpreter, a state machine) jumps from
+// every case back to one dispatch block that ends in the jump table's `br`.
+// That one indirect branch then has to predict every transition, and on
+// Apple M-series cores it mispredicts most of them: scalar-bench's interpreter
+// ran 2x faster with the dispatch copied into each case, so that each case
+// ends in its own `br` and the predictor learns which case follows which.
+//
+// The dispatch block is the straight-line code from a label to a `br` that a
+// jump table follows: no calls, unconditional branches, returns or CFI, at
+// most MAX_DISPATCH instructions (conditional branches out, like the
+// default-case test, are fine). Each later `b label` into it (a loop back
+// edge) becomes a copy of the block from that label on. The copy runs the
+// same instructions the jump would have reached, and labels are not copied.
+
+/// Most instructions in a copied dispatch block.
+const MAX_DISPATCH: usize = 16;
+/// Most dispatch copies per function.
+const MAX_DISPATCH_COPIES: usize = 64;
+
+fn duplicate_switch_dispatch(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<LineKind>) {
+    let n = lines.len();
+    // Line index -> the instruction lines to put in its place.
+    let mut replace: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (start, end) in function_ranges(&lines, n) {
+        let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for k in start..end {
+            if kinds[k] == LineKind::Label {
+                if let Some(name) = label_name(&lines[k]) {
+                    labels.insert(name, k);
+                }
+            }
+        }
+        let label_index = |name: &str| labels.get(name).copied();
+        let mut copies = 0;
+        for k in start..end {
+            if kinds[k] == LineKind::Nop || jump_table_targets(&lines, &kinds, k, end, &label_index).is_none() {
+                continue;
+            }
+            // Walk back over the block: each label met is an entry, with the
+            // instructions from it to the `br`.
+            let mut entries: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+            let mut insns = vec![k];
+            let mut j = k;
+            while j > start {
+                j -= 1;
+                let line = lines[j].trim();
+                match kinds[j] {
+                    LineKind::Nop => continue,
+                    LineKind::Label => {
+                        let mut body = insns.clone();
+                        body.reverse();
+                        entries.insert(j, body);
+                        continue;
+                    }
+                    LineKind::Call | LineKind::Ret | LineKind::Branch => break,
+                    _ if line.starts_with(".cfi") => {
+                        entries.clear();
+                        break;
+                    }
+                    _ if line.starts_with('.') => break,
+                    _ => {}
+                }
+                if insns.len() == MAX_DISPATCH {
+                    break;
+                }
+                insns.push(j);
+            }
+            // Backward unconditional branches to an entry get a copy.
+            for b in k + 1..end {
+                if copies == MAX_DISPATCH_COPIES {
+                    break;
+                }
+                if kinds[b] != LineKind::Branch || replace.contains_key(&b) {
+                    continue;
+                }
+                let Some(("b", target)) = split_insn(&lines[b]) else { continue };
+                if let Some(body) = label_index(target.trim()).and_then(|t| entries.get(&t)) {
+                    replace.insert(b, body.clone());
+                    copies += 1;
+                }
+            }
+        }
+    }
+    if replace.is_empty() {
+        return (lines, kinds);
+    }
+    let mut out_lines = Vec::with_capacity(n + replace.len() * MAX_DISPATCH);
+    let mut out_kinds = Vec::with_capacity(out_lines.capacity());
+    for i in 0..n {
+        match replace.get(&i) {
+            Some(body) => {
+                for &k in body {
+                    out_lines.push(lines[k].clone());
+                    out_kinds.push(kinds[k]);
+                }
+            }
+            None => {
+                out_lines.push(lines[i].clone());
+                out_kinds.push(kinds[i]);
+            }
+        }
+    }
+    (out_lines, out_kinds)
 }
 
 // ── Loop alignment ───────────────────────────────────────────────────────────
@@ -1099,12 +1216,12 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
     }
     // Relocations and literals carry symbol names that could look like registers.
     let has_symbol = ops.contains(':') || ops.contains('@') || ops.contains('=');
-    // Address materialization (`adrp xD, sym`; `add xD, xS, :lo12:sym`) is an
+    // Address materialization (`adrp`/`adr xD, sym`; `add xD, xS, :lo12:sym`) is an
     // ordinary write when the symbol text contains nothing register-like, so
     // no pass can misread or rewrite it.
     let (first, rest) = first_and_rest(ops);
     if gpr_operand(first).is_some() && !ops.contains('[') {
-        if mnemonic == "adrp" && !rest.contains(':') && regs_in(rest) == 0 {
+        if matches!(mnemonic, "adrp" | "adr") && !rest.contains(':') && regs_in(rest) == 0 {
             return Access::Write { deletable: true };
         }
         let sym = last_operand(ops);
@@ -1965,6 +2082,137 @@ fn eliminate_redundant_narrow_extends(lines: &mut [String], kinds: &mut [LineKin
     changed
 }
 
+/// A repeated `add xA, sp, #k` (or `x29`) with nothing in between, in
+/// straight-line code, writing xA or the base: nothing. Codegen rematerializes
+/// a stack array's address for every access through it.
+fn eliminate_repeated_frame_addrs(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    // Per register: the frame address line it holds.
+    let mut holds: [Option<usize>; 29] = [None; 29];
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        if matches!(kinds[i], LineKind::Label) || classify_access(&lines[i], kinds[i]) == Access::Barrier {
+            holds = [None; 29];
+            continue;
+        }
+        let frame_addr = split_insn(&lines[i]).and_then(|(m, ops)| {
+            let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+            (m == "add" && p.len() == 3 && matches!(p[1], "sp" | "x29") && p[2].starts_with('#') && p[0].starts_with('x'))
+                .then(|| gpr_operand(p[0]))
+                .flatten()
+        });
+        if let Some(a) = frame_addr {
+            if holds[a as usize].is_some_and(|k| lines[k] == lines[i]) {
+                kinds[i] = LineKind::Nop;
+                changed = true;
+                continue;
+            }
+        }
+        let info = line_info(&lines[i], kinds[i], &|_| None);
+        // Writing sp or x29 (directly, or by writeback) invalidates every
+        // address; `line_info` tracks x0-x28 only.
+        let dest = split_insn(&lines[i]).map(|(_, ops)| first_and_rest(ops).0);
+        if matches!(dest, Some("sp" | "x29" | "w29")) || lines[i].contains("]!") || lines[i].contains("], #") {
+            holds = [None; 29];
+        }
+        for (r, slot) in holds.iter_mut().enumerate() {
+            if info.defs & (1 << r) != 0 {
+                *slot = None;
+            }
+        }
+        if let Some(a) = frame_addr {
+            holds[a as usize] = Some(i);
+        }
+    }
+    changed
+}
+
+/// The bit count `b` of an immediate `#2^b - 1` (b = 8, 16 or 32).
+fn low_mask_bits(imm: &str) -> Option<u8> {
+    let imm = imm.trim().strip_prefix('#')?;
+    let v = match imm.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok()?,
+        None => imm.parse::<u64>().ok()?,
+    };
+    match v {
+        0xff => Some(8),
+        0xffff => Some(16),
+        0xffff_ffff => Some(32),
+        _ => None,
+    }
+}
+
+/// `and D, S, #0xff` / `#0xffff` / `#0xffffffff` (or `uxtb`/`uxth`) where S's
+/// last write in this straight-line run already left it below 2^8 / 2^16 /
+/// 2^32 (`ldrb`, `ldrh`, `uxtb`, `uxth`, the same masks, any w-register
+/// write): a move, or nothing. Codegen zero-extends every unsigned narrow
+/// cast, including those of values just loaded with `ldrb`.
+fn eliminate_redundant_zero_extends(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    // Per register: a bit count its 64-bit value is known to fit in.
+    let mut bits: [Option<u8>; 29] = [None; 29];
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        if matches!(kinds[i], LineKind::Label) || classify_access(&lines[i], kinds[i]) == Access::Barrier {
+            bits = [None; 29];
+            continue;
+        }
+        let Some((m, ops)) = split_insn(&lines[i]) else { continue };
+        let (dest, srcs) = first_and_rest(ops);
+        let src = first_and_rest(srcs).0;
+        let width = match m {
+            "and" => low_mask_bits(last_operand(srcs)).filter(|_| srcs.split(',').count() == 2),
+            "uxtb" => Some(8),
+            "uxth" => Some(16),
+            _ => None,
+        };
+        if let (Some(w), Some(d), Some(s)) = (width, gpr_operand(dest), gpr_operand(src)) {
+            // An x-register source whose upper half is unknown is not
+            // narrowed by a w-register write of the same bits; require an
+            // x destination to read the same register width as the mask.
+            if bits[s as usize].is_some_and(|known| known <= w) && (dest.starts_with('x') == src.starts_with('x')) {
+                if d == s {
+                    kinds[i] = LineKind::Nop;
+                } else {
+                    let (dn, sn) = if dest.starts_with('x') { (xreg_name(d), xreg_name(s)) }
+                                   else { (wreg_name(d), wreg_name(s)) };
+                    lines[i] = format!("    mov {}, {}", dn, sn);
+                    kinds[i] = classify_line(&lines[i]);
+                }
+                changed = true;
+                bits[d as usize] = bits[s as usize];
+                continue;
+            }
+        }
+        // Record what this line leaves in the registers it writes.
+        let info = line_info(&lines[i], kinds[i], &|_| None);
+        let copied = match (m, gpr_operand(src)) {
+            ("mov", Some(s)) if srcs.split(',').count() == 1 && dest.starts_with('x') && src.starts_with('x') => bits[s as usize],
+            _ => None,
+        };
+        for (r, slot) in bits.iter_mut().enumerate() {
+            if info.defs & (1 << r) != 0 {
+                *slot = None;
+            }
+        }
+        if let Some(d) = gpr_operand(dest).filter(|d| info.defs & (1 << d) != 0) {
+            bits[d as usize] = match m {
+                "ldrb" | "uxtb" => Some(8),
+                "ldrh" | "uxth" => Some(16),
+                _ if width.is_some() => width,
+                "mov" if copied.is_some() => copied,
+                _ if dest.starts_with('w') => Some(32),
+                _ => None,
+            };
+        }
+    }
+    changed
+}
+
 fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let mut sext = [false; 29];
@@ -2395,9 +2643,27 @@ fn fold_shift_into_operand(lines: &mut [String], kinds: &mut [LineKind], n: usiz
             continue;
         }
         let (t_name, s_name, amount) = (parts[0], parts[1], parts[2]);
-        let (Some(t), Some(_)) = (gpr_operand(t_name), gpr_operand(s_name)) else { continue };
+        let (Some(t), Some(s)) = (gpr_operand(t_name), gpr_operand(s_name)) else { continue };
+        // The user may come a few lines later, past straight-line code that
+        // neither reads T nor writes T or S.
         let mut j = i + 1;
-        while j < n && kinds[j] == LineKind::Nop {
+        let mut skipped = 0;
+        while j < n {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            if split_insn(&lines[j]).is_some_and(|(m, o)| matches!(m, "add" | "sub" | "orr" | "and" | "eor")
+                                                       && o.split(',').any(|r| r.trim() == t_name)) {
+                break;
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            if skipped == 4 || !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call)
+                || info.uses & (1 << t) != 0 || info.defs & ((1 << t) | (1 << s)) != 0 {
+                j = n;
+                break;
+            }
+            skipped += 1;
             j += 1;
         }
         if j >= n {
@@ -2654,8 +2920,8 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
         _ => {}
     }
     let (dest, srcs) = first_and_rest(ops);
-    // Address materialization: `adrp xN, sym` and `add xN, xM, :lo12:sym`.
-    if mnemonic == "adrp" {
+    // Address materialization: `adrp`/`adr xN, sym` and `add xN, xM, :lo12:sym`.
+    if matches!(mnemonic, "adrp" | "adr") {
         if let Some(d) = gpr_operand(dest) {
             return LineInfo { uses: 0, defs: 1 << d, flow: Flow::Next, deletable_dest: Some(d) };
         }
@@ -2730,6 +2996,36 @@ fn eliminate_dead_writes_global(lines: &[String], kinds: &mut [LineKind], n: usi
 /// GPRs live after each line of the function `start..end`, and each line's
 /// deletable destination. None for functions the model does not cover
 /// (setjmp-like calls).
+/// The target lines of `br xN` at line `k` when the jump table it indexes
+/// follows it (as the switch lowering emits it): an alignment directive, the
+/// table's label, then one `.word|.long target - table` per entry, every
+/// target a label of this function.
+fn jump_table_targets(lines: &[String], kinds: &[LineKind], k: usize, end: usize,
+                      label_index: &dyn Fn(&str) -> Option<usize>) -> Option<Vec<usize>> {
+    if !matches!(split_insn(&lines[k]), Some(("br", _))) {
+        return None;
+    }
+    let mut j = k + 1;
+    while j < end && (kinds[j] == LineKind::Nop || lines[j].trim_start().starts_with(".p2align")) {
+        j += 1;
+    }
+    if j >= end || kinds[j] != LineKind::Label {
+        return None;
+    }
+    let table = label_name(&lines[j])?;
+    let mut targets = Vec::new();
+    for line in &lines[j + 1..end] {
+        let entry = line.trim();
+        let Some(expr) = entry.strip_prefix(".word ").or_else(|| entry.strip_prefix(".long ")) else { break };
+        let (target, base) = expr.split_once(" - ")?;
+        if base.trim() != table {
+            return None;
+        }
+        targets.push(label_index(target.trim())?);
+    }
+    (!targets.is_empty()).then_some(targets)
+}
+
 fn function_liveness(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> Option<(Vec<RegSet>, Vec<Option<u8>>)> {
     function_liveness_with(lines, kinds, start, end, false)
 }
@@ -2776,9 +3072,20 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
     for info in infos.iter_mut().filter(|i| matches!(i.flow, Flow::Exit)) {
         info.uses &= ret_mask;
     }
+    // A jump-table dispatch reads only its register and goes to the table's labels.
+    let mut tables: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for k in body.clone() {
+        if let Some(targets) = jump_table_targets(lines, kinds, k, end, &label_index) {
+            infos[k - start].uses = regs_in(split_insn(&lines[k]).map_or("", |(_, o)| o));
+            tables.insert(k - start, targets);
+        }
+    }
     let len = infos.len();
     let succ_live = |live_in: &[RegSet], idx: usize| -> RegSet {
         let next = if idx + 1 < len { live_in[idx + 1] } else { ALL_REGS };
+        if let Some(targets) = tables.get(&idx) {
+            return targets.iter().fold(0, |m, &t| m | live_in[t - start]);
+        }
         match infos[idx].flow {
             Flow::Next => next,
             Flow::Exit => 0,
@@ -2788,13 +3095,22 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
             }
         }
     };
+    // For upper halves, `mov xD, xS` reads S's upper half only where D's is
+    // live afterwards: a copy passes the upper half on rather than using it.
+    let copies: Vec<Option<(u8, u8)>> = body.clone().map(|k| match kinds[k] {
+        LineKind::Move { dst, src, is_32bit: false } if upper && dst != src && dst <= 28 && src <= 28 => Some((dst, src)),
+        _ => None,
+    }).collect();
     let mut live_in: Vec<RegSet> = vec![0; len];
     let mut iterate = true;
     while iterate {
         iterate = false;
         for idx in (0..len).rev() {
             let out = succ_live(&live_in, idx);
-            let new_in = (out & !infos[idx].defs) | infos[idx].uses;
+            let new_in = match copies[idx] {
+                Some((d, s)) => (out & !(1 << d)) | if out & (1 << d) != 0 { 1 << s } else { 0 },
+                None => (out & !infos[idx].defs) | infos[idx].uses,
+            };
             if new_in != live_in[idx] {
                 live_in[idx] = new_in;
                 iterate = true;
@@ -3527,6 +3843,75 @@ f:
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("mov x3, x9"), "call argument: {}", result);
         assert!(result.contains("mov x11, x9"), "indirect branch: {}", result);
+    }
+
+    #[test]
+    fn test_global_dead_write_through_jump_table() {
+        // The dispatch reads x14 and goes to the table's labels only: x0 and
+        // x11 are dead there, x12 is read by a target.
+        let input = ".type f, %function\nf:\n    mov x0, x14\n    mov x11, x9\n    mov x12, x9\n    adr x17, .Ljt_1\n    ldr w16, [x17, x14, lsl #2]\n    add x17, x17, w16, sxtw\n    br x17\n.p2align 2\n.Ljt_1:\n    .word .LBB1 - .Ljt_1\n    .word .LBB2 - .Ljt_1\n.LBB1:\n    mov x0, #1\n    ret\n.LBB2:\n    mov x0, x12\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x0, x14"), "{}", result);
+        assert!(!result.contains("mov x11, x9"), "{}", result);
+        assert!(result.contains("mov x12, x9") || result.contains("mov x0, x9"), "{}", result);
+        assert!(result.contains(".word .LBB1 - .Ljt_1"), "{}", result);
+    }
+
+    #[test]
+    fn test_zero_extend_of_narrow_load_removed() {
+        let input = "    ldrb w14, [x10, #1]\n    and x0, x14, #0xff\n    str x0, [x9]\n    ldrh w15, [x10]\n    and x15, x15, #0xffff\n    str x15, [x9]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("#0xff"), "{}", result);
+        // A full-width load leaves the mask needed.
+        let input = "    ldr x14, [x10]\n    and x0, x14, #0xff\n    str x0, [x9]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("and x0, x14, #0xff"), "{}", result);
+    }
+
+    #[test]
+    fn test_repeated_frame_address_removed() {
+        let input = "    add x1, sp, #32\n    ldr x2, [x1, x3, lsl #3]\n    add x1, sp, #32\n    str x2, [x1, x4, lsl #3]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("add x1, sp, #32").count(), 1, "{}", result);
+        // Kept after x1 is overwritten.
+        let input = "    add x1, sp, #32\n    ldr x2, [x1, x3, lsl #3]\n    ldr x1, [x2]\n    add x1, sp, #32\n    str x2, [x1, x4, lsl #3]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("add x1, sp, #32").count(), 2, "{}", result);
+    }
+
+    #[test]
+    fn test_shift_folded_past_unrelated_line() {
+        let input = ".type f, %function\nf:\n    lsl x14, x0, #3\n    add x1, sp, #32\n    add x14, x1, x14\n    ldr x2, [x14]\n    str x2, [x9]\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr x2, [x1, x0, lsl #3]"), "{}", result);
+        assert!(!result.contains("lsl x14"), "{}", result);
+    }
+
+    #[test]
+    fn test_sign_extend_dead_through_copy() {
+        // Only the low half of x10 is read after the copy.
+        let input = ".type f, %function\nf:\n    add w11, w10, #1\n    sxtw x11, w11\n    mov x10, x11\n    add x0, x13, w10, sxtw #3\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("sxtw x11"), "{}", result);
+        // A full-width read of the copy keeps it.
+        let input = ".type f, %function\nf:\n    add w11, w10, #1\n    sxtw x11, w11\n    mov x10, x11\n    str x10, [x9]\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("sxtw x11"), "{}", result);
+    }
+
+    #[test]
+    fn test_switch_dispatch_copied_into_cases() {
+        let dispatch = ".LBB1:\n    ldrb w14, [x10], #1\n    cmp x14, #2\n    b.hs .LBB9\n    adr x17, .Ljt_1\n    ldr w16, [x17, x14, lsl #2]\n    add x17, x17, w16, sxtw\n    br x17\n.p2align 2\n.Ljt_1:\n    .word .LBB2 - .Ljt_1\n    .word .LBB3 - .Ljt_1\n";
+        let cases = ".LBB2:\n    add x0, x0, #1\n    b .LBB1\n.LBB3:\n    sub x0, x0, #1\n    b .LBB1\n.LBB9:\n    ret\n";
+        let input = format!(".type f, %function\nf:\n    b .LBB1\n{}{}.size f, .-f\n", dispatch, cases);
+        let result = peephole_optimize(input);
+        assert_eq!(result.matches("br x17").count(), 3, "{}", result);
+        assert_eq!(result.matches(".LBB1:").count(), 1, "{}", result);
+        // Not with a call in the dispatch.
+        let input = format!(".type f, %function\nf:\n    b .LBB1\n{}{}.size f, .-f\n",
+                            dispatch.replace("    cmp x14, #2\n", "    bl g\n    cmp x14, #2\n"), cases);
+        let result = peephole_optimize(input);
+        assert_eq!(result.matches("br x17").count(), 1, "{}", result);
     }
 
     #[test]
