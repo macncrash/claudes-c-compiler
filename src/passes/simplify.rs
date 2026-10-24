@@ -54,6 +54,7 @@
 //! - Cmp(op, x, x) => constant -- self-comparison
 //! - Cmp(Ule, x, 0) => Cmp(Eq, x, 0) -- unsigned x <= 0 is x == 0
 //! - Cmp(Ugt, x, 0) => Cmp(Ne, x, 0) -- unsigned x > 0 is x != 0
+//! - x >= L && x <= H => x - L <=u H - L, x < L || x > H => x - L >u H - L
 //!
 //! Operand canonicalization (for better codegen):
 //! - Cmp(op, Const, Value) => Cmp(swapped_op, Value, Const)
@@ -258,7 +259,124 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
             }
         }
     }
-    total + fold_fabs_below_zero(func, max_id)
+    total + fold_fabs_below_zero(func, max_id) + fold_range_checks(func)
+}
+
+/// One side of a range check on x, read as the check's "inside" condition:
+/// (x, lower bound L or upper bound H, compare type, signed).
+type Bound = (Value, Result<i128, i128>, IrType, bool);
+
+/// `x >= L && x <= H` (as `select c1, c2, 0` or `c1 & c2`) is one unsigned
+/// compare, `x - L <= H - L`, and `x < L || x > H` (`select c1, 1, c2` or
+/// `c1 | c2`) is `x - L > H - L`: the subtraction wraps the values below L
+/// past the top. Both compares must read the same x at the same type and
+/// signedness, against constants with L <= H.
+fn fold_range_checks(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize;
+    let wide_ok = !crate::common::types::target_is_32bit();
+    // Each compare of a value with a constant: (x, op, k, ty), k read in
+    // the op's signedness at the type's width.
+    let mut cmps: Vec<Option<(Value, IrCmpOp, i128, IrType)>> = vec![None; max_id + 1];
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        let Instruction::Cmp { dest, op, lhs: Operand::Value(x), rhs: Operand::Const(c), ty } = inst else { continue };
+        if !ty.is_integer() || !(ty.size() == 4 || ty.size() == 8 && wide_ok) {
+            continue;
+        }
+        let Some(k) = c.to_i64() else { continue };
+        let signed = matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
+        let k = match (ty.size(), signed) {
+            (4, true) => k as i32 as i128,
+            (4, false) => k as u32 as i128,
+            (_, true) => k as i128,
+            (_, false) => k as u64 as i128,
+        };
+        set_def(&mut cmps, dest.0, (*x, *op, k, *ty));
+    }
+    // The bound a compare puts on x when true (`negate` false) or when false.
+    let bound = |op: &Operand, negate: bool| -> Option<Bound> {
+        let Operand::Value(v) = op else { return None };
+        let (x, op, k, ty) = cmps.get(v.0 as usize).copied().flatten()?;
+        let op = if negate { invert_cmp_op(op) } else { op };
+        let bits = 8 * ty.size() as u32;
+        let signed = matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
+        let (min, max) = if signed { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) } else { (0, (1i128 << bits) - 1) };
+        let b = match op {
+            IrCmpOp::Sge | IrCmpOp::Uge => Ok(k),
+            IrCmpOp::Sgt | IrCmpOp::Ugt if k < max => Ok(k + 1),
+            IrCmpOp::Sle | IrCmpOp::Ule => Err(k),
+            IrCmpOp::Slt | IrCmpOp::Ult if k > min => Err(k - 1),
+            _ => return None,
+        };
+        Some((x, b, ty, signed))
+    };
+    // x and its bounds [L, H] when a and b (both true when `inside`, else
+    // both false) say L <= x <= H.
+    let pair = |a: &Operand, b: &Operand, inside: bool| -> Option<(Value, i128, i128, IrType)> {
+        let (x1, b1, t1, s1) = bound(a, !inside)?;
+        let (x2, b2, t2, s2) = bound(b, !inside)?;
+        if x1 != x2 || t1 != t2 || s1 != s2 {
+            return None;
+        }
+        let (lo, hi) = match (b1, b2) {
+            (Ok(lo), Err(hi)) | (Err(hi), Ok(lo)) => (lo, hi),
+            _ => return None,
+        };
+        (lo <= hi).then_some((x1, lo, hi, t1))
+    };
+    let mut next_id = func.next_value_id.max(max_id as u32 + 1);
+    let mut changes = 0;
+    for block in &mut func.blocks {
+        let mut i = 0;
+        while i < block.instructions.len() {
+            let is_zero = |o: &Operand| matches!(o, Operand::Const(c) if c.is_zero());
+            let is_nonzero = |o: &Operand| matches!(o, Operand::Const(c) if !c.is_zero());
+            let found = match &block.instructions[i] {
+                Instruction::Select { dest, cond, true_val, false_val, ty } if ty.is_integer() => {
+                    if is_zero(false_val) {
+                        pair(cond, true_val, true).map(|p| (*dest, p, true))
+                    } else if is_nonzero(true_val) {
+                        pair(cond, false_val, false).map(|p| (*dest, p, false))
+                    } else {
+                        None
+                    }
+                }
+                Instruction::BinOp { dest, op: op @ (IrBinOp::And | IrBinOp::Or), lhs, rhs, ty } if ty.is_integer() => {
+                    let inside = *op == IrBinOp::And;
+                    pair(lhs, rhs, inside).map(|p| (*dest, p, inside))
+                }
+                _ => None,
+            };
+            let Some((dest, (x, lo, hi, ty), inside)) = found else {
+                i += 1;
+                continue;
+            };
+            let uty = ty.to_unsigned();
+            let diff = Value(next_id);
+            next_id += 1;
+            block.instructions[i] = Instruction::Cmp {
+                dest,
+                op: if inside { IrCmpOp::Ule } else { IrCmpOp::Ugt },
+                lhs: Operand::Value(diff),
+                rhs: Operand::Const(IrConst::from_i64((hi - lo) as i64, uty)),
+                ty: uty,
+            };
+            block.instructions.insert(i, Instruction::BinOp {
+                dest: diff,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(x),
+                rhs: Operand::Const(IrConst::from_i64(lo as i64, uty)),
+                ty: uty,
+            });
+            if !block.source_spans.is_empty() && i < block.source_spans.len() {
+                let span = block.source_spans[i];
+                block.source_spans.insert(i, span);
+            }
+            changes += 1;
+            i += 2;
+        }
+    }
+    func.next_value_id = next_id;
+    changes
 }
 
 /// fabs(x) is never below zero, and a NaN compares false, so `fabs(x) < c`
@@ -3481,5 +3599,63 @@ mod tests {
             ty: IrType::I32,
         };
         assert!(simplify_default(&inst).is_none());
+    }
+
+    /// `%1 = x op1 k1; %2 = x op2 k2; %3 = combine(%1, %2)` on I32 x = %0.
+    fn range_check(op1: IrCmpOp, k1: i32, op2: IrCmpOp, k2: i32, combine: Instruction) -> IrFunction {
+        use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+        let cmp = |dest, op, k| Instruction::Cmp { dest: Value(dest), op, lhs: Operand::Value(Value(0)), rhs: Operand::Const(IrConst::I32(k)), ty: IrType::I32 };
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![cmp(1, op1, k1), cmp(2, op2, k2), combine],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }];
+        func.next_value_id = 4;
+        func
+    }
+
+    fn and_select() -> Instruction {
+        Instruction::Select { dest: Value(3), cond: Operand::Value(Value(1)), true_val: Operand::Value(Value(2)), false_val: Operand::Const(IrConst::I64(0)), ty: IrType::I64 }
+    }
+
+    #[test]
+    fn test_range_check_and_becomes_unsigned_compare() {
+        // x >= 'A' && x <= 'Z' => (x - 65) <=u 25
+        let mut func = range_check(IrCmpOp::Sge, 65, IrCmpOp::Sle, 90, and_select());
+        assert_eq!(fold_range_checks(&mut func), 1);
+        let insts = &func.blocks[0].instructions;
+        assert!(matches!(insts[2], Instruction::BinOp { op: IrBinOp::Sub, lhs: Operand::Value(Value(0)), rhs: Operand::Const(IrConst::I64(65)), ty: IrType::U32, dest: Value(4) }), "{:?}", insts[2]);
+        assert!(matches!(insts[3], Instruction::Cmp { dest: Value(3), op: IrCmpOp::Ule, lhs: Operand::Value(Value(4)), rhs: Operand::Const(IrConst::I64(25)), ty: IrType::U32 }), "{:?}", insts[3]);
+        assert_eq!(func.next_value_id, 5);
+    }
+
+    #[test]
+    fn test_range_check_or_with_strict_bounds() {
+        // x < -10 || x > -3, written as x <= -11 || x >= -2, swapped: c1 | c2
+        let or = Instruction::BinOp { dest: Value(3), op: IrBinOp::Or, lhs: Operand::Value(Value(1)), rhs: Operand::Value(Value(2)), ty: IrType::I32 };
+        let mut func = range_check(IrCmpOp::Sge, -2, IrCmpOp::Sle, -11, or);
+        assert_eq!(fold_range_checks(&mut func), 1);
+        let insts = &func.blocks[0].instructions;
+        // Inside is [-10, -3]: x - (-10) >u 7, the -10 as an unsigned 32-bit constant.
+        assert!(matches!(insts[2], Instruction::BinOp { op: IrBinOp::Sub, rhs: Operand::Const(IrConst::I64(0xffff_fff6)), .. }), "{:?}", insts[2]);
+        assert!(matches!(insts[3], Instruction::Cmp { op: IrCmpOp::Ugt, rhs: Operand::Const(IrConst::I64(7)), .. }), "{:?}", insts[3]);
+    }
+
+    #[test]
+    fn test_range_check_not_folded() {
+        // Empty range.
+        let mut func = range_check(IrCmpOp::Sge, 9, IrCmpOp::Sle, 8, and_select());
+        assert_eq!(fold_range_checks(&mut func), 0);
+        // Mixed signedness.
+        let mut func = range_check(IrCmpOp::Sge, 10, IrCmpOp::Ule, 20, and_select());
+        assert_eq!(fold_range_checks(&mut func), 0);
+        // Two lower bounds.
+        let mut func = range_check(IrCmpOp::Sge, 10, IrCmpOp::Sgt, 20, and_select());
+        assert_eq!(fold_range_checks(&mut func), 0);
+        // x > INT_MAX has no lower bound to give.
+        let mut func = range_check(IrCmpOp::Sgt, i32::MAX, IrCmpOp::Sle, 20, and_select());
+        assert_eq!(fold_range_checks(&mut func), 0);
     }
 }

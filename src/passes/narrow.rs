@@ -21,6 +21,8 @@
 //! the shift type: AShr with sign-extended LHS, LShr with zero-extended
 //! LHS. This is because the extension bits are exactly what the shift
 //! brings in, so the narrow-width shift produces the same low bits.
+//! Phase 4b treats a 32-bit Add/Sub/Mul/And/Or/Xor consumer like that
+//! Cast: it reads only the low 32 bits of its operands.
 //! Phase 5 (no Cast) is restricted to bitwise ops (And, Or, Xor) since
 //! arithmetic ops can produce different upper bits due to carries.
 //!
@@ -187,6 +189,7 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
     }
 
     changes += narrow_binops_with_cast(func, &binop_map, &unop_map, &use_counts, &widen_map, &narrow_def_map, &mut narrowed_map);
+    changes += narrow_binops_into_narrow_binops(func, &use_counts, &widen_map, &narrow_def_map, &mut narrowed_map);
     changes += narrow_binops_without_cast(func, &use_counts, &widen_map, &mut narrowed_map);
     changes += narrow_cmps(func, &widen_map);
 
@@ -305,6 +308,89 @@ fn narrow_binops_with_cast(
         }
     }
 
+    changes
+}
+
+/// Phase 4b: an I64 Add/Sub/Mul/And/Or/Xor whose one use is a 32-bit
+/// Add/Sub/Mul/And/Or/Xor reads only its low 32 bits, so it is done at that
+/// type (`(h ^ byte) * K` with h a uint32_t: the xor at 64 bits would need
+/// h zero-extended first). Its operands narrow as in Phase 4, or are
+/// single-use widening casts from a smaller type, which then widen to the
+/// 32-bit type instead (the low 32 bits are the same).
+fn narrow_binops_into_narrow_binops(
+    func: &mut IrFunction,
+    use_counts: &[u32],
+    widen_map: &[Option<CastInfo>],
+    narrow_def_map: &[Option<IrType>],
+    narrowed_map: &mut [Option<IrType>],
+) -> usize {
+    let max_id = narrowed_map.len() - 1;
+    let low_bits_only = |op: IrBinOp| matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor);
+    // I64 BinOps to narrow, with the 32-bit type their consumer reads.
+    let mut target: Vec<Option<IrType>> = vec![None; max_id + 1];
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        let Instruction::BinOp { op, lhs, rhs, ty, .. } = inst else { continue };
+        if !(low_bits_only(*op) && ty.is_integer() && ty.size() == 4) {
+            continue;
+        }
+        for v in [lhs, rhs] {
+            if let Operand::Value(v) = v {
+                let id = v.0 as usize;
+                if id <= max_id && use_counts[id] == 1 {
+                    target[id] = Some(*ty);
+                }
+            }
+        }
+    }
+    // The defining BinOp must be an I64 one of the same kind.
+    let mut plans: Vec<Option<(IrType, Operand, Operand)>> = vec![None; max_id + 1];
+    // Widening casts to retarget to the 32-bit type.
+    let mut retype: Vec<Option<IrType>> = vec![None; max_id + 1];
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        let Instruction::BinOp { dest, op, lhs, rhs, ty: IrType::I64 | IrType::U64 } = inst else { continue };
+        let id = dest.0 as usize;
+        let Some(Some(t)) = target.get(id).copied() else { continue };
+        if !low_bits_only(*op) {
+            continue;
+        }
+        let narrow = |o: &Operand| -> Option<(Operand, bool)> {
+            if let Some(n) = try_narrow_operand(o, t, Some(narrow_def_map), widen_map, narrowed_map) {
+                return Some((n, false));
+            }
+            let Operand::Value(v) = o else { return None };
+            let w = widen_map.get(v.0 as usize)?.as_ref()?;
+            (w.from_ty.size() < t.size() && use_counts[v.0 as usize] == 1).then_some((*o, true))
+        };
+        let (Some((l, rl)), Some((r, rr))) = (narrow(lhs), narrow(rhs)) else { continue };
+        // The same cast on both sides would be retyped once but read twice.
+        if rl && rr && matches!((lhs, rhs), (Operand::Value(a), Operand::Value(b)) if a.0 == b.0) {
+            continue;
+        }
+        for (o, re) in [(lhs, rl), (rhs, rr)] {
+            if let (Operand::Value(v), true) = (o, re) {
+                retype[v.0 as usize] = Some(t);
+            }
+        }
+        plans[id] = Some((t, l, r));
+    }
+    let mut changes = 0;
+    for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+        match inst {
+            Instruction::BinOp { dest, lhs, rhs, ty, .. } => {
+                if let Some(Some((t, l, r))) = plans.get(dest.0 as usize).copied() {
+                    (*lhs, *rhs, *ty) = (l, r, t);
+                    narrowed_map[dest.0 as usize] = Some(t);
+                    changes += 1;
+                }
+            }
+            Instruction::Cast { dest, to_ty, .. } => {
+                if let Some(Some(t)) = retype.get(dest.0 as usize).copied() {
+                    *to_ty = t;
+                }
+            }
+            _ => {}
+        }
+    }
     changes
 }
 
@@ -1037,5 +1123,50 @@ mod tests {
             }
             other => panic!("Expected narrowed BinOp LShr U32, got {:?}", other),
         }
+    }
+
+    /// `(zext h ^ zext byte) * K` at U32: h (U32) and the byte (U8)
+    /// widened to I64, the xor's one use a U32 multiply.
+    fn fnv_step(op: IrBinOp, extra_use: bool) -> IrFunction {
+        let mut instructions = vec![
+            Instruction::Cast { dest: Value(2), src: Operand::Value(Value(0)), from_ty: IrType::U32, to_ty: IrType::I64 },
+            Instruction::Cast { dest: Value(3), src: Operand::Value(Value(1)), from_ty: IrType::U8, to_ty: IrType::I64 },
+            Instruction::BinOp { dest: Value(4), op, lhs: Operand::Value(Value(2)), rhs: Operand::Value(Value(3)), ty: IrType::I64 },
+            Instruction::BinOp { dest: Value(5), op: IrBinOp::Mul, lhs: Operand::Value(Value(4)), rhs: Operand::Const(IrConst::I64(16777619)), ty: IrType::U32 },
+        ];
+        if extra_use {
+            instructions.push(Instruction::BinOp { dest: Value(6), op: IrBinOp::Add, lhs: Operand::Value(Value(4)), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 });
+        }
+        make_func_with_blocks(vec![BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        }])
+    }
+
+    #[test]
+    fn test_binop_feeding_u32_binop_narrowed() {
+        let mut func = fnv_step(IrBinOp::Xor, false);
+        narrow_function(&mut func);
+        let insts = &func.blocks[0].instructions;
+        assert!(matches!(insts[1], Instruction::Cast { to_ty: IrType::U32, from_ty: IrType::U8, .. }), "{:?}", insts[1]);
+        match &insts[2] {
+            Instruction::BinOp { op: IrBinOp::Xor, ty: IrType::U32, lhs: Operand::Value(Value(0)), rhs: Operand::Value(Value(3)), .. } => {}
+            other => panic!("expected xor at U32 of %0 and %3, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_binop_with_other_uses_or_high_bits_kept() {
+        // Its result is also read at 64 bits.
+        let mut func = fnv_step(IrBinOp::Xor, true);
+        narrow_function(&mut func);
+        assert!(matches!(func.blocks[0].instructions[2], Instruction::BinOp { ty: IrType::I64, .. }));
+        assert!(matches!(func.blocks[0].instructions[1], Instruction::Cast { to_ty: IrType::I64, .. }));
+        // A right shift brings high bits down into the low 32.
+        let mut func = fnv_step(IrBinOp::LShr, false);
+        narrow_function(&mut func);
+        assert!(matches!(func.blocks[0].instructions[2], Instruction::BinOp { ty: IrType::I64, .. }));
     }
 }
