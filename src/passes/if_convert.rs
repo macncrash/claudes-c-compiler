@@ -57,6 +57,10 @@ pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
         return 0; // Need at least 3 blocks (pred + one arm + merge)
     }
 
+    // Dead copies and phi cycles that mem2reg leaves behind count as uses
+    // in is_short_circuit_test; clear them first.
+    super::dce::eliminate_dead_code(func);
+
     let mut total = 0;
 
     // Iterate to a fixpoint since converting one diamond may expose another.
@@ -85,11 +89,21 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // Collect diamond candidates
     let mut diamonds: Vec<DiamondInfo> = Vec::new();
 
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
+        }
+        block.terminator.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
+    }
+
     for pred_idx in 0..num_blocks {
-        if let Some(diamond) = detect_diamond(func, pred_idx, &label_to_idx, &preds) {
-            diamonds.push(diamond);
-        } else if let Some(triangle) = detect_triangle(func, pred_idx, &label_to_idx, &preds) {
-            diamonds.push(triangle);
+        let found = detect_diamond(func, pred_idx, &label_to_idx, &preds)
+            .or_else(|| detect_triangle(func, pred_idx, &label_to_idx, &preds));
+        if let Some(d) = found {
+            if !is_short_circuit_test(func, &d, &use_count) {
+                diamonds.push(d);
+            }
         }
     }
 
@@ -146,6 +160,21 @@ struct DiamondInfo {
     /// Phi nodes in the merge block that can be converted to Select.
     /// Each entry is (phi_dest, phi_ty, true_val, false_val).
     phi_selects: Vec<(Value, IrType, Operand, Operand)>,
+}
+
+/// Whether the diamond is one step of an `a && b` or `a || b` test: its merge
+/// block holds only a phi with a constant incoming value and branches on that
+/// phi, its only use. cfg_simplify threads the constant's edge
+/// straight to the branch target, leaving one branch per operand, where a
+/// select would compute the boolean (cset, csel) and then branch on it.
+fn is_short_circuit_test(func: &IrFunction, d: &DiamondInfo, use_count: &FxHashMap<u32, u32>) -> bool {
+    let merge = &func.blocks[d.merge_idx];
+    let [Instruction::Phi { dest, .. }] = merge.instructions.as_slice() else { return false };
+    let Terminator::CondBranch { cond: Operand::Value(c), .. } = &merge.terminator else { return false };
+    let [(_, _, tv, fv)] = d.phi_selects.as_slice() else { return false };
+    c.0 == dest.0
+        && use_count.get(&dest.0).copied() == Some(1)
+        && (matches!(tv, Operand::Const(_)) || matches!(fv, Operand::Const(_)))
 }
 
 /// Check if a block contains only simple, side-effect-free instructions
@@ -876,5 +905,39 @@ mod tests {
 
         let converted = if_convert_function(&mut func);
         assert_eq!(converted, 0); // Should NOT convert due to side effects
+    }
+
+    /// `a && b` branched on: block0 tests %0, block1 computes %1 = (%9 < 8),
+    /// block2 merges %2 = phi [%1, block1], [0, block0] and branches on it
+    /// (or, with `used`, also returns %2 from block3).
+    fn and_test(used: bool) -> IrFunction {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let ret = |v| Terminator::Return(Some(Operand::Value(Value(v))));
+        func.blocks = vec![
+            block(0, vec![], Terminator::CondBranch { cond: Operand::Value(Value(0)), true_label: BlockId(1), false_label: BlockId(2) }),
+            block(1, vec![Instruction::Cmp {
+                dest: Value(1), op: crate::ir::reexports::IrCmpOp::Slt,
+                lhs: Operand::Value(Value(9)), rhs: Operand::Const(IrConst::I32(8)), ty: IrType::I32,
+            }], Terminator::Branch(BlockId(2))),
+            block(2, vec![Instruction::Phi {
+                dest: Value(2), ty: IrType::I32,
+                incoming: vec![(Operand::Value(Value(1)), BlockId(1)), (Operand::Const(IrConst::I32(0)), BlockId(0))],
+            }], Terminator::CondBranch { cond: Operand::Value(Value(2)), true_label: BlockId(3), false_label: BlockId(4) }),
+            block(3, vec![], if used { ret(2) } else { ret(9) }),
+            block(4, vec![], ret(9)),
+        ];
+        func.next_value_id = 10;
+        func
+    }
+
+    #[test]
+    fn test_short_circuit_test_left_for_threading() {
+        let mut func = and_test(false);
+        assert_eq!(if_convert_function(&mut func), 0);
+        // A boolean also used as a value becomes a select.
+        let mut func = and_test(true);
+        assert_eq!(if_convert_function(&mut func), 1);
+        assert!(matches!(func.blocks[0].instructions[..], [.., Instruction::Select { .. }]));
     }
 }

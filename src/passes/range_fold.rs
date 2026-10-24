@@ -8,8 +8,9 @@
 //!
 //! the second test runs only on the false edge of `var <= 0`, so there
 //! `var` is in [1, INT_MAX], `var - 1` in [0, INT_MAX - 1], and the
-//! comparison is always true. A comparison whose outcome the two operand
-//! ranges decide becomes a constant; constant folding and CFG
+//! comparison is always true. A comparison of two values is also decided by
+//! a dominating comparison of the same two (`x != y` under `x == y`). A
+//! comparison so decided becomes a constant; constant folding and CFG
 //! simplification then remove the dead branch.
 //!
 //! Ranges are intervals of i128 in the interpretation of a value's own IR
@@ -240,6 +241,35 @@ fn compare(op: IrCmpOp, a: R, b: R) -> Option<bool> {
     }
 }
 
+/// `a q b` given `a k b`, when that decides it: each comparison as the set
+/// of orderings (less, equal, greater) it accepts. Equality is the same in
+/// either signedness; signed and unsigned orderings say nothing of each other.
+fn implied(k: IrCmpOp, q: IrCmpOp) -> Option<bool> {
+    let set = |op: IrCmpOp| match op {
+        IrCmpOp::Eq => (0b010, None),
+        IrCmpOp::Ne => (0b101, None),
+        IrCmpOp::Slt => (0b100, Some(true)),
+        IrCmpOp::Sle => (0b110, Some(true)),
+        IrCmpOp::Sgt => (0b001, Some(true)),
+        IrCmpOp::Sge => (0b011, Some(true)),
+        IrCmpOp::Ult => (0b100, Some(false)),
+        IrCmpOp::Ule => (0b110, Some(false)),
+        IrCmpOp::Ugt => (0b001, Some(false)),
+        IrCmpOp::Uge => (0b011, Some(false)),
+    };
+    let ((ks, ksign), (qs, qsign)) = (set(k), set(q));
+    if matches!((ksign, qsign), (Some(a), Some(b)) if a != b) {
+        return None;
+    }
+    if ks & !qs == 0 {
+        Some(true)
+    } else if ks & qs == 0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn const_interp(c: &IrConst) -> Option<(i128, Interp)> {
     let (x, ty) = match *c {
         IrConst::I8(x) => (x as i128, IrType::I8),
@@ -305,6 +335,11 @@ impl<'a> Ranges<'a> {
                 return Some(x);
             }
         }
+        if let (Operand::Value(x), Operand::Value(y)) = (lhs, rhs) {
+            if let Some(r) = self.related(op, *x, *y, ty, b) {
+                return Some(r);
+            }
+        }
         // `v == k` under a dominating `v != k`, which no interval holds.
         if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
             return None;
@@ -317,6 +352,38 @@ impl<'a> Ranges<'a> {
         self.dominating_facts(v, b).into_iter()
             .any(|(fop, fit, fk)| fop == IrCmpOp::Ne && fit.w == it.w && it.wrap(fk) == k)
             .then_some(op == IrCmpOp::Ne)
+    }
+
+    /// `x op y` decided by a dominating branch on a comparison of the same
+    /// two values: `x != y` under `x == y`, `y < x` under `x < y`.
+    fn related(&self, op: IrCmpOp, x: Value, y: Value, ty: IrType, b: usize) -> Option<bool> {
+        let mut cur = b;
+        for _ in 0..MAX_DOM_STEPS {
+            let up = self.cfg.idom[cur];
+            if up == usize::MAX || up == cur {
+                break;
+            }
+            if let &[p] = self.cfg.preds.row(cur) {
+                if let Terminator::CondBranch { cond: Operand::Value(c), true_label, false_label }
+                    = &self.func.blocks[p as usize].terminator {
+                    let known = match self.def(*c) {
+                        Some(Instruction::Cmp { op: k, lhs: Operand::Value(l), rhs: Operand::Value(r), ty: kt, .. })
+                            if true_label != false_label && *kt == ty => {
+                            if (*l, *r) == (x, y) { Some(*k) } else if (*l, *r) == (y, x) { Some(swapped(*k)) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some(k) = known {
+                        let k = if self.labels.get(true_label) == Some(&cur) { k } else { negated(k) };
+                        if let Some(r) = implied(k, op) {
+                            return Some(r);
+                        }
+                    }
+                }
+            }
+            cur = up;
+        }
+        None
     }
 
     /// An operand's range in block `b`, read in `it`.
@@ -600,5 +667,21 @@ mod tests {
         assert_eq!(compare(IrCmpOp::Uge, a, R::point(0x7fff_ffff)), Some(false));
         assert_eq!(compare(IrCmpOp::Eq, R::point(3), R::point(3)), Some(true));
         assert_eq!(compare(IrCmpOp::Ne, R { lo: 1, hi: 4 }, R::point(5)), Some(true));
+    }
+
+    #[test]
+    fn implied_by_same_operands() {
+        use IrCmpOp::*;
+        assert_eq!(implied(Eq, Ne), Some(false));
+        assert_eq!(implied(Eq, Sle), Some(true));
+        assert_eq!(implied(Eq, Ult), Some(false));
+        assert_eq!(implied(Slt, Sgt), Some(false));
+        assert_eq!(implied(Slt, Ne), Some(true));
+        assert_eq!(implied(Ugt, Eq), Some(false));
+        assert_eq!(implied(Sle, Slt), None);
+        assert_eq!(implied(Ne, Slt), None);
+        // x <s y says nothing of x <u y (x = -1, y = 0).
+        assert_eq!(implied(Slt, Ult), None);
+        assert_eq!(implied(Slt, Ugt), None);
     }
 }

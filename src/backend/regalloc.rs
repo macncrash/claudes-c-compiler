@@ -74,7 +74,7 @@ pub struct RegAllocConfig {
     /// Whether Memcpy pointer operands may be register-allocated. Requires a
     /// backend whose memcpy reads register-assigned pointers (AArch64).
     pub allow_memcpy_regalloc: bool,
-    /// Whether the dest of a Copy, Cast, BinOp, UnaryOp, Cmp, GEP or Load
+    /// Whether the dest of a Copy, Cast, BinOp, UnaryOp, Cmp, Select, GEP or Load
     /// may share a register with an operand whose live range ends at that
     /// instruction (`i = i + 1` in place, and a loop's latch copy becoming
     /// a no-op). Requires a backend that reads every operand of those
@@ -437,7 +437,7 @@ fn dest_reuse_points(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<u32>)> {
         for inst in &block.instructions {
             let simple = matches!(inst,
                 Instruction::Copy { .. } | Instruction::Cast { .. } | Instruction::BinOp { .. }
-                | Instruction::UnaryOp { .. } | Instruction::Cmp { .. }
+                | Instruction::UnaryOp { .. } | Instruction::Cmp { .. } | Instruction::Select { .. }
                 | Instruction::GetElementPtr { .. } | Instruction::Load { .. });
             if let (true, Some(dest)) = (simple, inst.dest()) {
                 // (All read values: a GEP's base and a load's pointer are not

@@ -627,7 +627,10 @@ one predecessor says `v op k` held, including each comparison under an
 `&&` taken or an `||` not taken. In
 `if (var <= 0 || (unsigned)(var - 1) < UINT_MAX)` the second comparison runs
 only when `var` is in [1, INT_MAX], so it is always true (gcc-torture
-20041114-1). Under `v != k`, `v == k` is false.
+20041114-1). Under `v != k`, `v == k` is false. A comparison of two values
+is also decided by a dominating comparison of the same two: under `x == y`,
+`x != y` is false and `x <= y` true; under `x < y`, `y < x` is false
+(gcc-torture compare-3). A signed order says nothing of the unsigned one.
 
 Ranges are i128 intervals in the interpretation (width and signedness) of a
 value's own type, for integer types up to 64 bits. A range is read at another
@@ -714,6 +717,11 @@ into it and the stores move to the end of the entry block. A local whose writes
 are all in the entry block is invariant in every loop, so in later rounds a
 whole copy of one, or a single vector op reading only such locals, constants
 and entry values (e.g. `-lim` of a hoisted literal), moves there too.
+
+**Split addresses.** An address `gep p, (inv + var)` in a loop, where `p` and
+`inv` come from outside it (`p[j + i]` in a loop over `i`), becomes `gep (gep
+p, inv), var` when the add has no other use, so `p + j` is hoisted and each
+access indexes it by `i` (`ldrb w0, [x1, x2]`).
 
 ### iv_strength_reduce -- Induction Variable Strength Reduction
 
@@ -944,6 +952,13 @@ cfg_simplify). F128 and I128 phi types are rejected. The pass iterates to a
 fixpoint within each invocation, since converting one diamond may expose
 another. Overlapping diamonds within a single iteration are detected and skipped
 to avoid conflicts.
+
+One shape is left as branches: a step of an `a && b` or `a || b` test, whose
+merge block holds only the boolean phi (with a constant from the
+short-circuiting edge) and branches on it. cfg_simplify threads the constant's
+edge to the branch target, giving one branch per operand instead of computing
+the boolean with `cset`/`csel` and then branching on it. Dead code is removed
+first, so copies and phi cycles that mem2reg leaves do not count as uses.
 
 ### ipcp -- Interprocedural Constant Propagation
 

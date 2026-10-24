@@ -28,10 +28,12 @@
 //! because stores through derived pointers may not be tracked in `stored_allocas`.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::common::source::Span;
 use crate::ir::reexports::{
     Instruction,
+    IrBinOp,
     IntrinsicOp,
     IrFunction,
     Operand,
@@ -839,6 +841,8 @@ fn hoist_loop_invariants(
         }
     }
 
+    split_invariant_offsets(func, natural_loop, &loop_defined);
+
     // Build a set of Value IDs that point to global memory — this includes
     // direct GlobalAddr instructions AND any GetElementPtr that derives a
     // pointer from a GlobalAddr (transitively). Stores through any of these
@@ -1071,6 +1075,52 @@ fn hoist_loop_invariants(
 
 /// Topologically sort instructions so that definitions come before uses.
 /// This ensures SSA correctness in the preheader.
+/// Split an address whose offset adds a loop-invariant value to a varying one:
+///
+///   %s = add %inv, %var                   %t = gep %p, %inv     (now invariant)
+///   %a = gep %p, %s                   =>  %a = gep %t, %var
+///
+/// `p[j + i]` in a loop over `i` adds `j` on every iteration; after the split
+/// `p + j` is hoisted with the other invariants and the access indexes it by
+/// `i` directly. Only an add whose single use is that GEP, in the same block,
+/// with `p` defined outside the loop. (GEP offsets are byte offsets; both
+/// forms are the same sum modulo 2^64.)
+fn split_invariant_offsets(func: &mut IrFunction, natural_loop: &NaturalLoop, loop_defined: &FxHashSet<u32>) -> usize {
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| *use_count.entry(v).or_insert(0) += 1);
+        }
+        block.terminator.for_each_used_value(|v| *use_count.entry(v).or_insert(0) += 1);
+    }
+    let invariant = |op: &Operand| matches!(op, Operand::Value(v) if !loop_defined.contains(&v.0));
+    let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
+    let mut changes = 0;
+    for &b in &natural_loop.body {
+        let block = &mut func.blocks[b];
+        for g in 0..block.instructions.len() {
+            let Instruction::GetElementPtr { dest, base, offset: Operand::Value(s), ty } = block.instructions[g] else { continue };
+            if loop_defined.contains(&base.0) || use_count.get(&s.0) != Some(&1) {
+                continue;
+            }
+            let Some(a) = block.instructions[..g].iter().position(|i| i.dest() == Some(s)) else { continue };
+            let Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, ty: IrType::I64 | IrType::U64, .. } = block.instructions[a] else { continue };
+            let (inv, var) = match (invariant(&lhs), invariant(&rhs)) {
+                (true, false) => (lhs, rhs),
+                (false, true) => (rhs, lhs),
+                _ => continue,
+            };
+            let t = Value(next_id);
+            next_id += 1;
+            block.instructions[a] = Instruction::GetElementPtr { dest: t, base, offset: inv, ty };
+            block.instructions[g] = Instruction::GetElementPtr { dest, base: t, offset: var, ty };
+            changes += 1;
+        }
+    }
+    func.next_value_id = next_id;
+    changes
+}
+
 fn topological_sort_instructions(mut insts: Vec<Instruction>) -> Vec<Instruction> {
     if insts.len() <= 1 {
         return insts;
@@ -1140,8 +1190,8 @@ fn topological_sort_instructions(mut insts: Vec<Instruction>) -> Vec<Instruction
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::{AddressSpace, IrType};
-    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, IrConst};
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, IrConst};
 
     /// Helper to create a simple loop: preheader -> header -> body -> header, header -> exit
     fn make_loop_func() -> IrFunction {
@@ -1271,6 +1321,32 @@ mod tests {
             Instruction::BinOp { op: IrBinOp::Mul, .. } => {} // correct
             other => panic!("Expected BinOp::Mul, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_invariant_part_of_address_hoisted() {
+        // Body: %6 = add %1, %2; %7 = gep %1, %6  (p[n + i], p = n here)
+        let mut func = make_loop_func();
+        func.blocks[2].instructions.extend([
+            Instruction::BinOp {
+                dest: Value(6), op: IrBinOp::Add, lhs: Operand::Value(Value(1)), rhs: Operand::Value(Value(2)), ty: IrType::I64,
+            },
+            Instruction::GetElementPtr { dest: Value(7), base: Value(1), offset: Operand::Value(Value(6)), ty: IrType::Ptr },
+        ]);
+        func.next_value_id = 8;
+        let alloca_info = analyze_allocas(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+        let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+
+        assert_eq!(hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info), 2);
+        assert!(func.blocks[0].instructions.iter().any(|i| matches!(i, Instruction::GetElementPtr {
+            dest: Value(8), base: Value(1), offset: Operand::Value(Value(1)), ..
+        })));
+        assert!(matches!(func.blocks[2].instructions[..], [_, Instruction::GetElementPtr {
+            dest: Value(7), base: Value(8), offset: Operand::Value(Value(2)), ..
+        }]));
     }
 
     #[test]
