@@ -101,7 +101,7 @@ The optimizer executes in four sequential phases:
          |
          v
  Phi elimination (src/ir/mem2reg), then:
-     loop_rotate, loop_hoist, loop_layout, step_to_load
+     loop_rotate, loop_hoist, loop_layout, step_to_load, const_hoist
 ```
 
 ## Phase Structure
@@ -884,6 +884,18 @@ and when nothing else in the loop defines either. A one-block `while (p < e)
 s = s * 3 + *p++;` loop drops from eight instructions to six. Measured no
 speedup on chess-perft.
 
+### const_hoist -- Loop Constants Built Once
+
+Runs last, after step_to_load, where no copy propagation folds constants
+back in. A 64-bit constant used in a loop that takes three or more
+instructions to build (three or more 16-bit pieces that are neither 0 nor
+0xffff; on AArch64 a movz and two or three movks) is defined once by a copy
+at the end of the entry block, and its loop uses read that value. Operands
+of BinOps, Cmps, Stores and Copies qualify, except shift amounts and masks
+that AArch64 encodes in and/orr/eor. At most four constants per function,
+most loop uses first. The splitmix64 steps in scalar-bench's hash kernel
+drop sixteen instructions per operation, about 20% faster.
+
 ### if_convert -- If-Conversion
 
 Converts simple diamond and triangle branch-and-phi patterns into `Select`
@@ -1095,7 +1107,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`.
+`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1118,6 +1130,7 @@ behavior across iterations.
 | `mod.rs`                 | Pipeline orchestration, dirty tracking, shared analysis |
 | `bound_hoist.rs`         | Invariant loads of loop exit-test bounds moved out     |
 | `cfg_simplify.rs`        | CFG simplification (branch folding, jump threading)    |
+| `const_hoist.rs`         | Large loop constants built once at function entry      |
 | `constant_fold.rs`       | Constant expression evaluation at compile time         |
 | `copy_prop.rs`           | Copy propagation with path compression                 |
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |

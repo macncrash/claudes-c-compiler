@@ -468,10 +468,11 @@ fn range_within(r: Range, ty: IrType) -> bool {
 }
 
 /// The range of each value (see Range), from its producer and the ranges
-/// of its operands, in one pass in block order (a value defined later, as
-/// around a loop, is unknown). Masks (`m & 63`), shifts, byte loads,
-/// comparisons and arithmetic on them get bounds; so does an extension of a
-/// value already in range. Empty on 32-bit targets, where I64 values take
+/// of its operands, in block order (a value defined later is unknown), then
+/// again with phis bounded by what the first pass found for their incoming
+/// values (a loop index `i = (i + 1) & mask`). Masks (`m & 63`), shifts,
+/// byte loads, comparisons and arithmetic on them get bounds; so does an
+/// extension of a value already in range. Empty on 32-bit targets, where I64 values take
 /// two registers.
 fn value_ranges(func: &IrFunction, max_id: usize) -> Vec<Range> {
     let mut ranges: Vec<Range> = vec![None; max_id + 1];
@@ -484,33 +485,53 @@ fn value_ranges(func: &IrFunction, max_id: usize) -> Vec<Range> {
             Operand::Const(c) => c.to_i64().map(|k| (k as i128, k as i128)),
         }
     };
-    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-        let Some(dest) = inst.dest() else { continue };
-        let r = match inst {
-            Instruction::Load { ty, .. } if !matches!(ty, IrType::I128 | IrType::U128) => type_range(*ty),
-            Instruction::Cmp { .. } => Some((0, 1)),
-            Instruction::Copy { src, .. } => get(src, &ranges),
-            Instruction::Select { true_val, false_val, ty, .. } if ty.is_integer() => {
-                match (get(true_val, &ranges), get(false_val, &ranges)) {
-                    (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
-                    _ => None,
+    // Two sweeps: in the second, a phi gets the union of its incoming
+    // ranges from the first, where every value not yet seen (a loop phi
+    // and what depends on it) was unknown, so each range there holds.
+    let mut first: Vec<Range> = Vec::new();
+    for sweep in 0..2 {
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            let Some(dest) = inst.dest() else { continue };
+            let r = match inst {
+                // Constants only where every backend builds the same register
+                // contents whatever the phi's type.
+                Instruction::Phi { incoming, ty, .. } if sweep == 1 && ty.is_integer() && ty.size() >= 4 => {
+                    incoming.iter().try_fold(None, |acc: Range, (op, _)| {
+                        let r = match op {
+                            Operand::Const(c) => c.to_i64().filter(|k| (0..=i32::MAX as i64).contains(k)).map(|k| (k as i128, k as i128)),
+                            Operand::Value(_) => get(op, &first),
+                        }?;
+                        Some(Some(acc.map_or(r, |a| (a.0.min(r.0), a.1.max(r.1)))))
+                    }).flatten()
                 }
+                Instruction::Load { ty, .. } if !matches!(ty, IrType::I128 | IrType::U128) => type_range(*ty),
+                Instruction::Cmp { .. } => Some((0, 1)),
+                Instruction::Copy { src, .. } => get(src, &ranges),
+                Instruction::Select { true_val, false_val, ty, .. } if ty.is_integer() => {
+                    match (get(true_val, &ranges), get(false_val, &ranges)) {
+                        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.max(b.1))),
+                        _ => None,
+                    }
+                }
+                Instruction::Cast { src, from_ty, to_ty, .. } if from_ty.size() != to_ty.size() => {
+                    // The backend extends the low bits per the narrower type to
+                    // the whole register (a short widened to unsigned stays
+                    // sign-extended).
+                    let ext = if from_ty.size() < to_ty.size() { *from_ty } else { *to_ty };
+                    let s = get(src, &ranges);
+                    if range_within(s, ext) { s } else { type_range(ext) }
+                }
+                Instruction::BinOp { op, lhs, rhs, ty, .. } if ty.size() >= 4 => {
+                    binop_range(*op, get(lhs, &ranges), get(rhs, &ranges), *ty)
+                }
+                _ => None,
+            };
+            if let Some(slot) = ranges.get_mut(dest.0 as usize) {
+                *slot = r;
             }
-            Instruction::Cast { src, from_ty, to_ty, .. } if from_ty.size() != to_ty.size() => {
-                // The backend extends the low bits per the narrower type to
-                // the whole register (a short widened to unsigned stays
-                // sign-extended).
-                let ext = if from_ty.size() < to_ty.size() { *from_ty } else { *to_ty };
-                let s = get(src, &ranges);
-                if range_within(s, ext) { s } else { type_range(ext) }
-            }
-            Instruction::BinOp { op, lhs, rhs, ty, .. } if ty.size() >= 4 => {
-                binop_range(*op, get(lhs, &ranges), get(rhs, &ranges), *ty)
-            }
-            _ => None,
-        };
-        if let Some(slot) = ranges.get_mut(dest.0 as usize) {
-            *slot = r;
+        }
+        if sweep == 0 {
+            first = std::mem::replace(&mut ranges, vec![None; max_id + 1]);
         }
     }
     ranges
@@ -3657,5 +3678,36 @@ mod tests {
         // x > INT_MAX has no lower bound to give.
         let mut func = range_check(IrCmpOp::Sgt, i32::MAX, IrCmpOp::Sle, 20, and_select());
         assert_eq!(fold_range_checks(&mut func), 0);
+    }
+
+    /// `i = phi [start, entry], [(i + 1) & 0xffff, loop]` at U32.
+    fn masked_index_loop(start: IrConst) -> IrFunction {
+        use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            BasicBlock { label: BlockId(0), instructions: vec![], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![
+                    Instruction::Phi { dest: Value(1), ty: IrType::U32, incoming: vec![(Operand::Const(start), BlockId(0)), (Operand::Value(Value(3)), BlockId(1))] },
+                    Instruction::BinOp { dest: Value(2), op: IrBinOp::Add, lhs: Operand::Value(Value(1)), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::U32 },
+                    Instruction::BinOp { dest: Value(3), op: IrBinOp::And, lhs: Operand::Value(Value(2)), rhs: Operand::Const(IrConst::I64(0xffff)), ty: IrType::I64 },
+                ],
+                terminator: Terminator::CondBranch { cond: Operand::Value(Value(3)), true_label: BlockId(1), false_label: BlockId(2) },
+                source_spans: Vec::new(),
+            },
+            BasicBlock { label: BlockId(2), instructions: vec![], terminator: Terminator::Return(None), source_spans: Vec::new() },
+        ];
+        func.next_value_id = 4;
+        func
+    }
+
+    #[test]
+    fn test_phi_range_from_incoming_values() {
+        let ranges = value_ranges(&masked_index_loop(IrConst::I64(7)), 3);
+        assert_eq!(ranges[1], Some((0, 0xffff)));
+        // A negative constant may be built differently per backend and type.
+        let ranges = value_ranges(&masked_index_loop(IrConst::I64(-1)), 3);
+        assert_eq!(ranges[1], None);
     }
 }
