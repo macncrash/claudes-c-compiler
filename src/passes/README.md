@@ -52,6 +52,7 @@ The optimizer executes in four sequential phases:
    |  2b. narrow                                           |
    |  3.  simplify                                         |
    |  4.  constant_fold                                    |
+   |  4a. range_fold                                       |
    |  5.  gvn              \                               |
    |  6.  licm               > shared CFG analysis         |
    |  6a. iv_strength_reduce /  (iteration 0 only)         |
@@ -614,6 +615,29 @@ Inf or NaN per IEEE 754).
 compile-time constant. Non-constant operands are left for the Phase 0.5
 resolution step (see above).
 
+### range_fold -- Range-Decided Comparisons
+
+Runs right after constant_fold, on the same skip condition. Each integer
+comparison is decided from the ranges of its operands where they do not
+overlap. A value's range comes from its definition: constants, casts,
+add/sub/mul whose exact result stays in the type, masks, remainders,
+divisions and shifts by constants, selects, and phis (to a small depth). The
+dominating branch conditions on the value narrow it: an edge into a block with
+one predecessor says `v op k` held, including each comparison under an
+`&&` taken or an `||` not taken. In
+`if (var <= 0 || (unsigned)(var - 1) < UINT_MAX)` the second comparison runs
+only when `var` is in [1, INT_MAX], so it is always true (gcc-torture
+20041114-1). Under `v != k`, `v == k` is false.
+
+Ranges are i128 intervals in the interpretation (width and signedness) of a
+value's own type, for integer types up to 64 bits. A range is read at another
+interpretation only when that reads no bits above the value's type and every
+number in it means the same there; a fact from a comparison at the value's
+width but the other signedness is mapped across the sign boundary. Signed
+overflow is never assumed away: arithmetic whose exact result leaves the type
+gives no range. Folded comparisons become constants, which constant_fold,
+copy_prop and cfg_simplify carry on to the branches they feed.
+
 ### gvn -- Global Value Numbering
 
 A dominator-based common subexpression elimination (CSE) pass with redundant
@@ -1071,7 +1095,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`.
+`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1114,6 +1138,7 @@ behavior across iterations.
 | `loop_rotate.rs`         | Header duplication into latches (bottom-tested loops)  |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
 | `pressure_hoist.rs`      | Instructions hoisted to end several live ranges early  |
+| `range_fold.rs`          | Comparisons decided by value ranges and dominating branches |
 | `remat.rs`               | Cheap values recomputed where a leaf runs out of registers |
 | `ret_dup.rs`             | Return blocks copied into predecessors passing constants |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |

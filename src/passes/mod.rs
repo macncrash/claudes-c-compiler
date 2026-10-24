@@ -33,6 +33,7 @@ pub(crate) mod step_to_load;
 pub(crate) mod loop_rotate;
 pub(crate) mod mod_ref;
 pub(crate) mod narrow;
+pub(crate) mod range_fold;
 mod pressure_hoist;
 mod remat;
 mod resolve_asm;
@@ -411,6 +412,16 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         if !dis.constfold && should_run!(4, 1, 2, 3, 7, 8) {
             let n = timed_pass!("constfold", run_on_visited(module, &dirty, &mut changed, constant_fold::fold_function));
             cur_pass_changes[4] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 4a: Comparisons decided by value ranges and dominating branch
+        // conditions. Same upstream passes as constfold; its folds count as
+        // constfold's, which they feed (constant branches, dead code).
+        if !disabled.contains("range_fold") && should_run!(4, 1, 2, 3, 7, 8) {
+            let n = timed_pass!("range_fold", run_on_visited(module, &dirty, &mut changed, range_fold::range_fold_function));
+            cur_pass_changes[4] += n;
             total_changes += n;
             total_changes_excl_dce += n;
         }
