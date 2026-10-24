@@ -1,0 +1,4 @@
+/scalarbench
+/scalarbench-clang
+/build-*.txt
+/build-*.cmp
