@@ -1,17 +1,17 @@
 # difftest baseline: darwin-arm64
 
-- date: 2026-10-23
-- ccc: `f1e07457` flags `-O2 -w`
+- date: 2026-10-24
+- ccc: `b6758ada` flags `-O2 -w`
 - reference: `Apple clang version 16.0.0 (clang-1600.0.26.6)` flags `-arch arm64 -O0 -w`
 
 | suite | pass | compile_error | asm_error | link_error | crash | timeout | wrong_exit | wrong_output | ref_fail | pass % |
 |---|---|---|---|---|---|---|---|---|---|---|
 | c-testsuite | 220 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 100.0 |
-| cases | 62 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 100.0 |
+| cases | 63 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 100.0 |
 | gcc-torture | 1351 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 138 | 99.9 |
 
 ## Failures
 
 ### wrong_output (1)
 
-- `gcc-torture/return-addr`: line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b9f2ddf 0x16b9f2ddf 0x16b9f2ddf 0x16b9f2ddf'
+- `gcc-torture/return-addr`: line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16fb96ddf 0x16fb96ddf 0x16fb96ddf 0x16fb96ddf'
