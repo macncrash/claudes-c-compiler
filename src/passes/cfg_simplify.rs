@@ -70,6 +70,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
         changed += simplify_redundant_cond_branches(func);
         changed += thread_jump_chains(func, &label_to_idx);
         changed += thread_phi_cond_branches(func, &label_to_idx);
+        changed += thread_phi_cond_branches_merging(func, &label_to_idx);
         changed += remove_dead_blocks(func, &label_to_idx);
         changed += simplify_trivial_phis(func);
         changed += merge_single_pred_blocks(func);
@@ -295,6 +296,229 @@ fn thread_phi_cond_branches(func: &mut IrFunction, label_to_idx: &FxHashMap<Bloc
         }
     }
     actions.len()
+}
+
+/// The same when B also merges values its targets read, as an inlined
+/// `find(key, &v)` merges `v` (loaded on the found path) with the flag it
+/// returns: `if (find(k, &v) && v == i)`. When every incoming flag is a
+/// constant, every predecessor goes straight to its target and B is left
+/// unreachable. A target reached only from B dominates the blocks that read
+/// B's phis through it, so each such phi becomes a phi at the start of that
+/// target over the predecessors now sent there. One B per call (the
+/// dominator tree is built for it).
+fn thread_phi_cond_branches_merging(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
+    let (pred_count, _) = build_pred_info(func);
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
+        }
+        block.terminator.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
+    }
+
+    // (B, [(pred, target)])
+    let mut candidates = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let b = block.label;
+        if block.instructions.len() < 2 || !block.instructions.iter().all(|i| matches!(i, Instruction::Phi { .. })) {
+            continue;
+        }
+        let Terminator::CondBranch { cond: Operand::Value(c), true_label: t, false_label: f } = block.terminator else { continue };
+        if t == b || f == b || t == f || use_count.get(&c.0) != Some(&1) {
+            continue;
+        }
+        let Some(Instruction::Phi { incoming, .. }) = block.instructions.iter().find(|i| i.dest() == Some(c)) else { continue };
+        if pred_count.get(&b).copied() != Some(incoming.len() as u32) {
+            continue;
+        }
+        let mut sends = Vec::with_capacity(incoming.len());
+        for (op, pred) in incoming {
+            let Some(v) = (match op { Operand::Const(k) => k.to_i64(), _ => None }) else { break };
+            let target = if v != 0 { t } else { f };
+            let Some(&pi) = label_to_idx.get(pred) else { break };
+            let pb = &func.blocks[pi];
+            let mut targets_b = 0;
+            let mut targets_s = false;
+            for_each_terminator_target(&pb.terminator, |x| {
+                targets_b += (x == b) as u32;
+                targets_s |= x == target;
+            });
+            let plain = matches!(pb.terminator, Terminator::Branch(_) | Terminator::CondBranch { .. });
+            let asm_goto = pb.instructions.iter()
+                .any(|i| matches!(i, Instruction::InlineAsm { goto_labels, .. } if !goto_labels.is_empty()));
+            if !plain || targets_b != 1 || targets_s || asm_goto || pi == bi {
+                break;
+            }
+            sends.push((pi, *pred, target));
+        }
+        if sends.len() == incoming.len() {
+            candidates.push((bi, sends));
+        }
+    }
+    if candidates.is_empty() {
+        return 0;
+    }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let dominated_by = |x: usize, mut u: usize| loop {
+        if u == x {
+            return true;
+        }
+        let up = cfg.idom[u];
+        if up == u || up == usize::MAX {
+            return false;
+        }
+        u = up;
+    };
+    // Where B's other phis are read: each in the region of one target,
+    // which must be reached only from B. Returns the (target, phi) pairs.
+    let reads = |bi: usize| -> Option<FxHashSet<(usize, u32)>> {
+        let b = func.blocks[bi].label;
+        let Terminator::CondBranch { true_label: t, false_label: f, .. } = func.blocks[bi].terminator else { return None };
+        let (ti, fi) = (label_to_idx[&t], label_to_idx[&f]);
+        let is_b_phi = |v: u32| func.blocks[bi].instructions.iter().any(|i| i.dest().is_some_and(|d| d.0 == v));
+        let region = |u: usize| if dominated_by(ti, u) { Some(ti) } else if dominated_by(fi, u) { Some(fi) } else { None };
+        let mut needed: FxHashSet<(usize, u32)> = FxHashSet::default();
+        let mut ok = true;
+        for (ui, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (op, l) in incoming {
+                        let Operand::Value(v) = op else { continue };
+                        // Read at the end of the predecessor (B itself for a target's phi).
+                        if !is_b_phi(v.0) || *l == b {
+                            continue;
+                        }
+                        match label_to_idx.get(l).and_then(|&w| region(w)) {
+                            Some(r) if ui != bi => { needed.insert((r, v.0)); }
+                            _ => return None,
+                        }
+                    }
+                } else {
+                    inst.for_each_used_value(|v| {
+                        if is_b_phi(v) {
+                            match region(ui) {
+                                Some(r) => { needed.insert((r, v)); }
+                                None => ok = false,
+                            }
+                        }
+                    });
+                }
+            }
+            if ui != bi {
+                block.terminator.for_each_used_value(|v| {
+                    if is_b_phi(v) {
+                        match region(ui) {
+                            Some(r) => { needed.insert((r, v)); }
+                            None => ok = false,
+                        }
+                    }
+                });
+            }
+        }
+        let single = needed.iter().all(|&(r, _)| pred_count.get(&func.blocks[r].label) == Some(&1));
+        (ok && single).then_some(needed)
+    };
+    let Some((bi, sends, needed)) = candidates.into_iter().find_map(|(bi, sends)| reads(bi).map(|n| (bi, sends, n)))
+    else { return 0 };
+
+    let b = func.blocks[bi].label;
+    let Terminator::CondBranch { true_label: t, false_label: f, .. } = func.blocks[bi].terminator else { return 0 };
+    // B's phis: (dest, type, incoming).
+    type Merged = (Value, crate::common::types::IrType, Vec<(Operand, BlockId)>);
+    let phis: Vec<Merged> = func.blocks[bi].instructions.iter()
+        .filter_map(|i| match i {
+            Instruction::Phi { dest, ty, incoming } => Some((*dest, *ty, incoming.clone())),
+            _ => None,
+        })
+        .collect();
+    let is_b_phi = |v: u32| phis.iter().any(|(d, _, _)| d.0 == v);
+    let (ti, fi) = (label_to_idx[&t], label_to_idx[&f]);
+
+    // Redirect the predecessors.
+    for &(pi, _, target) in &sends {
+        let remap: FxHashMap<BlockId, BlockId> = [(b, target)].into_iter().collect();
+        remap_terminator_targets(&mut func.blocks[pi].terminator, &remap);
+    }
+    let incoming_of = |v: Value, p: BlockId| -> Option<Operand> {
+        phis.iter().find(|(d, _, _)| *d == v).and_then(|(_, _, inc)| inc.iter().find(|(_, l)| *l == p).map(|(op, _)| *op))
+    };
+    let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
+    for (target_idx, target) in [(ti, t), (fi, f)] {
+        let preds: Vec<BlockId> = sends.iter().filter(|s| s.2 == target).map(|s| s.1).collect();
+        // The target's own phis: B's entry becomes one per predecessor.
+        for inst in &mut func.blocks[target_idx].instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                if let Some(k) = incoming.iter().position(|(_, l)| *l == b) {
+                    let (op, _) = incoming.remove(k);
+                    for &p in &preds {
+                        let mapped = match op {
+                            Operand::Value(v) if is_b_phi(v.0) => incoming_of(v, p).unwrap_or(op),
+                            _ => op,
+                        };
+                        incoming.push((mapped, p));
+                    }
+                }
+            }
+        }
+        if preds.is_empty() {
+            continue;
+        }
+        // B's phis read in the region: merged again at its start.
+        let mut map: Vec<Option<Operand>> = Vec::new();
+        let mut new_phis = Vec::new();
+        for (d, ty, _) in &phis {
+            if !needed.contains(&(target_idx, d.0)) {
+                continue;
+            }
+            let Some(inc) = preds.iter().map(|&p| incoming_of(*d, p).map(|op| (op, p))).collect::<Option<Vec<_>>>() else { continue };
+            let nv = Value(next_id);
+            next_id += 1;
+            if map.len() <= d.0 as usize {
+                map.resize(d.0 as usize + 1, None);
+            }
+            map[d.0 as usize] = Some(Operand::Value(nv));
+            new_phis.push(Instruction::Phi { dest: nv, ty: *ty, incoming: inc });
+        }
+        if map.is_empty() {
+            continue;
+        }
+        for (ui, block) in func.blocks.iter_mut().enumerate() {
+            if ui == bi {
+                continue;
+            }
+            for inst in &mut block.instructions {
+                match inst {
+                    Instruction::Phi { incoming, .. } => {
+                        for (op, l) in incoming.iter_mut() {
+                            let in_region = label_to_idx.get(l).is_some_and(|&w| dominated_by(target_idx, w));
+                            if in_region {
+                                if let Operand::Value(v) = op {
+                                    if let Some(Some(r)) = map.get(v.0 as usize) {
+                                        *op = *r;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ if dominated_by(target_idx, ui) => {
+                        super::copy_prop::replace_operands_in_instruction(inst, &map);
+                    }
+                    _ => {}
+                }
+            }
+            if dominated_by(target_idx, ui) {
+                super::copy_prop::replace_operands_in_terminator(&mut block.terminator, &map);
+            }
+        }
+        let tb = &mut func.blocks[target_idx];
+        if !tb.source_spans.is_empty() {
+            let span = tb.source_spans[0];
+            tb.source_spans.splice(0..0, std::iter::repeat_n(span, new_phis.len()));
+        }
+        tb.instructions.splice(0..0, new_phis);
+    }
+    func.next_value_id = next_id;
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,5 +1901,44 @@ mod tests {
         // After all folding and merging, Block 0 should end with Return(42).
         assert!(matches!(func.blocks[0].terminator, Terminator::Return(Some(Operand::Const(IrConst::I32(42))))),
             "After full simplification, should return 42");
+    }
+
+    /// `if (find(k, &v) && v == 3)` after inlining: the hit and miss paths
+    /// merge the found flag with `v`, and the merge branches on the flag.
+    #[test]
+    fn test_flag_threaded_with_merged_value() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let (b, v) = (BlockId, |n| Operand::Value(Value(n)));
+        func.blocks = vec![
+            make_block(b(0), vec![], Terminator::CondBranch { cond: v(1), true_label: b(1), false_label: b(2) }),
+            // hit: v = 5
+            make_block(b(1), vec![], Terminator::Branch(b(3))),
+            // miss
+            make_block(b(2), vec![], Terminator::Branch(b(3))),
+            make_block(b(3), vec![
+                Instruction::Phi { dest: Value(20), ty: IrType::I32, incoming: vec![(Operand::Const(IrConst::I32(1)), b(1)), (Operand::Const(IrConst::I32(0)), b(2))] },
+                Instruction::Phi { dest: Value(21), ty: IrType::I32, incoming: vec![(Operand::Const(IrConst::I32(5)), b(1)), (Operand::Const(IrConst::I32(0)), b(2))] },
+            ], Terminator::CondBranch { cond: v(20), true_label: b(4), false_label: b(6) }),
+            make_block(b(4), vec![
+                Instruction::Cmp { dest: Value(30), op: IrCmpOp::Eq, lhs: v(21), rhs: Operand::Const(IrConst::I32(3)), ty: IrType::I32 },
+            ], Terminator::CondBranch { cond: v(30), true_label: b(5), false_label: b(6) }),
+            make_block(b(5), vec![], Terminator::Return(Some(v(21)))),
+            make_block(b(6), vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
+        ];
+        func.next_value_id = 31;
+        let label_to_idx = build_label_to_idx(&func);
+        assert_eq!(thread_phi_cond_branches_merging(&mut func, &label_to_idx), 1);
+        // Each path goes straight to its target.
+        assert!(matches!(func.blocks[1].terminator, Terminator::Branch(BlockId(4))));
+        assert!(matches!(func.blocks[2].terminator, Terminator::Branch(BlockId(6))));
+        // The found path's `v` is merged again where it is read: in the
+        // target, from the one predecessor sent there.
+        let Instruction::Phi { dest: nv, ref incoming, .. } = func.blocks[4].instructions[0]
+        else { panic!("{:?}", func.blocks[4].instructions) };
+        assert!(matches!(incoming[..], [(Operand::Const(IrConst::I32(5)), BlockId(1))]));
+        assert!(matches!(func.blocks[4].instructions[1], Instruction::Cmp { lhs: Operand::Value(l), .. } if l == nv));
+        assert!(matches!(func.blocks[5].terminator, Terminator::Return(Some(Operand::Value(r))) if r == nv));
+        // The miss path's target, also reached from block 4, is not touched.
+        assert!(func.blocks[6].instructions.is_empty());
     }
 }

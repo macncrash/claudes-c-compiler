@@ -19,6 +19,7 @@ mod dead_statics;
 pub(crate) mod div_by_const;
 mod gep_linear;
 mod gep_reassoc;
+mod global_promote;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
@@ -43,7 +44,8 @@ mod ret_dup;
 pub(crate) mod simplify;
 
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{IrFunction, IrModule};
+use crate::common::fx_hash::FxHashSet;
+use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand};
 
 /// Run a per-function pass only on functions in the visit set.
 ///
@@ -253,7 +255,39 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     simplify::run(module);
     constant_fold::run(module);
     copy_prop::run(module);
+    // A local passed by address to an inlined callee (`find(key, &v)`) was
+    // still reached through `gep v, 0` and the callee's promoted parameter
+    // (a phi where the call sat in a loop). Simplification made the GEP a
+    // copy and the uses read v directly; with the dead copies and phis gone,
+    // v is only loaded and stored, so promote it now. Only in functions with
+    // such a local: DCE this early changes what later passes see elsewhere.
+    for func in module.functions.iter_mut().filter(|f| !f.is_declaration && copied_scalar_alloca(f)) {
+        dce::eliminate_dead_code(func);
+        crate::ir::mem2reg::promote_function_allocas(func);
+    }
     resolve_asm::resolve_inline_asm_symbols(module);
+
+    // File-scope variables a call-free loop updates (an inlined generator's
+    // state) live in registers through the loop.
+    if !disabled.contains("global_promote") {
+        global_promote::promote_module(module);
+    }
+}
+
+/// Whether a register-sized alloca is read by a Copy or a phi (its address
+/// left over from an inlined call), which keeps mem2reg from promoting it.
+fn copied_scalar_alloca(func: &IrFunction) -> bool {
+    let small: FxHashSet<u32> = func.blocks.iter().flat_map(|b| &b.instructions)
+        .filter_map(|i| match i {
+            Instruction::Alloca { dest, size, volatile: false, .. } if *size <= 8 => Some(dest.0),
+            _ => None,
+        })
+        .collect();
+    func.blocks.iter().flat_map(|b| &b.instructions).any(|i| match i {
+        Instruction::Copy { src: Operand::Value(v), .. } => small.contains(&v.0),
+        Instruction::Phi { incoming, .. } => incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if small.contains(&v.0))),
+        _ => false,
+    })
 }
 
 /// All optimization levels run the same pipeline with the same number of

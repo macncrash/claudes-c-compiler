@@ -61,6 +61,14 @@ pub fn promote_allocas_with_params(module: &mut IrModule) {
     }
 }
 
+/// Promote one function's allocas (parameters included), for passes that
+/// introduce allocas of their own after inlining.
+pub fn promote_function_allocas(func: &mut IrFunction) {
+    if !func.is_declaration && !func.blocks.is_empty() {
+        promote_function(func, true);
+    }
+}
+
 /// Information about a promotable alloca.
 struct AllocaInfo {
     /// The Value that is the alloca's destination (pointer to the stack slot).
@@ -186,6 +194,18 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     // because the inliner relies on their presence for argument passing.
     // When promote_params is true (post-inlining), parameter allocas are eligible
     // because the IR has explicit ParamRef + Store instructions for their initial values.
+    // Parameter allocas the IR stores the incoming value into (ParamRef +
+    // Store). Others (a struct passed by value, the sret pointer) are filled
+    // by the backend, invisibly to the IR, and must stay in memory.
+    let param_refs: FxHashSet<u32> = func.blocks[0].instructions.iter()
+        .filter_map(|i| match i { Instruction::ParamRef { dest, .. } => Some(dest.0), _ => None })
+        .collect();
+    let param_stored: FxHashSet<u32> = func.blocks[0].instructions.iter()
+        .filter_map(|i| match i {
+            Instruction::Store { val: Operand::Value(v), ptr, .. } if param_refs.contains(&v.0) => Some(ptr.0),
+            _ => None,
+        })
+        .collect();
     let mut alloca_index = 0;
     let mut all_allocas: Vec<(Value, IrType, usize)> = func.blocks[0]
         .instructions
@@ -195,7 +215,7 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                 let idx = alloca_index;
                 alloca_index += 1;
                 // Skip parameter allocas when not promoting params
-                if !promote_params && idx < num_params {
+                if idx < num_params && (!promote_params || !param_stored.contains(&dest.0)) {
                     return None;
                 }
                 // Never promote volatile allocas -- volatile locals must remain

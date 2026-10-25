@@ -150,6 +150,19 @@ impl Lowerer {
 
             if let Some(ref init) = declarator.init {
                 self.lower_local_var_init(init, decl, declarator, &da, alloca, is_complex, &complex_elem_ctype);
+            } else if !self.func().continue_labels.is_empty() && vla_size.is_none() && !da.is_array && !da.is_struct
+                && !is_complex && !decl.object_quals(declarator).volatile
+                && matches!(da.var_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+                    | IrType::I64 | IrType::U64 | IrType::Ptr)
+            {
+                // A scalar declared without an initializer in a loop body is a
+                // new object each iteration, its value indeterminate. Starting
+                // it at 0 (free once promoted) keeps mem2reg from carrying the
+                // last iteration's value around the loop: `uint32_t v;` set
+                // only on a lookup's found path stays local to the iteration.
+                let ty = da.var_ty;
+                self.emit(Instruction::Store { val: Operand::Const(IrConst::zero(ty)), ptr: alloca, ty,
+                    seg_override: AddressSpace::Default, volatile: false });
             }
         }
     }

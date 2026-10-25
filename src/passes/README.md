@@ -37,7 +37,9 @@ The optimizer executes in four sequential phases:
      simplify
      constant_fold
      copy_prop
+     dce, mem2reg (locals passed by address to inlined calls)
      resolve_asm
+     global_promote
          |
          v
  Phase 0.5: IsConstant Resolution
@@ -133,8 +135,28 @@ code:
 5. **constant_fold** (again) -- catches additional folding opportunities exposed
    by simplification.
 6. **copy_prop** (again) -- cleans up any remaining copies.
-7. **resolve_asm** -- resolves inline assembly symbol references that became
+7. **dce** and **mem2reg** (again) -- a local passed by address to an inlined
+   callee (`find(key, &v)`) is still reached through `gep v, 0` and the
+   callee's promoted parameter (a phi when the call is in a loop). Once
+   simplification has made the GEP a copy and DCE has removed the dead
+   copies and phis, the local is only loaded and stored, and is promoted.
+   Only in functions with such a local (a small alloca read by a copy or a
+   phi): DCE this early changes what later passes do elsewhere.
+8. **resolve_asm** -- resolves inline assembly symbol references that became
    computable after inlining with constant arguments.
+9. **global_promote** -- a `static` variable whose address the module uses
+   only for direct loads and stores of its type, accessed in a loop with no
+   calls, inline assembly or other unseen memory effects, is kept in a
+   register through the loop: copied to a fresh local before it, stored back
+   at each exit (each reached only from the loop), and promoted by mem2reg.
+   The outermost such loop is used. An inlined generator's `state += ...`
+   was otherwise loaded and stored on every iteration, each load waiting on
+   the previous store.
+
+A scalar declared without an initializer in a loop body is lowered with a
+store of 0 at its declaration: it is a new object each iteration, and
+without it mem2reg would carry the last iteration's value around the loop
+(the `v` that an inlined lookup sets only on a hit).
 
 ### Phase 0.5 -- IsConstant Resolution
 
@@ -341,7 +363,14 @@ fixpoint (repeating until no sub-pass makes changes):
    unconditional branch terminator) and redirects their predecessors to the
    final target. Chains are followed transitively with cycle detection, up to
    a depth limit of 32 hops. A safety check prevents threading when it would
-   merge `CondBranch` edges that carry conflicting phi values.
+   merge `CondBranch` edges that carry conflicting phi values. A block that
+   only merges a boolean (phi of constants) and branches on it is threaded
+   too: each predecessor goes straight to the target its constant selects
+   (`a || b || c`). When the block also merges other values its targets
+   read (the `v` an inlined `find(key, &v)` sets on a hit), every
+   predecessor is redirected, and each such value is merged again by a phi
+   at the start of the one target whose region reads it, which must be
+   reached only from the block.
 
 5. **Remove dead blocks.** BFS from the entry block to compute reachability
    (also marking blocks referenced by `LabelAddr`, inline asm goto labels, and
@@ -1184,8 +1213,10 @@ behavior across iterations.
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |
 | `dead_statics.rs`        | Dead static function/global elimination (BFS)          |
 | `div_by_const.rs`        | Division by constant strength reduction                |
+| `exit_addr.rs`           | Loop addresses recomputed after the loop (AArch64)     |
 | `gep_linear.rs`          | GEP chain offsets summed and cancelled (`a[x / n][x % n]`) |
 | `gep_reassoc.rs`         | Constant GEP offsets moved into loads and stores       |
+| `global_promote.rs`      | Static variables kept in registers through loops       |
 | `gvn.rs`                 | Dominator-based GVN/CSE with load elimination          |
 | `if_convert.rs`          | Diamond/triangle to Select conversion                  |
 | `inline.rs`              | Function inlining with tiered size heuristics          |
