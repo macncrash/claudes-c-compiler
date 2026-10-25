@@ -1103,6 +1103,7 @@ impl Driver {
 
         // Run optimization passes
         let t5 = std::time::Instant::now();
+        crate::passes::scalarize_local_copies(&mut module, self.target);
         promote_allocas(&mut module);
         if time_phases { eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64()); }
 

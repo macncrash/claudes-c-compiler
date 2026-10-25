@@ -696,7 +696,8 @@ is a no-op (natural fall-through) and is eliminated.
 
 `mov xN, xN` (64-bit) is a no-op and removed. Importantly, `mov wN, wN` (32-bit) is
 **not** eliminated because it zeros the upper 32 bits of the 64-bit register, which
-is a meaningful operation.
+is a meaningful operation. It goes only right after a 32-bit write of wN (`sub w13, w13, w10; mov w13,
+w13`), which has already cleared them.
 
 **4. Move Chain Optimization**
 
@@ -737,8 +738,9 @@ Removes `str` instructions to stack slots that are overwritten before being read
 
 - `lsr T, S, #k; and D, T, #(2^w - 1)` becomes `ubfx D, S, #k, #w` (in w form
   when the field lies in the low 32 bits).
-- `sxtb|uxtb|sxth|uxth A, wB` feeding only a byte (or, after a halfword
-  extension, halfword) store of wA stores wB instead.
+- `sxtb|uxtb|sxth|uxth A, wB` (or `and A, B, #0xff` / `#0xffff`) feeding
+  only a byte (or, after a halfword extension, halfword) store of wA stores
+  wB instead.
 - `sxtw xA, wB` whose reads, until A dies, can all take wB with the
   extension folded in (`add xC, xD, wB, sxtw #s`, `[xD, wB, sxtw #s]`,
   `smaddl` for a `madd` by a 32-bit constant, `cbz`/`cbnz wB` as A's last
@@ -779,11 +781,34 @@ v1 and nothing between the copy and the call uses v22:
 - `lsl T, S, #k` folds into a later `add|sub|orr|and|eor D, X, T` past up to
   four unrelated lines, so that `fold_index_into_mem` can then make
   `[X, S, lsl #k]` of the access through D.
+- `add xI, xJ, xJ` (or `lsl xI, xJ, #k`) feeding only the index of an
+  access `[xB, xI]` whose size is 2^k becomes `[xB, xJ, lsl #k]`: the
+  `prev[m & mask]` of a hash chain. Lines already deleted are never folded
+  again (an add folded into one access once also matched a later one).
 - In the liveness of registers' upper halves, `mov xD, xS` reads S's upper
   half only where D's is live afterwards, so an `sxtw` of an `int` that is
   only copied and then read as a w register goes away.
 
-**13. Switch Dispatch Duplication** (after the local cleanup)
+**13. Constants and Zero** (local cleanup)
+
+- A constant built again (`movz`/`movk`, or `mov #imm`) into the register
+  that still holds it, in straight-line code with nothing writing it in
+  between, is not built again; `mul` then `add` of that register fuse into
+  `madd` (zlib's `value * 66521 + 66521`).
+- `mov xR, #0` read only by a conditional select, R dying there, becomes
+  the select's `xzr`/`wzr` operand (`m >= w ? m - w : 0`).
+
+**14. Leaf Frame Records** (after the local cleanup)
+
+A function that calls nothing and never touches the stack, fp or lr loses
+its frame record entirely. One that still keeps callee-saved registers or
+stack slots, but never reads fp or lr, loses only the record: its first
+save, right above the record, takes the sp update (`stp x20, x21, [sp,
+#-(N-16)]!`) and its restore the post-increment, and every `[sp, #k]`
+moves down by 16, as clang lays out such leaves. Otherwise the record's
+`stp` and `ldp` become `sub` and `add` of sp.
+
+**15. Switch Dispatch Duplication** (after the local cleanup)
 
 A `switch` with a jump table ends in `adr x17, .Ljt; ldr w16, [x17, idx,
 lsl #2]; add x17, x17, w16, sxtw; br x17`, with the table right after the

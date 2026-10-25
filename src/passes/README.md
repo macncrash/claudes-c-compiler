@@ -846,6 +846,15 @@ when the check cannot fail (the object size is unknown, or a constant length
 fits) and the length is constant; this catches lengths that became constant
 during optimization (a size computed in an inlined helper).
 
+Before the first mem2reg (on the same targets), a copy of exactly a scalar
+local's size into or out of it, as a Memcpy or a plain `memcpy` call with a
+constant length whose result is unused, becomes a load and a store of the
+local's own type (`memcpy(&value, p, 4)`, an unaligned read). The casts and
+zero-offset GEPs lowering puts between the call and `&value` are looked
+through and removed when nothing else reads them, so mem2reg then promotes
+the local: zlib's hash insertion had written each word to the stack and read
+it back. A `double` read this way stays a double.
+
 ### bound_hoist -- Loop Bound Hoisting
 
 Runs once after the main loop, before iv_widen. iv_widen and lftr need a

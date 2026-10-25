@@ -121,6 +121,153 @@ fn expand(inst: &Instruction, wide_stores: bool, fresh: &mut dyn FnMut() -> Valu
     Some(out)
 }
 
+/// A copy of exactly a scalar local's size into or out of it, with no other
+/// local of another type on the other side, becomes a load and a store of
+/// the local's own type, which mem2reg can then promote:
+///
+///   memcpy %value <- %p, 4      =>   %t = load U32 %p; store U32 %t -> %value
+///
+/// `memcpy(&v, p, sizeof v)` is how portable code reads an unaligned word
+/// (zlib's hash insertion); the copy kept `v` on the stack, written and
+/// read back for every byte hashed. The local's own type keeps a `double`
+/// read this way a double. Only where unaligned scalar loads and stores
+/// are fine (AArch64, x86-64). Runs before the first mem2reg.
+pub(crate) fn scalarize_local_copies(func: &mut IrFunction) -> usize {
+    use crate::common::fx_hash::{FxHashMap, FxHashSet};
+    let scalar = |ty: &IrType| matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32
+        | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr | IrType::F32 | IrType::F64);
+    let mut locals: FxHashMap<u32, IrType> = FxHashMap::default();
+    // Copies and casts (`(void *)&v`, `(size_t)4`), which lowering puts
+    // between a call and its arguments.
+    let bits = |t: &IrType| t.is_integer() || *t == IrType::Ptr;
+    let mut moves: FxHashMap<u32, Operand> = FxHashMap::default();
+    let mut defs: FxHashMap<u32, u32> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Some(d) = inst.dest() {
+            *defs.entry(d.0).or_insert(0) += 1;
+        }
+        match inst {
+            Instruction::Alloca { dest, ty, volatile: false, .. } if scalar(ty) => { locals.insert(dest.0, *ty); }
+            Instruction::Copy { dest, src } => { moves.insert(dest.0, *src); }
+            Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } if c.to_i64() == Some(0) => {
+                moves.insert(dest.0, Operand::Value(*base));
+            }
+            // A pointer or integer passed on unchanged, or a constant.
+            Instruction::Cast { dest, src, from_ty, to_ty }
+                if matches!(src, Operand::Const(_)) || (bits(from_ty) && bits(to_ty) && from_ty.size() == to_ty.size()) => {
+                moves.insert(dest.0, *src);
+            }
+            _ => {}
+        }
+    }
+    moves.retain(|v, _| defs.get(v) == Some(&1));
+    if locals.is_empty() {
+        return 0;
+    }
+    let resolve = |op: Operand, via: &mut Vec<u32>| {
+        let mut op = op;
+        for _ in 0..4 {
+            match op {
+                Operand::Value(v) => match moves.get(&v.0) {
+                    Some(&next) => {
+                        via.push(v.0);
+                        op = next;
+                    }
+                    None => break,
+                },
+                Operand::Const(_) => break,
+            }
+        }
+        op
+    };
+    // Values something reads (a call's result is its destination).
+    let mut used: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| { used.insert(v); });
+        }
+        block.terminator.for_each_used_value(|v| { used.insert(v); });
+    }
+    let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
+    let mut count = 0;
+    let mut bypassed: FxHashSet<u32> = FxHashSet::default();
+    for block in &mut func.blocks {
+        let mut k = 0;
+        while k < block.instructions.len() {
+            k += 1;
+            let mut via = Vec::new();
+            let (dest, src, size) = match &block.instructions[k - 1] {
+                Instruction::Memcpy { dest, src, size } => (Operand::Value(*dest), Operand::Value(*src), *size),
+                // A plain call, before mem_inline makes it a Memcpy.
+                Instruction::Call { func: name, info } if name == "memcpy" && info.args.len() == 3
+                    && info.dest.is_none_or(|r| !used.contains(&r.0)) => {
+                    let len = match resolve(info.args[2], &mut via) { Operand::Const(c) => c.to_i64(), _ => None };
+                    match len {
+                        Some(n @ 1..=8) => (info.args[0], info.args[1], n as usize),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            let k = k - 1;
+            let (Operand::Value(dest), Operand::Value(src)) = (resolve(dest, &mut via), resolve(src, &mut via)) else { continue };
+            let (d, s) = (locals.get(&dest.0).copied(), locals.get(&src.0).copied());
+            let ty = match (d, s) {
+                (Some(a), Some(b)) if a != b => continue,
+                (Some(t), _) | (None, Some(t)) => t,
+                (None, None) => continue,
+            };
+            if ty.size() != size {
+                continue;
+            }
+            bypassed.extend(via);
+            let t = Value(next_id);
+            next_id += 1;
+            block.instructions[k] = Instruction::Load { dest: t, ptr: src, ty, seg_override: AddressSpace::Default, volatile: false };
+            block.instructions.insert(k + 1, Instruction::Store {
+                val: Operand::Value(t), ptr: dest, ty, seg_override: AddressSpace::Default, volatile: false,
+            });
+            if !block.source_spans.is_empty() {
+                let span = block.source_spans[k.min(block.source_spans.len() - 1)];
+                block.source_spans.insert((k + 1).min(block.source_spans.len()), span);
+            }
+            count += 1;
+        }
+    }
+    func.next_value_id = next_id;
+    // The casts the copies were reached through, now unread, would still
+    // count as uses of the local's address.
+    loop {
+        let mut used: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|v| { used.insert(v); });
+            }
+            block.terminator.for_each_used_value(|v| { used.insert(v); });
+        }
+        let mut removed = false;
+        for block in &mut func.blocks {
+            let keep: Vec<bool> = block.instructions.iter()
+                .map(|i| !i.dest().is_some_and(|d| bypassed.contains(&d.0) && !used.contains(&d.0)))
+                .collect();
+            if keep.iter().all(|&k| k) {
+                continue;
+            }
+            removed = true;
+            if block.source_spans.len() == keep.len() {
+                let mut it = keep.iter();
+                block.source_spans.retain(|_| *it.next().unwrap());
+            }
+            let mut it = keep.iter();
+            block.instructions.retain(|_| *it.next().unwrap());
+        }
+        if !removed {
+            break;
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +286,38 @@ mod tests {
         func.blocks = vec![BasicBlock { label: BlockId(0), instructions: vec![inst], terminator: Terminator::Return(None), source_spans: Vec::new() }];
         func.next_value_id = 10;
         func
+    }
+
+    #[test]
+    fn copies_of_a_whole_local_become_a_load_and_a_store() {
+        let alloca = |d: u32, ty: IrType| Instruction::Alloca { dest: Value(d), ty, size: 8, align: 0, volatile: false };
+        // memcpy(&value, p, 4) through a zero GEP and a constant cast, its
+        // result unused: the GEP and cast go too.
+        let mut f = func_with(alloca(1, IrType::U32));
+        f.blocks[0].instructions.extend([
+            Instruction::GetElementPtr { dest: Value(3), base: Value(1), offset: Operand::Const(IrConst::I64(0)), ty: IrType::Ptr },
+            Instruction::Cast { dest: Value(4), src: Operand::Const(IrConst::I32(4)), from_ty: IrType::I32, to_ty: IrType::U64 },
+            call("memcpy", vec![Operand::Value(Value(3)), Operand::Value(Value(2)), Operand::Value(Value(4))],
+                vec![IrType::Ptr, IrType::Ptr, IrType::U64]),
+        ]);
+        assert_eq!(scalarize_local_copies(&mut f), 1);
+        assert!(matches!(f.blocks[0].instructions[..], [
+            Instruction::Alloca { .. },
+            Instruction::Load { ptr: Value(2), ty: IrType::U32, .. },
+            Instruction::Store { ptr: Value(1), ty: IrType::U32, .. },
+        ]), "{:?}", f.blocks[0].instructions);
+        // A double keeps its type; a copy of part of a local, or between
+        // locals of different types, stays.
+        let mut f = func_with(alloca(1, IrType::F64));
+        f.blocks[0].instructions.push(Instruction::Memcpy { dest: Value(1), src: Value(2), size: 8 });
+        assert_eq!(scalarize_local_copies(&mut f), 1);
+        assert!(matches!(f.blocks[0].instructions[1], Instruction::Load { ty: IrType::F64, .. }));
+        let mut f = func_with(alloca(1, IrType::U64));
+        f.blocks[0].instructions.push(Instruction::Memcpy { dest: Value(1), src: Value(2), size: 4 });
+        assert_eq!(scalarize_local_copies(&mut f), 0);
+        let mut f = func_with(alloca(1, IrType::U32));
+        f.blocks[0].instructions.extend([alloca(2, IrType::F32), Instruction::Memcpy { dest: Value(1), src: Value(2), size: 4 }]);
+        assert_eq!(scalarize_local_copies(&mut f), 0);
     }
 
     #[test]

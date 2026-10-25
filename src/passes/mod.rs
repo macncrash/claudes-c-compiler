@@ -283,6 +283,19 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     }
 }
 
+/// Copies of exactly a scalar local's size into or out of it become a load
+/// and a store, so the first mem2reg promotes the local (`memcpy(&v, p, 4)`,
+/// an unaligned read). Only where unaligned accesses are fine.
+pub(crate) fn scalarize_local_copies(module: &mut IrModule, target: crate::backend::Target) {
+    if !matches!(target, crate::backend::Target::Aarch64 | crate::backend::Target::X86_64)
+        || std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("mem_inline")) {
+        return;
+    }
+    for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+        mem_inline::scalarize_local_copies(func);
+    }
+}
+
 /// Whether a register-sized alloca is read by a Copy or a phi (its address
 /// left over from an inlined call), which keeps mem2reg from promoting it.
 fn copied_scalar_alloca(func: &IrFunction) -> bool {

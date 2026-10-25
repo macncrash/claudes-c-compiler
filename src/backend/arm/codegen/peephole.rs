@@ -468,12 +468,16 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_dead_upper_extends(&lines, &mut kinds, n));
             changed2 |= pass!(fold_shift_into_operand(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_index_into_mem(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_scale_into_mem(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_offset_into_global_addr(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_cset_into_csel(&mut lines, &mut kinds, n));
             changed2 |= pass!(forward_copy_propagation(&mut lines, &mut kinds, n));
             changed2 |= pass!(retarget_results(&mut lines, &mut kinds, n));
             changed2 |= pass!(build_vec_args_in_place(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_and_into_tst(&mut lines, &mut kinds, n));
+            changed2 |= pass!(reuse_constants(&mut lines, &mut kinds, n));
+            changed2 |= pass!(zero_reg_into_select(&mut lines, &mut kinds, n));
+            changed2 |= pass!(drop_redundant_zero_extend(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
@@ -491,6 +495,7 @@ pub fn peephole_optimize(asm: String) -> String {
 
     // Phase 4: drop frame records that leaf functions no longer need.
     omit_leaf_frames(&lines, &mut kinds, n);
+    drop_leaf_frame_records(&mut lines, &mut kinds, n);
 
     for i in 0..n {
         if lines[i] == RET_NONE_MARKER || lines[i] == RET_X0_MARKER {
@@ -1632,6 +1637,157 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
     changed
 }
 
+/// `mov wA, wA` (a zero extension) right after a 32-bit write of wA, which
+/// has already cleared the upper half: `sub w13, w13, w10; mov w13, w13`.
+fn drop_redundant_zero_extend(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut prev: Option<usize> = None;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        if let Some(("mov", ops)) = split_insn(&lines[i]) {
+            let (a, b) = first_and_rest(ops);
+            let b = b.trim();
+            if a.starts_with('w') && a == b {
+                if let Some(p) = prev {
+                    let info = line_info(&lines[p], kinds[p], &|_| None);
+                    let wrote = split_insn(&lines[p]).is_some_and(|(m, o)| !m.starts_with("st") && first_and_rest(o).0 == a);
+                    if wrote && matches!(info.flow, Flow::Next) && gpr_operand(a).is_some_and(|r| info.defs & (1 << r) != 0)
+                        && !matches!(kinds[p], LineKind::Call | LineKind::Label) {
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        prev = (kinds[i] != LineKind::Label).then_some(i);
+    }
+    changed
+}
+
+/// `mov xR, #0` whose only read, R dying there, is an operand of a
+/// conditional select: the select reads the zero register instead
+/// (`csel x0, x13, xzr, hs`, as for `m >= w ? m - w : 0`).
+fn zero_reg_into_select(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some(("mov", ops)) = split_insn(&lines[i]) else { continue };
+        let (r, imm) = first_and_rest(ops);
+        if imm.trim() != "#0" {
+            continue;
+        }
+        let Some(rn) = gpr_operand(r) else { continue };
+        let mut j = i + 1;
+        let mut skipped = 0;
+        while j < n && skipped < 4 {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            if info.uses & (1 << rn) != 0 || !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call) {
+                break;
+            }
+            if info.defs & (1 << rn) != 0 {
+                j = n;
+                break;
+            }
+            skipped += 1;
+            j += 1;
+        }
+        if j >= n || skipped >= 4 {
+            continue;
+        }
+        let Some((m @ ("csel" | "csinc" | "csinv" | "csneg"), sops)) = split_insn(&lines[j]) else { continue };
+        let p: Vec<&str> = sops.split(',').map(str::trim).collect();
+        let [d, a, b, cond] = p[..] else { continue };
+        // The select's first two sources only, at the select's width.
+        let zero = if d.starts_with('w') { "wzr" } else { "xzr" };
+        let swap = |x: &str| if gpr_operand(x) == Some(rn) { zero.to_string() } else { x.to_string() };
+        if gpr_operand(d) == Some(rn) || gpr_operand(cond).is_some() || (gpr_operand(a) != Some(rn) && gpr_operand(b) != Some(rn))
+            || live[j] & (1 << rn) != 0 {
+            continue;
+        }
+        lines[j] = format!("    {} {}, {}, {}, {}", m, d, swap(a), swap(b), cond);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// A constant built again into the register that still holds it
+///   movz x0, #985; movk x0, #1, lsl #16; mul w1, w1, w0
+///   movz x0, #985; movk x0, #1, lsl #16; add w1, w1, w0
+/// in straight-line code with nothing writing the register in between: the
+/// second build goes (and `mul` then `add` of the same w0 fuse into madd).
+fn reuse_constants(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    // The lines building a constant at i: mov/movz/movn #imm, then movks of
+    // the same register. (register, last line index)
+    let group = |lines: &[String], kinds: &[LineKind], i: usize| -> Option<(u8, Vec<usize>)> {
+        let (m, ops) = split_insn(&lines[i])?;
+        let (reg, imm) = first_and_rest(ops);
+        if !matches!(m, "mov" | "movz" | "movn") || !imm.trim().starts_with('#') {
+            return None;
+        }
+        let r = gpr_operand(reg)?;
+        let mut idx = vec![i];
+        let mut k = i + 1;
+        while k < n {
+            if kinds[k] == LineKind::Nop {
+                k += 1;
+                continue;
+            }
+            match split_insn(&lines[k]) {
+                Some(("movk", o)) if first_and_rest(o).0 == reg => idx.push(k),
+                _ => break,
+            }
+            k += 1;
+        }
+        Some((r, idx))
+    };
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((r, first)) = group(lines, kinds, i) else { continue };
+        let text: Vec<String> = first.iter().map(|&k| lines[k].trim().to_string()).collect();
+        let mut j = *first.last().unwrap() + 1;
+        let mut seen = 0;
+        while j < n && seen < 32 {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            if let Some((r2, again)) = group(lines, kinds, j) {
+                if r2 == r && again.len() == text.len() && again.iter().zip(&text).all(|(&k, t)| lines[k].trim() == t) {
+                    for &k in &again {
+                        kinds[k] = LineKind::Nop;
+                    }
+                    changed = true;
+                    j = *again.last().unwrap() + 1;
+                    continue;
+                }
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            if !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call)
+                || info.defs & (1 << r) != 0 {
+                break;
+            }
+            seen += 1;
+            j += 1;
+        }
+    }
+    changed
+}
+
 /// `mul T, A, B` then `add D, C, T` (either order) or `sub D, C, T`, with T
 /// dead afterwards: `madd D, A, B, C` / `msub D, A, B, C`.
 fn fuse_mul_into_madd(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
@@ -1775,14 +1931,26 @@ fn fuse_shift_mask_into_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: us
 /// `sxtb|uxtb|sxth|uxth A, wB` immediately followed by a byte or halfword
 /// store of wA that the extension does not change (`strb` after a byte or
 /// halfword extension, `strh` after a halfword one), with A dead afterwards:
-/// the store takes wB and the extension goes.
+/// the store takes wB and the extension goes. A mask of the low byte or
+/// halfword (`and A, B, #0xffff`) counts as uxtb or uxth.
 fn fold_extend_into_narrow_store(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
     for i in 0..n {
-        let Some((ext @ ("sxtb" | "uxtb" | "sxth" | "uxth"), ops)) = split_insn(&lines[i]) else { continue };
-        let (a, b) = first_and_rest(ops);
-        let b = b.trim();
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((m, ops)) = split_insn(&lines[i]) else { continue };
+        let (a, rest) = first_and_rest(ops);
+        let (ext, b) = match m {
+            "sxtb" | "uxtb" | "sxth" | "uxth" => (m, rest.trim()),
+            "and" => match rest.split(',').map(str::trim).collect::<Vec<_>>()[..] {
+                [b, "#0xff" | "#255"] => ("uxtb", b),
+                [b, "#0xffff" | "#65535"] => ("uxth", b),
+                _ => continue,
+            },
+            _ => continue,
+        };
         let (Some(ar), Some(br)) = (gpr_operand(a), gpr_operand(b)) else { continue };
         let mut j = i + 1;
         while j < n && kinds[j] == LineKind::Nop {
@@ -2387,6 +2555,203 @@ fn omit_leaf_frame_in(lines: &[String], kinds: &mut [LineKind], start: usize, en
     }
 }
 
+// ── Leaf frame records ───────────────────────────────────────────────────────
+//
+// A leaf that keeps its frame for callee-saved registers (or stack slots) but
+// never reads fp or lr does not need the frame record in it:
+//   stp x29, x30, [sp, #-N]!          stp x20, x21, [sp, #-(N-16)]!
+//   mov x29, sp                       ...
+//   stp x20, x21, [sp, #16]     =>    (every [sp, #k] becomes [sp, #k-16])
+//   ...                               ldp x20, x21, [sp], #(N-16)
+//   ldp x20, x21, [sp, #16]           ret
+//   ldp x29, x30, [sp], #N
+//   ret
+// as clang emits. Two instructions fewer on each side when the first save
+// sits right above the record; otherwise the record's stp and ldp become a
+// sub and add of sp. The CFA is then sp + N - 16 with the return address in
+// x30, which no instruction changes.
+
+fn drop_leaf_frame_records(lines: &mut [String], kinds: &mut [LineKind], n: usize) {
+    let mut i = 0;
+    while i < n {
+        if !is_function_start(&lines[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        while end < n && !lines[end].trim().starts_with(".size ") && !is_function_start(&lines[end]) {
+            end += 1;
+        }
+        drop_leaf_frame_record_in(lines, kinds, start, end);
+        i = end;
+    }
+}
+
+/// The k of each `[sp, #k]` in a line (None if sp appears any other way
+/// than that or as `add xN, sp, #k`, given as the second element).
+fn sp_offsets(t: &str) -> Option<(Vec<i64>, Option<i64>)> {
+    let mentions = t.split(|c: char| !c.is_ascii_alphanumeric()).filter(|tok| *tok == "sp" || *tok == "wsp").count();
+    if mentions == 0 {
+        return Some((Vec::new(), None));
+    }
+    if let Some(rest) = t.strip_prefix("add ") {
+        let parts: Vec<&str> = rest.split(", ").collect();
+        if let [d, "sp", k] = parts[..] {
+            if d.starts_with('x') && mentions == 1 {
+                return Some((Vec::new(), Some(k.strip_prefix('#')?.parse().ok()?)));
+            }
+        }
+        return None;
+    }
+    let mut offs = Vec::new();
+    let mut rest = t;
+    while let Some(p) = rest.find("[sp, #") {
+        let after = &rest[p + 6..];
+        let close = after.find(']')?;
+        offs.push(after[..close].parse().ok()?);
+        rest = &after[close..];
+    }
+    // Pre- and post-indexed forms move sp: not ours to rewrite.
+    if offs.len() != mentions || t.contains("]!") || t.contains("], #") {
+        return None;
+    }
+    Some((offs, None))
+}
+
+fn drop_leaf_frame_record_in(lines: &mut [String], kinds: &mut [LineKind], start: usize, end: usize) {
+    let live = |k: usize, kinds: &[LineKind]| kinds[k] != LineKind::Nop;
+    // Prologue: stp x29, x30, [sp, #-N]!; CFI; mov x29, sp; .cfi_def_cfa_register x29.
+    let mut k = start;
+    while k < end && (!live(k, kinds) || kinds[k] == LineKind::Label || lines[k].trim() == ".cfi_startproc" || lines[k].trim().starts_with(".loc ")) {
+        k += 1;
+    }
+    if k >= end {
+        return;
+    }
+    let Some(size) = lines[k].trim().strip_prefix("stp x29, x30, [sp, #-").and_then(|r| r.strip_suffix("]!")).and_then(|s| s.parse::<i64>().ok()) else { return };
+    if size < 32 || size % 16 != 0 {
+        return;
+    }
+    let record = k;
+    let cfi = [format!(".cfi_def_cfa_offset {size}"), format!(".cfi_offset x29, -{size}"),
+               format!(".cfi_offset x30, -{}", size - 8), ".cfi_def_cfa_register x29".to_string()];
+    let mut prologue = vec![record];
+    k += 1;
+    let mut saw_mov = false;
+    while k < end {
+        let t = lines[k].trim();
+        if !live(k, kinds) {
+            k += 1;
+            continue;
+        }
+        if cfi.iter().any(|c| c == t) {
+            prologue.push(k);
+        } else if t == "mov x29, sp" && !saw_mov {
+            saw_mov = true;
+            prologue.push(k);
+        } else {
+            break;
+        }
+        k += 1;
+    }
+    if !saw_mov {
+        return;
+    }
+    let body_start = k;
+    let epilogue = format!("ldp x29, x30, [sp], #{size}");
+    let mut epilogues = Vec::new();
+    let mut rewrites: Vec<(usize, String)> = Vec::new();
+    for j in body_start..end {
+        if !live(j, kinds) {
+            continue;
+        }
+        let t = lines[j].trim();
+        if t == epilogue {
+            epilogues.push(j);
+            continue;
+        }
+        if kinds[j] == LineKind::Call || (t.starts_with(".cfi_") && t != ".cfi_endproc") {
+            return;
+        }
+        if t.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| matches!(tok, "x29" | "w29" | "x30" | "w30" | "fp" | "lr")) {
+            return;
+        }
+        let Some((offs, add)) = sp_offsets(t) else { return };
+        if offs.iter().any(|&o| o < 16) || add.is_some_and(|o| o < 16) {
+            return;
+        }
+        if let Some(o) = add {
+            let d = t.strip_prefix("add ").unwrap().split(", ").next().unwrap();
+            rewrites.push((j, format!("    add {d}, sp, #{}", o - 16)));
+        } else if !offs.is_empty() {
+            let mut s = t.to_string();
+            for o in offs {
+                s = s.replacen(&format!("[sp, #{o}]"), &format!("[sp, #\u{1}{}]", o - 16), 1);
+            }
+            rewrites.push((j, format!("    {}", s.replace('\u{1}', ""))));
+        }
+    }
+    if epilogues.is_empty() {
+        return;
+    }
+    let m = size - 16;
+    // The first save, right after the record, merges with the sp update when
+    // each epilogue restores it just before the record's ldp, nothing between
+    // but other restores.
+    let Some(save_at) = (body_start..end).find(|&j| live(j, kinds) && !lines[j].trim().starts_with('.')) else { return };
+    let first_save = lines[save_at].trim().to_string();
+    let saved = ["stp ", "str "].iter().find_map(|mn| {
+        let regs = first_save.strip_prefix(mn)?.strip_suffix(", [sp, #16]")?;
+        (!regs.contains("sp")).then(|| (mn.trim().to_string(), regs.to_string()))
+    });
+    let restores: Option<Vec<usize>> = saved.as_ref().and_then(|(mn, regs)| {
+        let restore = format!("{} {regs}, [sp, #16]", if mn == "stp" { "ldp" } else { "ldr" });
+        epilogues.iter().map(|&e| {
+            let mut j = e;
+            while j > body_start {
+                j -= 1;
+                if !live(j, kinds) {
+                    continue;
+                }
+                let t = lines[j].trim();
+                if t == restore {
+                    return Some(j);
+                }
+                if !(t.starts_with("ldp x") || t.starts_with("ldr x") || t.starts_with("ldp d") || t.starts_with("ldr d")) || !t.contains("[sp, #") {
+                    return None;
+                }
+            }
+            None
+        }).collect()
+    });
+
+    for (j, s) in rewrites {
+        lines[j] = s;
+    }
+    for &p in &prologue {
+        kinds[p] = LineKind::Nop;
+    }
+    match (saved, restores) {
+        (Some((mn, regs)), Some(restores)) => {
+            lines[save_at] = format!("    {mn} {regs}, [sp, #-{m}]!\n    .cfi_def_cfa_offset {m}");
+            kinds[save_at] = LineKind::Other;
+            let ld = if mn == "stp" { "ldp" } else { "ldr" };
+            for (&e, &r) in epilogues.iter().zip(&restores) {
+                kinds[r] = LineKind::Nop;
+                lines[e] = format!("    {ld} {regs}, [sp], #{m}");
+            }
+        }
+        _ => {
+            lines[record] = format!("    sub sp, sp, #{m}\n    .cfi_def_cfa_offset {m}");
+            kinds[record] = LineKind::Other;
+            for &e in &epilogues {
+                lines[e] = format!("    add sp, sp, #{m}");
+            }
+        }
+    }
+}
+
 // ── Condition reuse for selects ──────────────────────────────────────────────
 //
 // A select on a compare result is emitted as
@@ -2762,6 +3127,9 @@ fn fold_index_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
     for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
         let Some(("add", ops)) = split_insn(&lines[i]) else { continue };
         let p: Vec<&str> = ops.split(',').map(str::trim).collect();
         let shift = match p.len() {
@@ -2833,6 +3201,91 @@ fn fold_index_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
             format!("[{}, {}, lsl #{}]", p[1], p[2], shift)
         };
         lines[j] = format!("    {} {}, {}", m, reg, mem);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `add xI, xJ, xJ` (or `lsl xI, xJ, #k`) followed by an access through
+/// `[xB, xI]` (I dead afterwards, 2^k the access size) becomes
+/// `[xB, xJ, lsl #k]`: a hash chain's `prev[m & mask]`, whose doubled index
+/// was computed into a register of its own.
+fn fold_scale_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((mn, ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let shift = match (mn, p.len()) {
+            ("add", 3) if p[1] == p[2] => 1,
+            ("lsl", 3) => match p[2].strip_prefix('#').and_then(|k| k.parse::<u32>().ok()) {
+                Some(k @ 1..=4) => k,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        // (In place, `add x1, x1, x1`, the access reads the undoubled
+        // register once the add is gone.)
+        if !p[..2].iter().all(|r| r.starts_with('x') && gpr_operand(r).is_some()) {
+            continue;
+        }
+        let (a, src) = (gpr_operand(p[0]).unwrap(), gpr_operand(p[1]).unwrap());
+        let written = (1 << a) | (1 << src);
+        let mut j = i + 1;
+        let mut skipped = 0;
+        let suffix = format!(", {}]", p[0]);
+        while j < n {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            if split_insn(&lines[j]).is_some_and(|(_, o)| first_and_rest(o).1.trim().ends_with(&suffix)) {
+                break;
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            if skipped == 6 || !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call)
+                || info.uses & (1 << a) != 0 || info.defs & written != 0 {
+                j = n;
+                break;
+            }
+            skipped += 1;
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((m, mops)) = split_insn(&lines[j]) else { continue };
+        let (reg, addr) = first_and_rest(mops);
+        let addr = addr.trim();
+        let Some(base) = addr.strip_prefix('[').and_then(|r| r.strip_suffix(&suffix)) else { continue };
+        if !base.starts_with('x') || base == p[0] || gpr_operand(base).is_none() {
+            continue;
+        }
+        let is_load = m.starts_with("ld");
+        let size = match (m, reg.chars().next()) {
+            ("ldrh" | "ldrsh" | "strh", _) => 2,
+            ("ldrsw", _) => 4,
+            ("ldr" | "str", Some('x' | 'd')) => 8,
+            ("ldr" | "str", Some('w' | 's')) => 4,
+            ("ldr" | "str", Some('q')) => 16,
+            _ => continue,
+        };
+        if 1u32 << shift != size {
+            continue;
+        }
+        let value_reg = gpr_operand(reg);
+        if !is_load && value_reg == Some(a) {
+            continue;
+        }
+        if !(is_load && value_reg == Some(a)) && live[j] & (1 << a) != 0 {
+            continue;
+        }
+        lines[j] = format!("    {} {}, [{}, {}, lsl #{}]", m, reg, base, p[1], shift);
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
         changed = true;
@@ -3538,6 +3991,71 @@ mod tests {
         assert!(!result.contains("x29") && !result.contains("cfa"), "{}", result);
         let result = peephole_optimize(format!("{}    add x0, x0, x1\n{}", big, tail));
         assert!(result.contains("stp x29, x30"), "{}", result);
+    }
+
+    /// A leaf function around the given lines.
+    fn frame(body: &str) -> String {
+        format!(".globl f\n.type f, %function\nf:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n.size f, .-f\n")
+    }
+
+    #[test]
+    fn test_scaled_index_folds_once() {
+        // The doubled index folds into the load; the store after it has its
+        // own index, which must not pick up the deleted add.
+        let asm = frame("    add x11, x0, x0\n    ldrh w21, [x13, x11]\n    add x12, x12, x9\n    strh w21, [x12]\n");
+        let result = peephole_optimize(asm);
+        assert!(result.contains("ldrh w21, [x13, x0, lsl #1]"), "{}", result);
+        assert!(!result.contains("[x12, x0, lsl #1]") && !result.contains("add x11"), "{}", result);
+        // In place, and not when the size does not match the shift.
+        let result = peephole_optimize(frame("    add x10, x10, x10\n    ldrh w1, [x2, x10]\n    mov x0, x1\n"));
+        assert!(result.contains("ldrh w1, [x2, x10, lsl #1]") && !result.contains("add x10"), "{}", result);
+        let result = peephole_optimize(frame("    add x10, x3, x3\n    ldr w1, [x2, x10]\n    mov x0, x1\n"));
+        assert!(result.contains("add x10, x3, x3"), "{}", result);
+    }
+
+    #[test]
+    fn test_constant_built_once() {
+        let asm = frame("    movz x0, #985\n    movk x0, #1, lsl #16\n    mul w10, w10, w0\n    movz x0, #985\n    movk x0, #1, lsl #16\n    add w10, w10, w0\n    mov x0, x10\n");
+        let result = peephole_optimize(asm);
+        assert_eq!(result.matches("movz x0, #985").count(), 1, "{}", result);
+        assert!(result.contains("madd") && result.contains("w0, w0"), "{}", result);
+        // Not when the register changed in between.
+        let asm = frame("    movz x0, #985\n    movk x0, #1, lsl #16\n    add x0, x0, x1\n    str x0, [x3]\n    movz x0, #985\n    movk x0, #1, lsl #16\n    add x0, x0, x2\n");
+        assert_eq!(peephole_optimize(asm).matches("movz x0, #985").count(), 2);
+    }
+
+    #[test]
+    fn test_zero_into_select_and_extensions_dropped() {
+        let asm = frame("    cmp w13, w10\n    sub w13, w13, w10\n    mov w13, w13\n    mov x9, #0\n    csel x5, x13, x9, hs\n    and x5, x5, #0xffff\n    strh w5, [x11]\n");
+        let result = peephole_optimize(asm);
+        assert!(result.contains("csel x5, x13, xzr, hs"), "{}", result);
+        assert!(!result.contains("mov w13, w13") && !result.contains("#0xffff") && !result.contains("mov x9"), "{}", result);
+        // A zero extension of a value not just written in 32 bits stays.
+        let result = peephole_optimize(frame("    add x13, x13, x10\n    mov w13, w13\n    mov x0, x13\n"));
+        assert!(result.contains("mov w") || result.contains("uxtw"), "{}", result);
+    }
+
+    #[test]
+    fn test_leaf_frame_record_dropped() {
+        let frame = ".type f, %function\nf:\n.cfi_startproc\n    stp x29, x30, [sp, #-48]!\n    .cfi_def_cfa_offset 48\n    .cfi_offset x29, -48\n    .cfi_offset x30, -40\n    mov x29, sp\n    .cfi_def_cfa_register x29\n";
+        let body = "    add x1, sp, #32\n    ldr x20, [x1]\n    add x0, x20, x21\n";
+        let tail = "    ldp x29, x30, [sp], #48\n    ret\n.cfi_endproc\n.size f, .-f\n";
+        // Saves right above the record: the first save takes the sp update.
+        let saves = "    stp x20, x21, [sp, #16]\n";
+        let restores = "    ldp x20, x21, [sp, #16]\n";
+        let result = peephole_optimize(format!("{frame}{saves}{body}{restores}{tail}"));
+        assert!(!result.contains("x29") && !result.contains("x30"), "{}", result);
+        assert!(result.contains("stp x20, x21, [sp, #-32]!") && result.contains("ldp x20, x21, [sp], #32"), "{}", result);
+        assert!(result.contains("add x1, sp, #16") && result.contains(".cfi_def_cfa_offset 32"), "{}", result);
+        // No save there: the record's stp and ldp become sp updates.
+        let result = peephole_optimize(format!("{frame}{body}{tail}"));
+        assert!(result.contains("sub sp, sp, #32") && result.contains("add sp, sp, #32"), "{}", result);
+        assert!(!result.contains("x29"), "{}", result);
+        // A call, or a read of the record, keeps it.
+        for extra in ["    bl g\n", "    ldr x0, [sp, #8]\n", "    mov x0, x29\n"] {
+            let result = peephole_optimize(format!("{frame}{saves}{body}{extra}{restores}{tail}"));
+            assert!(result.contains("stp x29, x30") && result.contains("ldp x29, x30"), "{}", result);
+        }
     }
 
     #[test]
