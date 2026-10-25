@@ -169,13 +169,21 @@ impl Lowerer {
             let lhs_val = self.lower_expr(lhs);
             let rhs_val = self.lower_expr(rhs);
             let diff = self.emit_binop_val(IrBinOp::Sub, lhs_val, rhs_val, ptr_int_ty);
-            if elem_size > 1 {
-                let scale = Operand::Const(IrConst::ptr_int(elem_size as i64));
-                let dest = self.emit_binop_val(IrBinOp::SDiv, Operand::Value(diff), scale, ptr_int_ty);
-                Some(Operand::Value(dest))
-            } else {
-                Some(Operand::Value(diff))
+            // Both pointers point into one array, so the byte difference is a
+            // multiple of the element size 2^k * m: shift out 2^k, then
+            // multiply by the inverse of the odd m modulo 2^64 (as clang and
+            // GCC do), instead of a general signed division.
+            let (shift, odd) = (elem_size.trailing_zeros(), elem_size >> elem_size.trailing_zeros());
+            let mut result = Operand::Value(diff);
+            if shift > 0 {
+                let k = Operand::Const(IrConst::ptr_int(shift as i64));
+                result = Operand::Value(self.emit_binop_val(IrBinOp::AShr, result, k, ptr_int_ty));
             }
+            if odd > 1 {
+                let inverse = Operand::Const(IrConst::ptr_int(odd_inverse(odd as u64) as i64));
+                result = Operand::Value(self.emit_binop_val(IrBinOp::Mul, result, inverse, ptr_int_ty));
+            }
+            Some(result)
         } else {
             None
         }
@@ -909,5 +917,30 @@ impl Lowerer {
             let one = if wt == IrType::I32 { IrConst::I32(1) } else { IrConst::I64(1) };
             (Operand::Const(one), wt)
         }
+    }
+}
+
+/// The inverse of an odd number modulo 2^64 (its low 32 bits are the
+/// inverse modulo 2^32). Newton's iteration doubles the correct low bits
+/// each step, from 3 correct bits for x = m.
+fn odd_inverse(m: u64) -> u64 {
+    let mut x = m;
+    for _ in 0..5 {
+        x = x.wrapping_mul(2u64.wrapping_sub(m.wrapping_mul(x)));
+    }
+    x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::odd_inverse;
+
+    #[test]
+    fn test_odd_inverse() {
+        for m in [1u64, 3, 5, 7, 9, 13, 25, 0xffff_ffff_ffff_ffff, 0x1234_5679] {
+            assert_eq!(m.wrapping_mul(odd_inverse(m)), 1, "{m}");
+            assert_eq!((m as u32).wrapping_mul(odd_inverse(m) as u32), 1, "{m}");
+        }
+        assert_eq!(odd_inverse(3), 0xaaaa_aaaa_aaaa_aaab);
     }
 }

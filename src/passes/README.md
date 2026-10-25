@@ -953,6 +953,13 @@ fixpoint within each invocation, since converting one diamond may expose
 another. Overlapping diamonds within a single iteration are detected and skipped
 to avoid conflicts.
 
+Arms that each end by loading the merged value (`n = k < n->key ? n->left :
+n->right`), and converting it the same way if at all (`c ? p->s : q->s` of a
+`short` field), are first rewritten to merge the two addresses and load once
+in the merge block. One load still runs on either path, and the arms, now
+load-free, convert: the field address is selected (`csel`) and loaded, with
+no branch to mispredict on random keys.
+
 One shape is left as branches: a step of an `a && b` or `a || b` test, whose
 merge block holds only the boolean phi (with a constant from the
 short-circuiting edge) and branches on it. cfg_simplify threads the constant's

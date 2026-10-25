@@ -47,7 +47,7 @@ use crate::ir::reexports::{
     Value,
 };
 use crate::ir::analysis;
-use crate::common::types::IrType;
+use crate::common::types::{AddressSpace, IrType};
 use crate::common::fx_hash::FxHashMap;
 
 /// Run if-conversion on a single function.
@@ -61,7 +61,7 @@ pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
     // in is_short_circuit_test; clear them first.
     super::dce::eliminate_dead_code(func);
 
-    let mut total = 0;
+    let mut total = sink_arm_loads(func);
 
     // Iterate to a fixpoint since converting one diamond may expose another.
     loop {
@@ -160,6 +160,139 @@ struct DiamondInfo {
     /// Phi nodes in the merge block that can be converted to Select.
     /// Each entry is (phi_dest, phi_ty, true_val, false_val).
     phi_selects: Vec<(Value, IrType, Operand, Operand)>,
+}
+
+/// `c ? *p : *q` where each arm ends by loading the value the merge takes
+/// (and converting it the same way on both sides, as `c ? p->s : q->s` of a
+/// short field does):
+///
+///   T: ...; %a = load %p; br M           T: ...; br M
+///   F: ...; %b = load %q; br M      =>   F: ...; br M
+///   M: %r = phi [%a, T], [%b, F]         M: %pq = phi [%p, T], [%q, F]
+///                                           %r = load %pq
+///
+/// One load still runs on either path, now from the merged address, so arms
+/// that are otherwise side-effect-free can be if-converted: `n = key < n->key
+/// ? n->left : n->right` selects the field address and loads once, with no
+/// branch to mispredict on random keys.
+fn sink_arm_loads(func: &mut IrFunction) -> usize {
+    /// An arm's load: where it is, its address and type, and the value the
+    /// arm hands the merge (the load, or the last cast or copy of it).
+    struct ArmLoad {
+        at: usize,
+        ptr: Value,
+        ty: IrType,
+        out: Value,
+        merge: usize,
+    }
+    let label_to_idx = analysis::build_label_map(func);
+    let (preds, _) = analysis::build_cfg(func, &label_to_idx);
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
+        }
+        block.terminator.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
+    }
+    let single_use = |v: Value| use_count.get(&v.0) == Some(&1);
+    let arm_load = |idx: usize, pred: usize| -> Option<ArmLoad> {
+        let block = &func.blocks[idx];
+        if preds.len(idx) != 1 || preds.row(idx)[0] as usize != pred {
+            return None;
+        }
+        let Terminator::Branch(m) = block.terminator else { return None };
+        let at = block.instructions.iter().rposition(|i| matches!(i, Instruction::Load { .. }))?;
+        let Instruction::Load { dest, ptr, ty, seg_override: AddressSpace::Default, volatile: false } = block.instructions[at] else { return None };
+        // After the load, only casts and copies, each of the one before.
+        let mut out = dest;
+        for inst in &block.instructions[at + 1..] {
+            match *inst {
+                Instruction::Cast { dest, src: Operand::Value(s), .. } | Instruction::Copy { dest, src: Operand::Value(s) }
+                    if s == out && single_use(out) => out = dest,
+                _ => return None,
+            }
+        }
+        let rest = &block.instructions[..at];
+        let rest_ok = rest.len() < 8 && is_side_effect_free(&BasicBlock {
+            label: block.label, instructions: rest.to_vec(), terminator: Terminator::Unreachable, source_spans: Vec::new(),
+        });
+        (rest_ok && single_use(out)).then_some(ArmLoad { at, ptr, ty, out, merge: *label_to_idx.get(&m)? })
+    };
+    // Both arms convert their loads the same way.
+    let same_tail = |t: &ArmLoad, ti: usize, f: &ArmLoad, fi: usize| {
+        let (a, b) = (&func.blocks[ti].instructions[t.at + 1..], &func.blocks[fi].instructions[f.at + 1..]);
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| match (x, y) {
+            (Instruction::Cast { from_ty: f1, to_ty: t1, .. }, Instruction::Cast { from_ty: f2, to_ty: t2, .. }) => f1 == f2 && t1 == t2,
+            (Instruction::Copy { .. }, Instruction::Copy { .. }) => true,
+            _ => false,
+        })
+    };
+
+    // (merge index, phi index, T index, F index, T load, F load)
+    let mut found = Vec::new();
+    for p in 0..func.blocks.len() {
+        let Terminator::CondBranch { true_label, false_label, .. } = func.blocks[p].terminator else { continue };
+        let (Some(&t), Some(&f)) = (label_to_idx.get(&true_label), label_to_idx.get(&false_label)) else { continue };
+        if t == f {
+            continue;
+        }
+        let (Some(tl), Some(fl)) = (arm_load(t, p), arm_load(f, p)) else { continue };
+        let m = tl.merge;
+        if m != fl.merge || tl.ty != fl.ty || [p, t, f].contains(&m) || preds.len(m) != 2
+            || tl.ty.is_long_double() || tl.ty.is_128bit() || !same_tail(&tl, t, &fl, f) {
+            continue;
+        }
+        let (tlabel, flabel) = (func.blocks[t].label, func.blocks[f].label);
+        let phi = func.blocks[m].instructions.iter().position(|i| matches!(i, Instruction::Phi { incoming, .. }
+            if incoming.len() == 2 && incoming.iter().all(|(op, l)| matches!(op, Operand::Value(v)
+                if (*l == tlabel && *v == tl.out) || (*l == flabel && *v == fl.out)))));
+        if let Some(phi) = phi {
+            found.push((m, phi, t, f, tl, fl));
+        }
+    }
+
+    let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
+    let mut fresh = || {
+        next_id += 1;
+        Value(next_id - 1)
+    };
+    for (m, phi, t, f, tl, fl) in &found {
+        // The load and the conversions after it leave both arms; T's are
+        // rebuilt in the merge block, reading the merged address.
+        let tail: Vec<Instruction> = func.blocks[*t].instructions.drain(tl.at..).collect();
+        func.blocks[*f].instructions.truncate(fl.at);
+        for (idx, at) in [(*t, tl.at), (*f, fl.at)] {
+            func.blocks[idx].source_spans.truncate(at);
+        }
+        let (tlabel, flabel) = (func.blocks[*t].label, func.blocks[*f].label);
+        let Instruction::Phi { dest: r, .. } = func.blocks[*m].instructions[*phi] else { unreachable!() };
+        let pq = fresh();
+        let n = tail.len();
+        let mut moved = Vec::with_capacity(n);
+        let mut prev = pq;
+        for (k, inst) in tail.into_iter().enumerate() {
+            let dest = if k == n - 1 { r } else { fresh() };
+            moved.push(match inst {
+                Instruction::Load { ty, .. } => Instruction::Load { dest, ptr: prev, ty, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Cast { from_ty, to_ty, .. } => Instruction::Cast { dest, src: Operand::Value(prev), from_ty, to_ty },
+                Instruction::Copy { .. } => Instruction::Copy { dest, src: Operand::Value(prev) },
+                _ => unreachable!(),
+            });
+            prev = dest;
+        }
+        let block = &mut func.blocks[*m];
+        block.instructions[*phi] = Instruction::Phi {
+            dest: pq, ty: IrType::Ptr, incoming: vec![(Operand::Value(tl.ptr), tlabel), (Operand::Value(fl.ptr), flabel)],
+        };
+        let at = block.instructions.iter().position(|i| !matches!(i, Instruction::Phi { .. })).unwrap_or(block.instructions.len());
+        if !block.source_spans.is_empty() {
+            let span = block.source_spans[*phi];
+            block.source_spans.splice(at..at, std::iter::repeat_n(span, moved.len()));
+        }
+        block.instructions.splice(at..at, moved);
+    }
+    func.next_value_id = next_id;
+    found.len()
 }
 
 /// Whether the diamond is one step of an `a && b` or `a || b` test: its merge
@@ -693,7 +826,6 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::AddressSpace;
     use crate::ir::reexports::{IrBinOp, IrConst};
 
     #[test]
@@ -939,5 +1071,43 @@ mod tests {
         let mut func = and_test(true);
         assert_eq!(if_convert_function(&mut func), 1);
         assert!(matches!(func.blocks[0].instructions[..], [.., Instruction::Select { .. }]));
+    }
+
+    /// `%0 ? *(%5 + 8) : *(%5 + 16)`, each arm widening its I16 load to I32
+    /// (with `widen_false` as the false arm's target type).
+    fn field_ternary(widen_false: IrType) -> IrFunction {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let arm = |gep, load, cast, off, to| vec![
+            Instruction::GetElementPtr { dest: Value(gep), base: Value(5), offset: Operand::Const(IrConst::I64(off)), ty: IrType::Ptr },
+            Instruction::Load { dest: Value(load), ptr: Value(gep), ty: IrType::I16, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Cast { dest: Value(cast), src: Operand::Value(Value(load)), from_ty: IrType::I16, to_ty: to },
+        ];
+        func.blocks = vec![
+            block(0, vec![], Terminator::CondBranch { cond: Operand::Value(Value(0)), true_label: BlockId(1), false_label: BlockId(2) }),
+            block(1, arm(10, 11, 12, 8, IrType::I32), Terminator::Branch(BlockId(3))),
+            block(2, arm(20, 21, 22, 16, widen_false), Terminator::Branch(BlockId(3))),
+            block(3, vec![Instruction::Phi {
+                dest: Value(30), ty: IrType::I32,
+                incoming: vec![(Operand::Value(Value(12)), BlockId(1)), (Operand::Value(Value(22)), BlockId(2))],
+            }], Terminator::Return(Some(Operand::Value(Value(30))))),
+        ];
+        func.next_value_id = 31;
+        func
+    }
+
+    #[test]
+    fn test_arm_loads_become_one_load_of_selected_address() {
+        let mut func = field_ternary(IrType::I32);
+        assert_eq!(if_convert_function(&mut func), 2);
+        // Block 0 selects between the field addresses; the merge loads and widens once.
+        assert!(matches!(func.blocks[0].instructions[..], [.., Instruction::Select { ty: IrType::Ptr, .. }]));
+        assert!(matches!(func.blocks[3].instructions[..], [
+            Instruction::Load { ty: IrType::I16, .. },
+            Instruction::Cast { dest: Value(30), from_ty: IrType::I16, to_ty: IrType::I32, .. },
+        ]));
+        // Arms that convert their loads differently keep their branch.
+        let mut func = field_ternary(IrType::U32);
+        assert_eq!(if_convert_function(&mut func), 0);
     }
 }
