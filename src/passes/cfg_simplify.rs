@@ -222,6 +222,12 @@ fn for_each_terminator_target(term: &Terminator, mut f: impl FnMut(BlockId)) {
 /// (adding P1 to T's phis with B's incoming values). This is what `a || b ||
 /// c` and `a && b && c` lower to: each operand's result is merged into a
 /// boolean phi that the next test branches on again.
+///
+/// B may merge other values too (`*++p == *++q && ...` merges the pointers
+/// with the flag) when each of their uses is either S's phi entry from B
+/// (P's entry then takes the value B's phi has for P) or in the region of
+/// B's other successor O, which B alone enters: bypassing B only removes
+/// paths through B, so B still dominates those uses.
 fn thread_phi_cond_branches(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
     // Uses of each value outside block terminators that branch on it.
     let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
@@ -232,19 +238,61 @@ fn thread_phi_cond_branches(func: &mut IrFunction, label_to_idx: &FxHashMap<Bloc
         block.terminator.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
     }
 
-    // (pred index, B label, S label)
-    let mut actions: Vec<(usize, BlockId, BlockId)> = Vec::new();
+    // The other phis of candidate blocks, and where each is used: (block
+    // index, the incoming label for a use in a phi).
+    let mut extra_uses: FxHashMap<u32, Vec<(usize, Option<BlockId>)>> = FxHashMap::default();
+    for block in &func.blocks {
+        let Terminator::CondBranch { cond: Operand::Value(c), .. } = &block.terminator else { continue };
+        if block.instructions.len() > 1 && block.instructions.iter().all(|i| matches!(i, Instruction::Phi { .. })) {
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest().filter(|d| d != c) {
+                    extra_uses.insert(d.0, Vec::new());
+                }
+            }
+        }
+    }
+    let mut cfg: Option<(crate::ir::analysis::CfgAnalysis, FxHashMap<BlockId, u32>)> = None;
+    if !extra_uses.is_empty() {
+        for (ui, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (op, l) in incoming {
+                        if let Operand::Value(v) = op {
+                            if let Some(u) = extra_uses.get_mut(&v.0) {
+                                u.push((ui, Some(*l)));
+                            }
+                        }
+                    }
+                } else {
+                    inst.for_each_used_value(|v| if let Some(u) = extra_uses.get_mut(&v) { u.push((ui, None)); });
+                }
+            }
+            block.terminator.for_each_used_value(|v| if let Some(u) = extra_uses.get_mut(&v) { u.push((ui, None)); });
+        }
+    }
+    // Blocks whose region holds uses of a bypassed B's phis (they must keep
+    // B as their only predecessor), and this round's targets.
+    let mut anchors: FxHashSet<BlockId> = FxHashSet::default();
+    let mut targets: FxHashSet<BlockId> = FxHashSet::default();
+
+    // (pred index, B label, S label, B's phis that get a phi at S)
+    let mut actions: Vec<(usize, BlockId, BlockId, Vec<u32>)> = Vec::new();
     let mut touched: FxHashSet<BlockId> = FxHashSet::default();
+    let mut phi_inserted = false;
     for block in &func.blocks {
         let b = block.label;
-        let [Instruction::Phi { dest: p, incoming, .. }] = block.instructions.as_slice() else { continue };
+        if block.instructions.is_empty() || !block.instructions.iter().all(|i| matches!(i, Instruction::Phi { .. })) {
+            continue;
+        }
         let Terminator::CondBranch { cond: Operand::Value(c), true_label, false_label } = &block.terminator else { continue };
-        if c.0 != p.0 || *true_label == b || *false_label == b || true_label == false_label {
+        let Some(Instruction::Phi { dest: p, incoming, .. }) = block.instructions.iter().find(|i| i.dest() == Some(*c)) else { continue };
+        if *true_label == b || *false_label == b || true_label == false_label {
             continue;
         }
         if use_count.get(&p.0).copied().unwrap_or(0) != 1 {
             continue;
         }
+        let extras: Vec<u32> = block.instructions.iter().filter_map(|i| i.dest()).filter(|d| d != p).map(|d| d.0).collect();
         for (op, pred) in incoming {
             let Operand::Const(k) = op else { continue };
             let Some(v) = k.to_i64() else { continue };
@@ -276,30 +324,182 @@ fn thread_phi_cond_branches(func: &mut IrFunction, label_to_idx: &FxHashMap<Bloc
                 Instruction::Phi { incoming, .. } => incoming.iter().filter(|(_, l)| *l == b).count() == 1,
                 _ => true,
             });
-            if !phis_ok {
+            if !phis_ok || anchors.contains(&target) {
                 continue;
             }
+            if !extras.is_empty() {
+                let other = if target == *true_label { *false_label } else { *true_label };
+                if touched.contains(&b) || targets.contains(&other) {
+                    continue;
+                }
+                let (cfg, pred_count) = cfg.get_or_insert_with(|| {
+                    (crate::ir::analysis::CfgAnalysis::build(func), build_pred_info(func).0)
+                });
+                let Some(&oi) = label_to_idx.get(&other) else { continue };
+                let bi = label_to_idx[&b];
+                let dominated_by = |x: usize, mut u: usize| loop {
+                    if u == x {
+                        return true;
+                    }
+                    let up = cfg.idom[u];
+                    if up == u || up == usize::MAX {
+                        return false;
+                    }
+                    u = up;
+                };
+                let block_of = |l: &BlockId| label_to_idx.get(l).copied();
+                // Uses past O need O entered from B alone (a loop's merged
+                // counter read only by the header's phi entry from B does not).
+                let only_from_b = pred_count.get(&other) == Some(&1);
+                let mut in_region = false;
+                let mut needs_phi: Vec<u32> = Vec::new();
+                let ok = extras.iter().all(|v| {
+                    let one_entry = block.instructions.iter().any(|i| matches!(i, Instruction::Phi { dest, incoming, .. }
+                        if dest.0 == *v && incoming.iter().filter(|(_, l)| l == pred).count() == 1));
+                    one_entry && extra_uses[v].iter().all(|&(ui, l)| {
+                        let at = match l {
+                            Some(l) if l == b => return ui == si || ui == oi,
+                            Some(l) => match block_of(&l) { Some(w) => w, None => return false },
+                            None => ui,
+                        };
+                        if only_from_b && dominated_by(oi, at) {
+                            in_region = true;
+                            true
+                        } else if dominated_by(si, at) {
+                            if !needs_phi.contains(v) {
+                                needs_phi.push(*v);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                });
+                if !ok {
+                    continue;
+                }
+                // Uses past S (`len = end - scan` after a match loop that
+                // several tests leave) read a new phi at S. Every other
+                // predecessor of S must see B's value, and S takes no other
+                // new predecessor this round.
+                if !needs_phi.is_empty() {
+                    let preds_ok = cfg.preds.row(si).iter().all(|&p| {
+                        let p = p as usize;
+                        p == bi || dominated_by(si, p) || dominated_by(bi, p)
+                    });
+                    if !preds_ok || dominated_by(si, bi) || targets.contains(&target) || phi_inserted {
+                        continue;
+                    }
+                    phi_inserted = true;
+                    anchors.insert(target);
+                }
+                if in_region {
+                    anchors.insert(other);
+                }
+                touched.insert(b);
+                if !needs_phi.is_empty() {
+                    touched.insert(*pred);
+                    targets.insert(target);
+                    actions.push((pi, b, target, needs_phi));
+                    continue;
+                }
+            }
             touched.insert(*pred);
-            actions.push((pi, b, target));
+            targets.insert(target);
+            actions.push((pi, b, target, Vec::new()));
         }
     }
 
-    for &(pi, b, s) in &actions {
+    let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
+    for (pi, b, s, needs_phi) in &actions {
+        let (pi, b, s) = (*pi, *b, *s);
         let pred_label = func.blocks[pi].label;
         let remap: FxHashMap<BlockId, BlockId> = [(b, s)].into_iter().collect();
         remap_terminator_targets(&mut func.blocks[pi].terminator, &remap);
         let bi = label_to_idx[&b];
+        // The values B's phis have on the edge from the predecessor.
+        let via_pred: FxHashMap<u32, Operand> = func.blocks[bi].instructions.iter().filter_map(|i| match i {
+            Instruction::Phi { dest, incoming, .. } => incoming.iter().find(|(_, l)| *l == pred_label).map(|(op, _)| (dest.0, *op)),
+            _ => None,
+        }).collect();
         remove_phi_entries_from(&mut func.blocks[bi], pred_label);
         let si = label_to_idx[&s];
         for inst in &mut func.blocks[si].instructions {
             if let Instruction::Phi { incoming, .. } = inst {
-                let from_b = incoming.iter().find(|(_, l)| *l == b).map(|(op, _)| op.clone());
+                let from_b = incoming.iter().find(|(_, l)| *l == b).map(|(op, _)| *op);
                 if let Some(op) = from_b {
+                    let op = match &op {
+                        Operand::Value(v) => via_pred.get(&v.0).cloned().unwrap_or(op),
+                        Operand::Const(_) => op,
+                    };
                     incoming.push((op, pred_label));
                 }
             }
         }
+        if needs_phi.is_empty() {
+            continue;
+        }
+        // Uses of each such value where S dominates them read a phi at S:
+        // B's value from B and from the predecessors B dominates, the phi
+        // itself around a loop through S, and P's value from P.
+        let (cfg, _) = cfg.as_ref().expect("built for extra phis");
+        let dominated_by_s = |mut u: usize| loop {
+            if u == si {
+                return true;
+            }
+            let up = cfg.idom[u];
+            if up == u || up == usize::MAX {
+                return false;
+            }
+            u = up;
+        };
+        let s_preds: Vec<usize> = cfg.preds.row(si).iter().map(|&p| p as usize).collect();
+        let mut map: Vec<Option<Operand>> = vec![None; next_id as usize];
+        let mut new_phis = Vec::new();
+        for &q in needs_phi {
+            let ty = func.blocks[bi].instructions.iter().find_map(|i| match i {
+                Instruction::Phi { dest, ty, .. } if dest.0 == q => Some(*ty),
+                _ => None,
+            }).expect("B's phi");
+            let phi = Value(next_id);
+            next_id += 1;
+            map.push(None);
+            map[q as usize] = Some(Operand::Value(phi));
+            let mut incoming: Vec<(Operand, BlockId)> = s_preds.iter().map(|&p| {
+                let v = if p != bi && dominated_by_s(p) { phi } else { Value(q) };
+                (Operand::Value(v), func.blocks[p].label)
+            }).collect();
+            incoming.push((via_pred.get(&q).cloned().unwrap_or(Operand::Value(Value(q))), pred_label));
+            new_phis.push(Instruction::Phi { dest: phi, ty, incoming });
+        }
+        for (ui, block) in func.blocks.iter_mut().enumerate() {
+            let here = dominated_by_s(ui);
+            for inst in &mut block.instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (op, l) in incoming.iter_mut() {
+                        if let Operand::Value(v) = op {
+                            if map.get(v.0 as usize).is_some_and(|m| m.is_some())
+                                && label_to_idx.get(l).is_some_and(|&w| dominated_by_s(w)) {
+                                *op = map[v.0 as usize].unwrap();
+                            }
+                        }
+                    }
+                } else if here {
+                    crate::passes::copy_prop::replace_operands_in_instruction(inst, &map);
+                }
+            }
+            if here {
+                crate::passes::copy_prop::replace_operands_in_terminator(&mut block.terminator, &map);
+            }
+        }
+        let block = &mut func.blocks[si];
+        if !block.source_spans.is_empty() {
+            let span = block.source_spans[0];
+            block.source_spans.splice(0..0, std::iter::repeat_n(span, new_phis.len()));
+        }
+        block.instructions.splice(0..0, new_phis);
     }
+    func.next_value_id = next_id;
     actions.len()
 }
 
@@ -1670,6 +1870,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_phi_constant_threading_with_merged_pointer() {
+        // bb3 merges a flag and a pointer; the edge from bb1 brings flag 0
+        // and goes on to bb5, which returns the pointer. Threaded, bb1 jumps
+        // to bb5, where a new phi gives the return bb1's pointer.
+        let add = |dest: u32, k: i64| Instruction::BinOp {
+            dest: Value(dest), op: crate::ir::reexports::IrBinOp::Add, lhs: Operand::Value(Value(5)), rhs: Operand::Const(IrConst::I64(k)), ty: IrType::I64,
+        };
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks.push(make_block(BlockId(0), vec![
+            Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
+            Instruction::ParamRef { dest: Value(1), param_idx: 1, ty: IrType::I32 },
+            Instruction::ParamRef { dest: Value(5), param_idx: 2, ty: IrType::I64 },
+        ], Terminator::CondBranch { cond: Operand::Value(Value(0)), true_label: BlockId(1), false_label: BlockId(2) }));
+        func.blocks.push(make_block(BlockId(1), vec![add(3, 1)], Terminator::Branch(BlockId(3))));
+        func.blocks.push(make_block(BlockId(2), vec![add(4, 2)], Terminator::Branch(BlockId(3))));
+        func.blocks.push(make_block(BlockId(3), vec![
+            Instruction::Phi { dest: Value(2), ty: IrType::I32, incoming: vec![
+                (Operand::Const(IrConst::I32(0)), BlockId(1)), (Operand::Value(Value(1)), BlockId(2))] },
+            Instruction::Phi { dest: Value(6), ty: IrType::I64, incoming: vec![
+                (Operand::Value(Value(3)), BlockId(1)), (Operand::Value(Value(4)), BlockId(2))] },
+        ], Terminator::CondBranch { cond: Operand::Value(Value(2)), true_label: BlockId(4), false_label: BlockId(5) }));
+        func.blocks.push(make_block(BlockId(4), vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(10))))));
+        func.blocks.push(make_block(BlockId(5), vec![], Terminator::Return(Some(Operand::Value(Value(6))))));
+        func.next_value_id = 7;
+        simplify_cfg(&mut func);
+
+        let b1 = func.blocks.iter().find(|b| b.instructions.iter().any(|i| i.dest() == Some(Value(3)))).unwrap();
+        let Terminator::Branch(to) = b1.terminator else { panic!("{:?}", b1.terminator) };
+        let ret = func.blocks.iter().find(|b| b.label == to).unwrap();
+        let Terminator::Return(Some(Operand::Value(r))) = ret.terminator else { panic!("{:?}", ret.terminator) };
+        let phi = ret.instructions.iter().find(|i| i.dest() == Some(r)).expect("a phi at the target");
+        let Instruction::Phi { incoming, .. } = phi else { panic!("{:?}", phi) };
+        assert!(incoming.iter().any(|(op, l)| matches!(op, Operand::Value(Value(3))) && *l == b1.label), "{:?}", incoming);
     }
 
     #[test]

@@ -300,14 +300,42 @@ fn sink_arm_loads(func: &mut IrFunction) -> usize {
 /// phi, its only use. cfg_simplify threads the constant's edge
 /// straight to the branch target, leaving one branch per operand, where a
 /// select would compute the boolean (cset, csel) and then branch on it.
+///
+/// The merge block may also merge values (`(m = prev[m]) > limit &&
+/// --chain != 0` merges `chain`) that only its successors' phis read on the
+/// edges from it; cfg_simplify threads those too.
 fn is_short_circuit_test(func: &IrFunction, d: &DiamondInfo, use_count: &FxHashMap<u32, u32>) -> bool {
     let merge = &func.blocks[d.merge_idx];
-    let [Instruction::Phi { dest, .. }] = merge.instructions.as_slice() else { return false };
-    let Terminator::CondBranch { cond: Operand::Value(c), .. } = &merge.terminator else { return false };
-    let [(_, _, tv, fv)] = d.phi_selects.as_slice() else { return false };
-    c.0 == dest.0
-        && use_count.get(&dest.0).copied() == Some(1)
-        && (matches!(tv, Operand::Const(_)) || matches!(fv, Operand::Const(_)))
+    if merge.instructions.is_empty() || !merge.instructions.iter().all(|i| matches!(i, Instruction::Phi { .. })) {
+        return false;
+    }
+    let Terminator::CondBranch { cond: Operand::Value(c), true_label, false_label } = &merge.terminator else { return false };
+    let Some((_, _, tv, fv)) = d.phi_selects.iter().find(|(dest, ..)| dest.0 == c.0) else { return false };
+    if use_count.get(&c.0).copied() != Some(1) || !(matches!(tv, Operand::Const(_)) || matches!(fv, Operand::Const(_))) {
+        return false;
+    }
+    if merge.instructions.len() == 1 {
+        return true;
+    }
+    let others: Vec<u32> = merge.instructions.iter().filter_map(|i| i.dest()).filter(|d| d.0 != c.0).map(|d| d.0).collect();
+    let label = merge.label;
+    let mut ok = true;
+    for block in &func.blocks {
+        let succ = block.label == *true_label || block.label == *false_label;
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, l) in incoming {
+                    if matches!(op, Operand::Value(v) if others.contains(&v.0)) && !(succ && *l == label) {
+                        ok = false;
+                    }
+                }
+            } else {
+                inst.for_each_used_value(|v| ok &= !others.contains(&v));
+            }
+        }
+        block.terminator.for_each_used_value(|v| ok &= !others.contains(&v));
+    }
+    ok
 }
 
 /// Check if a block contains only simple, side-effect-free instructions
@@ -1071,6 +1099,29 @@ mod tests {
         let mut func = and_test(true);
         assert_eq!(if_convert_function(&mut func), 1);
         assert!(matches!(func.blocks[0].instructions[..], [.., Instruction::Select { .. }]));
+    }
+
+    #[test]
+    fn test_short_circuit_test_merging_a_counter_left_for_threading() {
+        // `a && --n != 0` as a loop condition: block 2 also merges n (v6),
+        // which only the loop header's phi reads, on the edge from block 2.
+        let mut func = and_test(false);
+        func.blocks[1].instructions.insert(0, Instruction::BinOp {
+            dest: Value(5), op: crate::ir::reexports::IrBinOp::Sub,
+            lhs: Operand::Value(Value(8)), rhs: Operand::Const(IrConst::I32(1)), ty: IrType::I32,
+        });
+        func.blocks[2].instructions.push(Instruction::Phi {
+            dest: Value(6), ty: IrType::I32,
+            incoming: vec![(Operand::Value(Value(5)), BlockId(1)), (Operand::Value(Value(8)), BlockId(0))],
+        });
+        func.blocks[3].instructions.push(Instruction::Phi {
+            dest: Value(7), ty: IrType::I32, incoming: vec![(Operand::Value(Value(6)), BlockId(2))],
+        });
+        func.blocks[3].terminator = Terminator::Return(Some(Operand::Value(Value(7))));
+        assert_eq!(if_convert_function(&mut func), 0);
+        // Read anywhere else, it is a value: converted.
+        func.blocks[4].terminator = Terminator::Return(Some(Operand::Value(Value(6))));
+        assert_eq!(if_convert_function(&mut func), 1);
     }
 
     /// `%0 ? *(%5 + 8) : *(%5 + 16)`, each arm widening its I16 load to I32

@@ -17,6 +17,7 @@ pub(crate) mod copy_prop;
 pub(crate) mod dce;
 pub(crate) mod exit_addr;
 mod dead_statics;
+mod edge_addr;
 pub(crate) mod div_by_const;
 mod gep_linear;
 mod gep_reassoc;
@@ -686,6 +687,12 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             exit_addr::split_function(func);
         }
+    }
+
+    // Phase 10e3: Recompute on the edge into a phi a constant-offset
+    // address its block only accesses through, so the access folds it.
+    if !disabled.contains("edge_addr") {
+        edge_addr::split_module(module);
     }
 
     // Phase 10f: Recompute cheap values in blocks of leaf functions where

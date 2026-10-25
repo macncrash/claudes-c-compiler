@@ -420,8 +420,11 @@ fn build_live_segments(
             redef[dense] = (u32::MAX, u32::MAX);
         }
         for &dense in &touched {
+            // Not live in: the piece starts at a definition (each edge
+            // block of a lowered phi copying into it), apart from the piece
+            // of the block laid out before.
             if !live_in[bi].contains(dense) {
-                add(dense, first_seen[dense], u32::MAX, false);
+                add(dense, first_seen[dense], u32::MAX, true);
             }
             first_seen[dense] = u32::MAX;
         }

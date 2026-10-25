@@ -579,7 +579,11 @@ The analysis proceeds in three steps:
    but not out of it ends at its last use there, and one defined in a block
    it is live out of starts at its definition, not the block start. The
    live pieces (one per run of blocks) end the same way, at the last read in
-   the block, counting the reads the GEP-folding extension adds.
+   the block, counting the reads the GEP-folding extension adds. A piece
+   that starts at a definition (in a block the value is not live into, such
+   as each split edge copying into a lowered phi) stays apart from the piece
+   of the block laid out before it, so the value it copies can hand over
+   its register there.
 
 ### Auxiliary Results
 

@@ -8,7 +8,9 @@
 //! one iteration. A load that every iteration executes, before anything
 //! that might not return, can then run once in a new block on the guard's
 //! edge into the loop, provided nothing in the loop may write the memory it
-//! reads; mod_ref answers that for calls as well as stores. Loads from a
+//! reads; mod_ref answers that for calls as well as stores, and a store to
+//! other bytes at a constant offset from the same pointer (`s->match_start`
+//! against a load of `s->window`) does not count. Loads from a
 //! local at a constant in-bounds offset are safe anywhere in the loop, and
 //! pure instructions computed from hoisted loads follow them out.
 //!
@@ -134,17 +136,46 @@ fn hoist_loop(
         false
     };
 
-    // Everything the loop may write.
-    let mut writes: Vec<Root> = Vec::new();
+    // A pointer as a value defined once plus a constant byte offset.
+    let base_offset = |ptr: u32| {
+        let (mut v, mut off) = (ptr, 0i64);
+        for _ in 0..16 {
+            if defs[v as usize] != 1 {
+                return None;
+            }
+            match const_gep.get(&v) {
+                Some(&(base, o)) => {
+                    v = base;
+                    off = off.checked_add(o)?;
+                }
+                None => return Some((v, off)),
+            }
+        }
+        None
+    };
+    // Everything the loop may write, and for a plain store the bytes it
+    // writes: a store to `s->match_start` leaves a load of `s->window` alone.
+    let mut writes: Vec<(Root, Option<(u32, i64, i64)>)> = Vec::new();
     for &b in &blocks {
         for inst in &func.blocks[b].instructions {
+            if let Instruction::Store { ptr, ty, .. } = inst {
+                let w = (model.root(ptr.0), base_offset(ptr.0).map(|(v, o)| (v, o, o + ty.size() as i64)));
+                if !writes.contains(&w) {
+                    writes.push(w);
+                }
+                continue;
+            }
             model.for_each_write(inst, mr, |r| {
-                if !writes.contains(&r) {
-                    writes.push(r);
+                if !writes.contains(&(r, None)) {
+                    writes.push((r, None));
                 }
             });
         }
     }
+    let disjoint = |a: Option<(u32, i64, i64)>, b: Option<(u32, i64, i64)>| match (a, b) {
+        (Some((v, lo, hi)), Some((w, lo2, hi2))) => v == w && (hi <= lo2 || hi2 <= lo),
+        _ => false,
+    };
 
     // Blocks whose instructions run on every entry to the loop before
     // leaving it: those dominating every exit, when everything that can
@@ -204,7 +235,8 @@ fn hoist_loop(
                 let ok = match inst {
                     Instruction::Load { ptr, ty, seg_override: AddressSpace::Default, volatile: false, .. } => {
                         let root = model.root(ptr.0);
-                        !writes.iter().any(|&w| model.may_alias(w, root))
+                        let bytes = base_offset(ptr.0).map(|(v, o)| (v, o, o + ty.size() as i64));
+                        !writes.iter().any(|&(w, wb)| model.may_alias(w, root) && !disjoint(wb, bytes))
                             && (in_bounds_local(ptr.0, ty.size())
                                 || (*runs_first.entry(b).or_insert_with(|| always_runs(b))
                                     && func.blocks[b].instructions[..k].iter().all(|i| mr.always_continues(i))))

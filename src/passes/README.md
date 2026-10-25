@@ -99,6 +99,10 @@ The optimizer executes in four sequential phases:
      exit_addr
          |
          v
+ Phase 10e3: Edge Addresses (64-bit)
+     edge_addr
+         |
+         v
  Phase 10f: Leaf Rematerialization (AArch64)
      remat
          |
@@ -385,7 +389,13 @@ fixpoint (repeating until no sub-pass makes changes):
    merge `CondBranch` edges that carry conflicting phi values. A block that
    only merges a boolean (phi of constants) and branches on it is threaded
    too: each predecessor goes straight to the target its constant selects
-   (`a || b || c`). When the block also merges other values its targets
+   (`a || b || c`). It may merge other values as well (the pointers of
+   `*++scan == *++match && ...`, or a counter of `m > limit && --n != 0`)
+   when each use of them is the target's phi entry from the block (the
+   predecessor's entry takes its own value), lies past the other target
+   (which only the block enters), or lies past the target itself: then a
+   new phi at the target merges the value for the uses there (at most one
+   such target per round). When the block also merges other values its targets
    read (the `v` an inlined `find(key, &v)` sets on a hit), every
    predecessor is redirected, and each such value is merged again by a phi
    at the start of the one target whose region reads it, which must be
@@ -923,6 +933,21 @@ iteration. Only addresses whose every use in their innermost loop is an
 access the peephole folds (index scaled by the access size, or not at all),
 and that no phi reads.
 
+### edge_addr -- Edge Addresses
+
+Runs once after exit_addr, on 64-bit targets. An address `base + k` that its
+block only loads or stores through, and that a phi also reads on an edge
+from that block, is recomputed on the edge instead: in a new block on a
+critical edge (where phi elimination would have put the copy anyway), or at
+the end of a block with one successor. The block's access then folds the
+address (`ldrb w0, [x1, #3]`). A match loop that stops at the first
+differing byte (`while (*++scan == *++match && ...)`, zlib's longest_match)
+leaves with the address it reached, so each step's address had a register
+of its own: now each byte compared is two loads, a compare and a branch.
+Chains of constant offsets are first rebased on their first base (`(s + 2)
++ 4` is `s + 6`). Pointer increments are lowered as integer adds; one used
+only as access addresses becomes a GEP, which the backend folds the same way.
+
 ### remat -- Leaf Rematerialization
 
 Runs once after exit_addr, on AArch64 leaf functions (no calls, nothing
@@ -1059,7 +1084,9 @@ no branch to mispredict on random keys.
 
 One shape is left as branches: a step of an `a && b` or `a || b` test, whose
 merge block holds only the boolean phi (with a constant from the
-short-circuiting edge) and branches on it. cfg_simplify threads the constant's
+short-circuiting edge) and branches on it, or also phis that only its
+successors' phis read on the edges from it (the counter of a loop condition
+`m > limit && --n != 0`). cfg_simplify threads the constant's
 edge to the branch target, giving one branch per operand instead of computing
 the boolean with `cset`/`csel` and then branching on it. Dead code is removed
 first, so copies and phi cycles that mem2reg leaves do not count as uses.
@@ -1226,7 +1253,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`.
+`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1256,6 +1283,7 @@ behavior across iterations.
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |
 | `dead_statics.rs`        | Dead static function/global elimination (BFS)          |
 | `div_by_const.rs`        | Division by constant strength reduction                |
+| `edge_addr.rs`           | Addresses a phi reads recomputed on the edge into it   |
 | `exit_addr.rs`           | Loop addresses recomputed after the loop (AArch64)     |
 | `gep_linear.rs`          | GEP chain offsets summed and cancelled (`a[x / n][x % n]`) |
 | `gep_reassoc.rs`         | Constant GEP offsets moved into loads and stores       |
