@@ -84,6 +84,7 @@ pub(crate) fn rotate_function(func: &mut IrFunction) -> usize {
     }
 
     let mut rotated = 0;
+    let mut self_loops = Vec::new();
     for latch in 0..func.blocks.len() {
         let Terminator::Branch(target) = func.blocks[latch].terminator else { continue };
         let Some(&header) = label_to_idx.get(&target) else { continue };
@@ -161,8 +162,28 @@ pub(crate) fn rotate_function(func: &mut IrFunction) -> usize {
             lb.source_spans.extend(spans);
         }
         lb.instructions.extend(copies);
+        if matches!(term, Terminator::CondBranch { true_label, false_label, .. }
+            if true_label == lb.label || false_label == lb.label)
+        {
+            self_loops.push((lb.label, target));
+        }
         lb.terminator = term;
         rotated += 1;
+    }
+
+    // A one-block loop rotates into its back edge's block (the trampoline
+    // holding the phi copies), now a loop of its own entered only from the
+    // old header. Phi elimination put that block before the header; right
+    // after it, the header falls into the loop:
+    //
+    //   pre:     ...; b header                  pre:     ...
+    //   latch:   ...; b.lt latch, exit    =>    header:  ...; b.ge exit
+    //   header:  ...; b.lt latch, exit          latch:   ...; b.lt latch
+    for (latch, header) in self_loops {
+        let Some(from) = func.blocks.iter().position(|b| b.label == latch) else { continue };
+        let block = func.blocks.remove(from);
+        let at = func.blocks.iter().position(|b| b.label == header).map_or(from, |h| h + 1);
+        func.blocks.insert(at, block);
     }
     rotated
 }
@@ -174,5 +195,35 @@ fn set_dest(inst: &mut Instruction, v: Value) {
         | Instruction::Cast { dest, .. } | Instruction::Copy { dest, .. } | Instruction::GetElementPtr { dest, .. }
         | Instruction::Load { dest, .. } | Instruction::Select { dest, .. } => *dest = v,
         _ => unreachable!("loop rotation copies only simple instructions"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, IrConst};
+
+    /// A one-block loop after phi elimination: its back edge's trampoline
+    /// (holding the phi copy) laid out before the header.
+    #[test]
+    fn rotated_one_block_loop_follows_its_header() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let v = |n| Operand::Value(Value(n));
+        func.blocks = vec![
+            block(0, vec![Instruction::Copy { dest: Value(5), src: Operand::Const(IrConst::I64(0)) }], Terminator::Branch(BlockId(2))),
+            block(1, vec![Instruction::Copy { dest: Value(5), src: v(3) }], Terminator::Branch(BlockId(2))),
+            block(2, vec![
+                Instruction::BinOp { dest: Value(3), op: IrBinOp::Add, lhs: v(5), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 },
+                Instruction::Cmp { dest: Value(4), op: IrCmpOp::Slt, lhs: v(3), rhs: Operand::Const(IrConst::I64(100)), ty: IrType::I64 },
+            ], Terminator::CondBranch { cond: v(4), true_label: BlockId(1), false_label: BlockId(3) }),
+            block(3, vec![], Terminator::Return(Some(v(3)))),
+        ];
+        func.next_value_id = 6;
+        assert_eq!(rotate_function(&mut func), 1);
+        let order: Vec<u32> = func.blocks.iter().map(|b| b.label.0).collect();
+        assert_eq!(order, [0, 2, 1, 3]);
+        assert!(matches!(func.blocks[2].terminator, Terminator::CondBranch { true_label: BlockId(1), false_label: BlockId(3), .. }));
     }
 }

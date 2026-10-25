@@ -16,6 +16,7 @@
 //! other use reads an explicit truncation. Runs once, late (after narrowing
 //! has produced the I32 adds), on 64-bit targets only.
 
+use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
@@ -29,6 +30,8 @@ pub(crate) fn widen_function(func: &mut IrFunction) -> usize {
     let cfg = analysis::CfgAnalysis::build(func);
     let loops = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
     let mut widened = 0;
+    // Each truncation made so far, and the widened counter it truncates.
+    let mut narrow: FxHashMap<u32, Value> = FxHashMap::default();
     for lp in loop_analysis::merge_loops_by_header(loops) {
         let Some(pre) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else { continue };
         let latches: Vec<usize> = cfg.preds.row(lp.header).iter().map(|&p| p as usize)
@@ -41,25 +44,25 @@ pub(crate) fn widen_function(func: &mut IrFunction) -> usize {
             .filter_map(|i| match i { Instruction::Phi { dest, ty: IrType::I32, .. } => Some(*dest), _ => None })
             .collect();
         for phi in phis {
-            if widen_iv(func, &lp.body, lp.header, pre, phi, pre_label, latch_label) {
+            if widen_iv(func, &lp.body, lp.header, pre, phi, pre_label, latch_label, &cfg.idom, &mut narrow) {
                 widened += 1;
             }
         }
     }
-    widened
-}
-
-/// `op` sign-extended from I32 to I64: a constant, or a Cast appended to
-/// `pre_insts` (for the preheader).
-fn sext(op: Operand, pre_insts: &mut Vec<Instruction>, fresh: &mut dyn FnMut() -> Value) -> Operand {
-    match op {
-        Operand::Const(c) => Operand::Const(IrConst::I64(c.to_i64().unwrap_or(0) as i32 as i64)),
-        Operand::Value(_) => {
-            let w = fresh();
-            pre_insts.push(Instruction::Cast { dest: w, src: op, from_ty: IrType::I32, to_ty: IrType::I64 });
-            Operand::Value(w)
+    // A counter carried from one loop into the next (a partition's `i`, kept
+    // across swaps) is truncated where the first loop leaves it and sign
+    // extended where the next takes it: the wide value is that extension.
+    // Likewise any other extension of a value already extended once.
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            if let Instruction::Cast { dest, src: Operand::Value(v), from_ty: IrType::I32, to_ty: IrType::I64 | IrType::U64 } = *inst {
+                if let Some(&wide) = narrow.get(&v.0).filter(|w| **w != dest) {
+                    *inst = Instruction::Copy { dest, src: Operand::Value(wide) };
+                }
+            }
         }
     }
+    widened
 }
 
 /// The constant of `op` as an i64, if it is an integer constant.
@@ -72,7 +75,8 @@ fn const_i64(op: &Operand) -> Option<i64> {
 
 #[allow(clippy::too_many_arguments)]
 fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usize>, header: usize, pre: usize,
-            phi: Value, pre_label: crate::ir::reexports::BlockId, latch_label: crate::ir::reexports::BlockId) -> bool {
+            phi: Value, pre_label: crate::ir::reexports::BlockId, latch_label: crate::ir::reexports::BlockId,
+            idom: &[usize], narrow: &mut FxHashMap<u32, Value>) -> bool {
     // The phi: [init from the preheader, next from the latch].
     let Some((init, next)) = func.blocks[header].instructions.iter().find_map(|i| match i {
         Instruction::Phi { dest, incoming, .. } if *dest == phi && incoming.len() == 2 => {
@@ -100,33 +104,43 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
     let Some((next_block, next_idx)) = next_at else { return false };
 
     let is_iv = |v: u32| v == phi.0 || v == next.0;
-    let defined_in_loop = |func: &IrFunction, v: u32| body.iter().any(|&b| {
-        func.blocks[b].instructions.iter().any(|i| i.dest().is_some_and(|d| d.0 == v))
-    });
-    // No other phi may read the counter (its use point would be a
-    // predecessor's end, where a truncation might not be available).
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Phi { dest, incoming, .. } = inst {
-                if *dest != phi && incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if is_iv(v.0))) {
-                    return false;
-                }
+    // A value sign extended for the widened counter (its start, or the other
+    // side of a compare) must be available before the loop: not computed
+    // after it, for a compare after it.
+    let available_before = |func: &IrFunction, v: u32| {
+        let v = narrow.get(&v).map_or(v, |w| w.0);
+        let Some(def) = func.blocks.iter().position(|b| b.instructions.iter().any(|i| i.dest().is_some_and(|d| d.0 == v)))
+        else { return true };
+        let mut b = pre;
+        loop {
+            if b == def {
+                return true;
             }
+            if idom[b] == b || idom[b] == usize::MAX {
+                return false;
+            }
+            b = idom[b];
         }
-    }
-
-    let mut next_id = func.next_value_id;
-    let mut fresh = || { let v = Value(next_id); next_id += 1; v };
-    let mut pre_insts: Vec<Instruction> = Vec::new();
+    };
     if let Operand::Const(c) = init {
         if c.to_i64().is_none() {
             return false;
         }
     }
+    let label_to_idx = analysis::build_label_map(func);
 
-    // Rewrite the uses that widen naturally; note whether others remain.
-    let mut needs_trunc = [false, false]; // [phi, next]
+    // Find the uses that widen naturally. Every other use reads a
+    // truncation: one per block, placed before the block's first such use (a
+    // phi's incoming value is used at the end of its predecessor), so no
+    // narrow copy of the counter stays live across the loop.
     let mut compares: Vec<(usize, usize)> = Vec::new();
+    let mut trunc_at: FxHashMap<(usize, u32), usize> = FxHashMap::default();
+    let mut note = |b: usize, at: usize, v: u32| {
+        if is_iv(v) {
+            let first = trunc_at.entry((b, v)).or_insert(at);
+            *first = (*first).min(at);
+        }
+    };
     for (b, block) in func.blocks.iter().enumerate() {
         for (k, inst) in block.instructions.iter().enumerate() {
             let mut uses_iv = false;
@@ -137,52 +151,80 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
             match inst {
                 Instruction::Cast { src: Operand::Value(v), from_ty: IrType::I32, to_ty: IrType::I64 | IrType::U64, .. }
                     if is_iv(v.0) => {}
+                Instruction::Phi { incoming, .. } => {
+                    for (op, label) in incoming {
+                        if let Operand::Value(v) = op {
+                            let Some(&p) = label_to_idx.get(label) else { return false };
+                            note(p, func.blocks[p].instructions.len(), v.0);
+                        }
+                    }
+                }
                 Instruction::Cmp { ty: IrType::I32, lhs, rhs, .. } => {
                     let other = if matches!(lhs, Operand::Value(v) if is_iv(v.0)) { rhs } else { lhs };
                     let ok = match other {
                         Operand::Const(c) => c.to_i64().is_some(),
-                        Operand::Value(v) => !is_iv(v.0) && !defined_in_loop(func, v.0),
+                        Operand::Value(v) => !is_iv(v.0) && available_before(func, v.0),
                     };
                     if ok {
                         compares.push((b, k));
                     } else {
-                        inst.for_each_used_value(|v| { if v == phi.0 { needs_trunc[0] = true } else if v == next.0 { needs_trunc[1] = true } });
+                        inst.for_each_used_value(|v| note(b, k, v));
                     }
                 }
-                _ => inst.for_each_used_value(|v| { if v == phi.0 { needs_trunc[0] = true } else if v == next.0 { needs_trunc[1] = true } }),
+                _ => inst.for_each_used_value(|v| note(b, k, v)),
             }
         }
-        let mut uses_iv = false;
-        block.terminator.for_each_used_value(|v| uses_iv |= is_iv(v));
-        if uses_iv {
-            block.terminator.for_each_used_value(|v| { if v == phi.0 { needs_trunc[0] = true } else if v == next.0 { needs_trunc[1] = true } });
+        block.terminator.for_each_used_value(|v| note(b, block.instructions.len(), v));
+    }
+
+    let mut next_id = func.next_value_id;
+    let mut fresh = || { let v = Value(next_id); next_id += 1; v };
+    let trunc: FxHashMap<(usize, u32), Value> = trunc_at.keys().map(|&key| (key, fresh())).collect();
+
+    // Sign extensions go at the end of a preheader that only enters the
+    // loop, else right after the value's definition (which dominates the
+    // preheader).
+    let dedicated = matches!(func.blocks[pre].terminator,
+        crate::ir::reexports::Terminator::Branch(l) if l == func.blocks[header].label);
+    let mut pre_insts: Vec<Instruction> = Vec::new();
+    let mut after_def: Vec<(Value, Instruction)> = Vec::new();
+    let mut extended: FxHashMap<u32, Value> = FxHashMap::default();
+    let mut sext = |op: Operand, narrow: &mut FxHashMap<u32, Value>| match op {
+        Operand::Const(c) => Operand::Const(IrConst::I64(c.to_i64().unwrap_or(0) as i32 as i64)),
+        Operand::Value(v) => {
+            if let Some(&w) = narrow.get(&v.0).or(extended.get(&v.0)) {
+                return Operand::Value(w);
+            }
+            let w = fresh();
+            let cast = Instruction::Cast { dest: w, src: op, from_ty: IrType::I32, to_ty: IrType::I64 };
+            if dedicated {
+                pre_insts.push(cast);
+                extended.insert(v.0, w);
+            } else {
+                after_def.push((v, cast));
+                narrow.insert(v.0, w);
+            }
+            Operand::Value(w)
         }
-    }
+    };
+    let new_init = sext(init, narrow);
 
-    // Truncations for the remaining uses.
-    let trunc = [needs_trunc[0].then(&mut fresh), needs_trunc[1].then(&mut fresh)];
-    let mut map: Vec<Option<Operand>> = vec![None; func.next_value_id as usize];
-    if let Some(t) = trunc[0] {
-        map[phi.0 as usize] = Some(Operand::Value(t));
-    }
-    if let Some(t) = trunc[1] {
-        map[next.0 as usize] = Some(Operand::Value(t));
-    }
-    let new_init = sext(init, &mut pre_insts, &mut fresh);
-
-    // Widen the compares (their other operand: a constant, or sign-extended
-    // in the preheader), and turn sign extensions of the counter into copies.
+    // Widen the compares, and turn sign extensions of the counter into copies.
     for &(b, k) in &compares {
         if let Instruction::Cmp { ty, lhs, rhs, .. } = &mut func.blocks[b].instructions[k] {
             for op in [lhs, rhs] {
                 if !matches!(op, Operand::Value(v) if is_iv(v.0)) {
-                    *op = sext(*op, &mut pre_insts, &mut fresh);
+                    *op = sext(*op, narrow);
                 }
             }
             *ty = IrType::I64;
         }
     }
+    let mut map: Vec<Option<Operand>> = vec![None; phi.0.max(next.0) as usize + 1];
     for (b, block) in func.blocks.iter_mut().enumerate() {
+        for w in [phi, next] {
+            map[w.0 as usize] = trunc.get(&(b, w.0)).map(|t| Operand::Value(*t));
+        }
         for (k, inst) in block.instructions.iter_mut().enumerate() {
             match inst {
                 Instruction::Phi { dest, ty, incoming } if *dest == phi => {
@@ -190,6 +232,15 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
                     for (op, label) in incoming.iter_mut() {
                         if *label == pre_label {
                             *op = new_init;
+                        }
+                    }
+                }
+                Instruction::Phi { incoming, .. } => {
+                    for (op, label) in incoming.iter_mut() {
+                        if let Operand::Value(v) = op {
+                            if is_iv(v.0) {
+                                *op = Operand::Value(trunc[&(label_to_idx[label], v.0)]);
+                            }
                         }
                     }
                 }
@@ -205,7 +256,6 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
                     if is_iv(v.0) => {
                     *inst = Instruction::Copy { dest: *dest, src: Operand::Value(*v) };
                 }
-                Instruction::Phi { .. } => {}
                 _ if compares.contains(&(b, k)) => {}
                 _ => { replace_operands_in_instruction(inst, &map); }
             }
@@ -213,18 +263,90 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
         replace_operands_in_terminator(&mut block.terminator, &map);
     }
 
-    // Place the truncations: the phi's after the header's phis, next's
-    // right after its definition.
-    if let Some(t) = trunc[1] {
-        func.blocks[next_block].instructions.insert(next_idx + 1,
-            Instruction::Cast { dest: t, src: Operand::Value(next), from_ty: IrType::I64, to_ty: IrType::I32 });
+    // Place the truncations (last position first, so earlier ones stay put),
+    // then the sign extensions.
+    let mut placed: Vec<((usize, u32), usize)> = trunc_at.into_iter().collect();
+    placed.sort_by_key(|p| std::cmp::Reverse(p.1));
+    for ((b, w), at) in placed {
+        let t = trunc[&(b, w)];
+        narrow.insert(t.0, Value(w));
+        func.blocks[b].instructions.insert(at,
+            Instruction::Cast { dest: t, src: Operand::Value(Value(w)), from_ty: IrType::I64, to_ty: IrType::I32 });
     }
-    if let Some(t) = trunc[0] {
-        let insts = &mut func.blocks[header].instructions;
-        let at = insts.iter().position(|i| !matches!(i, Instruction::Phi { .. })).unwrap_or(insts.len());
-        insts.insert(at, Instruction::Cast { dest: t, src: Operand::Value(phi), from_ty: IrType::I64, to_ty: IrType::I32 });
+    for (v, cast) in after_def {
+        let def = func.blocks.iter().enumerate().find_map(|(b, block)| {
+            let k = block.instructions.iter().position(|i| i.dest() == Some(v))?;
+            let phis = block.instructions.iter().take_while(|i| matches!(i, Instruction::Phi { .. })).count();
+            Some((b, (k + 1).max(phis)))
+        });
+        let (b, at) = def.unwrap_or((0, 0));
+        func.blocks[b].instructions.insert(at, cast);
     }
     func.blocks[pre].instructions.extend(pre_insts);
     func.next_value_id = next_id;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Terminator};
+
+    fn uses(inst: &Instruction, v: u32) -> bool {
+        let mut found = false;
+        inst.for_each_used_value(|u| found |= u == v);
+        found
+    }
+
+    /// A scan whose counter the enclosing loop carries (`do i++; while
+    /// (a[i] < 0)` repeated from where it stopped), compared after the scan
+    /// with a value computed only after it.
+    #[test]
+    fn carried_counter_widened_and_late_compare_kept_narrow() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let v = |n| Operand::Value(Value(n));
+        func.blocks = vec![
+            block(0, vec![], Terminator::Branch(BlockId(1))),
+            block(1, vec![
+                Instruction::Phi { dest: Value(10), ty: IrType::I32, incoming: vec![(Operand::Const(IrConst::I32(-1)), BlockId(0)), (v(21), BlockId(3))] },
+            ], Terminator::Branch(BlockId(2))),
+            block(2, vec![
+                Instruction::Phi { dest: Value(20), ty: IrType::I32, incoming: vec![(v(10), BlockId(1)), (v(21), BlockId(2))] },
+                Instruction::BinOp { dest: Value(21), op: IrBinOp::Add, lhs: v(20), rhs: Operand::Const(IrConst::I32(1)), ty: IrType::I32 },
+                Instruction::Cast { dest: Value(22), src: v(21), from_ty: IrType::I32, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(23), op: IrBinOp::Shl, lhs: v(22), rhs: Operand::Const(IrConst::I64(2)), ty: IrType::I64 },
+                Instruction::GetElementPtr { dest: Value(24), base: Value(0), offset: v(23), ty: IrType::Ptr },
+                Instruction::Load { dest: Value(25), ptr: Value(24), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Cmp { dest: Value(26), op: IrCmpOp::Slt, lhs: v(25), rhs: Operand::Const(IrConst::I32(0)), ty: IrType::I32 },
+            ], Terminator::CondBranch { cond: v(26), true_label: BlockId(2), false_label: BlockId(3) }),
+            block(3, vec![
+                Instruction::BinOp { dest: Value(30), op: IrBinOp::Sub, lhs: v(1), rhs: v(25), ty: IrType::I32 },
+                Instruction::Cmp { dest: Value(31), op: IrCmpOp::Slt, lhs: v(21), rhs: v(30), ty: IrType::I32 },
+            ], Terminator::CondBranch { cond: v(31), true_label: BlockId(1), false_label: BlockId(4) }),
+            block(4, vec![], Terminator::Return(Some(v(21)))),
+        ];
+        func.next_value_id = 32;
+        assert_eq!(widen_function(&mut func), 1);
+
+        let b = &func.blocks;
+        assert!(matches!(b[2].instructions[0], Instruction::Phi { ty: IrType::I64, .. }));
+        assert!(matches!(b[2].instructions[1], Instruction::BinOp { ty: IrType::I64, .. }));
+        // The scan truncates nothing per iteration.
+        assert!(!b[2].instructions.iter().any(|i| matches!(i, Instruction::Cast { to_ty: IrType::I32, .. })));
+        // Its start is extended once per scan, from the carried counter.
+        assert!(matches!(b[1].instructions[..], [Instruction::Phi { .. }, Instruction::Cast { src: Operand::Value(Value(10)), .. }]));
+        // %30 is computed after the scan: not extended before it, so the
+        // compare stays narrow, reading a truncation made where the scan is left
+        // (which the outer phi also reads from this block).
+        assert!(!b[1].instructions.iter().any(|i| uses(i, 30)));
+        let Instruction::Cast { dest: t, src: Operand::Value(Value(21)), from_ty: IrType::I64, to_ty: IrType::I32 } = b[3].instructions[1]
+        else { panic!("no truncation before the late compare: {:?}", b[3].instructions) };
+        assert!(matches!(b[3].instructions[2], Instruction::Cmp { ty: IrType::I32, lhs: Operand::Value(l), .. } if l == t));
+        assert!(matches!(&b[1].instructions[0], Instruction::Phi { incoming, .. }
+            if incoming.iter().any(|(op, l)| *l == BlockId(3) && matches!(op, Operand::Value(x) if *x == t))));
+        // And the return its own, in its block.
+        assert!(matches!(b[4].instructions[..], [Instruction::Cast { from_ty: IrType::I64, to_ty: IrType::I32, .. }]));
+    }
 }

@@ -14,6 +14,7 @@ pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod dce;
+pub(crate) mod exit_addr;
 mod dead_statics;
 pub(crate) mod div_by_const;
 mod gep_linear;
@@ -623,6 +624,14 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
                 copy_prop::propagate_copies(func);
                 dce::eliminate_dead_code(func);
             }
+        }
+    }
+
+    // Phase 10e2: Recompute after a loop the element addresses it also
+    // accesses inside, so the backend folds them into the loop's accesses.
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("exit_addr") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            exit_addr::split_function(func);
         }
     }
 

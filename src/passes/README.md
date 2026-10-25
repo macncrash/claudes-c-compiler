@@ -88,6 +88,10 @@ The optimizer executes in four sequential phases:
      gep_reassoc
          |
          v
+ Phase 10e2: Loop Exit Addresses (AArch64)
+     exit_addr
+         |
+         v
  Phase 10f: Leaf Rematerialization (AArch64)
      remat
          |
@@ -784,8 +788,15 @@ every entry to the loop, so they then run on the same paths as before, once.
 Runs once after the main loop, on 64-bit targets. A signed `int` loop counter
 stepped by a constant is kept as a 64-bit value equal to its sign extension
 (signed overflow being undefined), so the step needs no `sxtw` and indexing
-needs no extension. Compares against constants or loop-invariant values are
-widened; other uses read an explicit truncation. Disabled by `-fwrapv`.
+needs no extension. Compares against constants or values available before
+the loop are widened; other uses read an explicit truncation, one per block
+before its first such use (for a phi, at the end of the predecessor), so no
+narrow copy stays live through the loop. A counter carried from one loop to
+the next, as a partition's `i` is across its swaps, is truncated where the
+first scan is left and extended where the next starts: the extension of a
+truncation is the wide value itself. Extensions go at the end of a preheader
+that only enters the loop, else right after the value's definition.
+Disabled by `-fwrapv`.
 
 ### lftr -- Linear Function Test Replacement
 
@@ -829,9 +840,21 @@ into each access (`[t, #120]`) instead of keeping the field address `p + 120`
 in a register for every `p->board[sq]`. GVN has already run, so a GEP equal to
 one in a dominating block (the `rays + sq` of each ray) then becomes a copy of it.
 
+### exit_addr -- Loop Exit Addresses
+
+Runs once after gep_reassoc, on AArch64. The backend folds an address into a
+load or store (`ldr w0, [x1, x2, lsl #2]`) only at its last use. An address a
+loop computes for its own accesses and also uses after the loop (a
+partition's scan `do i++; while (a[i] < p)` and then the swap of `a[i]`) is
+recomputed, with a single-use scaled index, in each block after the loop that
+uses it, so inside the loop it folds and the loop loses an `add` per
+iteration. Only addresses whose every use in their innermost loop is an
+access the peephole folds (index scaled by the access size, or not at all),
+and that no phi reads.
+
 ### remat -- Leaf Rematerialization
 
-Runs once after gep_reassoc, on AArch64 leaf functions (no calls, nothing
+Runs once after exit_addr, on AArch64 leaf functions (no calls, nothing
 that shrinks the backend's leaf register pool). Where a block outside any
 loop has more values live than the caller-saved registers a leaf allocates
 (x10-x15 and x3-x8 above the arguments), a value live through the peak only
@@ -864,7 +887,10 @@ unconditionally to a small header (at most 6 simple instructions ending in a
 conditional branch) gets a copy of the header, so each iteration ends with one
 conditional branch and the original header is left as the entry guard. Header
 values used outside the header become variables assigned by a Copy in both
-places, as lowered phis are.
+places, as lowered phis are. A one-block loop rotates into its back edge's
+trampoline, which phi elimination laid out before the header; that block,
+now a loop of its own, moves right after the header, so entering the loop
+falls into it.
 
 ### loop_layout -- Loop Tail Placement
 
