@@ -25,11 +25,13 @@ use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::PhysReg;
 use super::asm_emitter::ARM_GP_SCRATCH;
 
-/// Callee-saved registers available for register allocation: x20-x28.
-/// x19 is reserved (some ABIs use it), x29=fp, x30=lr.
-pub(super) const ARM_CALLEE_SAVED: [PhysReg; 9] = [
+/// Callee-saved registers available for register allocation: x20-x28, then
+/// x19 (last, so it is used only by functions that need a tenth). x29=fp,
+/// x30=lr. x19 is also an inline-asm scratch register; like x20 and x21,
+/// it is withheld from allocation in functions whose asm may need it.
+pub(super) const ARM_CALLEE_SAVED: [PhysReg; 10] = [
     PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23), PhysReg(24),
-    PhysReg(25), PhysReg(26), PhysReg(27), PhysReg(28),
+    PhysReg(25), PhysReg(26), PhysReg(27), PhysReg(28), PhysReg(19),
 ];
 
 /// Caller-saved registers available for register allocation: x10-x15.
@@ -519,6 +521,17 @@ impl ArmCodegen {
                                         excluded.push(format!("w{}", n));
                                     }
                                 }
+                            }
+                        }
+                    }
+
+                    // A callee-saved register the asm clobbers by name must hold
+                    // no allocated value across it, and must be saved for the
+                    // caller like any other this function changes.
+                    for name in &excluded {
+                        if let Some(n) = name.strip_prefix('x').and_then(|s| s.parse::<u8>().ok()) {
+                            if (19..=28).contains(&n) && !used_callee_saved.contains(&PhysReg(n)) {
+                                used_callee_saved.push(PhysReg(n));
                             }
                         }
                     }

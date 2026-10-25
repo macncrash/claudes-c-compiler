@@ -161,15 +161,18 @@ unassigned use the accumulator (`x0`) with stack spill/reload.
 
 ### Callee-Saved Pool
 
-Nine callee-saved registers are available for allocation:
+Ten callee-saved registers are available for allocation:
 
 ```
-x20, x21, x22, x23, x24, x25, x26, x27, x28
+x20, x21, x22, x23, x24, x25, x26, x27, x28, x19
 ```
 
 These survive across function calls, so values assigned to them do not need spilling
-around call sites. `x19` is excluded (reserved by some ABIs). `x29` is the frame
-pointer and `x30` is the link register.
+around call sites. `x19` comes last, so only functions needing a tenth register use it
+(SQLite's `sqlite3VdbeExec`, whose loop-carried variables fill all ten). `x29` is the
+frame pointer and `x30` is the link register. A register an inline asm statement
+clobbers or names in a constraint is withheld from allocation in that function, and
+saved and restored if callee-saved.
 
 ### Caller-Saved Pool
 
@@ -261,7 +264,7 @@ High addresses (caller's frame)
   | Caller's stack arguments         |  [x29 + frame_size + ...]
   +----------------------------------+  <-- previous sp (before prologue)
   | Callee-saved register save area  |  [sp + callee_save_offset]
-  |   (x20-x28 as needed, via STP)   |
+  |   (x19-x28 as needed, via STP)   |
   +----------------------------------+
   | Variadic FP save area (128 bytes)|  [sp + va_fp_save_offset]  (if variadic)
   | Variadic GP save area (64 bytes) |  [sp + va_gp_save_offset]  (if variadic)
@@ -644,7 +647,9 @@ The inline asm emitter allocates scratch registers from two pools:
 
 When inline asm clobbers enough caller-saved registers to force allocation into
 callee-saved registers (`x19`-`x21`), the prologue prescan (`prescan_inline_asm_callee_saved`)
-detects this ahead of time so the prologue can save/restore them.
+detects this ahead of time so the prologue can save/restore them. It also collects the
+callee-saved registers an asm clobbers by name (`"x19"`, `"w20"`, `"r27"`) or binds by
+constraint (`{x28}`): those are withheld from allocation and saved the same way.
 
 ### GCC Register Aliases
 
