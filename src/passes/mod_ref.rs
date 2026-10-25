@@ -148,11 +148,11 @@ impl FnEffects {
         }
     }
 
-    fn writes_param(&self, i: usize) -> bool {
+    pub(crate) fn writes_param(&self, i: usize) -> bool {
         i >= 64 || self.writes_params >> i & 1 != 0
     }
 
-    fn captures_param(&self, i: usize) -> bool {
+    pub(crate) fn captures_param(&self, i: usize) -> bool {
         i >= 64 || self.captures_params >> i & 1 != 0
     }
 }

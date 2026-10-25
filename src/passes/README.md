@@ -39,6 +39,7 @@ The optimizer executes in four sequential phases:
      copy_prop
      dce, mem2reg (locals passed by address to inlined calls)
      resolve_asm
+     addr_arg_promote
      global_promote
          |
          v
@@ -148,7 +149,16 @@ code:
    phi): DCE this early changes what later passes do elsewhere.
 8. **resolve_asm** -- resolves inline assembly symbol references that became
    computable after inlining with constant arguments.
-9. **global_promote** -- a `static` variable whose address the module uses
+9. **addr_arg_promote** -- a local whose address only goes to calls of
+   functions that do not capture it (per `mod_ref`), and is otherwise only
+   loaded and stored with its own type, is kept in a register: the loads
+   and stores move to a fresh local that mem2reg promotes, and the original
+   slot is written just before each such call and read back just after
+   (only if the callee may write it). `n = 0; get_varint(p, &n)` no longer
+   puts every read of `n` through the stack. A variable stored in more than
+   32 places is left alone: as one value live across a large function (an
+   interpreter's `rc`) it held a register the hot paths needed.
+10. **global_promote** -- a `static` variable whose address the module uses
    only for direct loads and stores of its type, accessed in a loop with no
    calls, inline assembly or other unseen memory effects, is kept in a
    register through the loop: copied to a fresh local before it, stored back
@@ -1237,6 +1247,7 @@ behavior across iterations.
 | File                     | Description                                            |
 |--------------------------|--------------------------------------------------------|
 | `mod.rs`                 | Pipeline orchestration, dirty tracking, shared analysis |
+| `addr_arg_promote.rs`    | Locals passed by address to calls kept in registers    |
 | `bound_hoist.rs`         | Invariant loads of loop exit-test bounds moved out     |
 | `cfg_simplify.rs`        | CFG simplification (branch folding, jump threading)    |
 | `const_hoist.rs`         | Large loop constants built once at function entry      |

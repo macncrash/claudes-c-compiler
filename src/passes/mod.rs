@@ -9,6 +9,7 @@
 //! another. We always run all passes to maximize test coverage of the
 //! optimizer and catch issues early.
 
+mod addr_arg_promote;
 mod bound_hoist;
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
@@ -267,6 +268,12 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
         crate::ir::mem2reg::promote_function_allocas(func);
     }
     resolve_asm::resolve_inline_asm_symbols(module);
+
+    // Locals whose address only goes to calls that do not keep it (`f(&n)`)
+    // live in registers, copied to memory just around those calls.
+    if !disabled.contains("addr_arg_promote") {
+        addr_arg_promote::promote_module(module);
+    }
 
     // File-scope variables a call-free loop updates (an inlined generator's
     // state) live in registers through the loop.
