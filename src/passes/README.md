@@ -815,8 +815,13 @@ loop_hoist moves such loads only after rotation. Here the instructions in the
 header that compute an operand of its exit test (casts, constant GEPs and
 loads, at most four) move to the preheader when each load reads memory nothing
 in the loop may write, as mod_ref and its alias model answer for calls and
-stores, and follows only instructions sure to continue. The header runs on
-every entry to the loop, so they then run on the same paths as before, once.
+stores, and follows only instructions sure to continue. The preheader must
+end in a plain branch to the header: a test that branches straight to the
+loop (`if (p) for (i = 0; i < p->n; i++)`, the counter's start being a phi
+constant) is the loop's only way in, but loads moved there would also run
+when it skips the loop, reading through a null `p` (SQLite's
+heightOfExprList). The header runs on every entry to the loop, so they then
+run on the same paths as before, once.
 
 ### iv_widen -- Induction Variable Widening
 

@@ -14,8 +14,10 @@
 //! header that compute an operand of its exit test (casts, constant GEPs and
 //! loads) move to the preheader when every load reads memory nothing in the
 //! loop may write (mod_ref answers that for calls) and follows only
-//! instructions sure to continue. The header runs on every entry to the
-//! loop, so they then run on the same paths as before, once.
+//! instructions sure to continue, and the preheader ends in a plain branch
+//! to the header. The header runs on every entry to the loop, and the
+//! preheader only before it, so they then run on the same paths as before,
+//! once.
 
 use crate::common::fx_hash::FxHashSet;
 use crate::common::types::AddressSpace;
@@ -37,6 +39,13 @@ pub(crate) fn hoist_function(func: &mut IrFunction, mr: &ModRef) -> usize {
     let mut moved = 0;
     for lp in loop_analysis::merge_loops_by_header(loops) {
         let Some(pre) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else { continue };
+        // Only into a preheader that always enters the loop: one that tests
+        // something first (`if (p) for (i = 0; i < p->n; i++)`, where the
+        // loop's start is a phi constant and the test branches straight to
+        // the header) would run the loads on paths that skip the loop.
+        if !matches!(func.blocks[pre].terminator, Terminator::Branch(_)) {
+            continue;
+        }
         let header = &func.blocks[lp.header];
         let Terminator::CondBranch { cond: Operand::Value(cond), .. } = header.terminator else { continue };
         let Some(Instruction::Cmp { lhs, rhs, .. }) = header.instructions.iter().find(|i| i.dest() == Some(cond))
