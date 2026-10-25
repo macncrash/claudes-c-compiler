@@ -370,7 +370,13 @@ fixpoint (repeating until no sub-pass makes changes):
    read (the `v` an inlined `find(key, &v)` sets on a hit), every
    predecessor is redirected, and each such value is merged again by a phi
    at the start of the one target whose region reads it, which must be
-   reached only from the block.
+   reached only from the block. Two tests of one value against constant
+   bounds, each in its own block and failing to the same target
+   (`c >= 'a' && c <= 'z'`, or negated, `x < lo || x > hi`), become one:
+   `x - lo <=u hi - lo` (an add of `-lo` for a negative bound), when the
+   second block does nothing else, is reached only from the first, both
+   compares are signed or both unsigned, and the failing target's phis
+   take the same values from both.
 
 5. **Remove dead blocks.** BFS from the entry block to compute reachability
    (also marking blocks referenced by `LabelAddr`, inline asm goto labels, and

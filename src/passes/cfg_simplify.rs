@@ -7,7 +7,9 @@
 //! 4. Threading jump chains: if block A branches to empty block B which just
 //!    branches to C, redirect A to branch directly to C (only when safe), and
 //!    threading predecessors that feed a constant into a phi that their
-//!    successor only branches on (`a || b || c` chains)
+//!    successor only branches on (`a || b || c` chains), and fusing two
+//!    branches on bounds of one value (`c >= 'a' && c <= 'z'`) into one
+//!    unsigned compare of the value minus the lower bound
 //! 5. Removing dead (unreachable) blocks that have no predecessors
 //! 6. Simplifying trivial phi nodes (single-entry or all-same-value) to Copy
 //! 7. Merging single-predecessor blocks into their predecessor
@@ -16,10 +18,12 @@
 //! Phi nodes in successor blocks are updated when edges are redirected.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
 use crate::ir::reexports::{
     BasicBlock,
     BlockId,
     Instruction,
+    IrCmpOp,
     IrConst,
     IrFunction,
     Operand,
@@ -71,6 +75,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
         changed += thread_jump_chains(func, &label_to_idx);
         changed += thread_phi_cond_branches(func, &label_to_idx);
         changed += thread_phi_cond_branches_merging(func, &label_to_idx);
+        changed += fuse_range_tests(func, &label_to_idx);
         changed += remove_dead_blocks(func, &label_to_idx);
         changed += simplify_trivial_phis(func);
         changed += merge_single_pred_blocks(func);
@@ -519,6 +524,162 @@ fn thread_phi_cond_branches_merging(func: &mut IrFunction, label_to_idx: &FxHash
     }
     func.next_value_id = next_id;
     1
+}
+
+// ---------------------------------------------------------------------------
+// Sub-pass: range tests
+// ---------------------------------------------------------------------------
+
+/// `c >= 'a' && c <= 'z'` left as two branches (each operand of `&&`
+/// branches on its own):
+///
+///   A: %p = cmp sge %x, 97; condbr %p, X, F      A: %t = sub %x, 97
+///   X: %q = cmp sle %x, 122; condbr %q, T, F  =>    %c = cmp ule %t, 25
+///                                                   condbr %c, T, F
+///
+/// One compare and one branch: x - lo, wrapping, is at most hi - lo exactly
+/// when lo <= x <= hi. Either test may be negated (its block reaching F when
+/// the compare holds). X must do nothing else and be reached only from A,
+/// and F must take the same phi values from both.
+fn fuse_range_tests(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
+    #[derive(Clone, Copy)]
+    enum Bound {
+        Lo(i128),
+        Hi(i128),
+    }
+    // The bound `cmp` puts on its value when it holds (or fails, if negated),
+    // and whether the comparison is signed.
+    fn bound(op: IrCmpOp, ty: IrType, k: i64, x_left: bool, negate: bool) -> Option<(Bound, bool)> {
+        use IrCmpOp::*;
+        let bits = ty.size() as u32 * 8;
+        let (signed, k) = match op {
+            Slt | Sle | Sgt | Sge => (true, if bits == 64 { k as i128 } else { k as i32 as i128 }),
+            Ult | Ule | Ugt | Uge => (false, if bits == 64 { k as u64 as i128 } else { k as u32 as i128 }),
+            _ => return None,
+        };
+        // Normalize to `x op k`.
+        let mut op = if x_left { op } else {
+            match op { Slt => Sgt, Sle => Sge, Sgt => Slt, Sge => Sle, Ult => Ugt, Ule => Uge, Ugt => Ult, _ => Ule }
+        };
+        if negate {
+            op = match op { Slt => Sge, Sle => Sgt, Sgt => Sle, Sge => Slt, Ult => Uge, Ule => Ugt, Ugt => Ule, _ => Ult };
+        }
+        let b = match op {
+            Sge | Uge => Bound::Lo(k),
+            Sgt | Ugt => Bound::Lo(k + 1),
+            Sle | Ule => Bound::Hi(k),
+            _ => Bound::Hi(k - 1),
+        };
+        Some((b, signed))
+    }
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
+        }
+        block.terminator.for_each_used_value(|id| *use_count.entry(id).or_insert(0) += 1);
+    }
+    let (pred_count, _) = build_pred_info(func);
+    // The compare a block ends with and branches on: (x, op, k, x on the left, ty).
+    let test = |block: &BasicBlock| -> Option<(Value, IrCmpOp, i64, bool, IrType, Value)> {
+        let Terminator::CondBranch { cond: Operand::Value(c), .. } = block.terminator else { return None };
+        let Some(Instruction::Cmp { dest, op, lhs, rhs, ty }) = block.instructions.last() else { return None };
+        if *dest != c || use_count.get(&c.0) != Some(&1) || !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+            return None;
+        }
+        match (lhs, rhs) {
+            (Operand::Value(x), Operand::Const(k)) => Some((*x, *op, k.to_i64()?, true, *ty, c)),
+            (Operand::Const(k), Operand::Value(x)) => Some((*x, *op, k.to_i64()?, false, *ty, c)),
+            _ => None,
+        }
+    };
+
+    let mut fused = 0;
+    for ai in 0..func.blocks.len() {
+        let a = &func.blocks[ai];
+        let Terminator::CondBranch { true_label: at, false_label: af, .. } = a.terminator else { continue };
+        let Some((x, op1, k1, left1, ty, c1)) = test(a) else { continue };
+        // A continues to X on one side and gives up to F on the other.
+        for (xl, f, neg1) in [(at, af, false), (af, at, true)] {
+            let Some(&xi) = label_to_idx.get(&xl) else { continue };
+            let xb = &func.blocks[xi];
+            if xi == ai || xb.instructions.len() != 1 || pred_count.get(&xl) != Some(&1) {
+                continue;
+            }
+            let Some((x2, op2, k2, left2, ty2, _)) = test(xb) else { continue };
+            let Terminator::CondBranch { true_label: xt, false_label: xf, .. } = xb.terminator else { continue };
+            let (t, neg2) = if xf == f { (xt, false) } else if xt == f { (xf, true) } else { continue };
+            if x2 != x || ty2.size() != ty.size() || t == f || t == xl {
+                continue;
+            }
+            let (Some((b1, s1)), Some((b2, s2))) = (bound(op1, ty, k1, left1, neg1), bound(op2, ty2, k2, left2, neg2)) else { continue };
+            let (lo, hi) = match (b1, b2) {
+                (Bound::Lo(l), Bound::Hi(h)) | (Bound::Hi(h), Bound::Lo(l)) => (l, h),
+                _ => continue,
+            };
+            if s1 != s2 || lo > hi {
+                continue;
+            }
+            // F's phis must not tell A's edge from X's.
+            let Some(&fi) = label_to_idx.get(&f) else { continue };
+            let (al, xlab) = (func.blocks[ai].label, xl);
+            let same = func.blocks[fi].instructions.iter().all(|i| match i {
+                Instruction::Phi { incoming, .. } => {
+                    let from = |l: BlockId| incoming.iter().find(|(_, p)| *p == l).map(|(op, _)| *op);
+                    match (from(al), from(xlab)) {
+                        (Some(p), Some(q)) => operands_equal(&p, &q),
+                        (p, q) => p.is_none() && q.is_none(),
+                    }
+                }
+                _ => true,
+            });
+            if !same {
+                continue;
+            }
+            let uty = ty.to_unsigned();
+            let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
+            let tv = Value(next_id);
+            next_id += 1;
+            func.next_value_id = next_id;
+            let ab = &mut func.blocks[ai];
+            let k = ab.instructions.len() - 1;
+            // x + 5 rather than x - (-5), which would build the constant.
+            let (op, k_lo) = if lo < 0 {
+                (crate::ir::reexports::IrBinOp::Add, (-lo) as i64)
+            } else {
+                (crate::ir::reexports::IrBinOp::Sub, lo as i64)
+            };
+            ab.instructions[k] = Instruction::BinOp {
+                dest: tv, op, lhs: Operand::Value(x), rhs: Operand::Const(IrConst::from_i64(k_lo, uty)), ty: uty,
+            };
+            ab.instructions.push(Instruction::Cmp {
+                dest: c1, op: IrCmpOp::Ule, lhs: Operand::Value(tv),
+                rhs: Operand::Const(IrConst::from_i64((hi - lo) as i64, uty)), ty: uty,
+            });
+            if !ab.source_spans.is_empty() {
+                let span = ab.source_spans[ab.source_spans.len() - 1];
+                ab.source_spans.push(span);
+            }
+            ab.terminator = Terminator::CondBranch { cond: Operand::Value(c1), true_label: t, false_label: f };
+            // T is now entered from A instead of X.
+            if let Some(&ti) = label_to_idx.get(&t) {
+                for inst in &mut func.blocks[ti].instructions {
+                    if let Instruction::Phi { incoming, .. } = inst {
+                        for (_, l) in incoming.iter_mut() {
+                            if *l == xlab {
+                                *l = al;
+                            }
+                        }
+                    }
+                }
+            }
+            fused += 1;
+            // Block indices are unchanged, but use counts and predecessor
+            // counts are stale: one fusion per call.
+            return fused;
+        }
+    }
+    fused
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,8 +1585,6 @@ fn consts_equal_for_phi(a: &IrConst, b: &IrConst) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::IrType;
-    use crate::ir::reexports::IrCmpOp;
 
     /// Create a basic block for testing. Reduces boilerplate since
     /// `source_spans` is always empty in tests.
@@ -1940,5 +2099,52 @@ mod tests {
         assert!(matches!(func.blocks[5].terminator, Terminator::Return(Some(Operand::Value(r))) if r == nv));
         // The miss path's target, also reached from block 4, is not touched.
         assert!(func.blocks[6].instructions.is_empty());
+    }
+
+    /// `if (x >= 97 && x <= 122) return 1; return phi` with F's phi taking
+    /// `f_from_x` from the second test's block.
+    fn range_test(f_from_x: i32) -> IrFunction {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let (b, v) = (BlockId, |n| Operand::Value(Value(n)));
+        let c = |n| Operand::Const(IrConst::I32(n));
+        func.blocks = vec![
+            make_block(b(0), vec![
+                Instruction::Cmp { dest: Value(10), op: IrCmpOp::Sge, lhs: v(1), rhs: c(97), ty: IrType::I32 },
+            ], Terminator::CondBranch { cond: v(10), true_label: b(1), false_label: b(3) }),
+            make_block(b(1), vec![
+                Instruction::Cmp { dest: Value(11), op: IrCmpOp::Sle, lhs: v(1), rhs: c(122), ty: IrType::I32 },
+            ], Terminator::CondBranch { cond: v(11), true_label: b(2), false_label: b(3) }),
+            make_block(b(2), vec![], Terminator::Return(Some(c(1)))),
+            make_block(b(3), vec![
+                Instruction::Phi { dest: Value(12), ty: IrType::I32, incoming: vec![(c(0), b(0)), (c(f_from_x), b(1))] },
+            ], Terminator::Return(Some(v(12)))),
+        ];
+        func.next_value_id = 13;
+        func
+    }
+
+    #[test]
+    fn test_range_tests_fused() {
+        let mut func = range_test(0);
+        let label_to_idx = build_label_to_idx(&func);
+        assert_eq!(fuse_range_tests(&mut func, &label_to_idx), 1);
+        assert!(matches!(func.blocks[0].instructions[..], [
+            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Sub, ty: IrType::U32, .. },
+            Instruction::Cmp { dest: Value(10), op: IrCmpOp::Ule, ty: IrType::U32, .. },
+        ]));
+        let Instruction::Cmp { rhs: Operand::Const(k), .. } = func.blocks[0].instructions[1] else { unreachable!() };
+        assert_eq!(k.to_i64(), Some(25));
+        assert!(matches!(func.blocks[0].terminator,
+            Terminator::CondBranch { true_label: BlockId(2), false_label: BlockId(3), .. }));
+        // The second test's block is left unreachable.
+        assert!(simplify_cfg(&mut func) > 0);
+        assert!(!func.blocks.iter().any(|b| b.label == BlockId(1)));
+    }
+
+    #[test]
+    fn test_range_tests_kept_when_failing_edges_differ() {
+        let mut func = range_test(5);
+        let label_to_idx = build_label_to_idx(&func);
+        assert_eq!(fuse_range_tests(&mut func, &label_to_idx), 0);
     }
 }
