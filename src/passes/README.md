@@ -66,6 +66,10 @@ The optimizer executes in four sequential phases:
    +-------------------------------------------------------+
          |
          v
+ Phase 9b: Small Memory Calls In Place
+     mem_inline
+         |
+         v
  Phase 10a: Loop Bound Hoisting
      bound_hoist
          |
@@ -294,7 +298,12 @@ functions.
 **Eligibility.** Not all functions can be inlined. Variadic functions, functions
 containing `VaStart`/`VaEnd`/`VaArg`, `DynAlloca`, `StackSave`/`StackRestore`,
 `IndirectBranch`, or static locals with label references are excluded.
-`__attribute__((noinline))` functions and recursive calls are also excluded.
+`__attribute__((noinline))` functions and recursive calls are also excluded, as
+are (unless `always_inline`) functions on a cycle of the call graph, found as
+strongly connected components: an inlined recursive function brings its own
+call along, which was inlined again up to the round limit (SQLite's
+22-instruction `sqlite3BitvecDestroy` became 5,000 instructions in each of its
+callers, and the whole file took twice as long to compile).
 
 **Heuristics.** The inliner uses a tiered size-based heuristic:
 
@@ -805,6 +814,18 @@ computations are removed by subsequent DCE.
 Runs only during the first iteration of the main loop. Uses shared CFG analysis
 with GVN and LICM.
 
+### mem_inline -- Small Memory Calls In Place
+
+Runs once after the main loop. A `memcpy` call with a constant length of at
+most 128 bytes becomes the IR's Memcpy (loads and stores in 32-, 16-, 8- and
+smaller chunks), and a `memset` one becomes 8-byte stores of the byte
+repeated, then 4-, 2- and 1-byte ones (AArch64 and x86-64 only, where
+unaligned stores are fine). Lowering already does this for the fortified
+`__builtin___memcpy_chk` calls the system headers make of every memcpy,
+when the check cannot fail (the object size is unknown, or a constant length
+fits) and the length is constant; this catches lengths that became constant
+during optimization (a size computed in an inlined helper).
+
 ### bound_hoist -- Loop Bound Hoisting
 
 Runs once after the main loop, before iv_widen. iv_widen and lftr need a
@@ -1235,6 +1256,7 @@ behavior across iterations.
 | `iv_strength_reduce.rs`  | Loop induction variable strength reduction             |
 | `iv_widen.rs`            | Signed 32-bit loop counters kept as 64-bit values      |
 | `lftr.rs`                | Exit tests moved off counters (one IV per loop)        |
+| `mem_inline.rs`          | Small constant-length memcpy/memset done in place      |
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
 | `loop_layout.rs`         | Loop tails moved before the header (latch falls through) |

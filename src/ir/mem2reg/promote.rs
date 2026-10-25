@@ -138,17 +138,29 @@ fn promote_function(func: &mut IrFunction, promote_params: bool) {
         .sum();
 
     if total_phi_cost > MAX_PHI_COPY_COST {
-        // Compute per-alloca costs and remove the most expensive first
-        let mut alloca_phi_costs: Vec<(usize, usize)> = alloca_infos.iter().enumerate()
-            .map(|(alloca_idx, _)| {
+        // Remove the allocas that cost the most per access first: a variable
+        // live across a large switch has phis at many merges, but if it is
+        // also the one every case reads (the interpreter's `pOp`), keeping it
+        // in memory costs a load and store on every use. Rarely accessed
+        // variables with big phi webs go before it.
+        let mut accesses: FxHashMap<u32, usize> = FxHashMap::default();
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            if let Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } = inst {
+                *accesses.entry(ptr.0).or_insert(0) += 1;
+            }
+        }
+        let mut alloca_phi_costs: Vec<(usize, usize, usize)> = alloca_infos.iter().enumerate()
+            .map(|(alloca_idx, info)| {
                 let cost: usize = phi_locations.iter().enumerate()
                     .filter(|(_, phi_set)| phi_set.contains(&alloca_idx))
                     .map(|(block_idx, _)| preds.len(block_idx))
                     .sum();
-                (alloca_idx, cost)
+                (alloca_idx, cost, accesses.get(&info.alloca_value.0).copied().unwrap_or(0).max(1))
             })
             .collect();
-        alloca_phi_costs.sort_by(|a, b| b.1.cmp(&a.1));
+        // cost / uses, descending (compared by cross-multiplying).
+        alloca_phi_costs.sort_by(|a, b| (b.1 * a.2).cmp(&(a.1 * b.2)).then(b.1.cmp(&a.1)));
+        let alloca_phi_costs: Vec<(usize, usize)> = alloca_phi_costs.into_iter().map(|(i, c, _)| (i, c)).collect();
 
         let mut remaining_cost = total_phi_cost;
         let mut remove_set: FxHashSet<usize> = FxHashSet::default();

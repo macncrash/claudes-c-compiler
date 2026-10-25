@@ -27,6 +27,7 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
 pub(crate) mod lftr;
+mod mem_inline;
 pub(crate) mod licm;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_hoist;
@@ -598,6 +599,17 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
 
         // Prepare dirty set for next iteration: only re-visit functions that changed.
         std::mem::swap(&mut dirty, &mut changed);
+    }
+
+    // Phase 9b: Small constant-length memcpy/memset calls (lengths that
+    // became constant during optimization) done in place.
+    if !disabled.contains("mem_inline") {
+        let wide = matches!(target, crate::backend::Target::Aarch64 | crate::backend::Target::X86_64);
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if mem_inline::inline_function(func, wide) > 0 {
+                copy_prop::propagate_copies(func);
+            }
+        }
     }
 
     // Phase 10a: Move loads an exit test reads from memory the loop never

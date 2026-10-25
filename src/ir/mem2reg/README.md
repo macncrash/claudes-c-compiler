@@ -94,9 +94,11 @@ reached. A phi node is placed at every block in this iterated frontier.
 instructions during phi elimination. For functions with large multi-way branches (e.g., a
 `switch` with 84 cases in a VM dispatch loop), promoting many allocas can produce
 O(cases x allocas) copies. The pass estimates the total copy cost and, if it exceeds the
-`MAX_PHI_COPY_COST` threshold (50,000), excludes the most expensive allocas from promotion,
-leaving them as stack variables. This keeps the generated code within reasonable bounds
-(roughly 400 KB of copy instructions at 8 bytes per slot).
+`MAX_PHI_COPY_COST` threshold (50,000), excludes allocas from promotion, leaving them as
+stack variables, those costing the most per load or store first. This keeps the generated
+code within reasonable bounds (roughly 400 KB of copy instructions at 8 bytes per slot)
+while keeping the variable every case reads (SQLite's `pOp` in `sqlite3VdbeExec`, whose phi
+web is the largest because it is live everywhere) in a register.
 
 ### Step 6: Rename Variables via Dominator-Tree DFS
 
@@ -333,7 +335,8 @@ Cooper-Harvey-Kennedy algorithm. The IDF approach also naturally supports the ph
 limiting heuristic, which examines all phi placement sites before committing.
 
 **Phi cost limiting.** Rather than unconditionally promoting every eligible alloca, the pass
-estimates total copy cost and drops the most expensive allocas when the threshold is exceeded.
+estimates total copy cost and drops allocas when the threshold is exceeded, ranked by phi
+cost per access so a heavily used variable outlasts rarely used ones with large phi webs.
 This is a pragmatic defense against pathological cases (e.g., large `switch` dispatch loops
 with many promoted variables) that would otherwise produce an explosion of copy instructions
 during phi elimination. The threshold of 50,000 copies balances optimization opportunity

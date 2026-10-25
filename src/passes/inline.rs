@@ -1187,8 +1187,83 @@ fn func_has_static_locals_with_label_refs(module: &IrModule, func_name: &str) ->
 }
 
 /// Build a map of function name -> callee data for functions eligible for inlining.
+/// The functions on a cycle of the module's call graph (calling themselves,
+/// directly or through others), by Tarjan's strongly connected components.
+fn recursive_functions(module: &IrModule) -> FxHashSet<&str> {
+    let index: HashMap<&str, usize> = module.functions.iter().enumerate()
+        .filter(|(_, f)| !f.is_declaration)
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    let n = module.functions.len();
+    let succs: Vec<Vec<usize>> = module.functions.iter().map(|f| {
+        let mut s: Vec<usize> = f.blocks.iter().flat_map(|b| &b.instructions)
+            .filter_map(|i| match i {
+                Instruction::Call { func, .. } => index.get(func.as_str()).copied(),
+                _ => None,
+            })
+            .collect();
+        s.sort_unstable();
+        s.dedup();
+        s
+    }).collect();
+
+    let mut out = FxHashSet::default();
+    let mut num = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next = 0;
+    for root in 0..n {
+        if num[root] != usize::MAX || module.functions[root].is_declaration {
+            continue;
+        }
+        // (node, index of the next successor to visit)
+        let mut work = vec![(root, 0usize)];
+        num[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (v, ref mut k)) = work.last_mut() {
+            if let Some(&w) = succs[v].get(*k) {
+                *k += 1;
+                if num[w] == usize::MAX {
+                    num[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(num[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == num[v] {
+                let mut scc = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    scc.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if scc.len() > 1 || succs[v].contains(&v) {
+                    out.extend(scc.iter().map(|&w| module.functions[w].name.as_str()));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
     let mut map = HashMap::new();
+    let recursive = recursive_functions(module);
 
     let debug_callee = std::env::var("CCC_INLINE_DEBUG").is_ok();
     for func in &module.functions {
@@ -1197,6 +1272,16 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         }
         // __attribute__((noinline)) takes precedence: never inline these functions
         if func.is_noinline {
+            continue;
+        }
+        // A recursive function inlined into a caller brings its own call
+        // along, which is inlined in turn, up to the round limit: SQLite's
+        // 22-instruction sqlite3BitvecDestroy became 5,000 instructions in
+        // each of its callers. (always_inline is left to its own limits.)
+        if !func.is_always_inline && recursive.contains(func.name.as_str()) {
+            if debug_callee {
+                eprintln!("[INLINE_DEBUG] {} skipped: recursive", func.name);
+            }
             continue;
         }
 
@@ -2056,5 +2141,37 @@ fn format_terminator(term: &Terminator) -> String {
             format!("switch {}, default .L{}, [{}]", format_operand(val), default.0, cases_str.join(", "))
         }
         Terminator::Unreachable => "unreachable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo};
+
+    /// A function calling each of `callees`, then returning.
+    fn caller(name: &str, callees: &[&str]) -> IrFunction {
+        let mut f = IrFunction::new(name.to_string(), IrType::Void, vec![], false);
+        let instructions = callees.iter().map(|c| Instruction::Call { func: c.to_string(), info: CallInfo {
+            dest: None, args: vec![], arg_types: vec![], return_type: IrType::Void, is_variadic: false, num_fixed_args: 0,
+            struct_arg_sizes: vec![], struct_arg_aligns: vec![], struct_arg_classes: Vec::new(),
+            struct_arg_riscv_float_classes: Vec::new(), is_sret: false, is_fastcall: false, ret_eightbyte_classes: Vec::new(),
+        } }).collect();
+        f.blocks = vec![BasicBlock { label: BlockId(0), instructions, terminator: Terminator::Return(None), source_spans: Vec::new() }];
+        f
+    }
+
+    #[test]
+    fn recursive_functions_are_the_call_graph_cycles() {
+        let mut module = IrModule::new();
+        // a <-> b, c -> c, d -> a (calls into a cycle, not on one), e -> extern.
+        for (name, callees) in [("a", &["b"][..]), ("b", &["a", "d"]), ("c", &["c"]), ("d", &["e"]), ("e", &["puts"])] {
+            module.functions.push(caller(name, callees));
+        }
+        module.functions.push(caller("f", &["a", "c"]));
+        let rec = recursive_functions(&module);
+        let mut names: Vec<&str> = rec.into_iter().collect();
+        names.sort_unstable();
+        assert_eq!(names, ["a", "b", "c"]);
     }
 }

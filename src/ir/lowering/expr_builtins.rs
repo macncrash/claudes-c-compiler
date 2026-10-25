@@ -529,6 +529,9 @@ impl Lowerer {
         // Lower all arguments in order
         let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
         let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
+        if let Some(result) = self.lower_unchecked_mem(name, &arg_vals, &arg_types) {
+            return Some(result);
+        }
 
         let dest = self.fresh_value();
         let return_type = Self::builtin_return_type(name)
@@ -554,6 +557,98 @@ impl Lowerer {
             },
         });
         Some(Operand::Value(dest))
+    }
+
+    /// `__builtin___memcpy_chk(d, s, n, size)`, and memmove and memset: what
+    /// the macOS and glibc headers make of every memcpy. When the check
+    /// cannot fail (the object size is unknown, -1, which is what
+    /// `__builtin_object_size` answers here, or a constant n fits in it), this
+    /// is the plain call, and a small constant-length memcpy or memset is done
+    /// in place, as clang does (SQLite copies and clears its 56-byte `Mem`
+    /// cells this way). `vals` are the four arguments, already lowered.
+    fn lower_unchecked_mem(&mut self, name: &str, vals: &[Operand], types: &[IrType]) -> Option<Operand> {
+        /// Largest constant length copied or cleared in place.
+        const MAX_INLINE: i64 = 128;
+        let plain = match name {
+            "__builtin___memcpy_chk" => "memcpy",
+            "__builtin___memmove_chk" => "memmove",
+            "__builtin___memset_chk" => "memset",
+            _ => return None,
+        };
+        let [d, x, n, size] = vals else { return None };
+        let constant = |op: &Operand| match op {
+            Operand::Const(c) => c.to_i64(),
+            _ => None,
+        };
+        let len = constant(n);
+        let fits = match constant(size) {
+            Some(-1) => true,
+            Some(s) => len.is_some_and(|l| (0..=s).contains(&l)),
+            None => false,
+        };
+        if !fits {
+            return None;
+        }
+        let dest = self.operand_to_value(*d);
+        let wide = matches!(self.target, crate::backend::Target::Aarch64 | crate::backend::Target::X86_64);
+        match (plain, len) {
+            (_, Some(0)) => return Some(Operand::Value(dest)),
+            ("memcpy", Some(l)) if l <= MAX_INLINE => {
+                let src = self.operand_to_value(*x);
+                self.emit(Instruction::Memcpy { dest, src, size: l as usize });
+                return Some(Operand::Value(dest));
+            }
+            // Stores of the byte repeated, 8 at a time (unaligned stores are
+            // fine on these targets).
+            ("memset", Some(l)) if l <= MAX_INLINE && wide => {
+                let pattern = match constant(x) {
+                    Some(b) => Operand::Const(IrConst::I64((b & 0xff) * 0x0101_0101_0101_0101)),
+                    None => {
+                        let wide_byte = self.emit_implicit_cast(*x, types[1], IrType::I64);
+                        let byte = self.emit_binop_val(IrBinOp::And, wide_byte, Operand::Const(IrConst::I64(0xff)), IrType::I64);
+                        let splat = self.emit_binop_val(IrBinOp::Mul, Operand::Value(byte),
+                            Operand::Const(IrConst::I64(0x0101_0101_0101_0101)), IrType::I64);
+                        Operand::Value(splat)
+                    }
+                };
+                let mut offset = 0usize;
+                let l = l as usize;
+                for (width, ty) in [(8, IrType::I64), (4, IrType::I32), (2, IrType::I16), (1, IrType::I8)] {
+                    while l - offset >= width {
+                        let val = match pattern {
+                            Operand::Const(IrConst::I64(p)) => Operand::Const(IrConst::from_i64(p, ty)),
+                            _ if ty == IrType::I64 => pattern,
+                            _ => self.emit_implicit_cast(pattern, IrType::I64, ty),
+                        };
+                        self.emit_store_at_offset(dest, offset, val, ty);
+                        offset += width;
+                    }
+                }
+                return Some(Operand::Value(dest));
+            }
+            _ => {}
+        }
+        let size_ty = crate::common::types::target_int_ir_type();
+        let result = self.fresh_value();
+        self.emit(Instruction::Call {
+            func: plain.to_string(),
+            info: CallInfo {
+                dest: Some(result),
+                args: vec![Operand::Value(dest), *x, *n],
+                arg_types: vec![IrType::Ptr, types[1], size_ty],
+                return_type: IrType::Ptr,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None; 3],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: Vec::new(),
+                struct_arg_riscv_float_classes: Vec::new(),
+                is_sret: false,
+                is_fastcall: false,
+                ret_eightbyte_classes: Vec::new(),
+            },
+        });
+        Some(Operand::Value(result))
     }
 
     /// Lower mempcpy(d, s, n) as memcpy(d, s, n) followed by d + n.
