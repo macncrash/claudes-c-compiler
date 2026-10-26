@@ -251,17 +251,28 @@ fn drop_extended_truncations(func: &mut IrFunction) -> usize {
 }
 
 /// Whether every use of the value `v` reads only its low `bits`:
-/// truncations and stores at most that wide, and 32- or 64-bit operations
+/// truncations and stores at most that wide, 32- or 64-bit operations
 /// whose low bits depend only on their operands' low bits, whose own uses
-/// do.
-fn reads_low_bits(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32, bits: usize, depth: usize) -> bool {
+/// do, and right shifts of v by a constant k whose uses read only their low
+/// (bits - k).
+pub(crate) fn reads_low_bits(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32, bits: usize, depth: usize) -> bool {
     let fits = |ty: &IrType| ty.is_integer() && ty.size() * 8 <= bits;
     uses[v as usize].iter().all(|u| {
         let Some((b, i)) = *u else { return false };
         match &func.blocks[b].instructions[i] {
             Instruction::Cast { to_ty, .. } => fits(to_ty),
             Instruction::Store { val: Operand::Value(x), ptr, ty, .. } => x.0 == v && ptr.0 != v && fits(ty),
-            Instruction::BinOp { dest, op, rhs, ty: IrType::I64 | IrType::U64 | IrType::I32 | IrType::U32, .. } => {
+            Instruction::BinOp { dest, op, lhs, rhs, ty: IrType::I64 | IrType::U64 | IrType::I32 | IrType::U32 } => {
+                // A right shift by k reads bits k.. of v: its uses may read
+                // only its low (bits - k).
+                let shift = match (op, lhs, rhs) {
+                    (IrBinOp::LShr | IrBinOp::AShr, Operand::Value(l), Operand::Const(k)) if l.0 == v => k.to_i64(),
+                    _ => None,
+                };
+                if let Some(k) = shift {
+                    return (0..bits as i64).contains(&k) && depth < 4
+                        && reads_low_bits(func, uses, dest.0, bits - k as usize, depth + 1);
+                }
                 let low = match op {
                     IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => true,
                     IrBinOp::Shl => !matches!(rhs, Operand::Value(r) if r.0 == v),

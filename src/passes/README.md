@@ -544,7 +544,8 @@ narrow to.
 
 A value truncated from 32 or 64 bits and extended back is the value itself to
 uses that read only the bits the truncation kept (truncations and stores at
-most that wide, through Add/Sub/Mul/And/Or/Xor and the left of Shl): `s->bi_buf
+most that wide, through Add/Sub/Mul/And/Or/Xor and the left of Shl, and right
+shifts by a constant k whose uses read k fewer): `s->bi_buf
 |= (ush)v << s->bi_valid` truncates the shift to 16 bits, extends it for the
 or and truncates the or to 16 bits, so the extension goes (a `sxtw` or an
 `and` each send).
@@ -907,11 +908,20 @@ the location stops the walk: a store through another root or overlapping the
 bytes, a call mod_ref cannot show writes nothing, a memcpy, atomics, inline
 asm. A loop header's own back edge can take part (a field never written in
 the loop is the value from before it); a walk that comes back to a block it is
-still answering for gives up. Only 32- and 64-bit integers and pointers: a
-narrower value in a phi needs extending at each use, which its load did for
-free. At most 4096 blocks are entered per function and 256 instructions looked
-at in each. compress_block keeps `bi_valid` in a register from one send to the
-next instead of loading it in each.
+still answering for gives up. At most 4096 blocks are entered per function and
+256 instructions looked at in each. compress_block keeps `bi_valid` in a
+register from one send to the next instead of loading it in each.
+
+A phi of an 8- or 16-bit value would need extending at each use, which its
+load does for free, so such loads are taken only when every use is an
+extension to one 32- or 64-bit type whose uses read only the loaded bits
+(narrow's low-bits check, which also follows right shifts by a constant).
+Then any wider value with those low bits will do: the walk looks for stores of
+truncations (or constants) and joins the values truncated, and the extensions
+read them, high bits unmasked. A truncation from the other width is cast to it
+right after it. zlib's 16-bit `bi_buf` is or-ed into, truncated and stored, or
+shifted down 8 for its high byte, so it too stays in a register between sends,
+as clang keeps it.
 
 ### bound_hoist -- Loop Bound Hoisting
 

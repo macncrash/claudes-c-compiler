@@ -3,8 +3,9 @@
  * a pointer that may point into the writer itself), int shifts of 16-bit
  * codes truncated back to 16 bits, unsigned distances, a table index
  * picked by a ternary, constants on the left of subtracts and shifts in
- * loops, table entries at a constant past a variable index, and unsigned
- * loop counters. */
+ * loops, table entries at a constant past a variable index, unsigned
+ * loop counters, and a 16-bit field carried between stores in a wider
+ * register. */
 #include <stdint.h>
 #include <stdio.h>
 
@@ -148,6 +149,31 @@ __attribute__((noinline)) static unsigned long counters(struct cnt *c, unsigned 
     return s + j * 3u + k;
 }
 
+/* A 16-bit field stored from wider ints on both arms of an if, then read:
+ * its low bits only (or-ed in and stored, low and high byte), or whole
+ * (compared, divided, shifted past bit 15), where the high bits of the
+ * stored ints must not show. */
+struct h16 { uint16_t f; uint16_t g; int x; };
+__attribute__((noinline)) static uint32_t halves(struct h16 *h, int a, int b, int n) {
+    uint32_t acc = 0;
+    for (int i = 0; i < n; i++) {
+        if ((a ^ i) & 1)
+            h->f = (uint16_t)((unsigned)a * 40503u + (unsigned)i);
+        else
+            h->f |= (uint16_t)((unsigned)b << (i & 15));
+        h->f |= (uint16_t)(a >> 3);
+        h->g = (uint16_t)(h->f & 0xff) + (uint16_t)(h->f >> 8);
+        acc = acc * 33 + h->g;
+        if (i % 3 == 0)
+            h->f = (uint16_t)(b * 977 - i);
+        else
+            h->f = (uint16_t)((unsigned)a + 70000u * (unsigned)i);
+        acc += h->f > 40000;
+        acc = acc * 7 + h->f / 3u + (uint32_t)(h->f >> 9) + (uint32_t)((int)h->f >> 17);
+    }
+    return acc;
+}
+
 int main(void) {
     for (int i = 0; i < 256; i++) len_code[i] = (uint8_t)(i * 29 / 256);
     for (int i = 0; i < 512; i++) dist_code[i] = (uint8_t)(i * 30 / 512);
@@ -213,6 +239,10 @@ int main(void) {
     static unsigned char bytes[200];
     for (int i = 0; i < 200; i++) bytes[i] = (uint8_t)rnd();
     struct cnt c = {150, bytes};
+    struct h16 h = {0x1234, 0, 0};
+    printf("halves %08x", halves(&h, 12345, -77, 40));
+    printf(" %08x %04x\n", halves(&h, -0x7ffff, 0x7fff, 33), h.f);
+
     printf("counters %lu", counters(&c, 0xfffffffdu, 0xffffffffu));
     c.n = 7;
     printf(" %lu", counters(&c, 3, 2));
