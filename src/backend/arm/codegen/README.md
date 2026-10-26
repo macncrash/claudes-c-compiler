@@ -565,6 +565,13 @@ Supported operations include:
 | `loaddqu` | `ldr q` | 128-bit unaligned load |
 | `storedqu` | `str q` | 128-bit unaligned store |
 
+Whole-vector operations (`IntrinsicOp::VecOp`, from GCC vector extensions and
+from the loop vectorizer) load their operands into `v0`-`v2` (or use a
+vector variable's own register), broadcast a scalar operand with `dup` (or
+keep a constant one in a register), apply one instruction of the lane
+arrangement (`add v0.8h`, `cmhi`, ...), and store the result. The vectorizer's
+saturating subtract is `uqsub`/`sqsub` by lane signedness.
+
 ### Scalar Operations
 
 | Intrinsic | NEON Instruction |

@@ -43,7 +43,10 @@ enum ExprKey {
     Gep { base: VNOperand, offset: VNOperand, ty: IrType },
     /// Load CSE key: two loads from the same pointer with the same type
     /// produce the same value if no intervening memory modification occurs.
-    Load { ptr: VNOperand, ty: IrType },
+    /// The pointer is its root (before any chain of constant-offset GEPs)
+    /// and the byte offset from it, so differently typed GEPs of one
+    /// address are one location.
+    Load { ptr: VNOperand, off: i64, ty: IrType },
     /// A symbol's address, the same everywhere in the function.
     GlobalAddr { name: String },
 }
@@ -62,11 +65,15 @@ enum VNOperand {
     ValueNum(u32),
 }
 
+/// The most loads, and stores, at one root a store to it carries over.
+const MAX_KEPT: usize = 64;
+
 /// Key for store-to-load forwarding: identifies a memory location by pointer
 /// value number and access type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct StoreFwdKey {
     ptr_vn: VNOperand,
+    off: i64,
     ty: IrType,
 }
 
@@ -129,6 +136,12 @@ struct GvnState {
     /// Calls (block, instruction index) to functions that write no memory
     /// the caller can see, which leave cached loads valid.
     silent_calls: FxHashSet<(usize, usize)>,
+    /// Pointer value -> (root, byte offset) through constant-offset GEPs.
+    locs: FxHashMap<u32, (Value, i64)>,
+    /// Root value number -> the load and store keys recorded at it, so a
+    /// store to the root keeps those it cannot overlap (stale keys are
+    /// skipped by their generation).
+    by_root: FxHashMap<u32, (Vec<ExprKey>, Vec<StoreFwdKey>)>,
 }
 
 impl GvnState {
@@ -150,6 +163,77 @@ impl GvnState {
             total_eliminated: 0,
             escaped_param_allocas,
             silent_calls: FxHashSet::default(),
+            locs: FxHashMap::default(),
+            by_root: FxHashMap::default(),
+        }
+    }
+
+    /// The (root value number, byte offset) a pointer addresses.
+    fn location(&mut self, ptr: Value) -> (VNOperand, i64) {
+        let (root, off) = self.locs.get(&ptr.0).copied().unwrap_or((ptr, 0));
+        (self.operand_to_vn(&Operand::Value(root)), off)
+    }
+
+    fn note_load_root(&mut self, key: &ExprKey) {
+        if let ExprKey::Load { ptr: VNOperand::ValueNum(r), .. } = key {
+            self.by_root.entry(*r).or_default().0.push(key.clone());
+        }
+    }
+
+    fn note_store_root(&mut self, key: &StoreFwdKey) {
+        if let VNOperand::ValueNum(r) = key.ptr_vn {
+            self.by_root.entry(r).or_default().1.push(key.clone());
+        }
+    }
+
+    /// The current load and store entries at the root of `ptr` whose bytes
+    /// an access of `size` bytes at `ptr` cannot overlap.
+    #[allow(clippy::type_complexity)]
+    fn disjoint_entries(&mut self, ptr: Value, size: i64) -> (Vec<(ExprKey, Value)>, Vec<(StoreFwdKey, StoreFwdEntry)>) {
+        let (VNOperand::ValueNum(root), off) = self.location(ptr) else { return (Vec::new(), Vec::new()) };
+        let Some((loads, stores)) = self.by_root.get_mut(&root).map(std::mem::take) else { return (Vec::new(), Vec::new()) };
+        let apart = |o: i64, ty: IrType| o + ty.size() as i64 <= off || off + size <= o;
+        let gen = self.load_generation;
+        let mut kept_loads = Vec::new();
+        let mut seen: FxHashSet<ExprKey> = FxHashSet::default();
+        for key in loads.into_iter().rev().take(MAX_KEPT) {
+            let ExprKey::Load { off: o, ty, .. } = key else { continue };
+            if let Some(&(v, g)) = self.load_expr_to_value.get(&key) {
+                if g == gen && apart(o, ty) && seen.insert(key.clone()) {
+                    kept_loads.push((key, v));
+                }
+            }
+        }
+        let mut kept_stores = Vec::new();
+        let mut seen: FxHashSet<StoreFwdKey> = FxHashSet::default();
+        for key in stores.into_iter().rev().take(MAX_KEPT) {
+            if let Some(&entry) = self.store_fwd_map.get(&key) {
+                if entry.1 == gen && apart(key.off, key.ty) && seen.insert(key.clone()) {
+                    kept_stores.push((key, entry));
+                }
+            }
+        }
+        // Only the kept keys stay listed: the rest are stale after the store
+        // (an entry a rollback makes current again just goes unkept by a
+        // later store, which is conservative). At most the MAX_KEPT most
+        // recent of each kind are kept, so a run of stores to one root
+        // (a large struct copied field by field) stays linear.
+        let lists = self.by_root.entry(root).or_default();
+        lists.0.extend(kept_loads.iter().rev().map(|(k, _)| k.clone()));
+        lists.1.extend(kept_stores.iter().rev().map(|(k, _)| k.clone()));
+        (kept_loads, kept_stores)
+    }
+
+    /// Carry entries kept across a store into the generation after it.
+    #[allow(clippy::type_complexity)]
+    fn renew(&mut self, (loads, stores): (Vec<(ExprKey, Value)>, Vec<(StoreFwdKey, StoreFwdEntry)>)) {
+        for (key, v) in loads {
+            let old = self.load_expr_to_value.insert(key.clone(), (v, self.load_generation));
+            self.load_rollback_log.push((key, old));
+        }
+        for (key, (op, _, _, local)) in stores {
+            let old = self.store_fwd_map.insert(key.clone(), (op, self.load_generation, self.local_generation, local));
+            self.store_fwd_rollback_log.push((key, old));
         }
     }
 
@@ -257,8 +341,8 @@ impl GvnState {
                 if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
                     return None;
                 }
-                let ptr_vn = self.operand_to_vn(&Operand::Value(*ptr));
-                Some((ExprKey::Load { ptr: ptr_vn, ty: *ty }, *dest))
+                let (ptr_vn, off) = self.location(*ptr);
+                Some((ExprKey::Load { ptr: ptr_vn, off, ty: *ty }, *dest))
             }
             Instruction::GlobalAddr { dest, name } => Some((ExprKey::GlobalAddr { name: name.clone() }, *dest)),
             // Other instructions (Store, Call, AtomicLoad, etc.) are not eligible.
@@ -467,6 +551,7 @@ pub(crate) fn run_gvn_function_with(func: &mut IrFunction, mr: Option<&ModRef>) 
     if num_blocks == 1 {
         let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
         state.silent_calls = silent_calls(func, mr);
+        state.locs = pointer_locations(func);
         return process_block(0, func, &mut state);
     }
 
@@ -489,16 +574,45 @@ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAn
     if num_blocks == 1 {
         let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
         state.silent_calls = silent_calls(func, mr);
+        state.locs = pointer_locations(func);
         return process_block(0, func, &mut state);
     }
 
     let mut state = GvnState::new(func.max_value_id() as usize, escaped, find_local_only_addresses(func));
     state.silent_calls = silent_calls(func, mr);
+    state.locs = pointer_locations(func);
 
     // DFS over the dominator tree
     gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
 
     state.total_eliminated
+}
+
+/// Each constant-offset GEP's (root, byte offset): the pointer at the start
+/// of its chain of such GEPs, and their offsets summed.
+fn pointer_locations(func: &IrFunction) -> FxHashMap<u32, (Value, i64)> {
+    let mut step: FxHashMap<u32, (Value, i64)> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
+            if let Some(k) = c.to_i64().filter(|k| k.unsigned_abs() < 1 << 31) {
+                step.insert(dest.0, (*base, k));
+            }
+        }
+    }
+    let mut locs = FxHashMap::default();
+    for &v in step.keys() {
+        let (mut root, mut off) = step[&v];
+        // Chains are short; the bound only guards against a malformed cycle.
+        for _ in 0..64 {
+            let Some(&(b, k)) = step.get(&root.0) else { break };
+            root = b;
+            off += k;
+        }
+        if off.unsigned_abs() < 1 << 40 {
+            locs.insert(v, (root, off));
+        }
+    }
+    locs
 }
 
 /// Positions of the calls in `func` that write no memory the caller can see.
@@ -621,10 +735,19 @@ fn process_block(
         // by bumping the generation counter. This is O(1) instead of iterating
         // all keys.
         if clobbers_memory(&inst) && !state.silent_calls.contains(&(block_idx, k)) {
+            // A store to a constant offset from a root leaves the loads and
+            // stores at other offsets from that same root, which it cannot
+            // overlap.
+            let kept = match &inst {
+                Instruction::Store { ptr, ty, volatile: false, seg_override: AddressSpace::Default, .. } =>
+                    state.disjoint_entries(*ptr, ty.size() as i64),
+                _ => (Vec::new(), Vec::new()),
+            };
             state.load_generation += 1;
             if !matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }) {
                 state.local_generation += 1;
             }
+            state.renew(kept);
         }
 
         // Store-to-load forwarding: record stored values for subsequent loads.
@@ -639,12 +762,13 @@ fn process_block(
         if is_forwardable_store(&inst) {
             if let Instruction::Store { val, ptr, ty, .. } = &inst {
                 if !state.escaped_param_allocas.contains(&ptr.0) {
-                    let ptr_vn = state.operand_to_vn(&Operand::Value(*ptr));
-                    let fwd_key = StoreFwdKey { ptr_vn, ty: *ty };
+                    let (ptr_vn, off) = state.location(*ptr);
+                    let fwd_key = StoreFwdKey { ptr_vn, off, ty: *ty };
                     let fwd_key_for_log = fwd_key.clone();
                     let local = state.local_only.contains(&ptr.0);
                     let entry = (*val, state.load_generation, state.local_generation, local);
                     let old_val = state.store_fwd_map.insert(fwd_key, entry);
+                    state.note_store_root(&fwd_key_for_log);
                     state.store_fwd_rollback_log.push((fwd_key_for_log, old_val));
                 }
             }
@@ -660,8 +784,8 @@ fn process_block(
                 // For loads, first try store-to-load forwarding before load CSE.
                 // This catches the pattern: store V -> *P; load *P -> replace with V.
                 if is_load {
-                    if let ExprKey::Load { ptr: ref ptr_vn, ty } = expr_key {
-                        let fwd_key = StoreFwdKey { ptr_vn: ptr_vn.clone(), ty };
+                    if let ExprKey::Load { ptr: ref ptr_vn, off, ty } = expr_key {
+                        let fwd_key = StoreFwdKey { ptr_vn: ptr_vn.clone(), off, ty };
                         if let Some(&(stored_op, gen, local_gen, local)) = state.store_fwd_map.get(&fwd_key) {
                             if gen == state.load_generation || (local && local_gen == state.local_generation) {
                                 // Forward the stored value to the load destination.
@@ -690,6 +814,7 @@ fn process_block(
                                     expr_key,
                                     (dest, state.load_generation),
                                 );
+                                state.note_load_root(&load_key_for_log);
                                 state.load_rollback_log.push((load_key_for_log, old_load));
                                 new_instructions.push(Instruction::Copy {
                                     dest,
@@ -743,6 +868,7 @@ fn process_block(
                     if is_load {
                         let key_for_log = expr_key.clone();
                         let old_val = state.load_expr_to_value.insert(expr_key, (dest, state.load_generation));
+                        state.note_load_root(&key_for_log);
                         state.load_rollback_log.push((key_for_log, old_val));
                     } else {
                         let key_for_log = expr_key.clone();
@@ -1933,5 +2059,72 @@ mod tests {
             }
             other => panic!("Expected Copy of constant 99, got {:?}", other),
         }
+    }
+
+    fn field(dest: u32, base: u32, off: i64, ty: IrType) -> Instruction {
+        Instruction::GetElementPtr { dest: Value(dest), base: Value(base), offset: Operand::Const(IrConst::I64(off)), ty }
+    }
+
+    fn load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty, seg_override: AddressSpace::Default, volatile: false }
+    }
+
+    fn store(val: i32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Store { val: Operand::Const(IrConst::I32(val)), ptr: Value(ptr), ty, seg_override: AddressSpace::Default, volatile: false }
+    }
+
+    #[test]
+    fn test_load_kept_across_store_to_another_field() {
+        // s->valid (offset 8) read, s->buf (offset 4, 2 bytes) written, then
+        // s->valid read again through a differently typed GEP: the same
+        // value. A 4-byte store at offset 6 overlaps it, and a store through
+        // another pointer may.
+        let func = make_func(vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                field(1, 0, 8, IrType::I32),
+                load(2, 1, IrType::I32),
+                field(3, 0, 4, IrType::U16),
+                store(7, 3, IrType::U16),
+                field(4, 0, 8, IrType::Ptr),
+                load(5, 4, IrType::I32),
+                field(6, 0, 6, IrType::I32),
+                store(9, 6, IrType::I32),
+                load(7, 1, IrType::I32),
+                store(3, 10, IrType::U8),
+                load(8, 4, IrType::I32),
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+            source_spans: Vec::new(),
+        }], 11);
+
+        let mut module = make_module(func);
+        assert_eq!(module.for_each_function(run_gvn_function), 1);
+        let insts = &module.functions[0].blocks[0].instructions;
+        assert!(matches!(insts[5], Instruction::Copy { dest: Value(5), src: Operand::Value(Value(2)) }), "{:?}", insts[5]);
+        assert!(matches!(insts[8], Instruction::Load { .. }), "{:?}", insts[8]);
+        assert!(matches!(insts[10], Instruction::Load { .. }), "{:?}", insts[10]);
+    }
+
+    #[test]
+    fn test_store_forwarded_across_store_to_another_field() {
+        // s->a = 5 (offset 0); s->b = 7 (offset 4); s->a read: 5.
+        let func = make_func(vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                store(5, 0, IrType::I32),
+                field(1, 0, 4, IrType::I32),
+                store(7, 1, IrType::I32),
+                field(2, 0, 0, IrType::I8),
+                load(3, 2, IrType::I32),
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }], 4);
+
+        let mut module = make_module(func);
+        module.for_each_function(run_gvn_function);
+        let insts = &module.functions[0].blocks[0].instructions;
+        assert!(matches!(insts[4], Instruction::Copy { src: Operand::Const(IrConst::I32(5)), .. }), "{:?}", insts[4]);
     }
 }

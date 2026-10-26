@@ -83,6 +83,10 @@ The optimizer executes in four sequential phases:
      lftr
          |
          v
+ Phase 10c1: In-Place Loop Vectorization (AArch64)
+     loop_vectorize
+         |
+         v
  Phase 10c2: GEP Offset Cancellation
      gep_linear
          |
@@ -729,10 +733,15 @@ previously computed values.
   long double, and 128-bit types.
 
 **Redundant load elimination.** Two loads from the same pointer with the same
-type produce the same value if no intervening memory modification occurs. Load
-value numbers use a generation counter: any memory-clobbering instruction
+type produce the same value if no intervening memory modification occurs. A
+pointer is keyed as its root (before a chain of constant-offset GEPs) and the
+byte offset from it, so differently typed GEPs of one field are one location.
+Load value numbers use a generation counter: any memory-clobbering instruction
 (Store, Call, CallIndirect, Memcpy, atomic operations, InlineAsm, fences, etc.)
-bumps the generation, instantly invalidating all cached load entries. At block
+bumps the generation, instantly invalidating all cached load entries, except
+that a store to a constant offset from a root carries over the loads and
+forwardable stores at that root whose bytes it cannot overlap (another field
+of the same struct: `s->bi_valid` read around a store to `s->bi_buf`). At block
 merge points (blocks with >1 predecessor), the generation is also bumped to
 conservatively invalidate inherited load entries.
 
@@ -900,6 +909,22 @@ and one register indexes every array (`[base, offset]` on AArch64). The bound
 and start must be small constants or sign-extended 32-bit values, so the
 scaled bound cannot overflow; pointer tests are signed, or unsigned when
 constant bounds show the loop runs.
+
+### loop_vectorize -- In-Place Loop Vectorization
+
+Runs once after lftr, for AArch64. A single-block loop counted down to zero
+(`do ... while (--n)`) that loads one element through a pointer stepping by
+the element size, stores one back to the same place, and does nothing else
+but compute the stored value as one lane operation of the element and a
+loop-invariant value gets a vector loop in front of it: while 16 bytes'
+worth of iterations remain, one `VecOp` reads, operates on and writes 16
+bytes, and the original loop does what is left. The operations are add,
+subtract, multiply (lanes below 8 bytes), and, or and xor, computed in any
+type at least as wide as the element (only the low bits reach memory), the
+invariant on either side, and `x >= w ? x - w : 0` on the zero-extended
+element, a saturating subtract of w clamped to the element's maximum. That
+is zlib's slide_hash, which shifts the hash chains each time the window
+slides (`uqsub v0.8h`, eight entries per step instead of one).
 
 ### pressure_hoist -- Pressure Hoisting
 
@@ -1262,7 +1287,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`.
+`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1304,6 +1329,7 @@ behavior across iterations.
 | `iv_strength_reduce.rs`  | Loop induction variable strength reduction             |
 | `iv_widen.rs`            | Signed 32-bit loop counters kept as 64-bit values      |
 | `lftr.rs`                | Exit tests moved off counters (one IV per loop)        |
+| `loop_vectorize.rs`      | In-place element loops done 16 bytes at a time (AArch64) |
 | `mem_inline.rs`          | Small constant-length memcpy/memset done in place      |
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |

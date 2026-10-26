@@ -34,6 +34,7 @@ pub(crate) mod licm;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_hoist;
 pub(crate) mod loop_layout;
+mod loop_vectorize;
 pub(crate) mod step_to_load;
 pub(crate) mod const_hoist;
 pub(crate) mod loop_rotate;
@@ -663,6 +664,12 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
                 dce::eliminate_dead_code(func);
             }
         }
+    }
+
+    // Phase 10c1: Loops rewriting each element of an array in place with
+    // one lane operation do 16 bytes at a time (AArch64 NEON).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("loop_vectorize") {
+        loop_vectorize::vectorize_module(module);
     }
 
     // Phase 10c2: Cancel terms between the offsets of GEP chains

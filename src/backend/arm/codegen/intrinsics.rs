@@ -1456,6 +1456,7 @@ impl ArmCodegen {
             }
             VecOpKind::Add => vec![bin(if f { "fadd" } else { "add" })],
             VecOpKind::Sub => vec![bin(if f { "fsub" } else { "sub" })],
+            VecOpKind::SatSub => vec![bin(if u { "uqsub" } else { "sqsub" })],
             VecOpKind::Mul => vec![bin(if f { "fmul" } else { "mul" })],
             VecOpKind::Div => vec![bin("fdiv")],
             VecOpKind::And => vec![bitwise(if folded.is_some() { "bic" } else { "and" })],
