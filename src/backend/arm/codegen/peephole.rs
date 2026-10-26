@@ -483,6 +483,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_extend_into_narrow_store(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_sxtw_into_users(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_zero_extension_into_user(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_writes(&lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_writes_global(&lines, &mut kinds, n));
             changed2 |= pass!(fuse_branch_over_branch(&mut lines, &mut kinds, n));
@@ -1876,6 +1877,58 @@ fn parse_imm(op: &str) -> Option<u64> {
         Some(hex) => u64::from_str_radix(hex, 16).ok(),
         None => v.parse().ok(),
     }
+}
+
+/// `mov wA, wB` (a zero extension) whose one read, the next instruction,
+/// can take wB with the extension folded in, A dead after it:
+///   add|sub xC, xD, xA            -> add|sub xC, xD, wB, uxtw
+///   lsr xC, xA, #k                -> lsr wC, wB, #k
+/// (`s->window + cur_match` with an unsigned cur_match, and `chain_length
+/// >> 2`, in longest_match.)
+fn fold_zero_extension_into_user(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some(("mov", ops)) = split_insn(&lines[i]) else { continue };
+        let [a, b] = ops.split(',').map(str::trim).collect::<Vec<_>>()[..] else { continue };
+        if !a.starts_with('w') || !b.starts_with('w') {
+            continue;
+        }
+        let (Some(ar), Some(br)) = (gpr_operand(a), gpr_operand(b)) else { continue };
+        if ar == br || ar > 28 || br > 28 {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((mn, jops)) = split_insn(&lines[j]) else { continue };
+        let q: Vec<&str> = jops.split(',').map(str::trim).collect();
+        let xa = xreg_name(ar);
+        let new = match (mn, &q[..]) {
+            ("add" | "sub", [c, d, x]) if *x == xa && c.starts_with('x') && d.starts_with('x')
+                && gpr_operand(d) != Some(ar) && *d != "sp" && *c != "sp" =>
+                format!("    {} {}, {}, {}, uxtw", mn, c, d, wreg_name(br)),
+            ("lsr", [c, x, k]) if *x == xa && c.starts_with('x') && k.starts_with('#') =>
+                format!("    lsr {}, {}, {}", wreg_name(gpr_operand(c).unwrap_or(0)), wreg_name(br), k),
+            _ => continue,
+        };
+        let dest = gpr_operand(q[0]);
+        if dest.is_none() || (live[j] & (1 << ar) != 0 && dest != Some(ar)) {
+            continue;
+        }
+        lines[j] = new;
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
 }
 
 /// `lsr T, S, #k` immediately followed by `and D, T, #(2^w - 1)` (T dead
@@ -4217,6 +4270,18 @@ mod tests {
         // Not when the extended value is read after the branch.
         let input = ".type f, %function\nf:\n    bl g\n    sxtw x0, w0\n    cbnz x0, .LBB1\n    mov x0, #1\n.LBB1:\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("sxtw x0, w0"));
+    }
+
+    #[test]
+    fn test_zero_extension_folded_into_add_and_lsr() {
+        let f = |body: &str| peephole_optimize(format!(".type f, %function\nf:\n{body}    ret\n.size f, .-f\n"));
+        let result = f("    mov w11, w7\n    add x13, x24, x11\n    mov w9, w8\n    lsr x10, x9, #2\n    str x13, [x5]\n    str x10, [x6]\n");
+        assert!(result.contains("add x13, x24, w7, uxtw") && result.contains("lsr w10, w8, #2") && !result.contains("mov w"), "{result}");
+        // Not when the extended value is read again (x0 is, by the return).
+        for body in ["    mov w11, w7\n    add x13, x24, x11\n    str x13, [x5]\n    str x11, [x6]\n",
+                     "    mov w0, w7\n    add x13, x24, x0\n    str x13, [x5]\n"] {
+            assert!(f(body).contains(", w7\n"), "{body}");
+        }
     }
 
     #[test]

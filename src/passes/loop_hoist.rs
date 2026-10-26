@@ -275,6 +275,25 @@ fn hoist_loop(
 
     let header_label = func.blocks[header].label;
     if matches!(func.blocks[guard].terminator, Terminator::Branch(_)) {
+        // A load the guard already made (of `s->window` before the loop
+        // used it too), with nothing since that may write memory, is reused:
+        // GVN has run, and only a copy is left to coalesce.
+        let defs = |v: crate::ir::reexports::Value| func.blocks.iter().flat_map(|b| &b.instructions)
+            .filter(|i| i.dest() == Some(v)).count();
+        let insts: Vec<Instruction> = insts.into_iter().map(|inst| {
+            let Instruction::Load { dest, ptr, ty, seg_override: AddressSpace::Default, volatile: false } = inst else { return inst };
+            let earlier = func.blocks[guard].instructions.iter().rev()
+                .take_while(|i| !writes_memory(i))
+                .find_map(|i| match i {
+                    Instruction::Load { dest: d, ptr: p, ty: t, seg_override: AddressSpace::Default, volatile: false }
+                        if *p == ptr && *t == ty => Some(*d),
+                    _ => None,
+                });
+            match earlier.filter(|&d| defs(d) == 1 && defs(ptr) <= 1) {
+                Some(d) => Instruction::Copy { dest, src: Operand::Value(d) },
+                None => inst,
+            }
+        }).collect();
         let g = &mut func.blocks[guard];
         let parallel = g.source_spans.len() == g.instructions.len();
         g.instructions.extend(insts);
@@ -296,3 +315,15 @@ fn hoist_loop(
     func.blocks.insert(header, BasicBlock { label, instructions: insts, terminator: Terminator::Branch(header_label), source_spans });
     count
 }
+
+/// Whether an instruction may write memory (for reusing an earlier load).
+fn writes_memory(inst: &Instruction) -> bool {
+    matches!(inst,
+        Instruction::Store { .. } | Instruction::Call { .. } | Instruction::CallIndirect { .. }
+        | Instruction::Memcpy { .. } | Instruction::AtomicRmw { .. } | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicStore { .. } | Instruction::Fence { .. } | Instruction::InlineAsm { .. }
+        | Instruction::VaStart { .. } | Instruction::VaEnd { .. } | Instruction::VaCopy { .. }
+        | Instruction::VaArg { .. } | Instruction::VaArgStruct { .. })
+        || matches!(inst, Instruction::Intrinsic { dest_ptr: Some(_), .. })
+}
+

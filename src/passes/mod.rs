@@ -31,6 +31,7 @@ pub(crate) mod iv_widen;
 pub(crate) mod lftr;
 mod mem_inline;
 pub(crate) mod licm;
+mod ext_elide;
 mod step_sink;
 mod load_phi;
 pub(crate) mod loop_analysis;
@@ -761,6 +762,14 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     if !disabled.contains("step_sink") {
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             step_sink::sink_steps(func);
+        }
+    }
+
+    // Phase 10i: Extensions of 8- and 16-bit values that their loads
+    // already made, through phis (AArch64).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("ext_elide") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            ext_elide::elide_extensions(func);
         }
     }
 

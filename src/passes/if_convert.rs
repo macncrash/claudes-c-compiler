@@ -61,7 +61,7 @@ pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
     // in is_short_circuit_test; clear them first.
     super::dce::eliminate_dead_code(func);
 
-    let mut total = sink_arm_loads(func);
+    let mut total = sink_arm_loads(func) + select_returns(func);
 
     // Iterate to a fixpoint since converting one diamond may expose another.
     loop {
@@ -160,6 +160,64 @@ struct DiamondInfo {
     /// Phi nodes in the merge block that can be converted to Select.
     /// Each entry is (phi_dest, phi_ty, true_val, false_val).
     phi_selects: Vec<(Value, IrType, Operand, Operand)>,
+}
+
+/// `if (c) return a; return b;`: a conditional branch to two blocks that
+/// only return a value, each reached only from it, returns a select:
+///
+///   p: condbr %c, t, f               p: %r = select %c, %a, %b
+///   t: ret %a                  =>       ret %r
+///   f: ret %b
+///
+/// (longest_match's `best_len <= s->lookahead ? best_len : s->lookahead`
+/// return becomes a `csel` instead of a branch to two epilogues.) The
+/// arms are left unreachable for cfg_simplify.
+fn select_returns(func: &mut IrFunction) -> usize {
+    let ty = func.return_type;
+    if !(ty.is_integer() || ty == IrType::Ptr) || ty.is_128bit() {
+        return 0;
+    }
+    let label_to_idx = analysis::build_label_map(func);
+    let (preds, _) = analysis::build_cfg(func, &label_to_idx);
+    let returns = |b: usize, p: usize| -> Option<Operand> {
+        let block = &func.blocks[b];
+        let Terminator::Return(Some(v)) = block.terminator else { return None };
+        (block.instructions.is_empty() && preds.len(b) == 1 && preds.row(b)[0] as usize == p).then_some(v)
+    };
+    let mut found = Vec::new();
+    for p in 0..func.blocks.len() {
+        let Terminator::CondBranch { cond, true_label, false_label } = func.blocks[p].terminator else { continue };
+        let (Some(&t), Some(&f)) = (label_to_idx.get(&true_label), label_to_idx.get(&false_label)) else { continue };
+        if t == f || t == p || f == p {
+            continue;
+        }
+        // Left to ret_dup and branch threading: two constants (`return a &&
+        // b` returns 0 or 1 straight from each test), and a branch on a phi
+        // of the block (a step of such a test).
+        let phi_cond = matches!(cond, Operand::Value(c) if func.blocks[p].instructions.iter()
+            .any(|i| matches!(i, Instruction::Phi { dest, .. } if *dest == c)));
+        if let (Some(a), Some(b)) = (returns(t, p), returns(f, p)) {
+            let constants = matches!(a, Operand::Const(_)) && matches!(b, Operand::Const(_));
+            if !constants && !phi_cond {
+                found.push((p, cond, a, b));
+            }
+        }
+    }
+    let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
+    for &(p, cond, a, b) in &found {
+        let r = Value(next_id);
+        next_id += 1;
+        let block = &mut func.blocks[p];
+        let spans = block.source_spans.len() == block.instructions.len();
+        block.instructions.push(Instruction::Select { dest: r, cond, true_val: a, false_val: b, ty });
+        if spans {
+            let span = block.source_spans.last().copied().unwrap_or(crate::common::source::Span::dummy());
+            block.source_spans.push(span);
+        }
+        block.terminator = Terminator::Return(Some(Operand::Value(r)));
+    }
+    func.next_value_id = next_id;
+    found.len()
 }
 
 /// `c ? *p : *q` where each arm ends by loading the value the merge takes
@@ -1189,5 +1247,22 @@ mod tests {
         // Arms that convert their loads differently keep their branch.
         let mut func = field_ternary(IrType::U32);
         assert_eq!(if_convert_function(&mut func), 0);
+    }
+
+    #[test]
+    fn two_returns_become_a_select() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let v = |n| Operand::Value(Value(n));
+        func.blocks = vec![
+            block(0, vec![Instruction::Cmp { dest: Value(3), op: crate::ir::reexports::IrCmpOp::Ule, lhs: v(1), rhs: v(2), ty: IrType::U32 }],
+                Terminator::CondBranch { cond: v(3), true_label: BlockId(1), false_label: BlockId(2) }),
+            block(1, vec![], Terminator::Return(Some(v(1)))),
+            block(2, vec![], Terminator::Return(Some(v(2)))),
+        ];
+        func.next_value_id = 4;
+        assert_eq!(select_returns(&mut func), 1);
+        assert!(matches!(func.blocks[0].instructions[1], Instruction::Select { dest: Value(4), cond: Operand::Value(Value(3)), .. }));
+        assert!(matches!(func.blocks[0].terminator, Terminator::Return(Some(Operand::Value(Value(4))))));
     }
 }

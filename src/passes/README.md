@@ -123,6 +123,10 @@ The optimizer executes in four sequential phases:
      step_sink
          |
          v
+ Phase 10i: Extensions Loads Already Made (AArch64)
+     ext_elide
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
          |
@@ -1110,6 +1114,28 @@ trampoline, which phi elimination laid out before the header; that block,
 now a loop of its own, moves right after the header, so entering the loop
 falls into it.
 
+loop_hoist then moves loads every iteration makes to the guard's edge into
+the loop. GVN has run by then, so a load the guard already makes (with
+nothing since that may write memory) is reused by a copy instead:
+longest_match loaded `s->window` before its loop for the scan pointer and
+again for the hoisted `s->window + cur_match`.
+
+### ext_elide -- Extensions Loads Already Made
+
+Runs after step_sink, on AArch64. `ldrb`/`ldrh` zero-extend and
+`ldrsb`/`ldrsh` sign-extend to 64 bits, so an 8- or 16-bit value loaded is
+already extended its own way in its register. The backend sees that when the
+extension follows the load, not when the value went through a phi:
+longest_match's `scan_end` bytes, loaded before the loop and again when a
+longer match is found, were masked with `and #0xff` at each candidate. A value
+counts as extended when it is such a load, a copy of one, or a phi all of
+whose incoming values are (or constants in its type's range), and its
+widening by its own type becomes a copy. It runs late because earlier passes
+may replace a load with another value of its type (GVN forwards stored
+values, which an 8- or 16-bit operation may leave with unspecified high
+bits). With the other longest_match changes, deflate at levels 6 and 9,
+where the candidate loop dominates, retires about 10% fewer instructions.
+
 ### latch_dup -- Latch Copies
 
 Runs after loop_layout (before step_to_load). A latch of at most four simple
@@ -1225,6 +1251,13 @@ from one base defined before the arms (or the addresses of one global, which
 each arm may still compute itself), the offsets merge instead and the merge
 block adds them to the base: `d < 256 ? tab[d] : tab[256 + (d >> 7)]` selects
 an index and loads `[base, index]`.
+
+`if (c) return a; return b;`, a conditional branch to two blocks that only
+return a value each (and that only it reaches), returns a select instead:
+longest_match's `best_len <= s->lookahead ? best_len : s->lookahead` becomes a
+`csel` rather than a branch to two copies of the epilogue. Two constants, and
+a branch on a phi of its block (a step of an `a && b` test), are left to
+ret_dup and branch threading.
 
 One shape is left as branches: a step of an `a && b` or `a || b` test, whose
 merge block holds only the boolean phi (with a constant from the
@@ -1397,7 +1430,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`.
+`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1427,6 +1460,7 @@ behavior across iterations.
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |
 | `dead_statics.rs`        | Dead static function/global elimination (BFS)          |
 | `div_by_const.rs`        | Division by constant strength reduction                |
+| `ext_elide.rs`           | Extensions of loaded bytes and halves dropped (AArch64) |
 | `edge_addr.rs`           | Addresses a phi reads recomputed on the edge into it   |
 | `exit_addr.rs`           | Loop addresses recomputed after the loop (AArch64)     |
 | `gep_linear.rs`          | GEP chain offsets summed and cancelled (`a[x / n][x % n]`) |

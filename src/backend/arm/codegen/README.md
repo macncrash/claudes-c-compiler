@@ -752,7 +752,11 @@ Removes `str` instructions to stack slots that are overwritten before being read
   extension folded in (`add xC, xD, wB, sxtw #s`, `[xD, wB, sxtw #s]`,
   `smaddl` for a `madd` by a 32-bit constant, `cbz`/`cbnz wB` as A's last
   read, `and wC, wB, #k` for a mask within the low 32 bits, or a 32-bit
-  read) goes away. A may be B: `sxtw x0, w0; cbnz x0`
+  read) goes away.
+- `mov wA, wB` (a zero extension) whose one read is the next instruction,
+  `add|sub xC, xD, xA` or `lsr xC, xA, #k`, with A dead after it, folds into
+  it: `add xC, xD, wB, uxtw`, `lsr wC, wB, #k` (`s->window + cur_match` in
+  longest_match's candidate loop). A may be B: `sxtw x0, w0; cbnz x0`
   after a call returning int becomes `cbnz w0`.
 
 **10. Jump Threading** (local cleanup)
