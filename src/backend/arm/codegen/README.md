@@ -751,7 +751,8 @@ Removes `str` instructions to stack slots that are overwritten before being read
 - `sxtw xA, wB` whose reads, until A dies, can all take wB with the
   extension folded in (`add xC, xD, wB, sxtw #s`, `[xD, wB, sxtw #s]`,
   `smaddl` for a `madd` by a 32-bit constant, `cbz`/`cbnz wB` as A's last
-  read, or a 32-bit read) goes away. A may be B: `sxtw x0, w0; cbnz x0`
+  read, `and wC, wB, #k` for a mask within the low 32 bits, or a 32-bit
+  read) goes away. A may be B: `sxtw x0, w0; cbnz x0`
   after a call returning int becomes `cbnz w0`.
 
 **10. Jump Threading** (local cleanup)

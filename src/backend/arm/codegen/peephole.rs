@@ -1984,6 +1984,7 @@ fn fold_extend_into_narrow_store(lines: &mut [String], kinds: &mut [LineKind], n
 ///   madd|msub xC, xA, xM, xN           -> smaddl|smsubl xC, wB, wM, xN
 ///     (xM set by the line before from a 32-bit constant)
 ///   cbz|cbnz xA, L                     -> cbz|cbnz wB, L
+///   and xC, xA, #k (k < 2^32)          -> and wC, wB, #k
 ///   a 32-bit read of wA                -> wB
 /// B must keep its value until A's last read. The sxtw then goes. (A may be
 /// B: `sxtw x0, w0; cbnz x0, L` tests w0.)
@@ -2076,6 +2077,14 @@ fn rewrite_sxtw_use(mnemonic: &str, ops: &str, first_is_dest: bool, a: u8, b: u8
         "cbz" | "cbnz" => {
             let [x, target] = p[..] else { return None };
             (x == xa).then(|| format!("    {} {}, {}", mnemonic, wb, target))
+        }
+        // A mask within the low 32 bits clears the extension anyway (the
+        // 32-bit and zeroes the high half).
+        "and" if p.len() == 3 && p[1] == xa => {
+            let (c, k) = (gpr_operand(p[0])?, parse_imm(p[2])?);
+            (p[0].starts_with('x') && k <= u32::MAX as u64
+                && crate::backend::arm::assembler::encoder::encode_bitmask_imm(k, false).is_some())
+                .then(|| format!("    and {}, {}, {}", wreg_name(c), wb, p[2]))
         }
         "madd" | "msub" => {
             let [c, m1, m2, acc] = p[..] else { return None };
@@ -4208,6 +4217,19 @@ mod tests {
         // Not when the extended value is read after the branch.
         let input = ".type f, %function\nf:\n    bl g\n    sxtw x0, w0\n    cbnz x0, .LBB1\n    mov x0, #1\n.LBB1:\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("sxtw x0, w0"));
+    }
+
+    #[test]
+    fn test_sxtw_folded_into_low_mask() {
+        let f = |mask: &str| {
+            let input = format!(".type f, %function\nf:\n    orr w3, w3, w4\n    sxtw x3, w3\n    and x0, x3, #{mask}\n    strh w0, [x5]\n    strb w0, [x6]\n    ret\n.size f, .-f\n");
+            peephole_optimize(input)
+        };
+        let result = f("0xffff");
+        assert!(result.contains("and w0, w3, #0xffff") && !result.contains("sxtw"), "{result}");
+        // A mask reaching the high half keeps the extension.
+        let result = f("0xffff00000000");
+        assert!(result.contains("sxtw x3, w3"), "{result}");
     }
 
     #[test]

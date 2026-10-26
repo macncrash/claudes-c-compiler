@@ -188,6 +188,115 @@ pub(crate) fn rotate_function(func: &mut IrFunction) -> usize {
     rotated
 }
 
+/// Most instructions a latch may have to be copied into the blocks that
+/// jump to it, and most copies of one latch.
+const MAX_LATCH_INSTS: usize = 4;
+const MAX_LATCH_COPIES: usize = 8;
+
+/// Copy a small latch that branches back conditionally into the loop blocks
+/// that jump to it, so each path through the loop ends with the latch's own
+/// test instead of a jump to it:
+///
+///   lit:    ...; b latch                      lit:    ...; ldr w0, [x10, #n]
+///   match:  ...; b latch            =>                cmp x14, x0; b.lo header
+///   latch:  ldr w0, [x10, #n]                 match:  ...; (likewise)
+///           cmp x14, x0; b.lo header          latch:  (the block falling into it)
+///
+/// compress_block's literal and match paths each took a jump to the shared
+/// loop test. The block laid out just before the latch keeps falling into
+/// it. The latch's values must be used only in it (their copies get fresh
+/// names), and its instructions be simple ones.
+pub(crate) fn duplicate_latches(func: &mut IrFunction) -> usize {
+    if func.blocks.len() < 3 {
+        return 0;
+    }
+    let cfg = analysis::CfgAnalysis::build(func);
+    let label_to_idx = analysis::build_label_map(func);
+    let dominates = |a: usize, mut b: usize| loop {
+        if a == b {
+            return true;
+        }
+        let up = cfg.idom[b];
+        if up == b || up == usize::MAX {
+            return false;
+        }
+        b = up;
+    };
+    // Blocks each value is used in.
+    let mut used_in: crate::common::fx_hash::FxHashMap<u32, Vec<usize>> = crate::common::fx_hash::FxHashMap::default();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| used_in.entry(v).or_default().push(b));
+        }
+        block.terminator.for_each_used_value(|v| used_in.entry(v).or_default().push(b));
+    }
+    if func.next_value_id == 0 {
+        func.next_value_id = func.max_value_id() + 1;
+    }
+    let mut copied = 0;
+    for latch in 0..func.blocks.len() {
+        let lb = &func.blocks[latch];
+        let Terminator::CondBranch { true_label, false_label, .. } = lb.terminator else { continue };
+        // A back edge: to a header, or to the block holding its phi copies.
+        let header_of = |t: usize| match func.blocks[t].terminator {
+            Terminator::Branch(h) if !dominates(t, latch) => label_to_idx.get(&h).copied(),
+            _ => Some(t),
+        };
+        let back = [true_label, false_label].iter().any(|l| label_to_idx.get(l).and_then(|&t| header_of(t))
+            .is_some_and(|h| h != latch && dominates(h, latch)));
+        if !back || lb.instructions.is_empty() || lb.instructions.len() > MAX_LATCH_INSTS {
+            continue;
+        }
+        let local = lb.instructions.iter().all(|inst| {
+            matches!(inst, Instruction::Cmp { .. } | Instruction::BinOp { .. } | Instruction::Cast { .. }
+                | Instruction::GetElementPtr { .. } | Instruction::Load { .. })
+                && inst.dest().is_some_and(|d| used_in.get(&d.0).is_none_or(|bs| bs.iter().all(|&b| b == latch)))
+        });
+        // Only a latch that rereads its bound from memory (`sx <
+        // s->sym_next`): copying a bare compare of values the path just
+        // assigned measured slower in SQLite's searches, the copy reading the
+        // value through an extra move.
+        if !local || !lb.instructions.iter().any(|i| matches!(i, Instruction::Load { .. })) {
+            continue;
+        }
+        let label = lb.label;
+        let preds: Vec<usize> = cfg.preds.row(latch).iter().map(|&p| p as usize)
+            .filter(|&p| p != latch && p + 1 != latch && matches!(func.blocks[p].terminator, Terminator::Branch(l) if l == label))
+            .take(MAX_LATCH_COPIES)
+            .collect();
+        for p in preds {
+            let lb = &func.blocks[latch];
+            let mut remap: Vec<Option<Operand>> = vec![None; func.next_value_id as usize];
+            let mut copies = Vec::with_capacity(lb.instructions.len());
+            for inst in &lb.instructions {
+                let mut copy = inst.clone();
+                replace_operands_in_instruction(&mut copy, &remap);
+                let d = inst.dest().unwrap();
+                let fresh = Value(func.next_value_id + copies.len() as u32);
+                set_dest(&mut copy, fresh);
+                if (d.0 as usize) < remap.len() {
+                    remap[d.0 as usize] = Some(Operand::Value(fresh));
+                }
+                copies.push(copy);
+            }
+            let mut term = lb.terminator.clone();
+            replace_operands_in_terminator(&mut term, &remap);
+            let spans = lb.source_spans.clone();
+            func.next_value_id += copies.len() as u32;
+            let pb = &mut func.blocks[p];
+            if pb.source_spans.len() == pb.instructions.len() && spans.len() == copies.len() {
+                pb.source_spans.extend(spans);
+            } else {
+                pb.source_spans.clear();
+            }
+            pb.instructions.extend(copies);
+            pb.terminator = term;
+            copied += 1;
+        }
+    }
+    copied
+}
+
 /// Rename the value an instruction defines (one of the kinds rotation copies).
 fn set_dest(inst: &mut Instruction, v: Value) {
     match inst {
@@ -225,5 +334,47 @@ mod tests {
         let order: Vec<u32> = func.blocks.iter().map(|b| b.label.0).collect();
         assert_eq!(order, [0, 2, 1, 3]);
         assert!(matches!(func.blocks[2].terminator, Terminator::CondBranch { true_label: BlockId(1), false_label: BlockId(3), .. }));
+    }
+
+    /// header -> a | b; a jumps to the latch, b falls into it; the latch
+    /// reloads the bound and branches back through the phi-copy block.
+    fn two_path_loop(load: bool) -> IrFunction {
+        use crate::common::types::AddressSpace;
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let v = |n| Operand::Value(Value(n));
+        let bound = if load {
+            Instruction::Load { dest: Value(20), ptr: Value(1), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false }
+        } else {
+            Instruction::BinOp { dest: Value(20), op: IrBinOp::Add, lhs: v(1), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 }
+        };
+        func.blocks = vec![
+            block(0, vec![], Terminator::Branch(BlockId(1))),
+            block(1, vec![Instruction::BinOp { dest: Value(5), op: IrBinOp::Add, lhs: v(4), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 }],
+                Terminator::CondBranch { cond: v(2), true_label: BlockId(2), false_label: BlockId(3) }),
+            block(2, vec![], Terminator::Branch(BlockId(4))),
+            block(3, vec![], Terminator::Branch(BlockId(4))),
+            block(4, vec![bound, Instruction::Cmp { dest: Value(21), op: IrCmpOp::Slt, lhs: v(5), rhs: v(20), ty: IrType::I64 }],
+                Terminator::CondBranch { cond: v(21), true_label: BlockId(5), false_label: BlockId(6) }),
+            block(5, vec![Instruction::Copy { dest: Value(4), src: v(5) }], Terminator::Branch(BlockId(1))),
+            block(6, vec![], Terminator::Return(Some(v(5)))),
+        ];
+        func.next_value_id = 30;
+        func
+    }
+
+    #[test]
+    fn latch_rereading_its_bound_copied_into_the_path_jumping_to_it() {
+        let mut func = two_path_loop(true);
+        assert_eq!(duplicate_latches(&mut func), 1);
+        let a = &func.blocks[2];
+        assert!(matches!(a.instructions[..], [Instruction::Load { dest: Value(30), .. }, Instruction::Cmp { dest: Value(31), rhs: Operand::Value(Value(30)), .. }]),
+            "{:?}", a.instructions);
+        assert!(matches!(a.terminator, Terminator::CondBranch { cond: Operand::Value(Value(31)), true_label: BlockId(5), false_label: BlockId(6) }));
+        // The block falling into the latch keeps it.
+        assert!(matches!(func.blocks[3].terminator, Terminator::Branch(BlockId(4))));
+        // A latch computing its bound without memory stays shared.
+        let mut func = two_path_loop(false);
+        assert_eq!(duplicate_latches(&mut func), 0);
     }
 }

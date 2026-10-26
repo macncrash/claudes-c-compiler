@@ -19,7 +19,7 @@
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value};
 use super::copy_prop::{replace_operands_in_instruction, replace_operands_in_terminator};
 use super::loop_analysis;
 
@@ -32,6 +32,8 @@ pub(crate) fn widen_function(func: &mut IrFunction) -> usize {
     let mut widened = 0;
     // Each truncation made so far, and the widened counter it truncates.
     let mut narrow: FxHashMap<u32, Value> = FxHashMap::default();
+    // Likewise for unsigned counters (zero extensions).
+    let mut unarrow: FxHashMap<u32, Value> = FxHashMap::default();
     for lp in loop_analysis::merge_loops_by_header(loops) {
         let Some(pre) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else { continue };
         let latches: Vec<usize> = cfg.preds.row(lp.header).iter().map(|&p| p as usize)
@@ -40,11 +42,16 @@ pub(crate) fn widen_function(func: &mut IrFunction) -> usize {
             continue;
         }
         let (pre_label, latch_label) = (func.blocks[pre].label, func.blocks[latches[0]].label);
-        let phis: Vec<Value> = func.blocks[lp.header].instructions.iter()
-            .filter_map(|i| match i { Instruction::Phi { dest, ty: IrType::I32, .. } => Some(*dest), _ => None })
+        let phis: Vec<(Value, bool)> = func.blocks[lp.header].instructions.iter()
+            .filter_map(|i| match i {
+                Instruction::Phi { dest, ty: IrType::I32, .. } => Some((*dest, false)),
+                Instruction::Phi { dest, ty: IrType::U32, .. } => Some((*dest, true)),
+                _ => None,
+            })
             .collect();
-        for phi in phis {
-            if widen_iv(func, &lp.body, lp.header, pre, phi, pre_label, latch_label, &cfg.idom, &mut narrow) {
+        for (phi, unsigned) in phis {
+            let maps = if unsigned { &mut unarrow } else { &mut narrow };
+            if widen_iv(func, &lp.body, lp.header, pre, latches[0], phi, unsigned, pre_label, latch_label, &cfg.idom, maps) {
                 widened += 1;
             }
         }
@@ -55,8 +62,9 @@ pub(crate) fn widen_function(func: &mut IrFunction) -> usize {
     // Likewise any other extension of a value already extended once.
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
-            if let Instruction::Cast { dest, src: Operand::Value(v), from_ty: IrType::I32, to_ty: IrType::I64 | IrType::U64 } = *inst {
-                if let Some(&wide) = narrow.get(&v.0).filter(|w| **w != dest) {
+            if let Instruction::Cast { dest, src: Operand::Value(v), from_ty: from @ (IrType::I32 | IrType::U32), to_ty: IrType::I64 | IrType::U64 } = *inst {
+                let maps = if from == IrType::U32 { &unarrow } else { &narrow };
+                if let Some(&wide) = maps.get(&v.0).filter(|w| **w != dest) {
                     *inst = Instruction::Copy { dest, src: Operand::Value(wide) };
                 }
             }
@@ -75,8 +83,11 @@ fn const_i64(op: &Operand) -> Option<i64> {
 
 #[allow(clippy::too_many_arguments)]
 fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usize>, header: usize, pre: usize,
-            phi: Value, pre_label: crate::ir::reexports::BlockId, latch_label: crate::ir::reexports::BlockId,
-            idom: &[usize], narrow: &mut FxHashMap<u32, Value>) -> bool {
+            latch: usize, phi: Value, unsigned: bool, pre_label: crate::ir::reexports::BlockId,
+            latch_label: crate::ir::reexports::BlockId, idom: &[usize], narrow: &mut FxHashMap<u32, Value>) -> bool {
+    let narrow_ty = if unsigned { IrType::U32 } else { IrType::I32 };
+    // A constant extended the way the counter is.
+    let ext_op = |k: i64| if unsigned { k as u32 as i64 } else { k as i32 as i64 };
     // The phi: [init from the preheader, next from the latch].
     let Some((init, next)) = func.blocks[header].instructions.iter().find_map(|i| match i {
         Instruction::Phi { dest, incoming, .. } if *dest == phi && incoming.len() == 2 => {
@@ -90,11 +101,15 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
     let mut next_at = None;
     for &b in body {
         for (k, inst) in func.blocks[b].instructions.iter().enumerate() {
-            if let Instruction::BinOp { dest, op: IrBinOp::Add | IrBinOp::Sub, lhs, rhs, ty: IrType::I32 } = inst {
+            if let Instruction::BinOp { dest, op: op @ (IrBinOp::Add | IrBinOp::Sub), lhs, rhs, ty } = inst {
+                if *ty != narrow_ty {
+                    continue;
+                }
                 let is_phi = |op: &Operand| matches!(op, Operand::Value(v) if *v == phi);
-                let steps = (is_phi(lhs) && const_i64(rhs).is_some())
-                    || (matches!(inst, Instruction::BinOp { op: IrBinOp::Add, .. })
-                        && is_phi(rhs) && const_i64(lhs).is_some());
+                // An unsigned counter steps by exactly 1 (see below).
+                let step_ok = |c: &Operand| const_i64(c).is_some_and(|k| !unsigned || (*op == IrBinOp::Add && k == 1));
+                let steps = (is_phi(lhs) && step_ok(rhs))
+                    || (*op == IrBinOp::Add && is_phi(rhs) && step_ok(lhs));
                 if *dest == next && steps {
                     next_at = Some((b, k));
                 }
@@ -127,6 +142,37 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
             return false;
         }
     }
+    // Unsigned wrapping is defined, so an unsigned counter widens only when
+    // it cannot wrap: it starts at a constant below 2^32 - 1, steps by 1, and
+    // the one latch goes back only while `next <u B`. Then the counter stays
+    // below 2^32 - 1 in the loop and `next` at most 2^32 - 1 (B being a
+    // 32-bit value), so each equals the zero extension of its narrow value,
+    // in the loop and after it.
+    if unsigned {
+        let Operand::Const(c) = init else { return false };
+        if !c.to_i64().is_some_and(|k| (0..0xffff_fffe).contains(&k)) {
+            return false;
+        }
+        let header_label = func.blocks[header].label;
+        let crate::ir::reexports::Terminator::CondBranch { cond: Operand::Value(c), true_label, false_label } = func.blocks[latch].terminator
+        else { return false };
+        let back_if_true = true_label == header_label && false_label != header_label;
+        let back_if_false = false_label == header_label && true_label != header_label;
+        let is_next = |op: &Operand| matches!(op, Operand::Value(v) if *v == next);
+        let bounded = func.blocks[latch].instructions.iter().any(|i| match i {
+            Instruction::Cmp { dest, op, lhs, rhs, ty: IrType::U32 } if *dest == c => match op {
+                IrCmpOp::Ult => back_if_true && is_next(lhs) && !is_next(rhs),
+                IrCmpOp::Ugt => back_if_true && is_next(rhs) && !is_next(lhs),
+                IrCmpOp::Uge => back_if_false && is_next(lhs) && !is_next(rhs),
+                IrCmpOp::Ule => back_if_false && is_next(rhs) && !is_next(lhs),
+                _ => false,
+            },
+            _ => false,
+        });
+        if !bounded {
+            return false;
+        }
+    }
     let label_to_idx = analysis::build_label_map(func);
 
     // Find the uses that widen naturally. Every other use reads a
@@ -134,6 +180,7 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
     // phi's incoming value is used at the end of its predecessor), so no
     // narrow copy of the counter stays live across the loop.
     let mut compares: Vec<(usize, usize)> = Vec::new();
+    let mut extensions = 0;
     let mut trunc_at: FxHashMap<(usize, u32), usize> = FxHashMap::default();
     let mut note = |b: usize, at: usize, v: u32| {
         if is_iv(v) {
@@ -149,8 +196,8 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
                 continue;
             }
             match inst {
-                Instruction::Cast { src: Operand::Value(v), from_ty: IrType::I32, to_ty: IrType::I64 | IrType::U64, .. }
-                    if is_iv(v.0) => {}
+                Instruction::Cast { src: Operand::Value(v), from_ty, to_ty: IrType::I64 | IrType::U64, .. }
+                    if *from_ty == narrow_ty && is_iv(v.0) => extensions += 1,
                 Instruction::Phi { incoming, .. } => {
                     for (op, label) in incoming {
                         if let Operand::Value(v) = op {
@@ -159,11 +206,14 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
                         }
                     }
                 }
-                Instruction::Cmp { ty: IrType::I32, lhs, rhs, .. } => {
+                Instruction::Cmp { ty, op, lhs, rhs, .. } if *ty == narrow_ty => {
                     let other = if matches!(lhs, Operand::Value(v) if is_iv(v.0)) { rhs } else { lhs };
-                    let ok = match other {
+                    // Zero extension keeps unsigned order and equality, not
+                    // signed order; it is placed after the value's definition.
+                    let signed_cmp = matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
+                    let ok = !(unsigned && signed_cmp) && match other {
                         Operand::Const(c) => c.to_i64().is_some(),
-                        Operand::Value(v) => !is_iv(v.0) && available_before(func, v.0),
+                        Operand::Value(v) => !is_iv(v.0) && (unsigned || available_before(func, v.0)),
                     };
                     if ok {
                         compares.push((b, k));
@@ -177,6 +227,13 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
         block.terminator.for_each_used_value(|v| note(b, block.instructions.len(), v));
     }
 
+    // Nothing makes an unsigned counter's 32-bit operations wrong, so it
+    // widens only to save more extensions than it adds truncations (even
+    // ones after the loop: SQLite ran more instructions counting only those
+    // in it).
+    if unsigned && extensions <= trunc_at.len() {
+        return false;
+    }
     let mut next_id = func.next_value_id;
     let mut fresh = || { let v = Value(next_id); next_id += 1; v };
     let trunc: FxHashMap<(usize, u32), Value> = trunc_at.keys().map(|&key| (key, fresh())).collect();
@@ -184,19 +241,19 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
     // Sign extensions go at the end of a preheader that only enters the
     // loop, else right after the value's definition (which dominates the
     // preheader).
-    let dedicated = matches!(func.blocks[pre].terminator,
+    let dedicated = !unsigned && matches!(func.blocks[pre].terminator,
         crate::ir::reexports::Terminator::Branch(l) if l == func.blocks[header].label);
     let mut pre_insts: Vec<Instruction> = Vec::new();
     let mut after_def: Vec<(Value, Instruction)> = Vec::new();
     let mut extended: FxHashMap<u32, Value> = FxHashMap::default();
     let mut sext = |op: Operand, narrow: &mut FxHashMap<u32, Value>| match op {
-        Operand::Const(c) => Operand::Const(IrConst::I64(c.to_i64().unwrap_or(0) as i32 as i64)),
+        Operand::Const(c) => Operand::Const(IrConst::I64(ext_op(c.to_i64().unwrap_or(0)))),
         Operand::Value(v) => {
             if let Some(&w) = narrow.get(&v.0).or(extended.get(&v.0)) {
                 return Operand::Value(w);
             }
             let w = fresh();
-            let cast = Instruction::Cast { dest: w, src: op, from_ty: IrType::I32, to_ty: IrType::I64 };
+            let cast = Instruction::Cast { dest: w, src: op, from_ty: narrow_ty, to_ty: IrType::I64 };
             if dedicated {
                 pre_insts.push(cast);
                 extended.insert(v.0, w);
@@ -248,12 +305,12 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
                     *ty = IrType::I64;
                     for op in [lhs, rhs] {
                         if let Some(c) = const_i64(op) {
-                            *op = Operand::Const(IrConst::I64(c as i32 as i64));
+                            *op = Operand::Const(IrConst::I64(ext_op(c)));
                         }
                     }
                 }
-                Instruction::Cast { dest, src: Operand::Value(v), from_ty: IrType::I32, to_ty: IrType::I64 | IrType::U64 }
-                    if is_iv(v.0) => {
+                Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty: IrType::I64 | IrType::U64 }
+                    if *from_ty == narrow_ty && is_iv(v.0) => {
                     *inst = Instruction::Copy { dest: *dest, src: Operand::Value(*v) };
                 }
                 _ if compares.contains(&(b, k)) => {}
@@ -271,7 +328,7 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
         let t = trunc[&(b, w)];
         narrow.insert(t.0, Value(w));
         func.blocks[b].instructions.insert(at,
-            Instruction::Cast { dest: t, src: Operand::Value(Value(w)), from_ty: IrType::I64, to_ty: IrType::I32 });
+            Instruction::Cast { dest: t, src: Operand::Value(Value(w)), from_ty: IrType::I64, to_ty: narrow_ty });
     }
     for (v, cast) in after_def {
         let def = func.blocks.iter().enumerate().find_map(|(b, block)| {
@@ -348,5 +405,48 @@ mod tests {
             if incoming.iter().any(|(op, l)| *l == BlockId(3) && matches!(op, Operand::Value(x) if *x == t))));
         // And the return its own, in its block.
         assert!(matches!(b[4].instructions[..], [Instruction::Cast { from_ty: IrType::I64, to_ty: IrType::I32, .. }]));
+    }
+
+    /// `do x = a[sx++]; while (sx < n)` with an unsigned sx: n loaded each
+    /// iteration, sx extended for the index. `op` is the exit test's.
+    fn unsigned_scan(op: IrCmpOp, init: Operand) -> IrFunction {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let v = |n| Operand::Value(Value(n));
+        func.blocks = vec![
+            block(0, vec![], Terminator::Branch(BlockId(1))),
+            block(1, vec![
+                Instruction::Phi { dest: Value(10), ty: IrType::U32, incoming: vec![(init, BlockId(0)), (v(11), BlockId(1))] },
+                Instruction::BinOp { dest: Value(11), op: IrBinOp::Add, lhs: v(10), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::U32 },
+                Instruction::Cast { dest: Value(12), src: v(10), from_ty: IrType::U32, to_ty: IrType::I64 },
+                Instruction::GetElementPtr { dest: Value(13), base: Value(0), offset: v(12), ty: IrType::Ptr },
+                Instruction::Load { dest: Value(14), ptr: Value(13), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Cast { dest: Value(17), src: v(10), from_ty: IrType::U32, to_ty: IrType::I64 },
+                Instruction::Load { dest: Value(15), ptr: Value(1), ty: IrType::U32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Cmp { dest: Value(16), op, lhs: v(11), rhs: v(15), ty: IrType::U32 },
+            ], Terminator::CondBranch { cond: v(16), true_label: BlockId(1), false_label: BlockId(2) }),
+            block(2, vec![], Terminator::Return(Some(v(17)))),
+        ];
+        func.next_value_id = 20;
+        func
+    }
+
+    #[test]
+    fn unsigned_counter_bounded_by_its_test_widened() {
+        let mut func = unsigned_scan(IrCmpOp::Ult, Operand::Const(IrConst::I64(0)));
+        assert_eq!(widen_function(&mut func), 1);
+        let b = &func.blocks[1].instructions;
+        assert!(matches!(b[0], Instruction::Phi { ty: IrType::I64, .. }));
+        assert!(matches!(b[1], Instruction::BinOp { ty: IrType::I64, .. }));
+        assert!(matches!(b[2], Instruction::Copy { dest: Value(12), src: Operand::Value(Value(10)) }));
+        // The bound is zero-extended where it is loaded, and compared at 64 bits.
+        assert!(b.iter().any(|i| matches!(i, Instruction::Cast { src: Operand::Value(Value(15)), from_ty: IrType::U32, to_ty: IrType::I64, .. })));
+        assert!(b.iter().any(|i| matches!(i, Instruction::Cmp { dest: Value(16), ty: IrType::I64, .. })));
+        // `sx <= n` lets it reach 2^32 - 1 and wrap; a start that is not
+        // constant may be 2^32 - 1.
+        for (op, init) in [(IrCmpOp::Ule, Operand::Const(IrConst::I64(0))), (IrCmpOp::Ult, Operand::Value(Value(2)))] {
+            let mut func = unsigned_scan(op, init);
+            assert_eq!(widen_function(&mut func), 0);
+        }
     }
 }

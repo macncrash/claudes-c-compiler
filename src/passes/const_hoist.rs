@@ -23,12 +23,13 @@ use super::loop_analysis;
 /// Most constants given a register per function.
 const MAX_HOISTED: usize = 4;
 
-pub(crate) fn hoist_constants(module: &mut IrModule) {
+/// `aarch64` also hoists the constants on the left of subtracts and shifts.
+pub(crate) fn hoist_constants(module: &mut IrModule, aarch64: bool) {
     if crate::common::types::target_is_32bit() {
         return;
     }
     for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
-        hoist_function(func);
+        hoist_function(func, aarch64);
     }
 }
 
@@ -52,10 +53,36 @@ fn candidate(op: &Operand, bitwise: bool) -> Option<i64> {
     Some(*k)
 }
 
+/// A nonzero constant on the left of a subtract or shift, which AArch64
+/// builds into a register at each use (it has no reversed forms taking an
+/// immediate); zero is the zero register.
+fn left_candidate(op: &Operand) -> Option<i64> {
+    match op {
+        Operand::Const(IrConst::I64(k)) if *k != 0 => Some(*k),
+        Operand::Const(IrConst::I32(k)) if *k != 0 => Some(*k as i64),
+        _ => None,
+    }
+}
+
+/// Instructions building a constant at a use: the weight of its loop uses.
+fn build_cost(k: i64) -> usize {
+    if costly(k) { 3 } else { 1 }
+}
+
 /// The hoistable constant operands of an instruction.
-fn for_each_candidate(inst: &mut Instruction, mut f: impl FnMut(&mut Operand, i64)) {
+fn for_each_candidate(inst: &mut Instruction, left: bool, mut f: impl FnMut(&mut Operand, i64)) {
     let wide = |ty: &IrType| matches!(ty, IrType::I64 | IrType::U64);
     match inst {
+        Instruction::BinOp { op, lhs, rhs, ty, .. } if left && !ty.is_float()
+            && matches!(op, IrBinOp::Sub | IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr)
+            && matches!(ty.size(), 4 | 8) && left_candidate(lhs).is_some() => {
+            let k = left_candidate(lhs).expect("checked by the guard");
+            f(lhs, k);
+            let shift = !matches!(op, IrBinOp::Sub);
+            if let (false, Some(k)) = (shift || !wide(ty), candidate(rhs, false)) {
+                f(rhs, k);
+            }
+        }
         Instruction::BinOp { op, lhs, rhs, ty, .. } if wide(ty) => {
             let bitwise = matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor);
             // A shift amount is always an immediate.
@@ -88,7 +115,7 @@ fn for_each_candidate(inst: &mut Instruction, mut f: impl FnMut(&mut Operand, i6
     }
 }
 
-fn hoist_function(func: &mut IrFunction) -> usize {
+fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
@@ -104,19 +131,27 @@ fn hoist_function(func: &mut IrFunction) -> usize {
     if in_loop[0] {
         return 0;
     }
-    // Loop uses of each candidate constant, in first-seen order.
+    // Loop uses of each candidate constant, weighted by the instructions
+    // building it takes, in first-seen order.
     let mut uses: Vec<(i64, usize)> = Vec::new();
     for (b, block) in func.blocks.iter_mut().enumerate() {
         if !in_loop[b] {
             continue;
         }
         for inst in &mut block.instructions {
-            for_each_candidate(inst, |_, k| match uses.iter_mut().find(|(c, _)| *c == k) {
-                Some((_, n)) => *n += 1,
-                None => uses.push((k, 1)),
+            for_each_candidate(inst, left, |_, k| match uses.iter_mut().find(|(c, _)| *c == k) {
+                Some((_, n)) => *n += build_cost(k),
+                None => uses.push((k, build_cost(k))),
             });
         }
     }
+    if uses.is_empty() {
+        return 0;
+    }
+    // A cheap constant read once saves one instruction but holds a register
+    // through the whole function (`MAX_MATCH - len` in longest_match lost
+    // more to the allocation around it); one read in several places pays.
+    uses.retain(|&(k, n)| costly(k) || n >= 2);
     if uses.is_empty() {
         return 0;
     }
@@ -134,7 +169,7 @@ fn hoist_function(func: &mut IrFunction) -> usize {
             continue;
         }
         for inst in &mut block.instructions {
-            for_each_candidate(inst, |o, k| {
+            for_each_candidate(inst, left, |o, k| {
                 if let Some(&(_, v)) = regs.iter().find(|(c, _)| *c == k) {
                     *o = Operand::Value(v);
                     changes += 1;
@@ -194,12 +229,37 @@ mod tests {
     #[test]
     fn test_loop_constant_built_at_entry() {
         let mut func = loop_func();
-        assert_eq!(hoist_function(&mut func), 1);
+        assert_eq!(hoist_function(&mut func, true), 1);
         assert!(matches!(func.blocks[0].instructions[..], [Instruction::Copy { dest: Value(3), src: Operand::Const(IrConst::I64(_)) }]));
         assert!(matches!(func.blocks[1].instructions[0], Instruction::BinOp { rhs: Operand::Value(Value(3)), .. }));
         // The use outside the loop keeps its immediate.
         assert!(matches!(func.blocks[2].instructions[0], Instruction::BinOp { rhs: Operand::Const(_), .. }));
         assert_eq!(func.next_value_id, 4);
+    }
+
+    #[test]
+    fn test_constant_left_of_subtract_built_once_on_aarch64() {
+        let with_subs = |n: u32| {
+            let mut func = loop_func();
+            for d in 0..n {
+                func.blocks[1].instructions.push(Instruction::BinOp {
+                    dest: Value(9 + d), op: IrBinOp::Sub, lhs: Operand::Const(IrConst::I32(16)), rhs: Operand::Value(Value(1)), ty: IrType::I32,
+                });
+            }
+            func.next_value_id = 20;
+            func
+        };
+        let (mut func, mut other) = (with_subs(2), with_subs(2));
+        assert_eq!(hoist_function(&mut func, true), 3);
+        assert!(matches!(func.blocks[1].instructions[1], Instruction::BinOp { lhs: Operand::Value(_), .. }));
+        assert!(func.blocks[0].instructions.iter().any(|i| matches!(i, Instruction::Copy { src: Operand::Const(IrConst::I64(16)), .. })));
+        // Elsewhere only the costly constant moves.
+        assert_eq!(hoist_function(&mut other, false), 1);
+        assert!(matches!(other.blocks[1].instructions[1], Instruction::BinOp { lhs: Operand::Const(_), .. }));
+        // Read once, it keeps its `mov`.
+        let mut once = with_subs(1);
+        assert_eq!(hoist_function(&mut once, true), 1);
+        assert!(matches!(once.blocks[1].instructions[1], Instruction::BinOp { lhs: Operand::Const(_), .. }));
     }
 
     #[test]

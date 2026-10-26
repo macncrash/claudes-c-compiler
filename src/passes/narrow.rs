@@ -38,7 +38,9 @@ use crate::ir::reexports::{
     IrFunction,
     IrUnaryOp,
     Operand,
+    Value,
 };
+use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 
 /// Information about a Cast instruction (widening).
@@ -192,8 +194,84 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
     changes += narrow_binops_into_narrow_binops(func, &use_counts, &widen_map, &narrow_def_map, &mut narrowed_map);
     changes += narrow_binops_without_cast(func, &use_counts, &widen_map, &mut narrowed_map);
     changes += narrow_cmps(func, &widen_map);
+    changes += drop_extended_truncations(func);
 
     changes
+}
+
+/// Phase 4c: a truncated 32- or 64-bit value extended back to its width is
+/// the value itself to uses that read no more of it than the truncation
+/// kept (`s->bi_buf |= (ush)v << n`: the shift is truncated to int and
+/// extended for the or, whose result is truncated to 16 bits). Extended to
+/// a narrower 32 bits, it is the value truncated to 32 bits.
+fn drop_extended_truncations(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize;
+    let reg = |ty: &IrType| ty.is_integer() && matches!(ty.size(), 4 | 8);
+    // Truncation -> (its source, the source's type, bits kept).
+    let mut kept: Vec<Option<(Operand, IrType, usize)>> = vec![None; max_id + 1];
+    let mut extensions = false;
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Cast { dest, src, from_ty, to_ty } = inst {
+            if reg(from_ty) && to_ty.is_integer() && to_ty.size() < from_ty.size() {
+                kept[dest.0 as usize] = Some((*src, *from_ty, to_ty.size() * 8));
+            } else if reg(to_ty) && from_ty.is_integer() && from_ty.size() < to_ty.size() {
+                extensions = true;
+            }
+        }
+    }
+    if !extensions {
+        return 0;
+    }
+    // Each value's uses: (block, instruction), or None for a terminator.
+    let mut uses: Vec<Vec<Option<(usize, usize)>>> = vec![Vec::new(); max_id + 1];
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (i, inst) in block.instructions.iter().enumerate() {
+            inst.for_each_used_value(|v| uses[v as usize].push(Some((b, i))));
+        }
+        block.terminator.for_each_used_value(|v| uses[v as usize].push(None));
+    }
+    let mut changes = 0;
+    for b in 0..func.blocks.len() {
+        for i in 0..func.blocks[b].instructions.len() {
+            let Instruction::Cast { dest, src: Operand::Value(t), from_ty, to_ty } = func.blocks[b].instructions[i] else { continue };
+            let Some((src, src_ty, bits)) = kept[t.0 as usize] else { continue };
+            if !(reg(&to_ty) && to_ty.size() <= src_ty.size() && from_ty.is_integer() && from_ty.size() * 8 == bits
+                && bits < to_ty.size() * 8 && reads_low_bits(func, &uses, dest.0, bits, 0)) {
+                continue;
+            }
+            func.blocks[b].instructions[i] = if to_ty == src_ty {
+                Instruction::Copy { dest, src }
+            } else {
+                Instruction::Cast { dest, src, from_ty: src_ty, to_ty }
+            };
+            changes += 1;
+        }
+    }
+    changes
+}
+
+/// Whether every use of the value `v` reads only its low `bits`:
+/// truncations and stores at most that wide, and 32- or 64-bit operations
+/// whose low bits depend only on their operands' low bits, whose own uses
+/// do.
+fn reads_low_bits(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32, bits: usize, depth: usize) -> bool {
+    let fits = |ty: &IrType| ty.is_integer() && ty.size() * 8 <= bits;
+    uses[v as usize].iter().all(|u| {
+        let Some((b, i)) = *u else { return false };
+        match &func.blocks[b].instructions[i] {
+            Instruction::Cast { to_ty, .. } => fits(to_ty),
+            Instruction::Store { val: Operand::Value(x), ptr, ty, .. } => x.0 == v && ptr.0 != v && fits(ty),
+            Instruction::BinOp { dest, op, rhs, ty: IrType::I64 | IrType::U64 | IrType::I32 | IrType::U32, .. } => {
+                let low = match op {
+                    IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => true,
+                    IrBinOp::Shl => !matches!(rhs, Operand::Value(r) if r.0 == v),
+                    _ => false,
+                };
+                low && depth < 4 && reads_low_bits(func, uses, dest.0, bits, depth + 1)
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Phase 4: Narrow BinOps that have an explicit narrowing Cast consumer.
@@ -213,6 +291,8 @@ fn narrow_binops_with_cast(
 ) -> usize {
     let max_id = narrowed_map.len() - 1;
     let mut changes = 0;
+    // Widening casts to retarget to the narrow type an operation now reads.
+    let mut retype: Vec<(Value, IrType)> = Vec::new();
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
@@ -283,12 +363,28 @@ fn narrow_binops_with_cast(
                     continue;
                 }
 
-                let narrow_lhs = try_narrow_operand(&binop_info.lhs, *to_ty, Some(narrow_def_map), widen_map, narrowed_map);
-                let narrow_rhs = try_narrow_operand(&binop_info.rhs, *to_ty, Some(narrow_def_map), widen_map, narrowed_map);
+                // An operand that is the one use of a widening cast from a
+                // smaller type gets that cast retargeted to the narrow type
+                // (as in Phase 4b), for operations whose low bits depend only
+                // on their operands' low bits.
+                let narrow = |o: &Operand| -> Option<(Operand, bool)> {
+                    if let Some(n) = try_narrow_operand(o, *to_ty, Some(narrow_def_map), widen_map, narrowed_map) {
+                        return Some((n, false));
+                    }
+                    let Operand::Value(v) = o else { return None };
+                    let w = widen_map.get(v.0 as usize)?.as_ref()?;
+                    (is_safe_op && to_ty.size() == 4 && w.from_ty.size() < 4 && use_counts[v.0 as usize] == 1)
+                        .then_some((*o, true))
+                };
 
-                if let (Some(new_lhs), Some(new_rhs)) = (narrow_lhs, narrow_rhs) {
+                if let (Some((new_lhs, rl)), Some((new_rhs, rr))) = (narrow(&binop_info.lhs), narrow(&binop_info.rhs)) {
                     let narrow_dest = *dest;
                     let narrow_ty = *to_ty;
+                    for (o, re) in [(new_lhs, rl), (new_rhs, rr)] {
+                        if let (Operand::Value(v), true) = (o, re) {
+                            retype.push((v, narrow_ty));
+                        }
+                    }
 
                     *inst = Instruction::BinOp {
                         dest: narrow_dest,
@@ -307,14 +403,25 @@ fn narrow_binops_with_cast(
             }
         }
     }
+    if !retype.is_empty() {
+        let retype: FxHashMap<u32, IrType> = retype.into_iter().map(|(v, t)| (v.0, t)).collect();
+        for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
+            if let Instruction::Cast { dest, to_ty, .. } = inst {
+                if let Some(&t) = retype.get(&dest.0) {
+                    *to_ty = t;
+                }
+            }
+        }
+    }
 
     changes
 }
 
-/// Phase 4b: an I64 Add/Sub/Mul/And/Or/Xor whose one use is a 32-bit
-/// Add/Sub/Mul/And/Or/Xor reads only its low 32 bits, so it is done at that
-/// type (`(h ^ byte) * K` with h a uint32_t: the xor at 64 bits would need
-/// h zero-extended first). Its operands narrow as in Phase 4, or are
+/// Phase 4b: an I64 Add/Sub/Mul/And/Or/Xor whose every use is a 32-bit
+/// Add/Sub/Mul/And/Or/Xor, or a truncation to 32 bits or fewer that Phase 4
+/// left (an operand wider than its result, or several uses), reads only its
+/// low 32 bits, so it is done at 32 bits (`(h ^ byte) * K` with h a
+/// uint32_t: the xor at 64 bits would need h zero-extended first). Its operands narrow as in Phase 4, or are
 /// single-use widening casts from a smaller type, which then widen to the
 /// 32-bit type instead (the low 32 bits are the same).
 fn narrow_binops_into_narrow_binops(
@@ -326,9 +433,20 @@ fn narrow_binops_into_narrow_binops(
 ) -> usize {
     let max_id = narrowed_map.len() - 1;
     let low_bits_only = |op: IrBinOp| matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor);
-    // I64 BinOps to narrow, with the 32-bit type their consumer reads.
-    let mut target: Vec<Option<IrType>> = vec![None; max_id + 1];
+    // Values all of whose uses read only their low 32 bits, with the 32-bit
+    // types those uses take (a truncation takes either): counts of such
+    // uses, and the types as a mask (1: I32, 2: U32).
+    let mut low_uses: Vec<u32> = vec![0; max_id + 1];
+    let mut mask: Vec<u8> = vec![3; max_id + 1];
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        // A truncation to 32 bits or fewer reads only the low 32 bits too.
+        if let Instruction::Cast { src: Operand::Value(v), from_ty: IrType::I64 | IrType::U64, to_ty, .. } = inst {
+            let id = v.0 as usize;
+            if to_ty.is_integer() && to_ty.size() <= 4 && id <= max_id {
+                low_uses[id] += 1;
+            }
+            continue;
+        }
         let Instruction::BinOp { op, lhs, rhs, ty, .. } = inst else { continue };
         if !(low_bits_only(*op) && ty.is_integer() && ty.size() == 4) {
             continue;
@@ -336,12 +454,17 @@ fn narrow_binops_into_narrow_binops(
         for v in [lhs, rhs] {
             if let Operand::Value(v) = v {
                 let id = v.0 as usize;
-                if id <= max_id && use_counts[id] == 1 {
-                    target[id] = Some(*ty);
+                if id <= max_id {
+                    low_uses[id] += 1;
+                    mask[id] &= if ty.is_unsigned() { 2 } else { 1 };
                 }
             }
         }
     }
+    const TYPES: [&[IrType]; 4] = [&[], &[IrType::I32], &[IrType::U32], &[IrType::I32, IrType::U32]];
+    let target: Vec<Option<&[IrType]>> = (0..=max_id)
+        .map(|id| (low_uses[id] > 0 && low_uses[id] == use_counts[id] && mask[id] != 0).then(|| TYPES[mask[id] as usize]))
+        .collect();
     // The defining BinOp must be an I64 one of the same kind.
     let mut plans: Vec<Option<(IrType, Operand, Operand)>> = vec![None; max_id + 1];
     // Widening casts to retarget to the 32-bit type.
@@ -349,11 +472,11 @@ fn narrow_binops_into_narrow_binops(
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         let Instruction::BinOp { dest, op, lhs, rhs, ty: IrType::I64 | IrType::U64 } = inst else { continue };
         let id = dest.0 as usize;
-        let Some(Some(t)) = target.get(id).copied() else { continue };
+        let Some(Some(types)) = target.get(id).copied() else { continue };
         if !low_bits_only(*op) {
             continue;
         }
-        let narrow = |o: &Operand| -> Option<(Operand, bool)> {
+        let narrow = |o: &Operand, t: IrType| -> Option<(Operand, bool)> {
             if let Some(n) = try_narrow_operand(o, t, Some(narrow_def_map), widen_map, narrowed_map) {
                 return Some((n, false));
             }
@@ -361,7 +484,7 @@ fn narrow_binops_into_narrow_binops(
             let w = widen_map.get(v.0 as usize)?.as_ref()?;
             (w.from_ty.size() < t.size() && use_counts[v.0 as usize] == 1).then_some((*o, true))
         };
-        let (Some((l, rl)), Some((r, rr))) = (narrow(lhs), narrow(rhs)) else { continue };
+        let Some((t, (l, rl), (r, rr))) = types.iter().find_map(|&t| Some((t, narrow(lhs, t)?, narrow(rhs, t)?))) else { continue };
         // The same cast on both sides would be retyped once but read twice.
         if rl && rr && matches!((lhs, rhs), (Operand::Value(a), Operand::Value(b)) if a.0 == b.0) {
             continue;
@@ -383,9 +506,16 @@ fn narrow_binops_into_narrow_binops(
                     changes += 1;
                 }
             }
-            Instruction::Cast { dest, to_ty, .. } => {
+            Instruction::Cast { dest, src, from_ty, to_ty } => {
                 if let Some(Some(t)) = retype.get(dest.0 as usize).copied() {
                     *to_ty = t;
+                }
+                // A truncation of a narrowed operation now reads the 32-bit
+                // result.
+                if let Operand::Value(v) = src {
+                    if let Some(Some((t, _, _))) = plans.get(v.0 as usize) {
+                        *from_ty = *t;
+                    }
                 }
             }
             _ => {}
@@ -1155,6 +1285,58 @@ mod tests {
             Instruction::BinOp { op: IrBinOp::Xor, ty: IrType::U32, lhs: Operand::Value(Value(0)), rhs: Operand::Value(Value(3)), .. } => {}
             other => panic!("expected xor at U32 of %0 and %3, got {:?}", other),
         }
+    }
+
+    /// %0 (I64) truncated to I32 and extended back, ored with %10 and the
+    /// result truncated to U16 and stored (or returned whole).
+    fn trunc_ext_or(returned: bool) -> IrFunction {
+        let ret = if returned { 4 } else { 5 };
+        make_func_with_blocks(vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Cast { dest: Value(2), src: Operand::Value(Value(0)), from_ty: IrType::I64, to_ty: IrType::I32 },
+                Instruction::Cast { dest: Value(3), src: Operand::Value(Value(2)), from_ty: IrType::I32, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(4), op: IrBinOp::Or, lhs: Operand::Value(Value(3)), rhs: Operand::Value(Value(10)), ty: IrType::I64 },
+                Instruction::Cast { dest: Value(5), src: Operand::Value(Value(4)), from_ty: IrType::I64, to_ty: IrType::U16 },
+                Instruction::Store { val: Operand::Value(Value(5)), ptr: Value(11), ty: IrType::U16, seg_override: crate::common::types::AddressSpace::Default, volatile: false },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(ret)))),
+            source_spans: Vec::new(),
+        }])
+    }
+
+    #[test]
+    fn test_extension_of_truncation_read_low_is_the_value() {
+        let mut func = trunc_ext_or(false);
+        narrow_function(&mut func);
+        assert!(matches!(func.blocks[0].instructions[1], Instruction::Copy { dest: Value(3), src: Operand::Value(Value(0)) }),
+            "{:?}", func.blocks[0].instructions[1]);
+        // The or's high bits are read: the extension stays.
+        let mut func = trunc_ext_or(true);
+        narrow_function(&mut func);
+        assert!(matches!(func.blocks[0].instructions[1], Instruction::Cast { .. }), "{:?}", func.blocks[0].instructions[1]);
+    }
+
+    #[test]
+    fn test_binop_whose_uses_all_truncate_narrowed() {
+        // dist - (unsigned)base, read as a U32 and as a U16.
+        let mut func = make_func_with_blocks(vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Cast { dest: Value(2), src: Operand::Value(Value(0)), from_ty: IrType::U32, to_ty: IrType::I64 },
+                Instruction::Cast { dest: Value(3), src: Operand::Value(Value(1)), from_ty: IrType::U32, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(4), op: IrBinOp::Sub, lhs: Operand::Value(Value(2)), rhs: Operand::Value(Value(3)), ty: IrType::I64 },
+                Instruction::Cast { dest: Value(5), src: Operand::Value(Value(4)), from_ty: IrType::I64, to_ty: IrType::U32 },
+                Instruction::Cast { dest: Value(6), src: Operand::Value(Value(4)), from_ty: IrType::I64, to_ty: IrType::U16 },
+                Instruction::Store { val: Operand::Value(Value(6)), ptr: Value(11), ty: IrType::U16, seg_override: crate::common::types::AddressSpace::Default, volatile: false },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        }]);
+        narrow_function(&mut func);
+        let insts = &func.blocks[0].instructions;
+        assert!(matches!(insts[2], Instruction::BinOp { ty: IrType::U32, lhs: Operand::Value(Value(0)), rhs: Operand::Value(Value(1)), .. }), "{:?}", insts[2]);
+        assert!(matches!(insts[4], Instruction::Cast { from_ty: IrType::U32, to_ty: IrType::U16, .. }), "{:?}", insts[4]);
     }
 
     #[test]

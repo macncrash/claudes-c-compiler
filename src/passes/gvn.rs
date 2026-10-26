@@ -141,8 +141,18 @@ struct GvnState {
     /// Root value number -> the load and store keys recorded at it, so a
     /// store to the root keeps those it cannot overlap (stale keys are
     /// skipped by their generation).
-    by_root: FxHashMap<u32, (Vec<ExprKey>, Vec<StoreFwdKey>)>,
+    by_root: FxHashMap<u32, RootKeys>,
+    /// Rollback log for `by_root`: each root's lists as they were before
+    /// the first change to them in a scope.
+    by_root_log: Vec<(u32, Option<RootKeys>)>,
+    /// The current scope's number, and the scope in which each root's lists
+    /// were last logged.
+    scope: u32,
+    next_scope: u32,
+    by_root_logged: FxHashMap<u32, u32>,
 }
+
+type RootKeys = (Vec<ExprKey>, Vec<StoreFwdKey>);
 
 impl GvnState {
     /// Create a new GVN state sized for `max_value_id` values.
@@ -165,6 +175,10 @@ impl GvnState {
             silent_calls: FxHashSet::default(),
             locs: FxHashMap::default(),
             by_root: FxHashMap::default(),
+            by_root_log: Vec::new(),
+            scope: 0,
+            next_scope: 1,
+            by_root_logged: FxHashMap::default(),
         }
     }
 
@@ -174,15 +188,28 @@ impl GvnState {
         (self.operand_to_vn(&Operand::Value(root)), off)
     }
 
+    /// The lists at `root`, logged first if this scope has not changed them
+    /// yet, so leaving the scope restores them for its siblings.
+    fn root_keys(&mut self, root: u32) -> &mut RootKeys {
+        if self.by_root_logged.insert(root, self.scope) != Some(self.scope) {
+            self.by_root_log.push((root, self.by_root.get(&root).cloned()));
+        }
+        self.by_root.entry(root).or_default()
+    }
+
     fn note_load_root(&mut self, key: &ExprKey) {
         if let ExprKey::Load { ptr: VNOperand::ValueNum(r), .. } = key {
-            self.by_root.entry(*r).or_default().0.push(key.clone());
+            let loads = &mut self.root_keys(*r).0;
+            loads.push(key.clone());
+            trim_keys(loads);
         }
     }
 
     fn note_store_root(&mut self, key: &StoreFwdKey) {
         if let VNOperand::ValueNum(r) = key.ptr_vn {
-            self.by_root.entry(r).or_default().1.push(key.clone());
+            let stores = &mut self.root_keys(r).1;
+            stores.push(key.clone());
+            trim_keys(stores);
         }
     }
 
@@ -191,7 +218,10 @@ impl GvnState {
     #[allow(clippy::type_complexity)]
     fn disjoint_entries(&mut self, ptr: Value, size: i64) -> (Vec<(ExprKey, Value)>, Vec<(StoreFwdKey, StoreFwdEntry)>) {
         let (VNOperand::ValueNum(root), off) = self.location(ptr) else { return (Vec::new(), Vec::new()) };
-        let Some((loads, stores)) = self.by_root.get_mut(&root).map(std::mem::take) else { return (Vec::new(), Vec::new()) };
+        if !self.by_root.contains_key(&root) {
+            return (Vec::new(), Vec::new());
+        }
+        let (loads, stores) = std::mem::take(self.root_keys(root));
         let apart = |o: i64, ty: IrType| o + ty.size() as i64 <= off || off + size <= o;
         let gen = self.load_generation;
         let mut kept_loads = Vec::new();
@@ -214,10 +244,10 @@ impl GvnState {
             }
         }
         // Only the kept keys stay listed: the rest are stale after the store
-        // (an entry a rollback makes current again just goes unkept by a
-        // later store, which is conservative). At most the MAX_KEPT most
-        // recent of each kind are kept, so a run of stores to one root
-        // (a large struct copied field by field) stays linear.
+        // (leaving the scope restores them with the generation they were
+        // current in). At most the MAX_KEPT most recent of each kind are
+        // kept, so a run of stores to one root (a large struct copied field
+        // by field) stays linear.
         let lists = self.by_root.entry(root).or_default();
         lists.0.extend(kept_loads.iter().rev().map(|(k, _)| k.clone()));
         lists.1.extend(kept_stores.iter().rev().map(|(k, _)| k.clone()));
@@ -353,8 +383,13 @@ impl GvnState {
     }
 
     /// Save the current log positions for later rollback.
-    fn save_scope(&self) -> ScopeCheckpoint {
+    fn save_scope(&mut self) -> ScopeCheckpoint {
+        let saved_scope = self.scope;
+        self.scope = self.next_scope;
+        self.next_scope += 1;
         ScopeCheckpoint {
+            by_root_log_start: self.by_root_log.len(),
+            saved_scope,
             rollback_start: self.rollback_log.len(),
             load_rollback_start: self.load_rollback_log.len(),
             store_fwd_rollback_start: self.store_fwd_rollback_log.len(),
@@ -407,6 +442,17 @@ impl GvnState {
             self.value_numbers[idx] = old_vn;
         }
 
+        // Rollback: restore by_root
+        while self.by_root_log.len() > checkpoint.by_root_log_start {
+            let (root, old) = self.by_root_log.pop()
+                .expect("by_root_log length checked by while condition");
+            match old {
+                Some(lists) => { self.by_root.insert(root, lists); }
+                None => { self.by_root.remove(&root); }
+            }
+        }
+        self.scope = checkpoint.saved_scope;
+
         // Rollback: restore load_generation
         self.load_generation = checkpoint.saved_load_generation;
         self.local_generation = checkpoint.saved_local_generation;
@@ -416,6 +462,8 @@ impl GvnState {
 /// Saved positions in the rollback logs, used by `GvnState::save_scope` /
 /// `GvnState::restore_scope` to implement scoped hash table semantics.
 struct ScopeCheckpoint {
+    by_root_log_start: usize,
+    saved_scope: u32,
     rollback_start: usize,
     load_rollback_start: usize,
     store_fwd_rollback_start: usize,
@@ -588,9 +636,17 @@ pub(crate) fn run_gvn_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAn
     state.total_eliminated
 }
 
+/// Drop the oldest keys of a root's list once it holds twice the most a
+/// store looks at, which keeps the copies `root_keys` logs small.
+fn trim_keys<K>(keys: &mut Vec<K>) {
+    if keys.len() > 2 * MAX_KEPT {
+        keys.drain(..keys.len() - MAX_KEPT);
+    }
+}
+
 /// Each constant-offset GEP's (root, byte offset): the pointer at the start
 /// of its chain of such GEPs, and their offsets summed.
-fn pointer_locations(func: &IrFunction) -> FxHashMap<u32, (Value, i64)> {
+pub(crate) fn pointer_locations(func: &IrFunction) -> FxHashMap<u32, (Value, i64)> {
     let mut step: FxHashMap<u32, (Value, i64)> = FxHashMap::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
@@ -2126,5 +2182,29 @@ mod tests {
         module.for_each_function(run_gvn_function);
         let insts = &module.functions[0].blocks[0].instructions;
         assert!(matches!(insts[4], Instruction::Copy { src: Operand::Const(IrConst::I32(5)), .. }), "{:?}", insts[4]);
+    }
+
+    #[test]
+    fn test_load_kept_in_second_arm_after_first_arm_clobbers() {
+        // s->valid read, then if/else: the first arm stores through another
+        // pointer and then to s->buf (dropping s->valid from the keys at s); the
+        // second arm stores only to s->buf and reads s->valid again: the same value.
+        let block = |label: u32, instructions: Vec<Instruction>, terminator| BasicBlock {
+            label: BlockId(label), instructions, terminator, source_spans: Vec::new(),
+        };
+        let func = make_func(vec![
+            block(0, vec![field(1, 0, 8, IrType::I32), load(2, 1, IrType::I32), field(3, 0, 4, IrType::U16)],
+                Terminator::CondBranch { cond: Operand::Value(Value(9)), true_label: BlockId(1), false_label: BlockId(2) }),
+            block(1, vec![store(1, 10, IrType::U8), store(2, 3, IrType::U16)],
+                Terminator::Return(Some(Operand::Value(Value(2))))),
+            block(2, vec![store(3, 3, IrType::U16), load(5, 1, IrType::I32)],
+                Terminator::Return(Some(Operand::Value(Value(5))))),
+        ], 11);
+
+        let mut module = make_module(func);
+        assert_eq!(module.for_each_function(run_gvn_function), 1);
+        let blocks = &module.functions[0].blocks;
+        assert!(matches!(blocks[2].instructions[1], Instruction::Copy { dest: Value(5), src: Operand::Value(Value(2)) }),
+            "{:?}", blocks[2].instructions[1]);
     }
 }

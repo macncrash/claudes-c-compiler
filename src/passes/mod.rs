@@ -31,6 +31,8 @@ pub(crate) mod iv_widen;
 pub(crate) mod lftr;
 mod mem_inline;
 pub(crate) mod licm;
+mod step_sink;
+mod load_phi;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_hoist;
 pub(crate) mod loop_layout;
@@ -634,6 +636,19 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         }
     }
 
+    // Phase 9c: Loads whose location holds a known value on every path to
+    // them (stored or loaded before, in a predecessor or across a merge)
+    // read that value, through phis where paths meet.
+    if !disabled.contains("load_phi") {
+        let mut changed = vec![false; module.functions.len()];
+        if load_phi::load_phis_module(module, &mut changed) > 0 {
+            for (func, _) in module.functions.iter_mut().zip(&changed).filter(|(_, c)| **c) {
+                copy_prop::propagate_copies(func);
+                dce::eliminate_dead_code(func);
+            }
+        }
+    }
+
     // Phase 10a: Move loads an exit test reads from memory the loop never
     // writes out of the loop, so iv_widen and lftr see a loop-invariant bound.
     if !disabled.contains("bound_hoist") {
@@ -738,6 +753,14 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
                 dce::eliminate_dead_code(func);
                 cfg_simplify::simplify_cfg(func);
             }
+        }
+    }
+
+    // Phase 10h: Move each loop counter's step below the counter's last use
+    // in its block, so phi elimination's back-edge copy can be coalesced.
+    if !disabled.contains("step_sink") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            step_sink::sink_steps(func);
         }
     }
 

@@ -251,6 +251,9 @@ fn sink_arm_loads(func: &mut IrFunction) -> usize {
         }
     }
 
+    let globals: FxHashMap<u32, String> = func.blocks.iter().flat_map(|b| &b.instructions)
+        .filter_map(|i| match i { Instruction::GlobalAddr { dest, name } => Some((dest.0, name.clone())), _ => None })
+        .collect();
     let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
     let mut fresh = || {
         next_id += 1;
@@ -267,8 +270,34 @@ fn sink_arm_loads(func: &mut IrFunction) -> usize {
         let (tlabel, flabel) = (func.blocks[*t].label, func.blocks[*f].label);
         let Instruction::Phi { dest: r, .. } = func.blocks[*m].instructions[*phi] else { unreachable!() };
         let pq = fresh();
+        // Addresses that are offsets from one base defined before the arms
+        // (`k < 256 ? tab[k] : tab[256 + (k >> 7)]`) merge their offsets,
+        // so the arms select an index and the load adds it to the base.
+        let offset_of = |idx: usize, ptr: Value| {
+            let block = &func.blocks[idx];
+            block.instructions.iter().find_map(|i| match *i {
+                Instruction::GetElementPtr { dest, base, offset, ty } if dest == ptr && single_use(ptr) => Some((base, offset, ty)),
+                _ => None,
+            }).filter(|(base, _, _)| !block.instructions.iter().any(|i| i.dest() == Some(*base)))
+        };
+        // (Each arm's address of a global may still be its own value.)
+        let same_base = |a: Value, b: Value| a == b || matches!((globals.get(&a.0), globals.get(&b.0)), (Some(x), Some(y)) if x == y);
+        let merged = match (offset_of(*t, tl.ptr), offset_of(*f, fl.ptr)) {
+            (Some((tb, to, ty)), Some((fb, fo, _))) if same_base(tb, fb) => Some((tb, to, fo, ty)),
+            _ => None,
+        };
         let n = tail.len();
-        let mut moved = Vec::with_capacity(n);
+        let mut moved = Vec::with_capacity(n + 1);
+        let phi_inst = match merged {
+            Some((base, to, fo, ty)) => {
+                let off = fresh();
+                moved.push(Instruction::GetElementPtr { dest: pq, base, offset: Operand::Value(off), ty });
+                Instruction::Phi { dest: off, ty: IrType::I64, incoming: vec![(to, tlabel), (fo, flabel)] }
+            }
+            None => Instruction::Phi {
+                dest: pq, ty: IrType::Ptr, incoming: vec![(Operand::Value(tl.ptr), tlabel), (Operand::Value(fl.ptr), flabel)],
+            },
+        };
         let mut prev = pq;
         for (k, inst) in tail.into_iter().enumerate() {
             let dest = if k == n - 1 { r } else { fresh() };
@@ -281,9 +310,7 @@ fn sink_arm_loads(func: &mut IrFunction) -> usize {
             prev = dest;
         }
         let block = &mut func.blocks[*m];
-        block.instructions[*phi] = Instruction::Phi {
-            dest: pq, ty: IrType::Ptr, incoming: vec![(Operand::Value(tl.ptr), tlabel), (Operand::Value(fl.ptr), flabel)],
-        };
+        block.instructions[*phi] = phi_inst;
         let at = block.instructions.iter().position(|i| !matches!(i, Instruction::Phi { .. })).unwrap_or(block.instructions.len());
         if !block.source_spans.is_empty() {
             let span = block.source_spans[*phi];
@@ -1151,9 +1178,11 @@ mod tests {
     fn test_arm_loads_become_one_load_of_selected_address() {
         let mut func = field_ternary(IrType::I32);
         assert_eq!(if_convert_function(&mut func), 2);
-        // Block 0 selects between the field addresses; the merge loads and widens once.
-        assert!(matches!(func.blocks[0].instructions[..], [.., Instruction::Select { ty: IrType::Ptr, .. }]));
+        // Block 0 selects between the field offsets (from one base); the
+        // merge adds it, loads and widens once.
+        assert!(matches!(func.blocks[0].instructions[..], [.., Instruction::Select { ty: IrType::I64, .. }]));
         assert!(matches!(func.blocks[3].instructions[..], [
+            Instruction::GetElementPtr { base: Value(5), .. },
             Instruction::Load { ty: IrType::I16, .. },
             Instruction::Cast { dest: Value(30), from_ty: IrType::I16, to_ty: IrType::I32, .. },
         ]));

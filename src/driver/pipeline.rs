@@ -1123,11 +1123,16 @@ impl Driver {
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("loop_layout")) {
             crate::passes::loop_layout::layout_loops(&mut module);
         }
+        if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("latch_dup")) {
+            for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+                crate::passes::loop_rotate::duplicate_latches(func);
+            }
+        }
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("step_to_load")) {
             crate::passes::step_to_load::step_to_loads(&mut module);
         }
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("const_hoist")) {
-            crate::passes::const_hoist::hoist_constants(&mut module);
+            crate::passes::const_hoist::hoist_constants(&mut module, self.target == Target::Aarch64);
         }
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 

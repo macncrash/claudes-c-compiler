@@ -71,6 +71,10 @@ The optimizer executes in four sequential phases:
      mem_inline
          |
          v
+ Phase 9c: Loads Joined Across Merges
+     load_phi
+         |
+         v
  Phase 10a: Loop Bound Hoisting
      bound_hoist
          |
@@ -115,12 +119,16 @@ The optimizer executes in four sequential phases:
      ret_dup
          |
          v
+ Phase 10h: Counter Steps After Their Last Use
+     step_sink
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
          |
          v
  Phi elimination (src/ir/mem2reg), then:
-     loop_rotate, loop_hoist, loop_layout, step_to_load, const_hoist
+     loop_rotate, loop_hoist, loop_layout, latch_dup, step_to_load, const_hoist
 ```
 
 ## Phase Structure
@@ -522,7 +530,24 @@ This is safe for operations where the low bits are width-independent when
 truncated: Add, Sub, Mul, And, Or, Xor, and Shl. Right shifts are safe when
 the extension type matches the shift type (arithmetic shift with sign extension,
 logical shift with zero extension). The BinOp result must have exactly one use
-(the narrowing cast).
+(the narrowing cast). For a 32-bit result, an operand that is the one use of a
+widening cast from a smaller type also qualifies: the cast then widens to the
+32-bit type instead (`(ush)v << n` with an int shift becomes a 32-bit shift
+of the 16-bit value zero-extended to 32 bits).
+
+An I64 Add/Sub/Mul/And/Or/Xor whose uses all read only its low 32 bits (32-bit
+operations of those kinds, and truncations to 32 bits or fewer) is done at 32
+bits, whatever the number of uses; a truncation then reads the 32-bit result
+(zlib's `dist - base_dist[code]`, read as an unsigned and as a 16-bit value).
+For uses that are all truncations, the signedness is the one the operands
+narrow to.
+
+A value truncated from 32 or 64 bits and extended back is the value itself to
+uses that read only the bits the truncation kept (truncations and stores at
+most that wide, through Add/Sub/Mul/And/Or/Xor and the left of Shl): `s->bi_buf
+|= (ush)v << s->bi_valid` truncates the shift to 16 bits, extends it for the
+or and truncates the or to 16 bits, so the extension goes (a `sxtw` or an
+`and` each send).
 
 **Phase 2: Narrow binary operations without explicit cast.** On 64-bit targets,
 narrows I64 bitwise operations (And, Or, Xor) to I32 when all operands are
@@ -751,8 +776,11 @@ replaced with `Copy(V)`. This is tracked with the same generation scheme as
 load CSE. Forwarding is disabled for escaped parameter allocas to preserve
 correctness of the backend's ParamRef optimization.
 
-**Scoped hash tables.** The pass maintains four rollback logs (pure expressions,
-load entries, store-forwarding entries, and value number assignments). On
+**Scoped hash tables.** The pass maintains five rollback logs (pure expressions,
+load entries, store-forwarding entries, value number assignments, and the
+per-root lists of load and store entries a store to another field keeps, each
+logged once per scope that changes it, so a sibling subtree sees what its
+parent recorded). On
 entering a dominator subtree, the current log positions are saved. On
 backtracking, all entries beyond the saved position are undone, giving scoped
 hash-table semantics without cloning. This is the same scoping pattern used by
@@ -864,6 +892,27 @@ through and removed when nothing else reads them, so mem2reg then promotes
 the local: zlib's hash insertion had written each word to the stack and read
 it back. A `double` read this way stays a double.
 
+### load_phi -- Loads Joined Across Merges
+
+Runs once after mem_inline. GVN reuses a load or a stored value only along
+dominator-tree paths and forgets everything at a merge, so a field both arms
+of an if store (zlib's send_bits stores `s->bi_valid` on either path) is
+loaded again after it. Here each load's value is looked for walking backward:
+in its block, a store to the same location (root pointer, constant byte
+offset and type) gives the stored value, and a load of it its result; at the
+top of a block with one predecessor the walk continues at that block's end,
+and a block with several gets a phi of the value each holds at its end, when
+all do (no phi when they all hold the same value). Anything that may write
+the location stops the walk: a store through another root or overlapping the
+bytes, a call mod_ref cannot show writes nothing, a memcpy, atomics, inline
+asm. A loop header's own back edge can take part (a field never written in
+the loop is the value from before it); a walk that comes back to a block it is
+still answering for gives up. Only 32- and 64-bit integers and pointers: a
+narrower value in a phi needs extending at each use, which its load did for
+free. At most 4096 blocks are entered per function and 256 instructions looked
+at in each. compress_block keeps `bi_valid` in a register from one send to the
+next instead of loading it in each.
+
 ### bound_hoist -- Loop Bound Hoisting
 
 Runs once after the main loop, before iv_widen. iv_widen and lftr need a
@@ -896,6 +945,15 @@ first scan is left and extended where the next starts: the extension of a
 truncation is the wide value itself. Extensions go at the end of a preheader
 that only enters the loop, else right after the value's definition.
 Disabled by `-fwrapv`.
+
+An `unsigned` counter, whose wrapping is defined, is widened (to its zero
+extension) only when it cannot wrap: it starts at a constant below 2^32 - 1,
+steps by 1, and the loop's one latch goes back only while `next <u B` for a
+32-bit B, so the counter stays below 2^32 - 1 and `next` at most 2^32 - 1.
+B may change in the loop (it is zero-extended where it is defined:
+compress_block's `sx < s->sym_next` reloads the bound). Unsigned and
+equality compares widen; signed ones read a truncation. It is done only when
+it removes more zero extensions than it adds truncations.
 
 ### lftr -- Linear Function Test Replacement
 
@@ -955,6 +1013,12 @@ into each access (`[t, #120]`) instead of keeping the field address `p + 120`
 in a register for every `p->board[sq]`. GVN has already run, so a GEP equal to
 one in a dominating block (the `rays + sq` of each ray) then becomes a copy of it.
 
+Before that, `gep(p, (x + C) << k)` or `gep(p, x + C)`, whose index is read
+only there and whose address only by loads, stores and constant GEPs that
+are, becomes `gep(gep(p, x << k), C << k)`, and those constant GEPs re-base
+onto the inner one: `tree[code + 257].Len` loads `[t, #1030]` after `add t,
+p, x, lsl #2` instead of adding 257 to the index first.
+
 ### exit_addr -- Loop Exit Addresses
 
 Runs once after gep_reassoc, on AArch64. The backend folds an address into a
@@ -1010,6 +1074,20 @@ it; when one predecessor is left, CFG simplification merges the block into
 it. Predecessors through a switch, or on both edges of a conditional branch,
 keep the shared block.
 
+### step_sink -- Counter Steps After Their Last Use
+
+Runs last before dead_statics. `p[i++]` steps the counter before the old
+value is read, so the two are live at once: phi elimination's copy on the
+back edge needs a register of its own and, when the latch branches
+conditionally, a block of its own (a move and a jump every iteration). A
+phi's incoming value that is an add or subtract of the phi and a constant in
+the phi's block moves as late as it can: before its first read in the block,
+or to the end (before a compare the branch tests), which must be after the
+phi's other uses, all in that block. It then takes the counter's register.
+(Right after the counter's last use, an address computed from it would no
+longer fold into its access.) compress_block's loop goes straight back to its
+header.
+
 ### loop_rotate -- Loop Rotation
 
 Runs after phi elimination, just before codegen. A latch that branches back
@@ -1021,6 +1099,18 @@ places, as lowered phis are. A one-block loop rotates into its back edge's
 trampoline, which phi elimination laid out before the header; that block,
 now a loop of its own, moves right after the header, so entering the loop
 falls into it.
+
+### latch_dup -- Latch Copies
+
+Runs after loop_layout (before step_to_load). A latch of at most four simple
+instructions, one of them a load, that branches back conditionally (to the
+header or the block holding its phi copies), and whose values are used only
+in it, is copied into each loop block that jumps to it (at most eight; the
+block laid out just before it keeps falling into it), so each path ends with
+the loop's test instead of a jump to it. compress_block's literal and match
+paths each jumped to the shared `sx < s->sym_next` test. A latch that only
+compares values the path just assigned is left alone: its copies read the
+value through an extra move, and SQLite's searches ran more instructions.
 
 ### loop_layout -- Loop Tail Placement
 
@@ -1056,8 +1146,14 @@ instructions to build (three or more 16-bit pieces that are neither 0 nor
 0xffff; on AArch64 a movz and two or three movks) is defined once by a copy
 at the end of the entry block, and its loop uses read that value. Operands
 of BinOps, Cmps, Stores and Copies qualify, except shift amounts and masks
-that AArch64 encodes in and/orr/eor. At most four constants per function,
-most loop uses first. The splitmix64 steps in scalar-bench's hash kernel
+that AArch64 encodes in and/orr/eor. On AArch64 a nonzero constant on the left
+of a subtract or shift also qualifies (`16 - len`, `1 << n`): it has no
+reversed forms taking an immediate, so the constant takes a `mov` at each use.
+At most four constants per function, most loop uses first, a use counted by
+the instructions building the constant there takes (three for a costly one,
+one otherwise). A cheap constant needs two loop uses: read once, it saves one
+`mov` but holds a register through the function, and longest_match lost
+more to the allocation around `MAX_MATCH - len` than it saved. The splitmix64 steps in scalar-bench's hash kernel
 drop sixteen instructions per operation, about 20% faster.
 
 ### if_convert -- If-Conversion
@@ -1114,7 +1210,11 @@ n->right`), and converting it the same way if at all (`c ? p->s : q->s` of a
 `short` field), are first rewritten to merge the two addresses and load once
 in the merge block. One load still runs on either path, and the arms, now
 load-free, convert: the field address is selected (`csel`) and loaded, with
-no branch to mispredict on random keys.
+no branch to mispredict on random keys. When the two addresses are offsets
+from one base defined before the arms (or the addresses of one global, which
+each arm may still compute itself), the offsets merge instead and the merge
+block adds them to the base: `d < 256 ? tab[d] : tab[256 + (d >> 7)]` selects
+an index and loads `[base, index]`.
 
 One shape is left as branches: a step of an `a && b` or `a || b` test, whose
 merge block holds only the boolean phi (with a constant from the
@@ -1287,7 +1387,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`.
+`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1329,6 +1429,7 @@ behavior across iterations.
 | `iv_strength_reduce.rs`  | Loop induction variable strength reduction             |
 | `iv_widen.rs`            | Signed 32-bit loop counters kept as 64-bit values      |
 | `lftr.rs`                | Exit tests moved off counters (one IV per loop)        |
+| `load_phi.rs`            | Loads given the values their location holds at merges |
 | `loop_vectorize.rs`      | In-place element loops done 16 bytes at a time (AArch64) |
 | `mem_inline.rs`          | Small constant-length memcpy/memset done in place      |
 | `licm.rs`                | Loop-invariant code motion                             |
@@ -1342,4 +1443,5 @@ behavior across iterations.
 | `ret_dup.rs`             | Return blocks copied into predecessors passing constants |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |
+| `step_sink.rs`           | Counter steps moved after the counter's last use       |
 | `step_to_load.rs`        | Loop pointer steps moved after their load (post-index) |
