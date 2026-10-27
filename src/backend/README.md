@@ -520,7 +520,11 @@ depth: a use at loop depth D contributes 10^D to the weighted count
 (depth 1 = 10x, depth 2 = 100x, depth 3 = 1000x, capped at 10,000 for
 very deep nesting). This ensures inner-loop temporaries receive registers
 ahead of straight-line code values, which is critical for compute-heavy
-loops like zlib's `deflate_slow`, `longest_match`, and `slide_hash`.
+loops like zlib's `deflate_slow`, `longest_match`, and `slide_hash`. A
+loop is the union of the bodies of its header's back edges, so a block
+counts each enclosing loop once: counted per back edge, sqlite3VdbeExec's
+dispatch loop, which every opcode's handler jumps back to, made its
+blocks hundreds deep, unevenly.
 
 A GEP with a constant offset that is only used as a load or store address
 (see GEP Constant Offset Folding) counts its uses toward its base instead,

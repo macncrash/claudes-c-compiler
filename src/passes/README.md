@@ -443,6 +443,11 @@ fixpoint (repeating until no sub-pass makes changes):
 
 3. **Simplify redundant conditional branches.** When a `CondBranch` has both
    targets pointing to the same block, replaces it with an unconditional branch.
+   A branch on a value that a dominating branch on the same value already
+   decided (the block lies under that branch's true or false edge, into a
+   block only it enters) becomes a jump: OP_Column's
+   `if (VdbeMemDynamic(pDest)) sqlite3VdbeMemSetNull(pDest)` tested the flags
+   again in the inlined helper, GVN making it the same value.
 
 4. **Thread jump chains.** Identifies empty blocks (no instructions,
    unconditional branch terminator) and redirects their predecessors to the

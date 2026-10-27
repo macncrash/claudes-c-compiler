@@ -694,6 +694,16 @@ register, same offset), the load is redundant and eliminated. If the registers d
 Also handles `str wN, [sp, #off]` followed by `ldrsw xN, [sp, #off]` (sign-extending
 load after 32-bit store).
 
+Further apart, in straight-line code: a reload of a slot that a register
+still holds, from a load of it or a store to it, becomes a move from that
+register, or goes when it is the same register (`forward_held_slots`). A
+value left on the stack is loaded at each use, and sqlite3VdbeExec reloaded
+them a few lines apart. What is held is forgotten at labels, branches,
+calls, any store other than of a whole x or w register to a slot (a store
+through a pointer may write a slot whose address was taken), anything
+moving sp, and any line not known to write no memory; a register's entries
+when it is written. SQLite's speedtest ran 0.7% fewer instructions.
+
 **2. Redundant Branch Elimination**
 
 An unconditional `b .label` where `.label:` is the immediately next non-empty line
@@ -840,7 +850,10 @@ v1 and nothing between the copy and the call uses v22:
 - A constant built again (`movz`/`movk`, or `mov #imm`) into the register
   that still holds it, in straight-line code with nothing writing it in
   between, is not built again; `mul` then `add` of that register fuse into
-  `madd` (zlib's `value * 66521 + 66521`).
+  `madd` (zlib's `value * 66521 + 66521`). A line the model does not know
+  (`adc x1, x3, x5`) counts as writing every register: taken as writing
+  none, it let the second `mov x1, #0` of pr85095 go once the reload
+  between them did.
 - `mov xR, #0` read only by a conditional select, R dying there, becomes
   the select's `xzr`/`wzr` operand (`m >= w ? m - w : 0`).
 

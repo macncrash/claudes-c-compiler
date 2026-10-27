@@ -456,6 +456,7 @@ pub fn peephole_optimize(asm: String) -> String {
         while changed2 && rounds2 < 4 {
             changed2 = false;
             changed2 |= pass!(eliminate_adjacent_store_load(&mut lines, &mut kinds, n));
+            changed2 |= pass!(forward_held_slots(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_redundant_branches(&lines, &mut kinds, n));
             changed2 |= pass!(eliminate_self_moves(&mut kinds, n));
             changed2 |= pass!(eliminate_move_chains(&mut lines, &mut kinds, n));
@@ -762,6 +763,82 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
 //
 // Pattern: b .LBBN  ;  .LBBN:  (branch to immediately next label)
 // Falls through naturally, so the branch is redundant.
+
+/// A reload of a stack slot that a register still holds, from a load of it
+/// or a store to it earlier in straight-line code, becomes a move from that
+/// register, or goes when it is the same one: a value left on the stack is
+/// loaded at each use, and sqlite3VdbeExec reloads them a few lines apart
+/// (`ldr x0, [sp, #3040]` twice around an unrelated store of a byte).
+/// What is held is forgotten at labels, branches and calls, at any store
+/// other than of a whole x or w register to a slot (a store through a
+/// pointer may write a slot whose address was taken), at anything moving
+/// sp, and at any line not known to write no memory; and a register's
+/// entries when it is written.
+fn forward_held_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    // (offset, is_word) -> register holding it.
+    let mut held: Vec<(i32, bool, u8)> = Vec::new();
+    let size = |w: bool| if w { 4 } else { 8 };
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Nop => continue,
+            LineKind::LoadSp { reg, offset, is_word } => {
+                if let Some(&(_, _, s)) = held.iter().find(|&&(o, w, _)| o == offset && w == is_word) {
+                    if s == reg {
+                        kinds[i] = LineKind::Nop;
+                    } else {
+                        let name = if is_word { wreg_name } else { xreg_name };
+                        lines[i] = format!("    mov {}, {}", name(reg), name(s));
+                        kinds[i] = LineKind::Move { dst: reg, src: s, is_32bit: is_word };
+                    }
+                    changed = true;
+                    held.retain(|&(_, _, r)| r != reg || r == s);
+                    continue;
+                }
+                held.retain(|&(_, _, r)| r != reg);
+                if reg < 31 {
+                    held.push((offset, is_word, reg));
+                }
+                continue;
+            }
+            LineKind::StoreSp { reg, offset, is_word } => {
+                let end = offset + size(is_word);
+                held.retain(|&(o, w, _)| o + size(w) <= offset || end <= o);
+                if reg < 31 {
+                    held.push((offset, is_word, reg));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if held.is_empty() {
+            continue;
+        }
+        let Some((mn, ops)) = split_insn(&lines[i]) else {
+            // A label or directive.
+            held.clear();
+            continue;
+        };
+        let info = line_info(&lines[i], kinds[i], &|_| None);
+        let plain_load = matches!(mn, "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldp" | "ldpsw" | "ldur" | "ldurb" | "ldurh");
+        let known = plain_load || matches!(kinds[i], LineKind::Move { .. } | LineKind::MoveImm { .. } | LineKind::MoveWide { .. } | LineKind::Sxtw { .. })
+            || matches!(classify_access(&lines[i], kinds[i]), Access::Write { .. } | Access::ReadOnly);
+        let writeback = ops.contains("]!") || ops.contains("],");
+        let uses_sp = ops.split([',', '[', ']', ' ']).any(|t| t == "sp" || t == "wsp");
+        if !known || mn.starts_with("st") || !matches!(info.flow, Flow::Next) || matches!(kinds[i], LineKind::Call | LineKind::Label)
+            || (uses_sp && (!plain_load || writeback)) {
+            held.clear();
+            continue;
+        }
+        // Written registers, including a writeback base.
+        let mut defs = info.defs;
+        if writeback {
+            defs |= regs_in(ops);
+        }
+        held.retain(|&(_, _, r)| r >= 31 || defs & (1 << r) == 0);
+    }
+    changed
+}
 
 fn eliminate_redundant_branches(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
@@ -2037,7 +2114,7 @@ fn drop_redundant_zero_extend(lines: &mut [String], kinds: &mut [LineKind], n: u
                 if let Some(p) = prev {
                     let info = line_info(&lines[p], kinds[p], &|_| None);
                     let wrote = split_insn(&lines[p]).is_some_and(|(m, o)| !m.starts_with("st") && first_and_rest(o).0 == a);
-                    if wrote && matches!(info.flow, Flow::Next) && gpr_operand(a).is_some_and(|r| info.defs & (1 << r) != 0)
+                    if wrote && matches!(info.flow, Flow::Next) && info.uses != ALL_REGS && gpr_operand(a).is_some_and(|r| info.defs & (1 << r) != 0)
                         && !matches!(kinds[p], LineKind::Call | LineKind::Label) {
                         kinds[i] = LineKind::Nop;
                         changed = true;
@@ -2161,8 +2238,10 @@ fn reuse_constants(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bo
                 }
             }
             let info = line_info(&lines[j], kinds[j], &|_| None);
+            // (A line the model does not know, such as `adc x1, x3, x5`,
+            // writes nothing as far as line_info says: stop there.)
             if !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call)
-                || info.defs & (1 << r) != 0 {
+                || info.defs & (1 << r) != 0 || info.uses == ALL_REGS {
                 break;
             }
             seen += 1;
@@ -3759,7 +3838,9 @@ fn fold_scale_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
 // and deletes deletable writes whose destination is dead on every path.
 //
 // The model is conservative: any line it does not understand reads every
-// register and writes none; `ret` reads the return and callee-saved
+// register and may write every one (so passes tracking what a register
+// holds forget it there; to liveness the reads already make all live);
+// `ret` reads the return and callee-saved
 // registers; calls read the argument registers; indirect branches, branches
 // to labels outside the function, and anything after them make every
 // register live. Functions that call setjmp-like routines are skipped.
@@ -3900,7 +3981,9 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
     }
     match classify_access(line, kind) {
         Access::Transparent => simple(0, 0),
-        Access::Barrier => simple(ALL_REGS, 0),
+        // Not known: it may read and write any register. (Passes that
+        // track what a register holds forget it here.)
+        Access::Barrier => simple(ALL_REGS, ALL_REGS),
         Access::ReadOnly => simple(regs_in(ops), 0),
         Access::Write { deletable } => match gpr_operand(dest) {
             Some(d) => LineInfo {
@@ -4620,6 +4703,32 @@ mod tests {
         assert!(peephole_optimize(input.to_string()).contains("lsl x11, x0, #3"));
         let input = ".type f, %function\nf:\n    lsl x11, x0, #3\n    sub x13, x11, x12\n    str x13, [x14]\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("lsl x11, x0, #3"));
+    }
+
+    #[test]
+    fn test_constant_rebuilt_after_unknown_write() {
+        // `adc` is not in the line model: x1 may have changed, so the second
+        // `mov x1, #0` stays (pr85095's high word read as 0).
+        let input = ".type f, %function\nf:\n    mov x1, #0\n    str x1, [sp, #8]\n    adc x1, x3, x5\n    str x1, [sp, #40]\n    mov x1, #0\n    str x1, [sp, #64]\n    ldr x3, [sp, #40]\n    eor x0, x3, x1\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("mov x1, #0").count(), 2, "{}", result);
+        assert!(result.contains("ldr x3, [sp, #40]") || result.contains("mov x3, x"), "{}", result);
+        assert!(!result.contains("eor x0, x1, x1"), "{}", result);
+    }
+
+    #[test]
+    fn test_held_slot_reload_forwarded() {
+        let body = |mid: &str| format!(
+            ".type f, %function\nf:\n    ldr x0, [sp, #40]\n    str w0, [sp, #48]\n{}    ldr x0, [sp, #40]\n    ldr x2, [sp, #40]\n    add x0, x0, x2\n    ldr w1, [sp, #48]\n    add x0, x0, x1\n    ret\n.size f, .-f\n", mid);
+        let result = peephole_optimize(body(""));
+        assert_eq!(result.matches("ldr x0, [sp, #40]").count(), 1, "{}", result);
+        assert!(!result.contains("ldr x2, [sp, #40]") && !result.contains("ldr w1, [sp, #48]"), "{}", result);
+        // A store through a pointer may write the slot; a call clobbers the
+        // register; so does a write of it.
+        for mid in ["    str x5, [x1]\n", "    bl g\n", "    ldr x0, [x6]\n"] {
+            let result = peephole_optimize(body(mid));
+            assert_eq!(result.matches("ldr x0, [sp, #40]").count(), 2, "{}: {}", mid, result);
+        }
     }
 
     #[test]

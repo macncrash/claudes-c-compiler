@@ -72,6 +72,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
         changed += fold_constant_cond_branches(func, &label_to_idx);
         changed += fold_constant_switches(func, &label_to_idx);
         changed += simplify_redundant_cond_branches(func);
+        changed += fold_dominated_cond_branches(func, &label_to_idx);
         changed += thread_jump_chains(func, &label_to_idx);
         changed += thread_phi_cond_branches(func, &label_to_idx);
         changed += thread_phi_cond_branches_merging(func, &label_to_idx);
@@ -900,6 +901,70 @@ fn simplify_redundant_cond_branches(func: &mut IrFunction) -> usize {
         }
     }
     count
+}
+
+// ---------------------------------------------------------------------------
+// Sub-pass: branches a dominating branch decided
+// ---------------------------------------------------------------------------
+
+/// Turn a branch on `%c` into a jump when an earlier branch on the same
+/// `%c` decided it: the block lies under that branch's true (or false)
+/// edge, an edge into a block it alone reaches, which dominates this one.
+/// OP_Column's `if (VdbeMemDynamic(pDest)) sqlite3VdbeMemSetNull(pDest)`
+/// tested the flags again in the inlined helper (GVN made it the same
+/// value), with a `cset`, a copy and a second `cbz` each time.
+fn fold_dominated_cond_branches(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
+    let has_condbr = func.blocks.iter().filter(|b| matches!(b.terminator, Terminator::CondBranch { cond: Operand::Value(_), .. })).count();
+    if has_condbr < 2 {
+        return 0;
+    }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let dominates = |a: usize, mut b: usize| loop {
+        if a == b {
+            return true;
+        }
+        let up = cfg.idom[b];
+        if up == b || up == usize::MAX {
+            return false;
+        }
+        b = up;
+    };
+    // (block, taken, dropped)
+    let mut decided: Vec<(usize, BlockId, BlockId)> = Vec::new();
+    for b in 0..func.blocks.len() {
+        let Terminator::CondBranch { cond: Operand::Value(c), true_label, false_label } = func.blocks[b].terminator else { continue };
+        if true_label == false_label || cfg.idom[b] == usize::MAX {
+            continue;
+        }
+        let mut d = b;
+        loop {
+            let up = cfg.idom[d];
+            if up == d || up == usize::MAX {
+                break;
+            }
+            d = up;
+            let Terminator::CondBranch { cond: Operand::Value(dc), true_label: dt, false_label: df } = func.blocks[d].terminator else { continue };
+            if dc != c || dt == df {
+                continue;
+            }
+            let edge = |l: BlockId| label_to_idx.get(&l).copied()
+                .filter(|&t| cfg.preds.row(t).len() == 1 && dominates(t, b));
+            let truth = if edge(dt).is_some() { Some(true) } else if edge(df).is_some() { Some(false) } else { None };
+            if let Some(t) = truth {
+                let (taken, dropped) = if t { (true_label, false_label) } else { (false_label, true_label) };
+                decided.push((b, taken, dropped));
+                break;
+            }
+        }
+    }
+    for &(b, taken, dropped) in &decided {
+        let label = func.blocks[b].label;
+        func.blocks[b].terminator = Terminator::Branch(taken);
+        if let Some(&di) = label_to_idx.get(&dropped) {
+            remove_phi_entries_from(&mut func.blocks[di], label);
+        }
+    }
+    decided.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -1790,6 +1855,33 @@ mod tests {
     /// `source_spans` is always empty in tests.
     fn make_block(label: BlockId, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
         BasicBlock { label, instructions, terminator, source_spans: Vec::new() }
+    }
+
+    #[test]
+    fn test_branch_decided_by_dominating_branch() {
+        // b0: condbr c, b1, b4; b1: x = load; condbr c, b2, b3 (decided: true);
+        // b2, b3, b4 return 2, 3, 4.
+        let ret = |k| Terminator::Return(Some(Operand::Const(IrConst::I32(k))));
+        let build = |second_cond: u32| {
+            let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+            func.blocks = vec![
+                make_block(BlockId(0), vec![], Terminator::CondBranch { cond: Operand::Value(Value(0)), true_label: BlockId(1), false_label: BlockId(4) }),
+                make_block(BlockId(1), vec![Instruction::Copy { dest: Value(5), src: Operand::Value(Value(1)) }],
+                    Terminator::CondBranch { cond: Operand::Value(Value(second_cond)), true_label: BlockId(2), false_label: BlockId(3) }),
+                make_block(BlockId(2), vec![], ret(2)),
+                make_block(BlockId(3), vec![], ret(3)),
+                make_block(BlockId(4), vec![], ret(4)),
+            ];
+            func
+        };
+        let mut func = build(0);
+        let label_to_idx = build_label_to_idx(&func);
+        assert_eq!(fold_dominated_cond_branches(&mut func, &label_to_idx), 1);
+        assert!(matches!(func.blocks[1].terminator, Terminator::Branch(BlockId(2))));
+        // Another condition is not decided.
+        let mut func = build(7);
+        let label_to_idx = build_label_to_idx(&func);
+        assert_eq!(fold_dominated_cond_branches(&mut func, &label_to_idx), 0);
     }
 
     #[test]

@@ -1416,26 +1416,38 @@ fn compute_loop_depth(successors: &[Vec<usize>], num_blocks: usize) -> Vec<u32> 
     // The loop body consists of all blocks that can reach `src` without going
     // through `header`, plus `header` itself. We compute this by a reverse
     // BFS/DFS from `src` following predecessor edges, stopping at `header`.
-    for &(tail, header) in &back_edges {
-        // All blocks in the loop body get +1 depth
-        depth[header] += 1;
-        if tail != header {
-            // BFS backwards from tail, stopping at header
-            let mut worklist = vec![tail];
-            let mut visited = vec![false; num_blocks];
-            visited[header] = true; // Don't go past header
-            visited[tail] = true;
-            depth[tail] += 1;
-
-            while let Some(b) = worklist.pop() {
-                for &pred in &predecessors[b] {
-                    if pred < num_blocks && !visited[pred] {
-                        visited[pred] = true;
-                        depth[pred] += 1;
-                        worklist.push(pred);
-                    }
+    // One loop per header: the union of its back edges' bodies, each block
+    // in it counted once. (Counted per back edge, sqlite3VdbeExec's
+    // dispatch loop, which each opcode's handler jumps back to, nested its
+    // blocks hundreds deep, some more than others.)
+    back_edges.sort_unstable_by_key(|&(_, header)| header);
+    let mut in_body = vec![false; num_blocks];
+    let mut members: Vec<usize> = Vec::new();
+    for group in back_edges.chunk_by(|a, b| a.1 == b.1) {
+        let header = group[0].1;
+        in_body[header] = true;
+        members.push(header);
+        let mut worklist: Vec<usize> = Vec::new();
+        for &(tail, _) in group {
+            if !in_body[tail] {
+                in_body[tail] = true;
+                members.push(tail);
+                worklist.push(tail);
+            }
+        }
+        // Backwards from the tails, stopping at the header.
+        while let Some(b) = worklist.pop() {
+            for &pred in &predecessors[b] {
+                if pred < num_blocks && !in_body[pred] {
+                    in_body[pred] = true;
+                    members.push(pred);
+                    worklist.push(pred);
                 }
             }
+        }
+        for b in members.drain(..) {
+            depth[b] += 1;
+            in_body[b] = false;
         }
     }
 
@@ -1686,5 +1698,15 @@ mod tests {
         let result = compute_live_intervals(&func);
         let iv = result.intervals.iter().find(|iv| iv.value_id == 0).unwrap();
         assert_eq!(result.segments_of(iv), vec![(0, 2), (3, 6)]);
+    }
+
+    /// A loop whose header three latches jump back to (a dispatch loop) is
+    /// one loop deep, not three; one nested in it is two.
+    #[test]
+    fn test_loop_depth_counts_each_header_once() {
+        // 0 -> 1 (header); 1 -> 2, 3, 4, 6; 2, 3, 4 -> 1; 4 -> 5 -> 5 / 1 (inner); 6 exit.
+        let succ = vec![vec![1], vec![2, 3, 4, 6], vec![1], vec![1], vec![5], vec![5, 1], vec![]];
+        let depth = compute_loop_depth(&succ, 7);
+        assert_eq!(depth, vec![0, 1, 1, 1, 1, 2, 0]);
     }
 }
