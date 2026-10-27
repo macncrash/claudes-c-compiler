@@ -817,10 +817,14 @@ v1 and nothing between the copy and the call uses v22:
   as writes of their destination (never deleted: their flags may be read);
   as unknown lines they made every register live and kept dead moves
   elsewhere in the function.
-- After the cleanup rounds, two adjacent `ldr`s of one width from `[B, #k]`
-  and `[B, #k + size]` become an `ldp` (not when the first replaces B, or
-  both load one register): `s->prev` and `s->head`, `s->strstart` and
-  `s->match_start`.
+- After the cleanup rounds, two `ldr`s of one width from `[B, #k]` and
+  `[B, #k + size]` become an `ldp` (not when the first replaces B, or both
+  load one register): `s->prev` and `s->head`, `s->strstart` and
+  `s->match_start`. Up to four lines may come between, none of them a
+  store, a branch, a label or a call, none writing B and none reading or
+  writing the second load's register.
+- A GEP by a multiple of 4096 up to 0xfff000 is an add of the shifted
+  immediate (`add x22, x12, #1, lsl #12`) rather than a movz and an add.
 - A call reads the GP argument registers its codegen names in a
   `.ccc_call_uses MASK` line before it (x0 up to the highest argument
   register, x8 for an sret pointer; all of x0-x8 when an argument may be a

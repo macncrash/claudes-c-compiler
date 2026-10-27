@@ -29,6 +29,39 @@ pub(crate) fn reassociate_function(func: &mut IrFunction, aarch64: bool) -> usiz
     reassociate_constant_bases(func, aarch64) + split
 }
 
+/// Whether an AArch64 add takes k as its immediate (12 bits, optionally
+/// shifted left by 12).
+fn add_imm(k: i64) -> bool {
+    (0..=0xfff).contains(&k) || (k & 0xfff == 0 && (0..=0xfff).contains(&(k >> 12)))
+}
+
+/// A constant GEP whose offset no add immediate holds becomes one from an
+/// earlier GEP of the same base in its block whose offset is within one:
+/// the braided CRC's table rows 5 to 7, at 5120 to 7168, were each a movz
+/// and an add every iteration, and are now the row before plus 1024.
+/// AArch64; runs last, after remat may have recomputed such GEPs.
+pub(crate) fn chain_large_offsets(func: &mut IrFunction) -> usize {
+    let mut changes = 0;
+    for block in &mut func.blocks {
+        // (base, offset, dest) of the constant GEPs so far.
+        let mut seen: Vec<(Value, i64, Value)> = Vec::new();
+        for inst in &mut block.instructions {
+            let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), ty } = *inst else { continue };
+            let Some(k) = c.to_i64() else { continue };
+            if !add_imm(k) && !add_imm(-k) {
+                if let Some(&(_, o, from)) = seen.iter()
+                    .filter(|&&(b, o, _)| b == base && o < k && add_imm(k - o))
+                    .min_by_key(|&&(_, o, _)| k - o) {
+                    *inst = Instruction::GetElementPtr { dest, base: from, offset: Operand::Const(IrConst::I64(k - o)), ty };
+                    changes += 1;
+                }
+            }
+            seen.push((base, k, dest));
+        }
+    }
+    changes
+}
+
 fn reassociate_constant_bases(func: &mut IrFunction, aarch64: bool) -> usize {
     // Constant-offset GEPs: dest -> (base, offset).
     let mut const_gep: FxHashMap<u32, (Value, Operand)> = FxHashMap::default();
@@ -329,5 +362,22 @@ mod tests {
         // An address that is itself stored keeps its index.
         let mut func = indexed(true);
         assert_eq!(split_index_constants(&mut func), 0);
+    }
+
+    #[test]
+    fn large_offsets_taken_from_an_earlier_gep() {
+        let c = |k| Operand::Const(IrConst::I64(k));
+        let gep = |dest, base, k| Instruction::GetElementPtr { dest: Value(dest), base: Value(base), offset: c(k), ty: IrType::Ptr };
+        let mut f = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+        f.blocks = vec![BasicBlock { label: BlockId(0), instructions: vec![
+            gep(1, 0, 4096), gep(2, 0, 5120), gep(3, 0, 6144), gep(4, 0, 70000),
+        ], terminator: Terminator::Return(None), source_spans: Vec::new() }];
+        assert_eq!(chain_large_offsets(&mut f), 2);
+        assert!(matches!(f.blocks[0].instructions[..], [
+            Instruction::GetElementPtr { base: Value(0), .. },
+            Instruction::GetElementPtr { base: Value(1), offset: Operand::Const(IrConst::I64(1024)), .. },
+            Instruction::GetElementPtr { base: Value(2), offset: Operand::Const(IrConst::I64(1024)), .. },
+            Instruction::GetElementPtr { base: Value(0), offset: Operand::Const(IrConst::I64(70000)), .. },
+        ]), "{:?}", f.blocks[0].instructions);
     }
 }

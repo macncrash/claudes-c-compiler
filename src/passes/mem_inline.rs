@@ -10,7 +10,8 @@
 //! a call, where clang copies or clears in place: SQLite clears 32- to
 //! 120-byte objects this way in dozens of places. Lengths up to 128 bytes;
 //! memset only on targets where unaligned 8-byte stores are fine (AArch64,
-//! x86-64). Runs once, after the main optimization loop.
+//! x86-64). Runs once, after the main optimization loop. There, a copy of
+//! 1, 2, 4 or 8 bytes (a call or a Memcpy) becomes one load and one store.
 
 use crate::common::types::AliasClass;
 use crate::common::types::{AddressSpace, IrType};
@@ -44,8 +45,31 @@ pub(crate) fn inline_function(func: &mut IrFunction, wide_stores: bool) -> usize
     inlined
 }
 
+/// A copy of 1, 2, 4 or 8 bytes as one load and one store. A Memcpy is a
+/// call point to the register allocator (its codegen uses scratch
+/// registers): inflate_table's 4-byte `code` entries, copied into the table
+/// in its fill loop, kept every value of the function out of the
+/// caller-saved registers, and most of them on the stack.
+fn one_access_copy(dest: Value, src: Value, size: usize, fresh: &mut dyn FnMut() -> Value) -> Option<Vec<Instruction>> {
+    let ty = match size {
+        1 => IrType::U8,
+        2 => IrType::U16,
+        4 => IrType::U32,
+        8 => IrType::U64,
+        _ => return None,
+    };
+    let t = fresh();
+    Some(vec![
+        Instruction::Load { dest: t, ptr: src, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+        Instruction::Store { val: Operand::Value(t), ptr: dest, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+    ])
+}
+
 /// The instructions replacing a small memcpy or memset call, if it is one.
 fn expand(inst: &Instruction, wide_stores: bool, fresh: &mut dyn FnMut() -> Value) -> Option<Vec<Instruction>> {
+    if let Instruction::Memcpy { dest, src, size } = *inst {
+        return if wide_stores { one_access_copy(dest, src, size, fresh) } else { None };
+    }
     let Instruction::Call { func, info } = inst else { return None };
     let kind = func.as_str();
     if !matches!(kind, "memcpy" | "memset") || info.args.len() != 3 {
@@ -61,8 +85,10 @@ fn expand(inst: &Instruction, wide_stores: bool, fresh: &mut dyn FnMut() -> Valu
     match kind {
         "memcpy" => {
             let Operand::Value(src) = info.args[1] else { return None };
-            if len > 0 {
-                out.push(Instruction::Memcpy { dest, src, size: len as usize });
+            match one_access_copy(dest, src, len as usize, fresh).filter(|_| wide_stores) {
+                Some(copy) => out.extend(copy),
+                None if len > 0 => out.push(Instruction::Memcpy { dest, src, size: len as usize }),
+                None => {}
             }
         }
         _ => {
@@ -330,6 +356,20 @@ mod tests {
         assert!(matches!(f.blocks[0].instructions[..], [
             Instruction::Memcpy { dest: Value(1), src: Value(2), size: 56 },
             Instruction::Copy { dest: Value(9), src: Operand::Value(Value(1)) },
+        ]));
+        // 4 bytes: a load and a store, and still the result.
+        let mut f = func_with(call("memcpy", vec![v(1), v(2), k(4)], vec![IrType::Ptr, IrType::Ptr, IrType::U64]));
+        assert_eq!(inline_function(&mut f, true), 1);
+        assert!(matches!(f.blocks[0].instructions[..], [
+            Instruction::Load { ptr: Value(2), ty: IrType::U32, .. },
+            Instruction::Store { ptr: Value(1), ty: IrType::U32, .. },
+            Instruction::Copy { dest: Value(9), src: Operand::Value(Value(1)) },
+        ]), "{:?}", f.blocks[0].instructions);
+        // So is a Memcpy lowering made.
+        let mut f = func_with(Instruction::Memcpy { dest: Value(1), src: Value(2), size: 8 });
+        assert_eq!(inline_function(&mut f, true), 1);
+        assert!(matches!(f.blocks[0].instructions[..], [
+            Instruction::Load { ty: IrType::U64, .. }, Instruction::Store { ty: IrType::U64, .. },
         ]));
         // 13 bytes of 0xab: an 8-, a 4- and a 1-byte store.
         let mut f = func_with(call("memset", vec![v(1), Operand::Const(IrConst::I32(0xab)), k(13)],

@@ -277,6 +277,89 @@ pub(crate) fn sink_addresses(func: &mut IrFunction) -> usize {
     moved
 }
 
+/// Move a load of the word after one an earlier load of its block read
+/// (`[p, #k + size]` after `[p, #k]`, both 4 or 8 bytes) up next to it, with
+/// its address, when nothing between may write memory (AArch64). The
+/// peephole then makes the two one `ldp`: the braided CRC loads its five
+/// words each next to the xor of the one before, all into one register.
+/// Each load joins one pair, as an ldp takes two, and moves past at most
+/// four instructions: moved further, the loads held registers longer and
+/// SQLite's speedtest ran more instructions.
+pub(crate) fn group_loads(func: &mut IrFunction) -> usize {
+    use crate::common::types::{AddressSpace, IrType};
+    /// Lines a load moves up past at most.
+    const WINDOW: usize = 4;
+    let mut const_gep: crate::common::fx_hash::FxHashMap<u32, (Value, i64)> = Default::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
+            if let Some(k) = c.to_i64() {
+                const_gep.insert(dest.0, (*base, k));
+            }
+        }
+    }
+    let loc = |p: Value| const_gep.get(&p.0).copied().unwrap_or((p, 0));
+    let plain = |ty: &IrType, volatile: bool, seg: &AddressSpace| {
+        !volatile && *seg == AddressSpace::Default && (ty.is_integer() || *ty == IrType::Ptr) && matches!(ty.size(), 4 | 8)
+    };
+    let mut moved = 0;
+    for block in &mut func.blocks {
+        // Loads already in a pair (an ldp takes two).
+        let mut paired: Vec<Value> = Vec::new();
+        let mut j = 0;
+        while j < block.instructions.len() {
+            let Instruction::Load { dest, ptr, ty, volatile, seg_override, .. } = block.instructions[j] else { j += 1; continue };
+            if !plain(&ty, volatile, &seg_override) || paired.contains(&dest) {
+                j += 1;
+                continue;
+            }
+            let (root, off) = loc(ptr);
+            // The partner: the nearest earlier load of [root, off - size].
+            let mut partner = None;
+            for i in (j.saturating_sub(WINDOW)..j).rev() {
+                match &block.instructions[i] {
+                    Instruction::Load { dest: d, ptr: p, ty: t, volatile: v, seg_override: s, .. }
+                        if plain(t, *v, s) && t.size() == ty.size() && loc(*p) == (root, off - ty.size() as i64) => {
+                        partner = (!paired.contains(d)).then_some((i, *d));
+                        break;
+                    }
+                    Instruction::Load { .. } | Instruction::BinOp { .. } | Instruction::UnaryOp { .. } | Instruction::Cmp { .. }
+                    | Instruction::Cast { .. } | Instruction::Copy { .. } | Instruction::GetElementPtr { .. }
+                    | Instruction::Select { .. } | Instruction::GlobalAddr { .. } => {}
+                    _ => break,
+                }
+            }
+            let Some((i, d)) = partner else { j += 1; continue };
+            paired.extend([d, dest]);
+            if i + 1 == j {
+                j += 1;
+                continue;
+            }
+            // The address: the root itself, or a constant GEP of it defined
+            // before the partner or between (then it moves too).
+            let gep_at = block.instructions[i + 1..j].iter().position(|x| x.dest() == Some(ptr)).map(|g| g + i + 1);
+            let root_ok = block.instructions[i + 1..j].iter().all(|x| x.dest() != Some(root));
+            if !root_ok {
+                j += 1;
+                continue;
+            }
+            if let Some(g) = gep_at {
+                if !matches!(block.instructions[g], Instruction::GetElementPtr { .. }) {
+                    j += 1;
+                    continue;
+                }
+                // (The load first, which moves the GEP down one.)
+                move_inst(block, j, i + 1);
+                move_inst(block, g + 1, i + 1);
+            } else {
+                move_inst(block, j, i + 1);
+            }
+            moved += 1;
+            j += 1;
+        }
+    }
+    moved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +441,37 @@ mod tests {
         // The old value is read after the latch: both stay live there.
         let mut func = latch_step(true);
         assert_eq!(sink_steps(&mut func), 0);
+    }
+
+    /// `a = p[0]; x ^= a; b = p[1]`, with a store to p[1] in between
+    /// when `store`.
+    fn two_words(store: bool) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let load = |dest, ptr| Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
+        let mut body = vec![
+            load(10, 0),
+            Instruction::BinOp { dest: Value(11), op: IrBinOp::Xor, lhs: v(1), rhs: v(10), ty: IrType::I64 },
+            Instruction::GetElementPtr { dest: Value(12), base: Value(0), offset: Operand::Const(IrConst::I64(8)), ty: IrType::Ptr },
+            load(13, 12),
+        ];
+        if store {
+            body.insert(3, Instruction::Store { val: v(11), ptr: Value(12), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+        }
+        let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![BasicBlock { label: BlockId(0), instructions: body, terminator: Terminator::Return(None), source_spans: Vec::new() }];
+        func
+    }
+
+    #[test]
+    fn load_of_the_next_word_moves_up_to_its_partner() {
+        let mut func = two_words(false);
+        assert_eq!(group_loads(&mut func), 1);
+        assert!(matches!(func.blocks[0].instructions[..], [
+            Instruction::Load { dest: Value(10), .. }, Instruction::GetElementPtr { .. },
+            Instruction::Load { dest: Value(13), .. }, Instruction::BinOp { .. },
+        ]), "{:?}", func.blocks[0].instructions);
+        let mut func = two_words(true);
+        assert_eq!(group_loads(&mut func), 0);
     }
 
     /// `out[pos] = *q >> 8`: the address first, then the value it stores

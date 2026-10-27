@@ -827,6 +827,22 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         }
     }
 
+    // Phase 10j2: A load of the word after another load's, moved up next
+    // to it, so the backend pairs them (AArch64).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("load_group") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            step_sink::group_loads(func);
+        }
+    }
+
+    // Phase 10k: Constant GEP offsets no add immediate holds, taken from an
+    // earlier GEP of the same base within one (AArch64).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("gep_reassoc") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            gep_reassoc::chain_large_offsets(func);
+        }
+    }
+
     // Phase 11: Dead static function elimination.
     // After all optimizations, remove internal-linkage (static) functions that are
     // never referenced by any other function or global initializer. This is critical

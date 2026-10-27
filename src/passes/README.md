@@ -137,6 +137,14 @@ The optimizer executes in four sequential phases:
      addr_sink (in step_sink.rs)
          |
          v
+ Phase 10j2: Next Words' Loads Next to Each Other (AArch64)
+     load_group (group_loads in step_sink.rs)
+         |
+         v
+ Phase 10k: Large GEP Offsets From Nearby Ones (AArch64)
+     chain_large_offsets (in gep_reassoc.rs)
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
          |
@@ -967,6 +975,14 @@ when the check cannot fail (the object size is unknown, or a constant length
 fits) and the length is constant; this catches lengths that became constant
 during optimization (a size computed in an inlined helper).
 
+On the same targets, a copy of 1, 2, 4 or 8 bytes, as a call or as a Memcpy
+lowering made (a small struct assigned), becomes one load and one store of
+that width. To the register allocator a Memcpy is a call point (its
+codegen uses scratch registers), so every value live across one kept out of
+the caller-saved registers: inflate_table copies its 4-byte `code` entries
+into the table in its fill loop, and most of its values lived on the stack.
+It retired 47M instructions in zbench's inflate run, now 36M (clang 35M).
+
 Before the first mem2reg (on the same targets), a copy of exactly a scalar
 local's size into or out of it, as a Memcpy or a plain `memcpy` call with a
 constant length whose result is unused, becomes a load and a store of the
@@ -1129,6 +1145,28 @@ one constant GEP keep it as their base, rebuilt in that block when it is
 defined elsewhere (LICM hoists it): the braided CRC's table rows
 (`crc_braid_table[k] + 4 * byte`, five bytes a row) take one add per row
 instead of one per byte.
+
+Last of the pipeline on AArch64 (after remat, which may recompute such
+GEPs in a loop), a constant GEP whose offset no add immediate holds (12
+bits, optionally shifted by 12) takes its base from an earlier constant GEP
+of the same base in its block whose offset is within one: the CRC's rows 5
+to 7, at 5120 to 7168 bytes, were a movz and an add each every iteration,
+and are each the row before plus 1024. (Row 4, at 4096, is one
+`add x22, x12, #1, lsl #12`.)
+
+### load_group -- Next Words' Loads Next to Each Other
+
+Runs after addr_sink, on AArch64. A load of the 4- or 8-byte word after one
+an earlier load in its block read (`[p, #k + size]` after `[p, #k]`, the
+address the base itself or a constant GEP of it) moves up next to it, with
+its address, past at most four instructions none of which may write memory
+(loads, arithmetic, compares, casts, copies, GEPs, selects). The peephole
+then pairs the two into an `ldp`. Each load joins one pair, as an ldp takes
+two. The braided CRC loaded its five words each next to the xor of the one
+before, all into one register, so none could pair; now they are two `ldp`s
+and an `ldr`, and its loop runs 133 instructions per 40 bytes (clang 135).
+Moved further, loads held registers longer and SQLite's speedtest ran 25M
+more instructions.
 
 ### exit_addr -- Loop Exit Addresses
 

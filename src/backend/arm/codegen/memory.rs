@@ -126,6 +126,8 @@ impl ArmCodegen {
             Operand::Const(c) => match c.to_i64() {
                 Some(n) if (0..=4095).contains(&n) => format!("#{}", n),
                 Some(n) if (-4095..0).contains(&n) => format!("#{}", n),
+                // A multiple of 4096 up to 0xfff000: the shifted immediate.
+                Some(n) if n > 0 && n & 0xfff == 0 && n >> 12 <= 0xfff => format!("#{}, lsl #12", n >> 12),
                 _ => return false,
             },
             Operand::Value(v) => match self.reg_assignments.get(&v.0) {

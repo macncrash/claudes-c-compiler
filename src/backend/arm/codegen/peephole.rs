@@ -1593,8 +1593,8 @@ fn fuse_cmp_sub_into_subs(lines: &mut [String], kinds: &mut [LineKind], n: usize
     changed
 }
 
-/// `ldr A, [B, #k]` then `ldr C, [B, #k + size]` (both x or both w, next
-/// to each other) become `ldp A, C, [B, #k]`: deflate's `s->prev` and
+/// `ldr A, [B, #k]` then `ldr C, [B, #k + size]` (both x or both w, at most
+/// four lines apart, see below) become `ldp A, C, [B, #k]`: deflate's `s->prev` and
 /// `s->head`, `s->strstart` and `s->match_start`. Neither A nor C may be
 /// B, nor A be C; k must fit ldp's scaled 7-bit offset.
 fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
@@ -1622,15 +1622,37 @@ fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
             continue;
         }
         let Some((a, b, k, size)) = parse(&lines[i]) else { i += 1; continue };
+        // The partner may come up to four lines later, past lines that
+        // neither store, nor write B, nor touch its destination (the
+        // braided CRC loads each word next to the eor of the one before).
+        let (reg_b, mut between) = (gpr_operand(&b).unwrap_or(255), 0u64);
         let mut j = i + 1;
-        while j < n && kinds[j] == LineKind::Nop {
+        let mut skipped = 0;
+        let pair = loop {
+            while j < n && kinds[j] == LineKind::Nop {
+                j += 1;
+            }
+            if j >= n {
+                break None;
+            }
+            if let Some(p) = parse(&lines[j]).filter(|p| p.1 == b && p.2 == k + size) {
+                break Some(p);
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            let stores = split_insn(&lines[j]).is_none_or(|(m, _)| m.starts_with("st"));
+            if skipped == 4 || stores || !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call)
+                || info.defs & (1 << reg_b) != 0 {
+                break None;
+            }
+            between |= (info.uses | info.defs) as u64;
+            skipped += 1;
             j += 1;
-        }
-        let pair = (j < n).then(|| parse(&lines[j])).flatten();
+        };
         let Some((c, b2, k2, size2)) = pair else { i += 1; continue };
         let reg = |r: &str| gpr_operand(r);
         let fits = k % size == 0 && (-64 * size..=63 * size).contains(&k);
-        if b2 == b && size2 == size && k2 == k + size && fits
+        let clear = reg(&c).is_some_and(|r| between & (1 << r) == 0);
+        if b2 == b && size2 == size && k2 == k + size && fits && clear
             && reg(&a) != reg(&b) && reg(&c) != reg(&b) && reg(&a) != reg(&c)
         {
             lines[i] = format!("    ldp {}, {}, [{}, #{}]", a, c, b, k);
@@ -4426,6 +4448,13 @@ mod tests {
         assert!(!peephole_optimize(input.to_string()).contains("ldp"));
         let input = "    ldr w3, [x0, #4]\n    ldr x4, [x0, #8]\n    add x0, x3, x4\n    ret\n";
         assert!(!peephole_optimize(input.to_string()).contains("ldp"));
+        // Past an unrelated line; not past a store, nor one reading the
+        // second load's register.
+        let body = |mid: &str| format!("    ldr x3, [x0, #16]\n{}    ldr x4, [x0, #24]\n    add x0, x3, x4\n    add x0, x0, x5\n    ret\n", mid);
+        let result = peephole_optimize(body("    eor x5, x5, x3\n"));
+        assert!(result.contains("ldp x3, x4, [x0, #16]"), "{}", result);
+        assert!(!peephole_optimize(body("    str x5, [x1]\n")).contains("ldp"));
+        assert!(!peephole_optimize(body("    eor x5, x5, x4\n")).contains("ldp"));
     }
 
     #[test]
