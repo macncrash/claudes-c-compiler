@@ -57,6 +57,7 @@ The optimizer executes in four sequential phases:
    |  3.  simplify                                         |
    |  4.  constant_fold                                    |
    |  4a. range_fold                                       |
+   |  4b. loop_unroll      (iteration 0 only)              |
    |  5.  gvn              \                               |
    |  6.  licm               > shared CFG analysis         |
    |  6a. iv_strength_reduce /  (iteration 0 only)         |
@@ -776,6 +777,29 @@ overflow is never assumed away: arithmetic whose exact result leaves the type
 gives no range. Folded comparisons become constants, which constant_fold,
 copy_prop and cfg_simplify carry on to the branches they feed.
 
+### loop_unroll -- Constant-Trip Loops Unrolled
+
+Runs in the first iteration, after constant folding and range_fold, once
+constants have reached loop bounds. A loop of a header (phis, then pure
+instructions ending in the exit compare) and one straight-line body block
+(no calls, atomics, inline asm or volatile accesses) that branches back is
+unrolled in full when running it on its constants decides the exit at
+every check, within 16 iterations and 600 instructions in all (copies,
+casts and symbol addresses not counted). The trip count comes from
+evaluating the header and body on the constants the phis start with, so an
+int counter compared and stepped at 64 bits through casts is followed too.
+The header then sets each phi to its starting value and branches into the
+body block, which holds one copy of the header's instructions and the body
+per iteration, each reading what the previous copy gave the phis (through
+copies), and branches to the exit; uses after the loop read the values after
+the last copy. Copy propagation, constant folding and GVN clean up.
+
+zlib's braided CRC steps through the bytes of each word with
+`for (k = 1; k < W; k++)`: a variable shift and table row per byte and a
+counter. Unrolled, the shift and mask fold into `ubfx` and the row into the
+address (see gep_reassoc). zbench's crc32 kernel retires 1.90G -> 1.31G
+instructions (clang 1.24G).
+
 ### gvn -- Global Value Numbering
 
 A dominator-based common subexpression elimination (CSE) pass with redundant
@@ -1079,6 +1103,15 @@ only there and whose address only by loads, stores and constant GEPs that
 are, becomes `gep(gep(p, x << k), C << k)`, and those constant GEPs re-base
 onto the inner one: `tree[code + 257].Len` loads `[t, #1030]` after `add t,
 p, x, lsl #2` instead of adding 257 to the index first.
+
+On AArch64 an access takes a constant offset or a scaled index, not both, so
+the first rewrite trades the constant GEP for an add at each access; that
+pays only when the constant GEP would otherwise sit in a register across
+code that does not use it. Two or more variable GEPs in one block through
+one constant GEP keep it as their base, rebuilt in that block when it is
+defined elsewhere (LICM hoists it): the braided CRC's table rows
+(`crc_braid_table[k] + 4 * byte`, five bytes a row) take one add per row
+instead of one per byte.
 
 ### exit_addr -- Loop Exit Addresses
 
@@ -1521,7 +1554,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, and `tbaa` (strict aliasing; see above).
+`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1565,6 +1598,7 @@ behavior across iterations.
 | `iv_widen.rs`            | Signed 32-bit loop counters kept as 64-bit values      |
 | `lftr.rs`                | Exit tests moved off counters (one IV per loop)        |
 | `load_phi.rs`            | Loads given the values their location holds at merges |
+| `loop_unroll.rs`         | Small constant-trip loops unrolled in full             |
 | `loop_vectorize.rs`      | In-place element loops done 16 bytes at a time (AArch64) |
 | `mem_inline.rs`          | Small constant-length memcpy/memset done in place      |
 | `licm.rs`                | Loop-invariant code motion                             |

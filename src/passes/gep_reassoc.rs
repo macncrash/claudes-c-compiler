@@ -12,7 +12,9 @@
 //! struct pointer is the only base left live.
 //!
 //! Only GEPs whose every use is the address of a load or store (the ones
-//! the backend folds) are rewritten. Runs once, after the main pipeline, so
+//! the backend folds) are rewritten. On AArch64 a constant GEP indexed by
+//! two or more of them in one block stays their base instead (an access
+//! takes a constant or a scaled index, not both). Runs once, after the main pipeline, so
 //! that GVN and LICM see the original form.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -20,12 +22,14 @@ use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
-pub(crate) fn reassociate_function(func: &mut IrFunction) -> usize {
+/// aarch64: a constant GEP indexed by two or more variable GEPs in one
+/// block stays their base (see reassociate_constant_bases).
+pub(crate) fn reassociate_function(func: &mut IrFunction, aarch64: bool) -> usize {
     let split = split_index_constants(func);
-    reassociate_constant_bases(func) + split
+    reassociate_constant_bases(func, aarch64) + split
 }
 
-fn reassociate_constant_bases(func: &mut IrFunction) -> usize {
+fn reassociate_constant_bases(func: &mut IrFunction, aarch64: bool) -> usize {
     // Constant-offset GEPs: dest -> (base, offset).
     let mut const_gep: FxHashMap<u32, (Value, Operand)> = FxHashMap::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
@@ -58,12 +62,60 @@ fn reassociate_constant_bases(func: &mut IrFunction) -> usize {
 
     let mut next_id = if func.next_value_id > 0 { func.next_value_id } else { func.max_value_id() + 1 };
     let mut changes = 0;
-    for block in &mut func.blocks {
+    // On AArch64 an access takes a constant offset or a (scaled) index, not
+    // both, so the rewrite trades the constant GEP for an add at each access.
+    // That pays only when the constant GEP is otherwise held in a register
+    // across code that does not use it. Two or more accesses in a block
+    // through one constant GEP keep it as their base, built in that block:
+    // the braided CRC's table rows (crc_braid_table[k] + 4 * byte, five
+    // bytes per row) take one add per row instead of one per byte.
+    let shared: FxHashSet<(usize, u32)> = if aarch64 {
+        let mut count: FxHashMap<(usize, u32), u32> = FxHashMap::default();
+        for (b, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr { dest, base, offset: Operand::Value(_), .. } = inst {
+                    if const_gep.contains_key(&base.0) && !other_use.contains(&dest.0) {
+                        *count.entry((b, base.0)).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        count.into_iter().filter(|&(_, n)| n >= 2).map(|(k, _)| k).collect()
+    } else {
+        FxHashSet::default()
+    };
+    let def_block: FxHashMap<u32, usize> = func.blocks.iter().enumerate()
+        .flat_map(|(b, block)| block.instructions.iter().filter_map(move |i| i.dest().map(|d| (d.0, b))))
+        .filter(|(d, _)| const_gep.contains_key(d))
+        .collect();
+    for (b, block) in func.blocks.iter_mut().enumerate() {
+        // Each shared constant GEP defined elsewhere, rebuilt here.
+        let mut local: FxHashMap<u32, Value> = FxHashMap::default();
         let mut i = 0;
         while i < block.instructions.len() {
             if let Instruction::GetElementPtr { dest, base, offset: index @ Operand::Value(_), ty } = block.instructions[i] {
                 if let Some(&(root, offset)) = const_gep.get(&base.0) {
-                    if !other_use.contains(&dest.0) {
+                    if shared.contains(&(b, base.0)) {
+                        if def_block.get(&base.0) != Some(&b) {
+                            let here = match local.get(&base.0) {
+                                Some(&v) => v,
+                                None => {
+                                    let v = Value(next_id);
+                                    next_id += 1;
+                                    block.instructions.insert(i, Instruction::GetElementPtr { dest: v, base: root, offset, ty: IrType::Ptr });
+                                    if !block.source_spans.is_empty() {
+                                        let span = block.source_spans[i];
+                                        block.source_spans.insert(i, span);
+                                    }
+                                    i += 1;
+                                    local.insert(base.0, v);
+                                    changes += 1;
+                                    v
+                                }
+                            };
+                            block.instructions[i] = Instruction::GetElementPtr { dest, base: here, offset: index, ty };
+                        }
+                    } else if !other_use.contains(&dest.0) {
                         let inner = Value(next_id);
                         next_id += 1;
                         block.instructions[i] = Instruction::GetElementPtr { dest, base: inner, offset, ty };

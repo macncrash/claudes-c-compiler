@@ -37,6 +37,7 @@ mod load_phi;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_hoist;
 pub(crate) mod loop_layout;
+mod loop_unroll;
 mod loop_vectorize;
 pub(crate) mod step_to_load;
 pub(crate) mod const_hoist;
@@ -499,6 +500,17 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             total_changes_excl_dce += n;
         }
 
+        // Phase 4b: Full unrolling of small constant-trip loops (first
+        // iteration only, once constants have propagated into their bounds).
+        // Counted as a CFG change: copy propagation, constant folding and
+        // GVN then clean up the copies.
+        if iter == 0 && !disabled.contains("loop_unroll") {
+            let n = timed_pass!("loop_unroll", run_on_visited(module, &dirty, &mut changed, loop_unroll::unroll_function));
+            cur_pass_changes[0] += n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phases 5-6a: GVN + LICM + IVSR with shared CFG analysis.
         //
         // These three passes all need CFG + dominator + loop analysis. Since GVN
@@ -721,7 +733,7 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // backend folds them into loads and stores.
     if !disabled.contains("gep_reassoc") {
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
-            if gep_reassoc::reassociate_function(func) > 0 {
+            if gep_reassoc::reassociate_function(func, target == crate::backend::Target::Aarch64) > 0 {
                 copy_prop::propagate_copies(func);
                 dce::eliminate_dead_code(func);
             }
