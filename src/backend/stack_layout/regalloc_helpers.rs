@@ -32,9 +32,16 @@ pub fn run_regalloc_and_merge_clobbers(
     caller_saved_at_call_boundaries: bool,
     allow_memcpy_regalloc: bool,
     dest_reuses_operand_reg: bool,
+    call_saves: Option<&mut FxHashMap<u32, Vec<PhysReg>>>,
 ) -> (FxHashMap<u32, PhysReg>, Option<super::super::liveness::LivenessResult>) {
-    let config = super::super::regalloc::RegAllocConfig { available_regs, caller_saved_regs, call_free_regs, allow_inline_asm_regalloc, caller_saved_at_call_boundaries, allow_memcpy_regalloc, dest_reuses_operand_reg };
+    let config = super::super::regalloc::RegAllocConfig {
+        available_regs, caller_saved_regs, call_free_regs, allow_inline_asm_regalloc, caller_saved_at_call_boundaries,
+        allow_memcpy_regalloc, dest_reuses_operand_reg, save_around_calls: call_saves.is_some(),
+    };
     let alloc_result = super::super::regalloc::allocate_registers(func, &config);
+    if let Some(saves) = call_saves {
+        *saves = alloc_result.call_saves;
+    }
     *reg_assignments = alloc_result.assignments;
     *used_callee_saved = alloc_result.used_regs;
     let cached_liveness = alloc_result.liveness;

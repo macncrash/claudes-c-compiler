@@ -247,6 +247,12 @@ pub struct ArmCodegen {
     pub(super) vec_param_loads: Vec<(Value, u8, u8)>,
     /// Lane stores that may write the whole register (fresh_lane_stores).
     pub(super) vec_fresh_stores: FxHashSet<usize>,
+    /// Caller-saved registers (x10-x15) holding values across a call, by
+    /// the call instruction's address: stored before the call and reloaded
+    /// after it, each in its slot of the area at gp_call_save_offset
+    /// (RegAllocConfig::save_around_calls).
+    pub(super) gp_call_saves: FxHashMap<usize, Vec<PhysReg>>,
+    pub(super) gp_call_save_offset: i64,
     /// Where to store and reload those variables (vec_vars_live_across).
     pub(super) vec_spills: super::intrinsics::VecSpillPlan,
     /// What scratch registers v0-v2 hold after the last vector op: the
@@ -318,6 +324,8 @@ impl ArmCodegen {
             vec_const_block_rebuilds: FxHashMap::default(),
             vec_param_loads: Vec::new(),
             vec_fresh_stores: FxHashSet::default(),
+            gp_call_saves: FxHashMap::default(),
+            gp_call_save_offset: 0,
             vec_spills: Default::default(),
             vec_scratch: (usize::MAX, [None; 3]),
             vec_not_folds: FxHashMap::default(),
@@ -2016,11 +2024,13 @@ impl ArchCodegen for ArmCodegen {
     fn state_ref(&self) -> &CodegenState { &self.state }
 
     fn before_instruction(&mut self, inst: &Instruction) -> bool {
+        self.save_around_call(inst, "str");
         self.vec_before_instruction(inst)
     }
 
     fn after_instruction(&mut self, inst: &Instruction) {
         self.vec_after_instruction(inst);
+        self.save_around_call(inst, "ldr");
     }
 
     fn block_start(&mut self, label: BlockId) {

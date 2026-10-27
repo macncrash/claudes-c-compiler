@@ -1,11 +1,25 @@
 //! ArmCodegen: function call operations.
 
-use crate::ir::reexports::{IrConst, Operand, Value};
+use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
 use super::emit::{ArmCodegen, callee_saved_name, ARM_ARG_REGS};
 
 impl ArmCodegen {
+    /// Store (`str`, before) or reload (`ldr`, after) the caller-saved
+    /// registers a call's gp_call_saves lists, each in its own slot.
+    pub(super) fn save_around_call(&mut self, inst: &Instruction, op: &str) {
+        let Some(regs) = self.gp_call_saves.get(&(inst as *const Instruction as usize)) else { return };
+        for r in regs.clone() {
+            let slot = self.gp_call_save_offset + 8 * (r.0 as i64 - 10);
+            if op == "str" {
+                self.emit_store_to_sp(callee_saved_name(r), slot, "str");
+            } else {
+                self.emit_load_from_sp(callee_saved_name(r), slot, "ldr");
+            }
+        }
+    }
+
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig {
             max_int_regs: 8, max_float_regs: 8,

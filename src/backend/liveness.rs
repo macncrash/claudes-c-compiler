@@ -49,6 +49,11 @@ pub struct LivenessResult {
     /// arguments in registers (see `is_reg_args_only_call`), each with the
     /// value the call defines, if any.
     pub reg_args_call_points: Vec<(u32, Option<u32>)>,
+    /// Program points of instructions whose AArch64 codegen may use x0-x8
+    /// as scratch registers (128-bit integer and long double operations,
+    /// atomics, intrinsics, inline asm, varargs, dynamic allocas): the
+    /// call-free registers are busy there, as at calls.
+    pub scratch_points: Vec<u32>,
     /// Loop nesting depth for each block (block_index -> depth).
     /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
     /// Used by the register allocator to weight uses inside loops more heavily.
@@ -159,6 +164,7 @@ struct ProgramPointState {
     setjmp_block_indices: Vec<usize>,
     call_points: Vec<u32>,
     reg_args_call_points: Vec<(u32, Option<u32>)>,
+    scratch_points: Vec<u32>,
     num_points: u32,
 }
 
@@ -175,7 +181,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
         return LivenessResult {
-            intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(),
+            intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), scratch_points: Vec::new(),
             block_loop_depth: Vec::new(), segments: FxHashMap::default(),
         };
     }
@@ -186,7 +192,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     let num_values = value_ids.len();
     if num_values == 0 {
         return LivenessResult {
-            intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(),
+            intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), scratch_points: Vec::new(),
             block_loop_depth: Vec::new(), segments: FxHashMap::default(),
         };
     }
@@ -241,6 +247,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         intervals,
         call_points: ps.call_points,
         reg_args_call_points: ps.reg_args_call_points,
+        scratch_points: ps.scratch_points,
         block_loop_depth,
         segments,
     }
@@ -519,6 +526,7 @@ fn assign_program_points(
     let mut setjmp_block_indices: Vec<usize> = Vec::new();
     let mut call_points: Vec<u32> = Vec::new();
     let mut reg_args_call_points: Vec<(u32, Option<u32>)> = Vec::new();
+    let mut scratch_points: Vec<u32> = Vec::new();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         block_id_to_idx.insert(block.label.0, block_idx);
@@ -592,6 +600,10 @@ fn assign_program_points(
                 _ => {}
             }
 
+            if uses_scratch_regs(inst) {
+                scratch_points.push(point);
+            }
+
             record_instruction_uses_dense(inst, point, alloca_set, id_to_dense, &mut last_use_points);
 
             // Record InlineAsm output definitions BEFORE gen collection so
@@ -656,7 +668,24 @@ fn assign_program_points(
         setjmp_block_indices,
         call_points,
         reg_args_call_points,
+        scratch_points,
         num_points: point,
+    }
+}
+
+/// Whether an instruction's AArch64 codegen may use argument registers
+/// (x0-x8) as scratch: see LivenessResult::scratch_points.
+pub(crate) fn uses_scratch_regs(inst: &Instruction) -> bool {
+    let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128 | IrType::F128);
+    match inst {
+        Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. } | Instruction::Cmp { ty, .. }
+        | Instruction::Load { ty, .. } | Instruction::Store { ty, .. } => wide(ty),
+        Instruction::Cast { from_ty, to_ty, .. } => wide(from_ty) || wide(to_ty),
+        Instruction::InlineAsm { .. } | Instruction::Intrinsic { .. } | Instruction::AtomicLoad { .. }
+        | Instruction::AtomicStore { .. } | Instruction::AtomicRmw { .. } | Instruction::AtomicCmpxchg { .. }
+        | Instruction::Fence { .. } | Instruction::VaArg { .. } | Instruction::VaStart { .. } | Instruction::VaEnd { .. }
+        | Instruction::VaCopy { .. } | Instruction::VaArgStruct { .. } | Instruction::DynAlloca { .. } => true,
+        _ => false,
     }
 }
 

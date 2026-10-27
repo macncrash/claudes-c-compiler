@@ -1,7 +1,7 @@
 //! ArmCodegen: prologue/epilogue and stack frame operations.
 
 use crate::ir::reexports::{IrFunction, Instruction, Operand, Terminator, Value};
-use crate::common::fx_hash::FxHashSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::backend::call_abi::{ParamClass, classify_params};
@@ -89,6 +89,7 @@ impl ArmCodegen {
             Self::leaf_extra_caller_saved(func, &config, true)
         };
 
+        let mut call_saves = FxHashMap::default();
         let (mut reg_assigned, mut cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, call_free, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
@@ -96,7 +97,23 @@ impl ArmCodegen {
             true, // argument setup leaves x10-x15 intact (calls.rs)
             true, // memcpy reads register-assigned pointers (memory.rs)
             true, // simple ops read their operands before writing the dest
+            Some(&mut call_saves), // saved around calls (save_around_call)
         );
+        // The calls, by program point (one per instruction and terminator,
+        // as liveness numbers them), to their instructions' addresses.
+        self.gp_call_saves.clear();
+        if !call_saves.is_empty() {
+            let mut point = 0u32;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Some(regs) = call_saves.remove(&point) {
+                        self.gp_call_saves.insert(inst as *const Instruction as usize, regs);
+                    }
+                    point += 1;
+                }
+                point += 1;
+            }
+        }
 
         // FP registers for F32/F64 values. Skipped for variadic functions
         // (like the GPR pools) and under -mgeneral-regs-only.
@@ -144,6 +161,13 @@ impl ArmCodegen {
             let new_space = slot + ((alloc_size + 7) & !7).max(8);
             (slot, new_space)
         }, &reg_assigned, &prestore_regs, cached_liveness, false);
+
+        // Save slots for x10-x15 across calls.
+        if !self.gp_call_saves.is_empty() {
+            space = (space + 7) & !7;
+            self.gp_call_save_offset = space;
+            space += 6 * 8;
+        }
 
         // Save slots for vector variables across calls.
         if !self.vec_vars.is_empty() {
@@ -305,6 +329,13 @@ impl ArmCodegen {
         let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128 | IrType::F128);
         let mut has_div = false;
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            // With calls, the registers are busy at every instruction that
+            // may use them as scratch (LivenessResult::scratch_points), as
+            // at calls: sqlite3VdbeExec's one relaxed atomic load and one
+            // 128-bit overflow check had kept them from the whole function.
+            if calls && crate::backend::liveness::uses_scratch_regs(inst) {
+                continue;
+            }
             match inst {
                 Instruction::BinOp { op, ty, .. } => {
                     if wide(ty) {

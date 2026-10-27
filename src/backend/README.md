@@ -485,11 +485,25 @@ the pool it may use:
   use of `x3`--`x8` is its calls' argument setup also gives those registers
   (above its own incoming arguments) to values live at no call at all, not
   even as its argument or result: they join the pool busy at every call
-  point. It falls back to a
+  point, and at every instruction whose codegen may use them as scratch
+  (128-bit and long double operations, atomics, intrinsics, inline asm,
+  varargs, dynamic allocas; `LivenessResult::scratch_points`), which
+  otherwise kept them from the whole function (sqlite3VdbeExec has one
+  relaxed atomic load and one 128-bit overflow check). It falls back to a
   callee-saved register, which matters for call-free hot loops (hash
   functions, matrix multiply, sorting kernels) where all values compete for
   the few caller-saved registers; the one-time save/restore is amortized
   over the iterations.
+- On ARM (`save_around_calls`), a call-spanning value that finds no
+  callee-saved register may take one of `x10`--`x15`, stored before and
+  reloaded after each call it spans (six save slots in the frame, one per
+  register; `save_around_call` in calls.rs), when every such call is a
+  register-args-only call and two accesses per spanned call, weighted by
+  the call's loop depth, cost less than the stack slot's store and loads.
+  A loop variable read several times an iteration, across a call on a
+  rarely taken path, is then in a register. In SQLite's speedtest most
+  values left on the stack span many calls of the interpreter loop, and
+  it ran 0.2% fewer instructions.
 
 Earlier, call-spanning values were all placed first, so values used only
 around a hot loop but live across calls for the whole function (deflate's

@@ -48,6 +48,10 @@ pub struct RegAllocResult {
     /// O(blocks * values * iterations) dataflow computation.
     /// None when no registers were available (empty available_regs).
     pub liveness: Option<super::liveness::LivenessResult>,
+    /// Caller-saved registers to save before and restore after each call
+    /// (by program point), for values live across it in them
+    /// (RegAllocConfig::save_around_calls).
+    pub call_saves: FxHashMap<u32, Vec<PhysReg>>,
 }
 
 /// Configuration for the register allocator.
@@ -82,6 +86,12 @@ pub struct RegAllocConfig {
     /// a no-op). Requires a backend that reads every operand of those
     /// instructions before writing the dest's register (AArch64).
     pub dest_reuses_operand_reg: bool,
+    /// Whether a value that spans calls but gets no callee-saved register
+    /// may take a caller-saved one, saved before and restored after each
+    /// call it spans (RegAllocResult::call_saves), when those calls are all
+    /// register-args-only calls and the saves cost less than keeping the
+    /// value on the stack. Requires a backend that does the saving (AArch64).
+    pub save_around_calls: bool,
 }
 
 /// Run the linear scan register allocator on a function.
@@ -104,6 +114,7 @@ pub fn allocate_registers(
             assignments: FxHashMap::default(),
             used_regs: Vec::new(),
             liveness: None,
+            call_saves: FxHashMap::default(),
         };
     }
 
@@ -254,7 +265,7 @@ pub fn allocate_registers(
     let mut callee_busy: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); callee.len()];
     let mut caller_busy: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); caller.len()];
     for busy in &mut caller_busy[config.caller_saved_regs.len()..] {
-        busy.extend(call_points.iter().map(|&p| (p, p, u32::MAX)));
+        busy.extend(call_points.iter().chain(&liveness.scratch_points).map(|&p| (p, p, u32::MAX)));
     }
     let fits = |busy: &[(u32, u32, u32)], segs: &[(u32, u32)], v: u32| {
         segs.iter().all(|&(lo, hi)| busy.iter().all(|&(s, e, w)| {
@@ -287,6 +298,40 @@ pub fn allocate_registers(
             .find(|&i| fits(&busy[i], segs, v))
     };
     let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
+    let mut call_saves: FxHashMap<u32, Vec<PhysReg>> = FxHashMap::default();
+    // Each program point's block weight (10^loop depth, as use_count).
+    let mut point_block: Vec<u32> = Vec::new();
+    if config.save_around_calls {
+        for (b, block) in func.blocks.iter().enumerate() {
+            point_block.extend(std::iter::repeat_n(b as u32, block.instructions.len() + 1));
+        }
+    }
+    let point_weight = |p: u32| -> u64 {
+        let depth = point_block.get(p as usize).and_then(|&b| liveness.block_loop_depth.get(b as usize)).copied().unwrap_or(0);
+        10u64.saturating_pow(depth.min(6))
+    };
+    // The calls a value would be saved around in a caller-saved register:
+    // those its pieces span (not just start or end at), all of them
+    // register-args-only calls, whose codegen leaves x10-x15 alone (not
+    // an implicit call: a memcpy, a 128-bit division).
+    let saved_calls = |iv: &LiveInterval, segs: &[(u32, u32)]| -> Option<Vec<u32>> {
+        let mut out = Vec::new();
+        for &(lo, hi) in segs {
+            let from = call_points.partition_point(|&cp| cp < lo);
+            for &cp in call_points[from..].iter().take_while(|&&cp| cp <= hi) {
+                let reg_args = liveness.reg_args_call_points.binary_search_by_key(&cp, |&(p, _)| p);
+                let boundary = reg_args.is_ok_and(|i| cp == iv.end || (cp == iv.start && liveness.reg_args_call_points[i].1 == Some(iv.value_id)));
+                if boundary {
+                    continue;
+                }
+                if reg_args.is_err() || cp == iv.start {
+                    return None;
+                }
+                out.push(cp);
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    };
     // A foldable GEP is never computed once its base has a register.
     let folded = foldable_geps(func);
     let is_folded = |v: u32, assignments: &FxHashMap<u32, PhysReg>| {
@@ -364,6 +409,21 @@ pub fn allocate_registers(
             if let Some(i) = pick {
                 occupy(&mut callee_busy[i], &segs, v);
                 assignments.insert(v, callee[i]);
+            } else if let Some(calls) = config.save_around_calls.then(|| saved_calls(interval, &segs)).flatten() {
+                // A caller-saved register, saved around the calls it spans,
+                // when that costs less than the stack slot's store and loads.
+                let saves: u64 = calls.iter().map(|&cp| 2 * point_weight(cp)).sum();
+                let spill = use_count.get(&v).copied().unwrap_or(0) + point_weight(interval.start);
+                let n = config.caller_saved_regs.len();
+                if saves < spill {
+                    if let Some(i) = (0..n).find(|&i| fits(&caller_busy[i], &segs, v)) {
+                        occupy(&mut caller_busy[i], &segs, v);
+                        assignments.insert(v, caller[i]);
+                        for cp in calls {
+                            call_saves.entry(cp).or_default().push(caller[i]);
+                        }
+                    }
+                }
             }
             continue;
         }
@@ -417,6 +477,7 @@ pub fn allocate_registers(
         assignments,
         used_regs,
         liveness: Some(liveness),
+        call_saves,
     }
 }
 
@@ -1065,6 +1126,7 @@ mod tests {
             intervals,
             call_points: vec![call],
             reg_args_call_points: vec![(call, dest)],
+            scratch_points: Vec::new(),
             block_loop_depth: Vec::new(),
             segments: FxHashMap::default(),
         }
@@ -1100,5 +1162,52 @@ mod tests {
         assert!(spans_clobbering_call(&lv, &iv, &lv.call_points.clone(), &[]));
         lv.segments.insert(7, vec![(2, 8), (20, 30)]);
         assert!(!spans_clobbering_call(&lv, &iv, &lv.call_points.clone(), &[]));
+    }
+
+    /// `x = load p; loop { s += x; if ((s * x ^ x) & 1) f(); } return s + x`:
+    /// x is read three times an iteration, across a call made in the loop. With no callee-saved
+    /// register it takes a caller-saved one saved around the call, given
+    /// save_around_calls; otherwise it stays on the stack.
+    #[test]
+    fn test_value_saved_around_call() {
+        use crate::common::types::{AddressSpace, AliasClass};
+        use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, Terminator, Value};
+        let v = |n| Operand::Value(Value(n));
+        let info = CallInfo {
+            dest: None, args: vec![], arg_types: vec![], return_type: IrType::Void, is_variadic: false, num_fixed_args: 0,
+            struct_arg_sizes: vec![], struct_arg_aligns: vec![], struct_arg_classes: Vec::new(),
+            struct_arg_riscv_float_classes: Vec::new(), is_sret: false, is_fastcall: false, ret_eightbyte_classes: Vec::new(),
+        };
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![
+            BasicBlock { label: BlockId(0), instructions: vec![
+                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::Copy { dest: Value(2), src: Operand::Const(IrConst::I64(0)) },
+            ], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(1), instructions: vec![
+                Instruction::BinOp { dest: Value(3), op: IrBinOp::Add, lhs: v(2), rhs: v(1), ty: IrType::I64 },
+                Instruction::Copy { dest: Value(2), src: v(3) },
+                Instruction::BinOp { dest: Value(6), op: IrBinOp::Mul, lhs: v(3), rhs: v(1), ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(7), op: IrBinOp::Xor, lhs: v(6), rhs: v(1), ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(4), op: IrBinOp::And, lhs: v(7), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 },
+            ], terminator: Terminator::CondBranch { cond: v(4), true_label: BlockId(2), false_label: BlockId(3) }, source_spans: Vec::new() },
+            BasicBlock { label: BlockId(2), instructions: vec![Instruction::Call { func: "f".to_string(), info }],
+                terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(3), instructions: vec![
+                Instruction::BinOp { dest: Value(5), op: IrBinOp::Add, lhs: v(2), rhs: v(1), ty: IrType::I64 },
+            ], terminator: Terminator::Return(Some(v(5))), source_spans: Vec::new() },
+        ];
+        let config = |save| RegAllocConfig {
+            available_regs: Vec::new(), caller_saved_regs: vec![PhysReg(10), PhysReg(11)], call_free_regs: Vec::new(),
+            allow_inline_asm_regalloc: false, caller_saved_at_call_boundaries: true, allow_memcpy_regalloc: false,
+            dest_reuses_operand_reg: false, save_around_calls: save,
+        };
+        let r = allocate_registers(&func, &config(true));
+        let reg = r.assignments.get(&1).copied();
+        assert!(reg.is_some(), "{:?}", r.assignments);
+        let call_point = 9; // after block 0 (2 instructions and a terminator) and block 1 (5 and one)
+        assert_eq!(r.call_saves.get(&call_point).map(|v| v.contains(&reg.unwrap())), Some(true), "{:?}", r.call_saves);
+        let r = allocate_registers(&func, &config(false));
+        assert!(!r.assignments.contains_key(&1) && r.call_saves.is_empty());
     }
 }

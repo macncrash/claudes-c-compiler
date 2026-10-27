@@ -72,6 +72,7 @@ impl I686Codegen {
             false,
             false,
             false,
+            None,
         );
 
         // In PIC mode, %ebx must be saved/restored as a callee-saved register.

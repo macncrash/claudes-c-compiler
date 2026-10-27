@@ -85,6 +85,7 @@ impl X86Codegen {
             false,
             false,
             false,
+            None,
         );
 
         let mut space = calculate_stack_space_common(&mut self.state, func, 0, |space, alloc_size, align| {
