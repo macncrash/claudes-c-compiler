@@ -481,7 +481,11 @@ the pool it may use:
   them.
 - A value no call interrupts tries the **caller-saved registers** first
   (x86: `r11`, `r10`, `r8`, `r9`; ARM: `x10`--`x15`, and `x3`--`x8` in
-  leaf functions): they need no saving at all. It falls back to a
+  leaf functions): they need no saving at all. On ARM a function whose only
+  use of `x3`--`x8` is its calls' argument setup also gives those registers
+  (above its own incoming arguments) to values live at no call at all, not
+  even as its argument or result: they join the pool busy at every call
+  point. It falls back to a
   callee-saved register, which matters for call-free hot loops (hash
   functions, matrix multiply, sorting kernels) where all values compete for
   the few caller-saved registers; the one-time save/restore is amortized

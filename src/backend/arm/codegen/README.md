@@ -809,6 +809,12 @@ v1 and nothing between the copy and the call uses v22:
   access `[xB, xI]` whose size is 2^k becomes `[xB, xJ, lsl #k]`: the
   `prev[m & mask]` of a hash chain. Lines already deleted are never folded
   again (an add folded into one access once also matched a later one).
+- A call reads the GP argument registers its codegen names in a
+  `.ccc_call_uses MASK` line before it (x0 up to the highest argument
+  register, x8 for an sret pointer; all of x0-x8 when an argument may be a
+  pointer to a copy), removed from the output; without one, all of x0-x8. A
+  value left in x4 across a call taking two arguments is then dead there,
+  and the folds above apply to it.
 - In the liveness of registers' upper halves, `mov xD, xS` reads S's upper
   half only where D's is live afterwards, so an `sxtw` of an `int` that is
   only copied and then read as a w register goes away.

@@ -78,11 +78,19 @@ impl ArmCodegen {
         if has_f128_ops {
             caller_saved_regs.clear();
         }
-        let leaf_extra = if has_f128_ops { Vec::new() } else { Self::leaf_extra_caller_saved(func, &self.call_abi_config_impl()) };
+        let config = self.call_abi_config_impl();
+        let leaf_extra = if has_f128_ops { Vec::new() } else { Self::leaf_extra_caller_saved(func, &config, false) };
         caller_saved_regs.extend_from_slice(&leaf_extra);
+        // A function whose only use of x3-x8 is its calls may give them to
+        // values live at no call.
+        let call_free = if has_f128_ops || !leaf_extra.is_empty() {
+            Vec::new()
+        } else {
+            Self::leaf_extra_caller_saved(func, &config, true)
+        };
 
         let (mut reg_assigned, mut cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
-            func, available_regs, caller_saved_regs, &asm_clobbered_regs,
+            func, available_regs, caller_saved_regs, call_free, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
             true, // argument setup leaves x10-x15 intact (calls.rs)
@@ -286,7 +294,9 @@ impl ArmCodegen {
     /// setup), division (x3), atomics, i128 arithmetic, variadics, and inline
     /// asm, so a function with none of those may allocate the ones above its
     /// own incoming GP arguments (and x8 unless it is the sret pointer).
-    fn leaf_extra_caller_saved(func: &IrFunction, config: &crate::backend::call_abi::CallAbiConfig) -> Vec<crate::backend::regalloc::PhysReg> {
+    /// With `calls`, a function's calls are allowed: the registers are then
+    /// only for values live at no call (RegAllocConfig::call_free_regs).
+    fn leaf_extra_caller_saved(func: &IrFunction, config: &crate::backend::call_abi::CallAbiConfig, calls: bool) -> Vec<crate::backend::regalloc::PhysReg> {
         use crate::ir::reexports::{Instruction, IrBinOp};
         use crate::backend::regalloc::PhysReg;
         if func.is_variadic {
@@ -305,6 +315,7 @@ impl ArmCodegen {
                 Instruction::Cast { from_ty, to_ty, .. } if wide(from_ty) || wide(to_ty) => return Vec::new(),
                 Instruction::Load { ty, .. } | Instruction::Store { ty, .. }
                 | Instruction::UnaryOp { ty, .. } | Instruction::Cmp { ty, .. } if wide(ty) => return Vec::new(),
+                Instruction::Call { .. } | Instruction::CallIndirect { .. } if calls => {}
                 Instruction::Call { .. } | Instruction::CallIndirect { .. } | Instruction::InlineAsm { .. }
                 | Instruction::Intrinsic { .. } | Instruction::AtomicLoad { .. } | Instruction::AtomicStore { .. }
                 | Instruction::AtomicRmw { .. } | Instruction::AtomicCmpxchg { .. } | Instruction::Fence { .. }

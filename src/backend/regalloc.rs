@@ -59,6 +59,10 @@ pub struct RegAllocConfig {
     /// Since they don't cross calls, no prologue/epilogue save/restore is needed.
     /// Examples: x86 r11, r10, r8, r9.
     pub caller_saved_regs: Vec<PhysReg>,
+    /// Caller-saved registers that calls themselves use (AArch64's argument
+    /// registers x3-x8, written while setting up arguments): only for values
+    /// live at no call at all, not even as its argument or result.
+    pub call_free_regs: Vec<PhysReg>,
     /// Whether to allow inline asm operands to be register-allocated.
     /// Only enable this when the backend's asm emitter checks reg_assignments
     /// before falling back to stack access. Currently only RISC-V does this.
@@ -95,7 +99,7 @@ pub fn allocate_registers(
     func: &IrFunction,
     config: &RegAllocConfig,
 ) -> RegAllocResult {
-    if config.available_regs.is_empty() && config.caller_saved_regs.is_empty() {
+    if config.available_regs.is_empty() && config.caller_saved_regs.is_empty() && config.call_free_regs.is_empty() {
         return RegAllocResult {
             assignments: FxHashMap::default(),
             used_regs: Vec::new(),
@@ -244,10 +248,14 @@ pub fn allocate_registers(
         reuse_points.get(&p).is_some_and(|(dest, ops)| *dest == b && ops.contains(&a))
     };
     let callee = &config.available_regs;
-    let caller = &config.caller_saved_regs;
+    // The call-free registers join the caller-saved pool, busy at every call.
+    let caller: &Vec<PhysReg> = &config.caller_saved_regs.iter().chain(&config.call_free_regs).copied().collect();
     // Each register's busy pieces: (start, end, value).
     let mut callee_busy: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); callee.len()];
     let mut caller_busy: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); caller.len()];
+    for busy in &mut caller_busy[config.caller_saved_regs.len()..] {
+        busy.extend(call_points.iter().map(|&p| (p, p, u32::MAX)));
+    }
     let fits = |busy: &[(u32, u32, u32)], segs: &[(u32, u32)], v: u32| {
         segs.iter().all(|&(lo, hi)| busy.iter().all(|&(s, e, w)| {
             hi < s || lo > e || (e == lo && handoff(w, v, lo)) || (hi == s && handoff(v, w, s))

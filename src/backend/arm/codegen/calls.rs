@@ -248,6 +248,12 @@ impl ArmCodegen {
         self.emit_call_struct_byval_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
     }
 
+    /// Tell the peephole optimizer which GP argument registers the call
+    /// reads (see peephole::CALL_USES_PREFIX); without it a call reads x0-x8.
+    pub(super) fn note_call_arg_regs_impl(&mut self, mask: u32) {
+        self.state.emit_fmt(format_args!("{}{:#x}", super::peephole::CALL_USES_PREFIX, mask));
+    }
+
     pub(super) fn emit_call_instruction_impl(&mut self, direct_name: Option<&str>, _func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) {
         if let Some(name) = direct_name {
             self.state.emit_fmt(format_args!("    bl {}", name));

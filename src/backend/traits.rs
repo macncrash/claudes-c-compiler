@@ -568,7 +568,9 @@ pub trait ArchCodegen {
             self.emit_call_sret_setup(sret_op, total_sp_adjust);
         }
 
-        // Phase 4: Emit the actual call instruction.
+        // Phase 4: Emit the actual call instruction, after noting the GP
+        // argument registers it reads.
+        self.note_call_arg_regs(call_gp_arg_mask(&arg_classes, is_sret));
         self.emit_call_instruction(direct_name, func_ptr, indirect, stack_arg_space);
 
         // Phase 5: Clean up stack.
@@ -627,6 +629,11 @@ pub trait ArchCodegen {
     /// Emit the call/bl/jalr instruction.
     /// `stack_arg_space` is passed so ARM can reload the spilled fptr at the correct offset.
     fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize);
+
+    /// Record which GP argument registers (bit N for xN, N <= 8) the call
+    /// about to be emitted reads, for a backend whose peephole optimizer
+    /// would otherwise take every argument register as read.
+    fn note_call_arg_regs(&mut self, _mask: u32) {}
 
     /// Clean up stack space after the call returns.
     fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool);
@@ -1654,6 +1661,35 @@ pub fn emit_cast_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, src
     cg.emit_load_operand(src);
     cg.emit_cast_instrs(from_ty, to_ty);
     cg.emit_store_result(dest);
+}
+
+/// The GP argument registers a call reads: x0 up to the highest one its
+/// arguments use, and x8 for an sret pointer. An argument that may be passed
+/// as a pointer to a copy counts as all of x0-x8.
+pub fn call_gp_arg_mask(classes: &[super::call_abi::CallArgClass], is_sret: bool) -> u32 {
+    use super::call_abi::CallArgClass as C;
+    let mut top: Option<usize> = None;
+    let mut all = false;
+    for c in classes {
+        let last = match *c {
+            C::IntReg { reg_idx } | C::StructSplitRegStack { reg_idx, .. } => reg_idx,
+            C::I128RegPair { base_reg_idx } => base_reg_idx + 1,
+            C::StructByValReg { base_reg_idx, size } => base_reg_idx + usize::from(size > 8),
+            C::StructMixedIntSseReg { int_reg_idx, .. } | C::StructMixedSseIntReg { int_reg_idx, .. } => int_reg_idx,
+            C::FloatReg { .. } | C::F128Reg { .. } | C::StructSseReg { .. } | C::StructHfaReg { .. }
+            | C::Stack | C::StackPacked { .. } | C::F128Stack | C::I128Stack | C::ZeroSizeSkip => continue,
+            C::StructByValStack { .. } | C::LargeStructStack { .. } => {
+                all = true;
+                continue;
+            }
+        };
+        top = Some(top.map_or(last, |t| t.max(last)));
+    }
+    if all || top.is_some_and(|t| t > 8) {
+        return 0x1ff;
+    }
+    let args = top.map_or(0, |t| (1u32 << (t + 1)) - 1);
+    args | if is_sret { 1 << 8 } else { 0 }
 }
 
 /// Default unary operation implementation: dispatches i128 → F128 neg → float → int

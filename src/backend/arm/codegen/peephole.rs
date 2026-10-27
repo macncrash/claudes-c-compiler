@@ -502,7 +502,7 @@ pub fn peephole_optimize(asm: String) -> String {
     drop_leaf_frame_records(&mut lines, &mut kinds, n);
 
     for i in 0..n {
-        if lines[i] == RET_NONE_MARKER || lines[i] == RET_X0_MARKER {
+        if lines[i] == RET_NONE_MARKER || lines[i] == RET_X0_MARKER || lines[i].starts_with(CALL_USES_PREFIX) {
             kinds[i] = LineKind::Nop;
         }
     }
@@ -1457,7 +1457,8 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
     }
     let Some((mnemonic, ops)) = split_insn(line) else { return Access::Barrier };
     if mnemonic.starts_with('.') {
-        return if mnemonic == ".loc" || mnemonic.starts_with(".cfi_") || mnemonic == ".ccc_ret_regs" {
+        return if mnemonic == ".loc" || mnemonic.starts_with(".cfi_") || mnemonic == ".ccc_ret_regs"
+            || mnemonic == ".ccc_call_uses" {
             Access::Transparent
         } else {
             Access::Barrier
@@ -3619,6 +3620,29 @@ fn fold_scale_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
 pub(super) const RET_NONE_MARKER: &str = "    .ccc_ret_regs 0";
 /// Emitted by the prologue when only x0 carries the return value.
 pub(super) const RET_X0_MARKER: &str = "    .ccc_ret_regs 1";
+/// Emitted before a call with the GP argument registers it reads (bit N for
+/// xN): without it a call reads x0-x8. Always removed from the output.
+pub(super) const CALL_USES_PREFIX: &str = "    .ccc_call_uses ";
+
+/// The registers the call at k reads, from the marker its codegen left
+/// shortly before it (past the indirect call's target load).
+fn call_uses(lines: &[String], kinds: &[LineKind], k: usize, start: usize) -> Option<RegSet> {
+    let mut i = k;
+    for _ in 0..8 {
+        if i == start {
+            return None;
+        }
+        i -= 1;
+        if let Some(m) = lines[i].strip_prefix(CALL_USES_PREFIX) {
+            return u32::from_str_radix(m.trim().trim_start_matches("0x"), 16).ok();
+        }
+        if matches!(kinds[i], LineKind::Label | LineKind::Call | LineKind::Branch | LineKind::CondBranch
+            | LineKind::CmpBranch | LineKind::Ret) {
+            return None;
+        }
+    }
+    None
+}
 
 /// Bitmask over x0-x28.
 type RegSet = u32;
@@ -3833,6 +3857,15 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
     }
     for info in infos.iter_mut().filter(|i| matches!(i.flow, Flow::Exit)) {
         info.uses &= ret_mask;
+    }
+    // A call reads only the argument registers its marker names.
+    for k in body.clone() {
+        if kinds[k] == LineKind::Call {
+            if let Some(m) = call_uses(lines, kinds, k, start) {
+                let info = &mut infos[k - start];
+                info.uses = (info.uses & !ARG_REGS) | (m & ARG_REGS);
+            }
+        }
     }
     // A jump-table dispatch reads only its register and goes to the table's labels.
     let mut tables: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
