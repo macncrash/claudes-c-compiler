@@ -3,7 +3,7 @@
 use crate::ir::reexports::{Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::cast::{CastKind, classify_cast};
-use super::emit::ArmCodegen;
+use super::emit::{ArmCodegen, callee_saved_name, callee_saved_name_32};
 
 impl ArmCodegen {
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
@@ -134,6 +134,49 @@ impl ArmCodegen {
         if crate::backend::f128_softfloat::f128_emit_cast(self, dest, src, from_ty, to_ty) {
             return;
         }
+        if self.emit_int_cast_in_regs(dest, src, from_ty, to_ty) {
+            return;
+        }
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
+
+    /// An integer cast of a value in a register, written straight to the
+    /// dest's register (`and x13, x12, #0xffff` rather than through x0 and a
+    /// move). The extensions are those emit_cast_instrs_impl makes.
+    fn emit_int_cast_in_regs(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) -> bool {
+        let int = |t: IrType| t.is_integer() && t.size() <= 8;
+        if !int(from_ty) || !int(to_ty) {
+            return false;
+        }
+        let Some(s) = self.operand_reg(src) else { return false };
+        let ext = match classify_cast(from_ty, to_ty) {
+            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => None,
+            CastKind::IntNarrow { to_ty: t } | CastKind::SignedToUnsignedSameSize { to_ty: t } => Some(t),
+            CastKind::IntWiden { from_ty: t, .. } => Some(t),
+            _ => return false,
+        };
+        let d = self.dest_reg(dest).map_or("x0", callee_saved_name);
+        let (sx, sw) = (callee_saved_name(s), callee_saved_name_32(s));
+        let dw = d.replacen('x', "w", 1);
+        match ext {
+            Some(IrType::I8) => self.state.emit_fmt(format_args!("    sxtb {}, {}", d, sw)),
+            Some(IrType::U8) => self.state.emit_fmt(format_args!("    and {}, {}, #0xff", d, sx)),
+            Some(IrType::I16) => self.state.emit_fmt(format_args!("    sxth {}, {}", d, sw)),
+            Some(IrType::U16) => self.state.emit_fmt(format_args!("    and {}, {}, #0xffff", d, sx)),
+            Some(IrType::I32) => self.state.emit_fmt(format_args!("    sxtw {}, {}", d, sw)),
+            Some(IrType::U32) => self.state.emit_fmt(format_args!("    mov {}, {}", dw, sw)),
+            _ => {
+                if d != sx {
+                    self.state.emit_fmt(format_args!("    mov {}, {}", d, sx));
+                }
+            }
+        }
+        if d == "x0" {
+            self.state.reg_cache.invalidate_acc();
+            self.store_x0_to(dest);
+        } else {
+            self.state.reg_cache.invalidate_acc();
+        }
+        true
     }
 }

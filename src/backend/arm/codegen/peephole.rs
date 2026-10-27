@@ -3110,7 +3110,11 @@ fn flags_dead_after(lines: &[String], kinds: &[LineKind], start: usize, n: usize
 fn fuse_cset_into_csel(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     for i in 0..n {
-        // `cmp xC, #0` / `cmp wC, #0`
+        // `cmp xC, #0` / `cmp wC, #0` (not one already fused: its text
+        // stays, and its select now has the condition it was fused into)
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
         let Some(("cmp", ops)) = split_insn(&lines[i]) else { continue };
         let (creg, imm) = first_and_rest(ops);
         if imm.trim() != "#0" {
@@ -4250,6 +4254,17 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         assert!(!result.contains("orr x12"), "{}", result);
         assert!(result.contains("sxtw x13, w12"), "{}", result);
+    }
+
+    #[test]
+    fn test_two_selects_on_one_condition_both_fused() {
+        let input = "    mov x10, x0\n    str x1, [sp, #0]\n    ldrsb x11, [x10]\n    cmp w11, #108\n    cset x0, eq\n    mov x11, x0\n    sub x12, x10, #1\n    cmp x11, #0\n    csel x12, x12, x10, ne\n    mov x0, #7\n    mov x2, #7\n    mov x0, #1\n    mov x1, #1\n    cmp x11, #0\n    csel x11, x2, x1, ne\n    sub x12, x12, x10\n    mov x0, #100\n    mul x12, x12, x0\n    add x12, x12, x11\n    mov x0, x12\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        // The first select is fused while the second still reads x11; once the
+        // copy into x11 goes the second is fused too, and the first keeps eq.
+        assert!(result.contains("csel x12, x12, x0, eq"), "{}", result);
+        assert!(result.contains("csel x11, x2, x1, eq"), "{}", result);
+        assert!(!result.contains("cmp x"), "{}", result);
     }
 
     #[test]

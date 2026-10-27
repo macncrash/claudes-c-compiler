@@ -12,7 +12,9 @@
 //! Only constants that need three or more instructions to build are moved
 //! (not ones whose pieces are mostly 0 or 0xffff, and not bitwise-operation
 //! masks that AArch64 encodes in the instruction), at most MAX_HOISTED per
-//! function, most loop uses first. Runs after phi elimination, where no
+//! function, most loop uses first. On AArch64 so are 32-bit operations'
+//! constants that take a movz and a movk and that the instruction cannot
+//! encode (see candidate32). Runs after phi elimination, where no
 //! copy propagation folds the constants back in.
 
 use crate::common::types::IrType;
@@ -53,6 +55,31 @@ fn candidate(op: &Operand, bitwise: bool) -> Option<i64> {
     Some(*k)
 }
 
+/// A constant in a 32-bit operation that AArch64 builds with a movz and a
+/// movk at each use (both 16-bit halves differ from 0 and 0xffff) and the
+/// instruction cannot encode: no add or subtract immediate (12 bits,
+/// optionally shifted by 12), no logical bitmask. deflate's hash multiplies
+/// by 66521 and adds it.
+fn candidate32(op: &Operand, binop: Option<IrBinOp>) -> Option<i64> {
+    let k = match op {
+        Operand::Const(IrConst::I64(k)) => *k,
+        Operand::Const(IrConst::I32(k)) => *k as i64,
+        _ => return None,
+    };
+    let w = k as u32;
+    let (lo, hi) = (w & 0xffff, w >> 16);
+    if lo == 0 || hi == 0 || lo == 0xffff || hi == 0xffff {
+        return None;
+    }
+    let imm12 = |x: u32| x <= 0xfff || x & !0xfff000 == 0;
+    match binop {
+        Some(IrBinOp::Add | IrBinOp::Sub) | None if imm12(w) || imm12(w.wrapping_neg()) => None,
+        Some(IrBinOp::And | IrBinOp::Or | IrBinOp::Xor)
+            if crate::backend::arm::assembler::encoder::encode_bitmask_imm(w as u64, false).is_some() => None,
+        _ => Some(k),
+    }
+}
+
 /// A nonzero constant on the left of a subtract or shift, which AArch64
 /// builds into a register at each use (it has no reversed forms taking an
 /// immediate); zero is the zero register.
@@ -81,6 +108,23 @@ fn for_each_candidate(inst: &mut Instruction, left: bool, mut f: impl FnMut(&mut
             let shift = !matches!(op, IrBinOp::Sub);
             if let (false, Some(k)) = (shift || !wide(ty), candidate(rhs, false)) {
                 f(rhs, k);
+            }
+        }
+        Instruction::BinOp { op, lhs, rhs, ty, .. } if left && matches!(ty, IrType::I32 | IrType::U32) => {
+            // A shift amount is always an immediate.
+            if !matches!(op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
+                for o in [lhs, rhs] {
+                    if let Some(k) = candidate32(o, Some(*op)) {
+                        f(o, k);
+                    }
+                }
+            }
+        }
+        Instruction::Cmp { lhs, rhs, ty, .. } if left && matches!(ty, IrType::I32 | IrType::U32) => {
+            for o in [lhs, rhs] {
+                if let Some(k) = candidate32(o, None) {
+                    f(o, k);
+                }
             }
         }
         Instruction::BinOp { op, lhs, rhs, ty, .. } if wide(ty) => {
@@ -260,6 +304,22 @@ mod tests {
         let mut once = with_subs(1);
         assert_eq!(hoist_function(&mut once, true), 1);
         assert!(matches!(once.blocks[1].instructions[1], Instruction::BinOp { lhs: Operand::Const(_), .. }));
+    }
+
+    #[test]
+    fn test_32bit_constant_built_once_when_not_an_immediate() {
+        let mut func = loop_func();
+        let op = |dest, op, k| Instruction::BinOp {
+            dest: Value(dest), op, lhs: Operand::Value(Value(1)), rhs: Operand::Const(IrConst::I64(k)), ty: IrType::U32,
+        };
+        func.blocks[1].instructions = vec![op(1, IrBinOp::Mul, 66521), op(4, IrBinOp::Add, 66521), op(5, IrBinOp::Add, 0x123000)];
+        func.next_value_id = 6;
+        assert_eq!(hoist_function(&mut func, true), 2);
+        assert!(func.blocks[0].instructions.iter().any(|i| matches!(i, Instruction::Copy { src: Operand::Const(IrConst::I64(66521)), .. })));
+        // An add immediate (shifted by 12) stays one.
+        assert!(matches!(func.blocks[1].instructions[2], Instruction::BinOp { rhs: Operand::Const(_), .. }));
+        assert_eq!(candidate32(&Operand::Const(IrConst::I64(0x0f0f0f0f)), Some(IrBinOp::And)), None);
+        assert_eq!(candidate32(&Operand::Const(IrConst::I64(0x10000)), Some(IrBinOp::Mul)), None);
     }
 
     #[test]

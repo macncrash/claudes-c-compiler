@@ -469,30 +469,30 @@ their live intervals, prioritizing values with the most uses and longest
 lifetimes. Values that do not receive a register remain on the stack and
 are accessed through the accumulator load/store path.
 
-### Three-Phase Allocation
+### One Pass in Priority Order
 
-**Phase 1 -- Callee-saved registers for call-spanning values.**
-Values whose live ranges span function calls are assigned callee-saved
-registers (x86: `rbx`, `r12`--`r15`; ARM: `x20`--`x28`; RISC-V: `s1`,
-`s7`--`s11`). These registers are preserved across calls by the ABI, so no
-per-call save/restore is needed -- only the prologue and epilogue must save
-and restore them. The linear scan walks sorted candidate intervals and
-assigns each to the callee-saved register with the earliest free time.
+Candidates are taken in one pass, in priority order (see below), each from
+the pool it may use:
 
-**Phase 2 -- Caller-saved registers for non-call-spanning values.**
-Values whose live ranges do not cross any call are assigned caller-saved
-registers (x86: `r11`, `r10`, `r8`, `r9`; ARM: `x13`, `x14`). Since
-these values are not live across calls, the registers do not need to be
-saved or restored at all -- neither at call sites nor in the
-prologue/epilogue.
+- A value whose live range spans a call may have only a **callee-saved
+  register** (x86: `rbx`, `r12`--`r15`; ARM: `x19`--`x28`; RISC-V: `s1`,
+  `s7`--`s11`). The ABI preserves these across calls, so no per-call
+  save/restore is needed -- only the prologue and epilogue save and restore
+  them.
+- A value no call interrupts tries the **caller-saved registers** first
+  (x86: `r11`, `r10`, `r8`, `r9`; ARM: `x10`--`x15`, and `x3`--`x8` in
+  leaf functions): they need no saving at all. It falls back to a
+  callee-saved register, which matters for call-free hot loops (hash
+  functions, matrix multiply, sorting kernels) where all values compete for
+  the few caller-saved registers; the one-time save/restore is amortized
+  over the iterations.
 
-**Phase 3 -- Callee-saved spillover.**
-After Phases 1 and 2, any remaining callee-saved registers are assigned to
-the highest-priority non-call-spanning values that did not fit in the
-caller-saved pool. This is critical for call-free hot loops (hash
-functions, matrix multiply, sorting kernels) where all values compete for
-only a few caller-saved registers. The one-time prologue/epilogue
-save/restore cost is amortized over many loop iterations.
+Earlier, call-spanning values were all placed first, so values used only
+around a hot loop but live across calls for the whole function (deflate's
+`flush`, the state pointer plus a constant offset, the static tables' addresses)
+took every callee-saved register, and the loop's own values were left on the
+stack. In one priority order the loop's values come first, and a
+low-priority value live across the whole function is what stays on the stack.
 
 ### Priority Scoring
 
@@ -519,8 +519,8 @@ group one register, so the copies become no-ops and a split edge holding only
 a copy becomes a jump the peephole threads away. Assigned one at a time, an
 unrelated value could take the register in a gap between members. A group
 with a call-spanning member (a sum carried around a loop that calls
-functions) is placed in phase 1, in one callee-saved register; one that
-does not fit there is allocated member by member.
+functions) needs one callee-saved register; one that does not fit is
+allocated member by member.
 
 ### Eligibility Filtering
 

@@ -871,11 +871,21 @@ load-operate-store pattern) at the cost of generating redundant moves and stack
 traffic. The peephole optimizer is specifically designed to recover much of this cost
 by eliminating the redundant patterns in a post-processing pass.
 
+The hottest operations skip the accumulator when their values have registers:
+integer ALU operations and shifts, selects (`csel x11, x0, x12, lt`, operands
+read in place, only those without a register loaded into `x2`/`x1`/`x0`), and
+integer casts of a value in a register (`and x13, x12, #0xffff`,
+`sxtw x13, w12`), each writing the dest's register directly. A select through
+`x1` and `x2` left both moves behind once the peephole had the `csel` read the
+original registers (deflate's `d_code`, every match).
+
 ### Register Allocation Strategy
 
 Rather than implementing a full graph-coloring register allocator, the backend uses a
 simple but effective two-pool approach: callee-saved registers for values that live
-across calls, and a small set of caller-saved registers for call-free live ranges.
+across calls, and a small set of caller-saved registers for call-free live ranges
+(taken first by values no call interrupts, all in one priority order; see
+`../../README.md`).
 This keeps the allocator simple while providing meaningful speedups for hot variables.
 The allocator is integrated with inline asm handling: the prescan mechanism ensures
 callee-saved registers used by inline asm scratch allocation are properly saved in

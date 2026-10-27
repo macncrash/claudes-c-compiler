@@ -4,24 +4,22 @@
 //! Values with the longest live ranges and most uses get priority for register
 //! assignment. Values that don't fit in available registers remain on the stack.
 //!
-//! Three-phase allocation:
-//! 1. **Callee-saved registers** (x86: rbx, r12-r15; ARM: x20-x28; RISC-V: s1, s7-s11):
-//!    Assigned to values whose live ranges span function calls. These registers
-//!    are preserved across calls by the ABI, so no save/restore is needed at call
-//!    sites (but prologue/epilogue must save them).
+//! Values are taken in one pass, in priority order (loop-weighted use count),
+//! each from the pool it may use:
+//! - **Callee-saved registers** (x86: rbx, r12-r15; ARM: x19-x28; RISC-V: s1,
+//!   s7-s11) are the only ones a value live across a call may have. The ABI
+//!   preserves them across calls, so no save/restore is needed at call sites
+//!   (but the prologue/epilogue must save them).
+//! - **Caller-saved registers** (x86: r11, r10, r8, r9; ARM: x10-x15) are tried
+//!   first by a value no call interrupts: calls destroy them, but they cost no
+//!   save/restore. Such a value falls back to a callee-saved register, which
+//!   matters for call-free hot loops (hash functions, matrix multiply,
+//!   sorting) where all values compete for the few caller-saved registers.
 //!
-//! 2. **Caller-saved registers** (x86: r11, r10, r8, r9; ARM: x13, x14):
-//!    Assigned to values whose live ranges do NOT span any function call. These
-//!    registers are destroyed by calls, so they can only hold values between calls.
-//!    No prologue/epilogue save/restore is needed since we never assign them to
-//!    values that cross call boundaries.
-//!
-//! 3. **Callee-saved spillover**: After phases 1 and 2, any remaining callee-saved
-//!    registers are assigned to the highest-priority non-call-spanning values that
-//!    didn't fit in the caller-saved pool. This is critical for call-free hot loops
-//!    (e.g., hash functions, matrix multiply, sorting) where all values compete for
-//!    only a few caller-saved registers. The one-time prologue/epilogue save/restore
-//!    cost is amortized over many loop iterations.
+//! Taking every value in one priority order (rather than giving the
+//! call-spanning ones their registers first) means a value read in a hot loop
+//! is not left on the stack because values used only around the loop, live
+//! across calls for the whole function, took every callee-saved register.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
@@ -293,7 +291,7 @@ pub fn allocate_registers(
     // every copy in it becomes a no-op; assigning members one at a time lets
     // an unrelated value take the register in a gap between them. A group
     // with a call-spanning member (a sum carried around a loop with calls)
-    // needs a callee-saved register, and is placed in phase 1.
+    // needs a callee-saved register.
     let groups = copy_groups(func, &liveness, &eligible, &folded, &handoff, config.dest_reuses_operand_reg);
     let interval_of: FxHashMap<u32, &LiveInterval> = if groups.is_empty() {
         FxHashMap::default()
@@ -309,55 +307,35 @@ pub fn allocate_registers(
         pieces.iter().any(|(m, _)| spans_clobbering_call(&liveness, interval_of[m], call_points, boundary_ok))
     };
 
-    // Phase 1: Callee-saved registers for call-spanning values.
-    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(true)) {
+    // One pass in priority order over every candidate. A call-spanning value
+    // needs a callee-saved register; another tries a caller-saved register
+    // first, as a callee-saved one costs a save and restore. Taking them in
+    // one order means a value used in a hot loop is not left on the stack
+    // because values used only around it, live across calls for the whole
+    // function, took every callee-saved register first.
+    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, None) {
         let segs = liveness.segments_of(interval);
         let v = interval.value_id;
         if is_folded(v, &assignments) || assignments.contains_key(&v) {
             continue;
-        }
-        if let Some(members) = groups.get(&v) {
-            let pieces = group_pieces(members);
-            let fits_all = |busy: &[(u32, u32, u32)]| pieces.iter().all(|(m, sg)| fits(busy, sg, *m));
-            let free = || (0..callee.len()).filter(|&i| fits_all(&callee_busy[i]));
-            if let Some(i) = free().find(|&i| !callee_busy[i].is_empty()).or_else(|| free().next()) {
-                for (m, sg) in &pieces {
-                    occupy(&mut callee_busy[i], sg, *m);
-                    assignments.insert(*m, callee[i]);
-                }
-                continue;
-            }
         }
         // A value never read from its register (a constant-offset address
         // folded into every access) may share a register already saved, but
         // is not worth saving another one for.
         let weightless = use_count.get(&v).copied().unwrap_or(0) == 0;
-        let pick = partner_reg(v, &assignments, callee, &callee_busy, &segs)
-            .or_else(|| pick_callee(&callee_busy, &segs, v))
-            .filter(|&i| !weightless || !callee_busy[i].is_empty());
-        if let Some(i) = pick {
-            occupy(&mut callee_busy[i], &segs, v);
-            assignments.insert(v, callee[i]);
-        }
-    }
-
-    // Phase 2: Caller-saved registers for non-call-spanning values (no
-    // prologue/epilogue cost).
-    // Phase 3: Callee-saved spillover for non-call-spanning values that did
-    // not fit in the caller-saved pool (e.g. high-priority values in call-free
-    // loops).
-    for interval in build_sorted_candidates(&liveness, &eligible, &assignments, call_points, boundary_ok, &use_count, Some(false)) {
-        let segs = liveness.segments_of(interval);
-        let v = interval.value_id;
-        if is_folded(v, &assignments) || assignments.contains_key(&v) {
-            continue;
-        }
-        // (A group with a call-spanning member that phase 1 could not place
-        // is allocated member by member.)
-        if let Some(pieces) = groups.get(&v).map(|m| group_pieces(m)).filter(|p| !spans_any(p)) {
+        if let Some(members) = groups.get(&v) {
+            let pieces = group_pieces(members);
             let fits_all = |busy: &[(u32, u32, u32)]| pieces.iter().all(|(m, sg)| fits(busy, sg, *m));
-            let pick = (0..caller.len()).find(|&i| fits_all(&caller_busy[i])).map(|i| (true, i))
-                .or_else(|| (0..callee.len()).find(|&i| !callee_busy[i].is_empty() && fits_all(&callee_busy[i])).map(|i| (false, i)));
+            let pick = if spans_any(&pieces) {
+                // A group with a call-spanning member needs a callee-saved
+                // register; one that cannot have one is allocated member
+                // by member.
+                let free = || (0..callee.len()).filter(|&i| fits_all(&callee_busy[i]));
+                free().find(|&i| !callee_busy[i].is_empty()).or_else(|| free().next()).map(|i| (false, i))
+            } else {
+                (0..caller.len()).find(|&i| fits_all(&caller_busy[i])).map(|i| (true, i))
+                    .or_else(|| (0..callee.len()).find(|&i| !callee_busy[i].is_empty() && fits_all(&callee_busy[i])).map(|i| (false, i)))
+            };
             if let Some((is_caller, i)) = pick {
                 for (m, sg) in &pieces {
                     if is_caller {
@@ -371,13 +349,20 @@ pub fn allocate_registers(
                 continue;
             }
         }
+        if spans_clobbering_call(&liveness, interval, call_points, boundary_ok) {
+            let pick = partner_reg(v, &assignments, callee, &callee_busy, &segs)
+                .or_else(|| pick_callee(&callee_busy, &segs, v))
+                .filter(|&i| !weightless || !callee_busy[i].is_empty());
+            if let Some(i) = pick {
+                occupy(&mut callee_busy[i], &segs, v);
+                assignments.insert(v, callee[i]);
+            }
+            continue;
+        }
         // A partner's register first (the handoff saves a move), but a
         // callee-saved one only when it is already saved; then any free
         // caller-saved register; a callee-saved register costs a save and
         // restore, so it comes last.
-        // A weightless value (as in phase 1) never takes a callee-saved
-        // register that is not saved already.
-        let weightless = use_count.get(&v).copied().unwrap_or(0) == 0;
         let callee_partner = partner_reg(v, &assignments, callee, &callee_busy, &segs)
             .filter(|&i| !weightless || !callee_busy[i].is_empty());
         if let Some(i) = partner_reg(v, &assignments, caller, &caller_busy, &segs) {

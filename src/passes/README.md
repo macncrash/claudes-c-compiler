@@ -1193,7 +1193,10 @@ cleared. compress_block's `bi_valid`, loaded as int and widened for
 `bi_valid += len - 16`, and `dist - 1`, widened as a table index, each got a
 register and a `mov` of their own. (The register allocator puts such a copy
 and its source in one register even where both are live: each is defined
-once, so they hold the same bits.)
+once, so they hold the same bits.) So does a narrowing cast, which extends its
+result its own way (`and #0xffff`, `sxth`, `mov w0, w0`, `sxtw`): deflate's
+`(Pos)strstart`, then widened as an index into the window, was moved to a
+second register at each hash insertion.
 
 Then an int add, subtract, multiply, logical operation or left shift whose
 uses, through copies and phis, read only its low 31 bits (narrower casts and
@@ -1263,7 +1266,11 @@ of BinOps, Cmps, Stores and Copies qualify, except shift amounts and masks
 that AArch64 encodes in and/orr/eor. On AArch64 a nonzero constant on the left
 of a subtract or shift also qualifies (`16 - len`, `1 << n`): it has no
 reversed forms taking an immediate, so the constant takes a `mov` at each use.
-At most four constants per function, most loop uses first, a use counted by
+On AArch64 a constant in a 32-bit operation also qualifies
+when both its 16-bit halves differ from 0 and 0xffff (a `movz` and a `movk`)
+and the instruction cannot encode it (no add or subtract immediate, no
+logical bitmask): deflate's hash multiplies by 66521 and adds it, rebuilt at
+every string inserted. At most four constants per function, most loop uses first, a use counted by
 the instructions building the constant there takes (three for a costly one,
 one otherwise). A cheap constant needs two loop uses: read once, it saves one
 `mov` but holds a register through the function, and longest_match lost

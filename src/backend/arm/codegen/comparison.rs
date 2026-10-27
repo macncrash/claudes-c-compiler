@@ -2,7 +2,7 @@
 
 use crate::ir::reexports::{IrCmpOp, Operand, Value};
 use crate::common::types::IrType;
-use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code};
+use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code, callee_saved_name};
 
 impl ArmCodegen {
     pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
@@ -90,15 +90,38 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_all();
     }
 
+    /// Operands with registers are read in place (the rest are loaded into
+    /// x2, x1 and x0), and the result goes straight to the dest's register.
     pub(super) fn emit_select_impl(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, _ty: IrType) {
-        self.operand_to_x0(false_val);
-        self.state.emit("    mov x1, x0");
-        self.operand_to_x0(true_val);
-        self.state.emit("    mov x2, x0");
-        self.operand_to_x0(cond);
-        self.state.emit("    cmp x0, #0");
-        self.state.emit("    csel x0, x2, x1, ne");
+        let t = match self.operand_reg(true_val) {
+            Some(r) => callee_saved_name(r),
+            None => {
+                self.operand_to_x0(true_val);
+                self.state.emit("    mov x2, x0");
+                "x2"
+            }
+        };
+        let f = match self.operand_reg(false_val) {
+            Some(r) => callee_saved_name(r),
+            None => {
+                self.operand_to_x0(false_val);
+                self.state.emit("    mov x1, x0");
+                "x1"
+            }
+        };
+        let c = match self.operand_reg(cond) {
+            Some(r) => callee_saved_name(r),
+            None => {
+                self.operand_to_x0(cond);
+                "x0"
+            }
+        };
+        self.state.emit_fmt(format_args!("    cmp {}, #0", c));
+        let d = self.dest_reg(dest).map_or("x0", callee_saved_name);
+        self.state.emit_fmt(format_args!("    csel {}, {}, {}, ne", d, t, f));
         self.state.reg_cache.invalidate_acc();
-        self.store_x0_to(dest);
+        if d == "x0" {
+            self.store_x0_to(dest);
+        }
     }
 }

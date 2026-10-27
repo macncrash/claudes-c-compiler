@@ -14,7 +14,8 @@
 //!
 //! A value is taken as extended when it is an 8-, 16- or 32-bit load
 //! (`ldrsw` for int), a U32 operation (a 32-bit instruction clears the high
-//! half), a copy of one, or a phi all of whose incoming values are (or
+//! half), a narrowing cast (deflate's `(Pos)strstart`, then widened as an
+//! index), a copy of one, or a phi all of whose incoming values are (or
 //! constants in its type's range). Runs late, after the passes that may
 //! replace a load with another value of its type (GVN forwards stored
 //! values, whose high bits an 8- or 16-bit operation may leave unspecified).
@@ -40,6 +41,13 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
             Instruction::Load { dest, ty, .. } if narrow(ty) => ext[dest.0 as usize] = Some(*ty),
             // A 32-bit operation (`sub w`) clears the high half.
             Instruction::BinOp { dest, ty: IrType::U32, .. } => ext[dest.0 as usize] = Some(IrType::U32),
+            // A narrowing cast extends its result its own way (`and #0xffff`,
+            // `sxth`, `mov w0, w0`, `sxtw`).
+            Instruction::Cast { dest, from_ty, to_ty, .. }
+                if narrow(to_ty) && from_ty.is_integer() && from_ty.size() > to_ty.size() =>
+            {
+                ext[dest.0 as usize] = Some(*to_ty)
+            }
             _ => {}
         }
     }
