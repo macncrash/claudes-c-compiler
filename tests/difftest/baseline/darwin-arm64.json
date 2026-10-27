@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-10-26",
-  "ccc_rev": "2d828055",
+  "ccc_rev": "f7857d11",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -754,6 +754,9 @@
   "cases/guarded_loop_bound": {
    "status": "pass"
   },
+  "cases/heap_sift": {
+   "status": "pass"
+  },
   "cases/inline_specialize": {
    "status": "pass"
   },
@@ -832,6 +835,9 @@
   "cases/range_tests": {
    "status": "pass"
   },
+  "cases/remainder_products": {
+   "status": "pass"
+  },
   "cases/return_tails": {
    "status": "pass"
   },
@@ -847,6 +853,9 @@
   "cases/slide_loops": {
    "status": "pass"
   },
+  "cases/slide_unrolled": {
+   "status": "pass"
+  },
   "cases/small_div": {
    "status": "pass"
   },
@@ -860,6 +869,9 @@
    "status": "pass"
   },
   "cases/switch_dispatch_loop": {
+   "status": "pass"
+  },
+  "cases/symbol_sends": {
    "status": "pass"
   },
   "cases/thread_local": {
@@ -5262,7 +5274,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16ce86ddf 0x16ce86ddf 0x16ce86ddf 0x16ce86ddf'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16ef0eddf 0x16ef0eddf 0x16ef0eddf 0x16ef0eddf'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
