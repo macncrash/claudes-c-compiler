@@ -32,6 +32,7 @@ const MAX_DEPTH: u32 = 6;
 const MAX_DOM_STEPS: usize = 64;
 
 pub(crate) fn range_fold_function(func: &mut IrFunction) -> usize {
+    let threaded = thread_decided_tests(func);
     let folds = {
         let mut ranges = Ranges::new(func);
         let mut folds = Vec::new();
@@ -56,7 +57,185 @@ pub(crate) fn range_fold_function(func: &mut IrFunction) -> usize {
         let Instruction::Cmp { dest, .. } = func.blocks[b].instructions[i] else { unreachable!() };
         func.blocks[b].instructions[i] = Instruction::Copy { dest, src: Operand::Const(IrConst::I32(result as i32)) };
     }
-    folds.len()
+    folds.len() + threaded
+}
+
+/// A block that only tests one of its phis against a constant, entered from
+/// a predecessor whose own branch on the incoming value decides the test:
+/// that edge goes straight to the successor the test picks, and the block
+/// keeps its other predecessors.
+///
+///   P:  c1 = x >= 262; condbr c1, B, F       P:  c1 = x >= 262; condbr c1, S, F
+///   B:  p = phi [x, P], [y, Q]          =>   B:  p = phi [y, Q]
+///       c2 = p >= 3; condbr c2, S, T             c2 = p >= 3; condbr c2, S, T
+///
+/// deflate_fast tests s->lookahead >= MIN_MATCH after the MIN_LOOKAHEAD test
+/// that skips fill_window, where it merges with the value fill_window left.
+/// A constant incoming value decides the test on its own (deflate_fast's
+/// hash_head = NIL when too few bytes are left, then hash_head != NIL).
+/// The phis may be read only by the test and by the successors' phis, which
+/// get the value from the predecessor.
+pub(crate) fn thread_decided_tests(func: &mut IrFunction) -> usize {
+    // The facts below go stale once edges move: start over after each block.
+    let mut total = 0;
+    for _ in 0..64 {
+        let n = thread_once(func);
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    total
+}
+
+fn thread_once(func: &mut IrFunction) -> usize {
+    let cfg = analysis::CfgAnalysis::build(func);
+    let labels: FxHashMap<crate::ir::reexports::BlockId, usize> =
+        func.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    let mut cmps: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> = FxHashMap::default();
+    // Where each value is read: a phi reads its incoming value at the end
+    // of the predecessor it comes from.
+    let mut uses: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Instruction::Cmp { dest, op, lhs, rhs, ty } = inst {
+                cmps.insert(dest.0, (*op, *lhs, *rhs, *ty));
+            }
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (o, l) in incoming {
+                    if let (Operand::Value(v), Some(&pb)) = (o, labels.get(l)) {
+                        uses.entry(v.0).or_default().push(pb);
+                    }
+                }
+                continue;
+            }
+            inst.for_each_used_value(|v| uses.entry(v).or_default().push(b));
+        }
+        block.terminator.for_each_used_value(|v| uses.entry(v).or_default().push(b));
+    }
+    // The test x op k as (x, op, k in its interpretation, interpretation).
+    let test = |op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType| -> Option<(Value, IrCmpOp, i128, Interp)> {
+        let (x, op, k) = match (lhs, rhs) {
+            (Operand::Value(x), Operand::Const(k)) => (*x, op, k),
+            (Operand::Const(k), Operand::Value(x)) => (*x, swapped(op), k),
+            _ => return None,
+        };
+        let it = cmp_interp(op, ty)?;
+        Some((x, op, it.wrap(const_interp(k)?.0), it))
+    };
+    let mut changes = 0;
+    for b in 0..func.blocks.len() {
+        let block = &func.blocks[b];
+        let Terminator::CondBranch { cond: Operand::Value(c), true_label: bt, false_label: bf } = block.terminator else { continue };
+        let nphis = block.instructions.iter().take_while(|i| matches!(i, Instruction::Phi { .. })).count();
+        let [Instruction::Cmp { dest, op, lhs, rhs, ty }] = &block.instructions[nphis..] else { continue };
+        if *dest != c || uses.get(&c.0).map_or(0, |u| u.len()) != 1 || bt == bf {
+            continue;
+        }
+        let Some((p, op2, k2, it2)) = test(*op, lhs, rhs, *ty) else { continue };
+        let Some(Instruction::Phi { incoming, .. }) = block.instructions[..nphis].iter().find(|i| i.dest() == Some(p)) else { continue };
+        let phi_dests: Vec<Value> = block.instructions[..nphis].iter().filter_map(|i| i.dest()).collect();
+        let blabel = block.label;
+        // Predecessor edges that decide the test.
+        let mut moves: Vec<(usize, crate::ir::reexports::BlockId)> = Vec::new();
+        for (x, pl) in incoming {
+            let Some(&pi) = labels.get(pl) else { continue };
+            // A constant decides the test whatever the edge.
+            if let Operand::Const(k) = x {
+                let Some((k, _)) = const_interp(k) else { continue };
+                let Some(result) = compare(op2, R::point(it2.wrap(k)), R::point(k2)) else { continue };
+                let to = if result { bt } else { bf };
+                let edges_to_b = match func.blocks[pi].terminator {
+                    Terminator::Branch(l) => l == blabel,
+                    Terminator::CondBranch { true_label, false_label, .. } =>
+                        (true_label == blabel) != (false_label == blabel) && true_label != to && false_label != to,
+                    _ => false,
+                };
+                if edges_to_b && to != blabel {
+                    moves.push((pi, to));
+                }
+                continue;
+            }
+            let Operand::Value(x) = x else { continue };
+            let Terminator::CondBranch { cond: Operand::Value(pc), true_label, false_label } = func.blocks[pi].terminator else { continue };
+            if (true_label == blabel) == (false_label == blabel) {
+                continue;
+            }
+            let Some(&(op1, ref l1, ref r1, ty1)) = cmps.get(&pc.0) else { continue };
+            let Some((x1, op1, k1, it1)) = test(op1, l1, r1, ty1) else { continue };
+            if x1 != *x || it1 != it2 {
+                continue;
+            }
+            let op1 = if true_label == blabel { op1 } else { negated(op1) };
+            let Some(r) = constrain(it1.full(), op1, k1) else { continue };
+            let Some(result) = compare(op2, r, R::point(k2)) else { continue };
+            let to = if result { bt } else { bf };
+            // The predecessor's other edge must not already go there.
+            let other = if true_label == blabel { false_label } else { true_label };
+            if to != blabel && other != to {
+                moves.push((pi, to));
+            }
+        }
+        // Once to has another predecessor, the block dominates only what its
+        // other successor dominates, if the block is that one's only
+        // predecessor: the phis may be read only in the block and there (a
+        // phi reads its value at the end of the predecessor it comes from).
+        let to_ok = |to: crate::ir::reexports::BlockId| {
+            let other = labels[&if to == bt { bf } else { bt }];
+            let sole = cfg.preds.row(other) == [b as u32];
+            let under_other = |mut u: usize| loop {
+                if u == other {
+                    return sole;
+                }
+                if u == b || cfg.idom[u] == u || cfg.idom[u] == usize::MAX {
+                    return false;
+                }
+                u = cfg.idom[u];
+            };
+            phi_dests.iter().all(|d| uses.get(&d.0).is_none_or(|u| u.iter().all(|&ub| ub == b || under_other(ub))))
+        };
+        moves.retain(|&(_, to)| to_ok(to));
+        for (pi, to) in moves {
+            let pl = func.blocks[pi].label;
+            // The phis' values on the edge from P.
+            let from_p: FxHashMap<u32, Operand> = func.blocks[b].instructions[..nphis].iter().filter_map(|i| match i {
+                Instruction::Phi { dest, incoming, .. } => incoming.iter().find(|(_, l)| *l == pl).map(|(o, _)| (dest.0, *o)),
+                _ => None,
+            }).collect();
+            if from_p.len() != nphis {
+                continue;
+            }
+            match &mut func.blocks[pi].terminator {
+                Terminator::CondBranch { true_label, false_label, .. } => {
+                    if *true_label == blabel { *true_label = to; } else { *false_label = to; }
+                }
+                Terminator::Branch(l) => *l = to,
+                _ => {}
+            }
+            for inst in &mut func.blocks[b].instructions[..nphis] {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    incoming.retain(|(_, l)| *l != pl);
+                }
+            }
+            let ti = labels[&to];
+            for inst in &mut func.blocks[ti].instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    if let Some(&(o, _)) = incoming.iter().find(|(_, l)| *l == blabel) {
+                        let o = match o {
+                            Operand::Value(v) => from_p.get(&v.0).copied().unwrap_or(o),
+                            k => k,
+                        };
+                        incoming.push((o, pl));
+                    }
+                }
+            }
+            changes += 1;
+        }
+        if changes > 0 {
+            return changes;
+        }
+    }
+    changes
 }
 
 /// An integer interpretation: width in bits and signedness.
@@ -633,6 +812,51 @@ mod tests {
     const I32: Interp = Interp { w: 32, signed: true };
     const U32: Interp = Interp { w: 32, signed: false };
     const I64: Interp = Interp { w: 64, signed: true };
+
+    use crate::ir::reexports::{BasicBlock, BlockId};
+
+    /// b0: c = x >= 262 ? b1 : b4;  b4: y = 7 -> b1;
+    /// b1: p = phi [x, b0], [y, b4]; t = p >= 3 ? b2 : b3;
+    /// b2 and b3 go on to b5, all returning; block reader returns p.
+    fn lookahead(reader: u32) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let k = |n| Operand::Const(IrConst::I32(n));
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let ret = |l: u32| Terminator::Return(Some(if reader == l { v(3) } else { k(l as i32) }));
+        let end = |l: u32| if reader == 5 { Terminator::Branch(BlockId(5)) } else { ret(l) };
+        let mut func = IrFunction::new("t".to_string(), IrType::U32, vec![], false);
+        func.blocks = vec![
+            block(0, vec![Instruction::Cmp { dest: Value(2), op: IrCmpOp::Uge, lhs: v(1), rhs: k(262), ty: IrType::U32 }],
+                  Terminator::CondBranch { cond: v(2), true_label: BlockId(1), false_label: BlockId(4) }),
+            block(1, vec![
+                Instruction::Phi { dest: Value(3), ty: IrType::U32, incoming: vec![(v(1), BlockId(0)), (v(5), BlockId(4))] },
+                Instruction::Cmp { dest: Value(4), op: IrCmpOp::Uge, lhs: v(3), rhs: k(3), ty: IrType::U32 },
+            ], Terminator::CondBranch { cond: v(4), true_label: BlockId(2), false_label: BlockId(3) }),
+            block(2, vec![], end(2)),
+            block(3, vec![], end(3)),
+            block(4, vec![Instruction::Copy { dest: Value(5), src: k(7) }], Terminator::Branch(BlockId(1))),
+            block(5, vec![], ret(5)),
+        ];
+        func.next_value_id = 6;
+        func
+    }
+
+    #[test]
+    fn edge_whose_branch_decides_the_test_skips_the_merge() {
+        // x >= 262 on b0's edge decides p >= 3: b0 may go straight to b2
+        // when p is read only where b1 still dominates, in b3 (b1 its only
+        // predecessor).
+        let mut func = lookahead(3);
+        assert_eq!(thread_decided_tests(&mut func), 1);
+        assert!(matches!(func.blocks[0].terminator, Terminator::CondBranch { true_label: BlockId(2), .. }));
+        let Instruction::Phi { incoming, .. } = &func.blocks[1].instructions[0] else { panic!() };
+        assert_eq!(incoming.len(), 1);
+        // Not when b2, reached from b0 then, reads p, nor b5 after both.
+        for reader in [2, 5] {
+            let mut func = lookahead(reader);
+            assert_eq!(thread_decided_tests(&mut func), 0, "p read in b{}", reader);
+        }
+    }
 
     #[test]
     fn wrap_reads_low_bits() {

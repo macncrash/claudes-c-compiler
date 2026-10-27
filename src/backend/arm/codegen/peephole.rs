@@ -471,6 +471,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fold_scale_into_mem(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_offset_into_global_addr(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_cset_into_csel(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_cmp_sub_into_subs(&mut lines, &mut kinds, n));
             changed2 |= pass!(forward_copy_propagation(&mut lines, &mut kinds, n));
             changed2 |= pass!(retarget_results(&mut lines, &mut kinds, n));
             changed2 |= pass!(build_vec_args_in_place(&mut lines, &mut kinds, n));
@@ -495,6 +496,10 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_unreachable_after_jumps(&lines, &mut kinds, n));
             rounds2 += 1;
         }
+    }
+
+    if !skip.contains(&"pair_adjacent_loads") {
+        pair_adjacent_loads(&mut lines, &mut kinds, n);
     }
 
     // Phase 4: drop frame records that leaf functions no longer need.
@@ -1488,6 +1493,9 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
         | "ubfiz" | "sbfiz" | "smaddl" | "smsubl" | "fmov" | "fcvtzs" | "fcvtzu" | "umov" if !has_symbol => {
             Access::Write { deletable: true }
         }
+        // Flag-setting arithmetic writes its destination too; the flags may
+        // be read, so it stays.
+        "adds" | "subs" | "ands" if !has_symbol => Access::Write { deletable: false },
         // Loads write their destination; never delete them (volatile/MMIO).
         // Pre/post-index forms also write the base register.
         "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldur" | "ldurb" | "ldurh"
@@ -1526,6 +1534,115 @@ fn gpr_operand(op: &str) -> Option<u8> {
 fn mentions_reg(text: &str, n: u8) -> bool {
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|tok| gpr_operand(tok) == Some(n))
+}
+
+/// `cmp A, #k; b.cc L; sub D, A, #k` becomes `subs D, A, #k; b.cc L` when D
+/// is dead at L: subs sets the flags as cmp does. deflate's
+/// `if (s->match_length >= MIN_MATCH)` and then `s->match_length - MIN_MATCH`.
+fn fuse_cmp_sub_into_subs(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let next = |kinds: &[LineKind], mut k: usize| {
+        k += 1;
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
+    let mut live: Option<Vec<RegSet>> = None;
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some(("cmp", ops)) = split_insn(&lines[i]) else { continue };
+        let (a, k) = first_and_rest(ops);
+        let k = k.trim();
+        if !k.starts_with('#') || gpr_operand(a).is_none() {
+            continue;
+        }
+        let j = next(kinds, i);
+        if j >= n || kinds[j] != LineKind::CondBranch {
+            continue;
+        }
+        let Some((m, target)) = split_insn(&lines[j]) else { continue };
+        if !m.starts_with("b.") {
+            continue;
+        }
+        let s = next(kinds, j);
+        if s >= n {
+            continue;
+        }
+        let Some(("sub", sops)) = split_insn(&lines[s]) else { continue };
+        let p: Vec<&str> = sops.split(',').map(str::trim).collect();
+        if p.len() != 3 || p[1] != a || p[2] != k || p[0].chars().next() != a.chars().next() {
+            continue;
+        }
+        let Some(d) = gpr_operand(p[0]) else { continue };
+        // D must be dead where the branch goes.
+        let Some(t) = (0..n).find(|&x| kinds[x] == LineKind::Label && label_name(&lines[x]) == Some(target.trim())) else { continue };
+        let live = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+        if live[t] & (1 << d) != 0 {
+            continue;
+        }
+        lines[i] = format!("    subs {}, {}, {}", p[0], a, k);
+        kinds[i] = classify_line(&lines[i]);
+        kinds[s] = LineKind::Nop;
+        // (Live-in at labels is unchanged: D was dead at L, and the
+        // fall-through defined it anyway.)
+        changed = true;
+    }
+    changed
+}
+
+/// `ldr A, [B, #k]` then `ldr C, [B, #k + size]` (both x or both w, next
+/// to each other) become `ldp A, C, [B, #k]`: deflate's `s->prev` and
+/// `s->head`, `s->strstart` and `s->match_start`. Neither A nor C may be
+/// B, nor A be C; k must fit ldp's scaled 7-bit offset.
+fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    // (dest, base, offset, size) of a plain `ldr` through a register.
+    let parse = |line: &str| -> Option<(String, String, i64, i64)> {
+        let ("ldr", ops) = split_insn(line)? else { return None };
+        let (dest, addr) = first_and_rest(ops);
+        let size = match dest.chars().next()? { 'x' => 8, 'w' => 4, _ => return None };
+        gpr_operand(dest)?;
+        let inner = addr.trim().strip_prefix('[')?.strip_suffix(']')?;
+        let (base, off) = match inner.split_once(',') {
+            Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i64>().ok()?),
+            None => (inner.trim(), 0),
+        };
+        if !base.starts_with('x') || gpr_operand(base).is_none() {
+            return None;
+        }
+        Some((dest.to_string(), base.to_string(), off, size))
+    };
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        if kinds[i] == LineKind::Nop {
+            i += 1;
+            continue;
+        }
+        let Some((a, b, k, size)) = parse(&lines[i]) else { i += 1; continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        let pair = (j < n).then(|| parse(&lines[j])).flatten();
+        let Some((c, b2, k2, size2)) = pair else { i += 1; continue };
+        let reg = |r: &str| gpr_operand(r);
+        let fits = k % size == 0 && (-64 * size..=63 * size).contains(&k);
+        if b2 == b && size2 == size && k2 == k + size && fits
+            && reg(&a) != reg(&b) && reg(&c) != reg(&b) && reg(&a) != reg(&c)
+        {
+            lines[i] = format!("    ldp {}, {}, [{}, #{}]", a, c, b, k);
+            kinds[i] = classify_line(&lines[i]);
+            kinds[j] = LineKind::Nop;
+            changed = true;
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    changed
 }
 
 /// Split operands into (first operand, everything after the first comma).
@@ -4287,6 +4404,31 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         assert!(!result.contains("orr x12"), "{}", result);
         assert!(result.contains("sxtw x13, w12"), "{}", result);
+    }
+
+    #[test]
+    fn test_adjacent_loads_paired() {
+        let input = "    ldr x3, [x0, #192]\n    ldr x4, [x0, #200]\n    add x0, x3, x4\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldp x3, x4, [x0, #192]"), "{}", result);
+        // Not when the first load replaces the base, nor across widths.
+        let input = "    ldr x0, [x0]\n    ldr x4, [x0, #8]\n    add x0, x0, x4\n    ret\n";
+        assert!(!peephole_optimize(input.to_string()).contains("ldp"));
+        let input = "    ldr w3, [x0, #4]\n    ldr x4, [x0, #8]\n    add x0, x3, x4\n    ret\n";
+        assert!(!peephole_optimize(input.to_string()).contains("ldp"));
+    }
+
+    #[test]
+    fn test_compare_and_subtract_fused_when_dead_at_target() {
+        let body = |target_reads: &str| format!(
+            ".type f, %function\nf:\n    cmp w3, #5\n    b.lo LBB1\n    sub w3, w3, #5\n    mov w0, w3\n    ret\nLBB1:\n    mov w0, {}\n    ret\n", target_reads);
+        let result = peephole_optimize(body("#0"));
+        assert!(result.contains("subs w3, w3, #5"), "{}", result);
+        assert!(!result.contains("cmp w3"), "{}", result);
+        // The branch target reads w3: the original value must reach it (the
+        // difference may still go to a register dead there).
+        let result = peephole_optimize(body("w3"));
+        assert!(!result.contains("subs w3"), "{}", result);
     }
 
     #[test]

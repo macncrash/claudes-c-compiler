@@ -117,6 +117,16 @@ pub(crate) fn sink_steps(func: &mut IrFunction) -> usize {
 /// backend can't fold the add into the access as `[p, i]`
 /// (compress_block's `s->pending_buf[s->pending++] = (Byte)(s->bi_buf >> 8)`).
 /// Not past a call, which would keep both live across it.
+/// Move the instruction at from to position to, keeping spans in step.
+fn move_inst(block: &mut crate::ir::reexports::BasicBlock, from: usize, to: usize) {
+    let inst = block.instructions.remove(from);
+    block.instructions.insert(to, inst);
+    if block.source_spans.len() == block.instructions.len() {
+        let span = block.source_spans.remove(from);
+        block.source_spans.insert(to, span);
+    }
+}
+
 pub(crate) fn sink_addresses(func: &mut IrFunction) -> usize {
     /// How far an address moves.
     const WINDOW: usize = 16;
@@ -152,14 +162,28 @@ pub(crate) fn sink_addresses(func: &mut IrFunction) -> usize {
                 }
                 break;
             }
-            let Some(k) = access.filter(|&k| k > at + 1) else { continue };
-            let inst = block.instructions.remove(at);
-            block.instructions.insert(k - 1, inst);
-            if block.source_spans.len() == block.instructions.len() {
-                let span = block.source_spans.remove(at);
-                block.source_spans.insert(k - 1, span);
+            let Some(k) = access else { continue };
+            let mut gep = at;
+            if k > at + 1 {
+                move_inst(block, at, k - 1);
+                gep = k - 1;
+                moved += 1;
             }
-            moved += 1;
+            // A doubled or shifted index read only here comes along, so the
+            // backend scales it in the access (`[x14, x13, lsl #1]`) rather
+            // than keeping the scaled value in a register of its own.
+            let Instruction::GetElementPtr { offset: Operand::Value(o), .. } = block.instructions[gep] else { continue };
+            if use_count.get(o.0 as usize) != Some(&1) {
+                continue;
+            }
+            let Some(d) = block.instructions[..gep].iter().rposition(|i| i.dest() == Some(o)) else { continue };
+            let scaled = matches!(block.instructions[d],
+                Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } if a == b)
+                || matches!(block.instructions[d], Instruction::BinOp { op: IrBinOp::Shl, rhs: Operand::Const(_), .. });
+            if scaled && d + 1 < gep {
+                move_inst(block, d, gep - 1);
+                moved += 1;
+            }
         }
     }
     moved

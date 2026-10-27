@@ -809,6 +809,16 @@ v1 and nothing between the copy and the call uses v22:
   access `[xB, xI]` whose size is 2^k becomes `[xB, xJ, lsl #k]`: the
   `prev[m & mask]` of a hash chain. Lines already deleted are never folded
   again (an add folded into one access once also matched a later one).
+- `cmp A, #k; b.cc L; sub D, A, #k` becomes `subs D, A, #k; b.cc L` when D
+  is dead at L (deflate's `match_length >= MIN_MATCH`, then
+  `match_length - MIN_MATCH`). The liveness model knows `adds`/`subs`/`ands`
+  as writes of their destination (never deleted: their flags may be read);
+  as unknown lines they made every register live and kept dead moves
+  elsewhere in the function.
+- After the cleanup rounds, two adjacent `ldr`s of one width from `[B, #k]`
+  and `[B, #k + size]` become an `ldp` (not when the first replaces B, or
+  both load one register): `s->prev` and `s->head`, `s->strstart` and
+  `s->match_start`.
 - A call reads the GP argument registers its codegen names in a
   `.ccc_call_uses MASK` line before it (x0 up to the highest argument
   register, x8 for an sret pointer; all of x0-x8 when an argument may be a

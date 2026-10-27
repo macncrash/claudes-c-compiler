@@ -777,6 +777,19 @@ overflow is never assumed away: arithmetic whose exact result leaves the type
 gives no range. Folded comparisons become constants, which constant_fold,
 copy_prop and cfg_simplify carry on to the branches they feed.
 
+Before that, a block that only tests one of its phis against a constant
+loses the predecessors whose edge decides the test: a constant incoming
+value, or one the predecessor's own branch just compared (`x >= 262` taken
+decides `x >= 3`). Such an edge goes straight to the successor the test
+picks, the successor's phis taking the predecessor's values. The phis may
+then be read only in the block and under its other successor, when that one
+has the block as its only predecessor (anywhere else, the new edge would
+reach the read without the phi being set). This also runs right after
+load_phi, whose phis of merged loads are what such a block tests: deflate_fast
+tests `lookahead >= MIN_MATCH` where the `lookahead >= MIN_LOOKAHEAD` path
+meets the one after fill_window, and `hash_head != NIL` after setting it to
+NIL on the other path.
+
 ### loop_unroll -- Constant-Trip Loops Unrolled
 
 Runs in the first iteration, after constant folding and range_fold, once
@@ -1245,7 +1258,10 @@ the value, so `p` and `i` die at the GEP and the value may take one of their
 registers; the backend then can't fold the add into the store as `[p, i]`. A
 GEP with a variable offset whose only use is a load or store at most 16
 instructions later in its block (with no call between) moves to just before
-it. compress_block's second byte of each flush,
+it, and a doubled or shifted index read only by it (`x + x`, `x << k`) moves
+to just before it in turn, so the peephole folds the scaling into the access
+(`[x14, x13, lsl #1]`) instead of the scaled index taking a register of its
+own across unrelated code. compress_block's second byte of each flush,
 `s->pending_buf[s->pending++] = (Byte)(s->bi_buf >> 8)`, was an `add` and a
 store. With the ext_elide changes, compress_block at deflate level 1 went
 from 21M instructions more than clang's to 3M fewer.

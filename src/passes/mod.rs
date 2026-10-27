@@ -669,6 +669,11 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             for (func, _) in module.functions.iter_mut().zip(&changed).filter(|(_, c)| **c) {
                 copy_prop::propagate_copies(func);
                 dce::eliminate_dead_code(func);
+                // A merged load is now a phi a block may only test: edges
+                // whose own branch decides that test skip the block.
+                if !disabled.contains("range_fold") && range_fold::thread_decided_tests(func) > 0 {
+                    cfg_simplify::run_function(func);
+                }
             }
         }
     }
