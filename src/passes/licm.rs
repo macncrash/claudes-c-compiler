@@ -1190,6 +1190,7 @@ fn topological_sort_instructions(mut insts: Vec<Instruction>) -> Vec<Instruction
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, IrConst};
 
@@ -1411,7 +1412,7 @@ mod tests {
                     volatile: false,
                 },
                 Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default, volatile: false },
+                seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Copy {
                     dest: Value(1),
                     src: Operand::Const(IrConst::I32(0)),
@@ -1434,7 +1435,7 @@ mod tests {
                     ],
                 },
                 Instruction::Load { dest: Value(3), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default, volatile: false },
+                seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Cmp {
                     dest: Value(4),
                     op: IrCmpOp::Slt,
@@ -1513,7 +1514,7 @@ mod tests {
                     volatile: false,
                 },
                 Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default, volatile: false },
+                seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1524,7 +1525,7 @@ mod tests {
             label: BlockId(1),
             instructions: vec![
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default, volatile: false },
+                seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Cmp {
                     dest: Value(2),
                     op: IrCmpOp::Slt,
@@ -1553,7 +1554,7 @@ mod tests {
                     ty: IrType::I32,
                 },
                 Instruction::Store { val: Operand::Value(Value(3)), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default, volatile: false },
+                seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
@@ -1645,7 +1646,7 @@ mod tests {
             label: BlockId(2),
             instructions: vec![
                 Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I32,
-                seg_override: AddressSpace::Default, volatile: false },
+                seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Cmp {
                     dest: Value(2),
                     op: IrCmpOp::Eq,
@@ -1834,20 +1835,20 @@ mod tests {
         // counter (left alone).
         let mut func = make_loop_func();
         let alloca = |dest: u32| Instruction::Alloca { dest: Value(dest), ty: IrType::Ptr, size: 8, align: 4, volatile: false };
-        let store = |val: Operand, ptr: u32| Instruction::Store { val, ptr: Value(ptr), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false };
+        let store = |val: Operand, ptr: u32| Instruction::Store { val, ptr: Value(ptr), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
         let body = vec![
             alloca(6),
             Instruction::GetElementPtr { dest: Value(7), base: Value(6), offset: Operand::Const(IrConst::I64(4)), ty: IrType::I32 },
             store(Operand::Const(IrConst::I32(5)), 6),
             store(Operand::Const(IrConst::I32(9)), 7),
-            Instruction::Load { dest: Value(8), ptr: Value(7), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Load { dest: Value(8), ptr: Value(7), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             alloca(9),
             store(Operand::Value(Value(2)), 9),
-            Instruction::Load { dest: Value(10), ptr: Value(9), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Load { dest: Value(10), ptr: Value(9), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             // A copy of the constant local: follows it in a second round.
             alloca(11),
             Instruction::Memcpy { dest: Value(11), src: Value(6), size: 8 },
-            Instruction::Load { dest: Value(12), ptr: Value(11), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Load { dest: Value(12), ptr: Value(11), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
         ];
         func.blocks[2].instructions.splice(0..0, body);
         func.next_value_id = 13;

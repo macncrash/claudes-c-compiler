@@ -240,13 +240,14 @@ fn merge_dominated_geps(func: &mut IrFunction) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
 
     /// %3 = %1 + 257; %4 = %3 << 2; %5 = gep %0, %4; %6 = gep %5, 2;
     /// loads of %5 and %6, and `escape` stores %5 itself.
     fn indexed(escape: bool) -> IrFunction {
         let c = |k| Operand::Const(IrConst::I64(k));
-        let load = |dest, ptr| Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty: IrType::I16, seg_override: AddressSpace::Default, volatile: false };
+        let load = |dest, ptr| Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty: IrType::I16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
         let mut instructions = vec![
             Instruction::BinOp { dest: Value(3), op: IrBinOp::Add, lhs: Operand::Value(Value(1)), rhs: c(257), ty: IrType::I64 },
             Instruction::BinOp { dest: Value(4), op: IrBinOp::Shl, lhs: Operand::Value(Value(3)), rhs: c(2), ty: IrType::I64 },
@@ -256,7 +257,7 @@ mod tests {
             load(8, 6),
         ];
         if escape {
-            instructions.push(Instruction::Store { val: Operand::Value(Value(5)), ptr: Value(2), ty: IrType::Ptr, seg_override: AddressSpace::Default, volatile: false });
+            instructions.push(Instruction::Store { val: Operand::Value(Value(5)), ptr: Value(2), ty: IrType::Ptr, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
         }
         let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
         func.blocks = vec![BasicBlock { label: BlockId(0), instructions, terminator: Terminator::Return(Some(Operand::Value(Value(8)))), source_spans: Vec::new() }];

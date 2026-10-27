@@ -6,14 +6,79 @@ use crate::ir::reexports::{
     Operand,
     Value,
 };
-use crate::common::types::{AccessQuals, AddressSpace, IrType, CType};
+use crate::common::types::{AccessQuals, AddressSpace, AliasClass, IrType, CType};
 use super::lower::Lowerer;
 use super::definitions::LValue;
 
 impl Lowerer {
     /// Try to get the lvalue (address) of an expression.
     /// Returns Some(LValue) if the expression is an lvalue, None otherwise.
+    /// An address's qualifiers carry the lvalue's alias class.
     pub(super) fn lower_lvalue(&mut self, expr: &Expr) -> Option<LValue> {
+        match self.lower_lvalue_untyped(expr)? {
+            LValue::Address(v, mut quals) => {
+                quals.alias = self.alias_class(expr);
+                Some(LValue::Address(v, quals))
+            }
+            lv => Some(lv),
+        }
+    }
+
+    /// The alias class of an access to the object `expr` designates: its
+    /// scalar type's, or ANY for character, aggregate and vector types and
+    /// for a member reached through a union (type punning through a union
+    /// is allowed).
+    pub(super) fn alias_class(&self, expr: &Expr) -> AliasClass {
+        let Some(ct) = self.get_expr_ctype(expr) else { return AliasClass::ANY };
+        let class = Self::scalar_alias_class(&ct, self.get_expr_type(expr));
+        if class != AliasClass::ANY && self.reached_through_union(expr) {
+            return AliasClass::ANY;
+        }
+        class
+    }
+
+    /// The alias class of a scalar of C type `ct` accessed as `ty`.
+    pub(super) fn scalar_alias_class(ct: &CType, ty: IrType) -> AliasClass {
+        match ct {
+            CType::Short | CType::UShort | CType::Int | CType::UInt | CType::Long | CType::ULong
+            | CType::LongLong | CType::ULongLong | CType::Int128 | CType::UInt128 | CType::Enum(_) => {
+                match ty.size() {
+                    2 => AliasClass::I16,
+                    4 => AliasClass::I32,
+                    8 => AliasClass::I64,
+                    16 => AliasClass::I128,
+                    _ => AliasClass::ANY,
+                }
+            }
+            CType::Float => AliasClass::F32,
+            CType::Double => AliasClass::F64,
+            CType::LongDouble => match ty {
+                IrType::F64 => AliasClass::F64,
+                IrType::F128 => AliasClass::F128,
+                _ => AliasClass::ANY,
+            },
+            CType::Pointer(..) => AliasClass::PTR,
+            _ => AliasClass::ANY,
+        }
+    }
+
+    /// Whether `expr` names a member of a union object, or part of one.
+    pub(super) fn reached_through_union(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::MemberAccess(base, _, _) => {
+                !matches!(self.get_expr_ctype(base), Some(CType::Struct(_))) || self.reached_through_union(base)
+            }
+            Expr::PointerMemberAccess(base, _, _) => {
+                !matches!(self.get_expr_ctype(base), Some(CType::Pointer(ref inner, _)) if matches!(**inner, CType::Struct(_)))
+            }
+            Expr::ArraySubscript(base, index, _) => {
+                [base, index].iter().any(|e| matches!(self.get_expr_ctype(e), Some(CType::Array(..))) && self.reached_through_union(e))
+            }
+            _ => false,
+        }
+    }
+
+    fn lower_lvalue_untyped(&mut self, expr: &Expr) -> Option<LValue> {
         match expr {
             Expr::Identifier(name, _) => {
                 // Check locals first so inner-scope locals shadow outer static locals.
@@ -185,7 +250,7 @@ impl Lowerer {
         let addr = self.lvalue_addr(lv);
         let quals = self.lvalue_quals(lv);
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { dest, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile });
+        self.emit(Instruction::Load { dest, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile, alias: quals.alias });
         Operand::Value(dest)
     }
 
@@ -193,7 +258,7 @@ impl Lowerer {
     pub(super) fn store_lvalue_typed(&mut self, lv: &LValue, val: Operand, ty: IrType) {
         let addr = self.lvalue_addr(lv);
         let quals = self.lvalue_quals(lv);
-        self.emit(Instruction::Store { val, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile });
+        self.emit(Instruction::Store { val, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile, alias: quals.alias });
     }
 
     /// Compute the address of an array element: base_addr + index * elem_size.
@@ -294,7 +359,7 @@ impl Lowerer {
                             return Operand::Value(addr);
                         } else {
                             let loaded = self.fresh_value();
-                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
+                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                             return Operand::Value(loaded);
                         }
                     }
@@ -303,7 +368,7 @@ impl Lowerer {
                         return Operand::Value(info.alloca);
                     } else {
                         let loaded = self.fresh_value();
-                        self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
+                        self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                         return Operand::Value(loaded);
                     }
                 }
@@ -317,7 +382,7 @@ impl Lowerer {
                             return Operand::Value(addr);
                         } else {
                             let loaded = self.fresh_value();
-                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
+                            self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                             return Operand::Value(loaded);
                         }
                     }
@@ -330,7 +395,7 @@ impl Lowerer {
                         return Operand::Value(addr);
                     } else {
                         let loaded = self.fresh_value();
-                        self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false });
+                        self.emit(Instruction::Load { dest: loaded, ptr: addr, ty: IrType::Ptr , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                         return Operand::Value(loaded);
                     }
                 }

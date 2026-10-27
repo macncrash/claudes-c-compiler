@@ -19,7 +19,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
-use crate::common::types::AddressSpace;
+use crate::common::types::{AddressSpace, AliasClass};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{BasicBlock, BlockId, Instruction, IrFunction, IrModule, Operand, Terminator};
 use super::licm::is_hoistable;
@@ -154,20 +154,22 @@ fn hoist_loop(
         None
     };
     // Everything the loop may write, and for a plain store the bytes it
-    // writes: a store to `s->match_start` leaves a load of `s->window` alone.
-    let mut writes: Vec<(Root, Option<(u32, i64, i64)>)> = Vec::new();
+    // writes and its alias class: a store to `s->match_start` leaves a load
+    // of `s->window` alone, and with strict aliasing a store to a `ush`
+    // array leaves loads of `unsigned` and pointer fields alone.
+    let mut writes: Vec<(Root, Option<(u32, i64, i64)>, AliasClass)> = Vec::new();
     for &b in &blocks {
         for inst in &func.blocks[b].instructions {
-            if let Instruction::Store { ptr, ty, .. } = inst {
-                let w = (model.root(ptr.0), base_offset(ptr.0).map(|(v, o)| (v, o, o + ty.size() as i64)));
+            if let Instruction::Store { ptr, ty, alias, .. } = inst {
+                let w = (model.root(ptr.0), base_offset(ptr.0).map(|(v, o)| (v, o, o + ty.size() as i64)), *alias);
                 if !writes.contains(&w) {
                     writes.push(w);
                 }
                 continue;
             }
             model.for_each_write(inst, mr, |r| {
-                if !writes.contains(&(r, None)) {
-                    writes.push((r, None));
+                if !writes.contains(&(r, None, AliasClass::ANY)) {
+                    writes.push((r, None, AliasClass::ANY));
                 }
             });
         }
@@ -233,10 +235,10 @@ fn hoist_loop(
                     continue;
                 }
                 let ok = match inst {
-                    Instruction::Load { ptr, ty, seg_override: AddressSpace::Default, volatile: false, .. } => {
+                    Instruction::Load { ptr, ty, seg_override: AddressSpace::Default, volatile: false, alias, .. } => {
                         let root = model.root(ptr.0);
                         let bytes = base_offset(ptr.0).map(|(v, o)| (v, o, o + ty.size() as i64));
-                        !writes.iter().any(|&(w, wb)| model.may_alias(w, root) && !disjoint(wb, bytes))
+                        !writes.iter().any(|&(w, wb, wa)| model.may_alias(w, root) && !disjoint(wb, bytes) && wa.may_alias(*alias))
                             && (in_bounds_local(ptr.0, ty.size())
                                 || (*runs_first.entry(b).or_insert_with(|| always_runs(b))
                                     && func.blocks[b].instructions[..k].iter().all(|i| mr.always_continues(i))))
@@ -281,11 +283,11 @@ fn hoist_loop(
         let defs = |v: crate::ir::reexports::Value| func.blocks.iter().flat_map(|b| &b.instructions)
             .filter(|i| i.dest() == Some(v)).count();
         let insts: Vec<Instruction> = insts.into_iter().map(|inst| {
-            let Instruction::Load { dest, ptr, ty, seg_override: AddressSpace::Default, volatile: false } = inst else { return inst };
+            let Instruction::Load { dest, ptr, ty, seg_override: AddressSpace::Default, volatile: false, .. } = inst else { return inst };
             let earlier = func.blocks[guard].instructions.iter().rev()
                 .take_while(|i| !writes_memory(i))
                 .find_map(|i| match i {
-                    Instruction::Load { dest: d, ptr: p, ty: t, seg_override: AddressSpace::Default, volatile: false }
+                    Instruction::Load { dest: d, ptr: p, ty: t, seg_override: AddressSpace::Default, volatile: false, .. }
                         if *p == ptr && *t == ty => Some(*d),
                     _ => None,
                 });

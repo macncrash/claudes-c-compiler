@@ -922,6 +922,7 @@ fn try_narrow_const_for_cmp(c: &IrConst, target_ty: IrType) -> Option<IrConst> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::ir::reexports::{BasicBlock, BlockId, Terminator, Value};
 
     fn make_func_with_blocks(blocks: Vec<BasicBlock>) -> IrFunction {
@@ -1309,7 +1310,7 @@ mod tests {
                 Instruction::Cast { dest: Value(3), src: Operand::Value(Value(2)), from_ty: IrType::I32, to_ty: IrType::I64 },
                 Instruction::BinOp { dest: Value(4), op: IrBinOp::Or, lhs: Operand::Value(Value(3)), rhs: Operand::Value(Value(10)), ty: IrType::I64 },
                 Instruction::Cast { dest: Value(5), src: Operand::Value(Value(4)), from_ty: IrType::I64, to_ty: IrType::U16 },
-                Instruction::Store { val: Operand::Value(Value(5)), ptr: Value(11), ty: IrType::U16, seg_override: crate::common::types::AddressSpace::Default, volatile: false },
+                Instruction::Store { val: Operand::Value(Value(5)), ptr: Value(11), ty: IrType::U16, seg_override: crate::common::types::AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(ret)))),
             source_spans: Vec::new(),
@@ -1339,7 +1340,7 @@ mod tests {
                 Instruction::BinOp { dest: Value(4), op: IrBinOp::Sub, lhs: Operand::Value(Value(2)), rhs: Operand::Value(Value(3)), ty: IrType::I64 },
                 Instruction::Cast { dest: Value(5), src: Operand::Value(Value(4)), from_ty: IrType::I64, to_ty: IrType::U32 },
                 Instruction::Cast { dest: Value(6), src: Operand::Value(Value(4)), from_ty: IrType::I64, to_ty: IrType::U16 },
-                Instruction::Store { val: Operand::Value(Value(6)), ptr: Value(11), ty: IrType::U16, seg_override: crate::common::types::AddressSpace::Default, volatile: false },
+                Instruction::Store { val: Operand::Value(Value(6)), ptr: Value(11), ty: IrType::U16, seg_override: crate::common::types::AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
             source_spans: Vec::new(),

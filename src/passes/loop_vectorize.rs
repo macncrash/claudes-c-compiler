@@ -479,6 +479,7 @@ fn rewrite(func: &mut IrFunction, plan: Plan, next_label: &mut u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::common::types::AddressSpace;
 
     /// slide_hash's loop over `n` (Value 1) halfwords below Value 0, less
@@ -492,17 +493,17 @@ mod tests {
             Instruction::Phi { dest: Value(10), ty: IrType::U32, incoming: vec![(v(1), BlockId(0)), (v(20), BlockId(1))] },
             Instruction::Phi { dest: Value(11), ty: IrType::Ptr, incoming: vec![(v(0), BlockId(0)), (v(12), BlockId(1))] },
             Instruction::BinOp { dest: Value(12), op: IrBinOp::Sub, lhs: v(11), rhs: k(2), ty: IrType::I64 },
-            Instruction::Load { dest: Value(13), ptr: Value(12), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Load { dest: Value(13), ptr: Value(12), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             Instruction::Cast { dest: Value(14), src: v(13), from_ty: IrType::U16, to_ty: IrType::U32 },
             Instruction::Cmp { dest: Value(15), op: IrCmpOp::Uge, lhs: v(14), rhs: v(2), ty: IrType::U32 },
             Instruction::BinOp { dest: Value(16), op: IrBinOp::Sub, lhs: v(14), rhs: v(2), ty: IrType::U32 },
             Instruction::Select { dest: Value(17), cond: v(15), true_val: v(16), false_val: k(0), ty: IrType::U32 },
             Instruction::Cast { dest: Value(18), src: v(17), from_ty: IrType::U32, to_ty: IrType::U16 },
-            Instruction::Store { val: v(18), ptr: Value(12), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Store { val: v(18), ptr: Value(12), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             Instruction::BinOp { dest: Value(20), op: IrBinOp::Sub, lhs: v(10), rhs: k(1), ty: IrType::U32 },
         ];
         if extra_load {
-            body.insert(4, Instruction::Load { dest: Value(21), ptr: Value(12), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false });
+            body.insert(4, Instruction::Load { dest: Value(21), ptr: Value(12), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
         }
         func.blocks = vec![
             block(0, vec![], Terminator::Branch(BlockId(1))),

@@ -10,6 +10,7 @@
 //!   - _Complex long double: [f128 real, f128 imag] = 32 bytes, align 16 (x86-64)
 //!     24 bytes, align 4  (i686)
 
+use crate::common::types::AliasClass;
 use crate::frontend::parser::ast::{BinOp, Expr, UnaryOp};
 use crate::ir::reexports::{
     GlobalInit,
@@ -94,7 +95,7 @@ impl Lowerer {
             ptr,
             ty: comp_ty,
             seg_override: AddressSpace::Default,
-            volatile: false,
+            volatile: false, alias: AliasClass::ANY
         });
 
         // Store imag part at offset comp_size
@@ -106,7 +107,7 @@ impl Lowerer {
             ty: IrType::I8, // byte offset
         });
         self.emit(Instruction::Store { val: imag, ptr: imag_ptr, ty: comp_ty,
-         seg_override: AddressSpace::Default, volatile: false });
+         seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
     }
 
     /// Load the real part of a complex value from a pointer.
@@ -118,7 +119,7 @@ impl Lowerer {
             ptr,
             ty: comp_ty,
             seg_override: AddressSpace::Default,
-            volatile: false,
+            volatile: false, alias: AliasClass::ANY
         });
         Operand::Value(dest)
     }
@@ -140,7 +141,7 @@ impl Lowerer {
             ptr: imag_ptr,
             ty: comp_ty,
             seg_override: AddressSpace::Default,
-            volatile: false,
+            volatile: false, alias: AliasClass::ANY
         });
         Operand::Value(dest)
     }
@@ -872,12 +873,12 @@ impl Lowerer {
                 let packed = self.fresh_value();
                 if packs_cf_variadic && is_variadic_arg && !uses_packed_cf {
                     // RISC-V variadic: load as I64 (two packed F32s in one GP register)
-                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 , seg_override: AddressSpace::Default, volatile: false });
+                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::I64 , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                     new_vals.push(Operand::Value(packed));
                     new_types.push(IrType::I64);
                 } else {
                     // x86-64: load as F64 (two packed F32s in one XMM register)
-                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::F64 , seg_override: AddressSpace::Default, volatile: false });
+                    self.emit(Instruction::Load { dest: packed, ptr, ty: IrType::F64 , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                     new_vals.push(Operand::Value(packed));
                     new_types.push(IrType::F64);
                 }

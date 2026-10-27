@@ -167,6 +167,7 @@ fn low_bits_only(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst, Terminator, Value};
 
@@ -174,7 +175,7 @@ mod tests {
     /// that also takes `other`), extended in the loop.
     fn byte_phi(other: Operand) -> IrFunction {
         let v = |n| Operand::Value(Value(n));
-        let load = |dest| Instruction::Load { dest: Value(dest), ptr: Value(0), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false };
+        let load = |dest| Instruction::Load { dest: Value(dest), ptr: Value(0), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
         let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
         func.blocks = vec![
             BasicBlock { label: BlockId(0), instructions: vec![load(1)], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
@@ -213,7 +214,7 @@ mod tests {
                 Instruction::BinOp { dest: Value(4), op: IrBinOp::Shl, lhs: v(1), rhs: v(2), ty: IrType::I32 },
                 Instruction::BinOp { dest: Value(5), op: IrBinOp::Or, lhs: v(3), rhs: v(4), ty: IrType::I32 },
                 Instruction::Cast { dest: Value(6), src: v(5), from_ty: IrType::I32, to_ty: IrType::U16 },
-                Instruction::Store { val: v(6), ptr: Value(0), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Store { val: v(6), ptr: Value(0), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 use_,
             ], terminator: Terminator::CondBranch { cond: v(1), true_label: BlockId(0), false_label: BlockId(1) }, source_spans: Vec::new() },
             BasicBlock { label: BlockId(1), instructions: vec![], terminator: Terminator::Return(None), source_spans: Vec::new() },
@@ -227,7 +228,7 @@ mod tests {
             Instruction::BinOp { ty, .. } => ty,
             _ => unreachable!(),
         };
-        let store = Instruction::Store { val: Operand::Value(Value(3)), ptr: Value(0), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false };
+        let store = Instruction::Store { val: Operand::Value(Value(3)), ptr: Value(0), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
         let mut func = int_or(store);
         assert_eq!(elide_extensions(&mut func), 2);
         assert_eq!((ty(&func, 1), ty(&func, 2)), (IrType::U32, IrType::U32));

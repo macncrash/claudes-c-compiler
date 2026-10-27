@@ -202,6 +202,49 @@ pub enum AddressSpace {
     SegFs,
 }
 
+/// The type-based alias class of a memory access (C11 6.5p7): with strict
+/// aliasing, accesses of two different known classes never touch the same
+/// bytes in a program without undefined behaviour. Classes go by the
+/// accessed scalar type with signedness and same-size integer types merged
+/// (`int` and `unsigned`, `long` and `long long`); `ANY` (character types,
+/// aggregates, unions, bitfields, and accesses the compiler makes itself)
+/// may alias everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct AliasClass(pub u8);
+
+impl AliasClass {
+    pub const ANY: AliasClass = AliasClass(0);
+    pub const I16: AliasClass = AliasClass(1);
+    pub const I32: AliasClass = AliasClass(2);
+    pub const I64: AliasClass = AliasClass(3);
+    pub const I128: AliasClass = AliasClass(4);
+    pub const F32: AliasClass = AliasClass(5);
+    pub const F64: AliasClass = AliasClass(6);
+    pub const F128: AliasClass = AliasClass(7);
+    pub const PTR: AliasClass = AliasClass(8);
+
+    /// Whether this class describes an access of IR type ty (ANY fits all).
+    pub fn fits(self, ty: IrType) -> bool {
+        match self {
+            AliasClass::ANY => true,
+            AliasClass::F32 => ty == IrType::F32,
+            AliasClass::F64 => ty == IrType::F64,
+            AliasClass::F128 => ty == IrType::F128,
+            AliasClass::PTR => ty == IrType::Ptr,
+            AliasClass::I16 => ty.is_integer() && ty.size() == 2,
+            AliasClass::I32 => ty.is_integer() && ty.size() == 4,
+            AliasClass::I64 => ty.is_integer() && ty.size() == 8,
+            AliasClass::I128 => ty.is_integer() && ty.size() == 16,
+            _ => false,
+        }
+    }
+
+    /// Whether accesses of classes `self` and `other` may overlap.
+    pub fn may_alias(self, other: AliasClass) -> bool {
+        self == AliasClass::ANY || other == AliasClass::ANY || self == other
+    }
+}
+
 /// The type qualifiers that change how an object is accessed: its named
 /// address space and `volatile`. On a pointer type they qualify the
 /// pointed-to type; on an lvalue, the object itself.
@@ -212,11 +255,16 @@ pub enum AddressSpace {
 /// `pointer_const` is different: on a pointer type it says the pointer
 /// itself is const (`int *const p`). Only `_Generic` and `__typeof__` look
 /// at it, so equality and hashing ignore it and types compare as before.
+///
+/// `alias` is set only on an lvalue's qualifiers, to the class of the
+/// scalar it designates (see AliasClass); types carry ANY, and equality
+/// and hashing ignore it too.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AccessQuals {
     pub space: AddressSpace,
     pub volatile: bool,
     pub pointer_const: bool,
+    pub alias: AliasClass,
 }
 
 impl PartialEq for AccessQuals {
@@ -235,11 +283,11 @@ impl std::hash::Hash for AccessQuals {
 }
 
 impl AccessQuals {
-    pub const NONE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: false, pointer_const: false };
-    pub const VOLATILE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: true, pointer_const: false };
+    pub const NONE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: false, pointer_const: false, alias: AliasClass::ANY };
+    pub const VOLATILE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: true, pointer_const: false, alias: AliasClass::ANY };
 
     pub fn in_space(space: AddressSpace) -> Self {
-        AccessQuals { space, volatile: false, pointer_const: false }
+        AccessQuals { space, ..AccessQuals::NONE }
     }
 
     /// The qualifiers of an object reached through both `self` and `other`,
@@ -249,6 +297,7 @@ impl AccessQuals {
             space: if self.space == AddressSpace::Default { other.space } else { self.space },
             volatile: self.volatile || other.volatile,
             pointer_const: self.pointer_const || other.pointer_const,
+            alias: AliasClass::ANY,
         }
     }
 }

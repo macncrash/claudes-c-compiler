@@ -287,6 +287,17 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     }
 }
 
+/// Without strict aliasing (-fno-strict-aliasing, -O0, a translation unit
+/// using `may_alias`, or CCC_DISABLE_PASSES=tbaa), every access may alias
+/// any other: lowering's alias classes are dropped.
+pub(crate) fn clear_alias_classes(module: &mut IrModule) {
+    for inst in module.functions.iter_mut().flat_map(|f| &mut f.blocks).flat_map(|b| &mut b.instructions) {
+        if let Instruction::Load { alias, .. } | Instruction::Store { alias, .. } = inst {
+            *alias = crate::common::types::AliasClass::ANY;
+        }
+    }
+}
+
 /// Copies of exactly a scalar local's size into or out of it become a load
 /// and a store, so the first mem2reg promotes the local (`memcpy(&v, p, 4)`,
 /// an unaligned read). Only where unaligned accesses are fine.

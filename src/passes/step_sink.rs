@@ -168,6 +168,7 @@ pub(crate) fn sink_addresses(func: &mut IrFunction) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrCmpOp, IrConst, Terminator};
 
@@ -178,7 +179,7 @@ mod tests {
             Instruction::Phi { dest: Value(10), ty: IrType::I64, incoming: vec![(Operand::Const(IrConst::I64(0)), BlockId(0)), (v(11), BlockId(1))] },
             Instruction::BinOp { dest: Value(11), op: IrBinOp::Add, lhs: v(10), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 },
             Instruction::GetElementPtr { dest: Value(12), base: Value(0), offset: v(10), ty: IrType::Ptr },
-            Instruction::Load { dest: Value(13), ptr: Value(12), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Load { dest: Value(13), ptr: Value(12), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             Instruction::Cmp { dest: Value(14), op: IrCmpOp::Ne, lhs: v(11), rhs: v(1), ty: IrType::I64 },
         ];
         if extra_use {
@@ -213,9 +214,9 @@ mod tests {
         let v = |n| Operand::Value(Value(n));
         let mut body = vec![
             Instruction::GetElementPtr { dest: Value(10), base: Value(0), offset: v(1), ty: IrType::Ptr },
-            Instruction::Load { dest: Value(11), ptr: Value(2), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Load { dest: Value(11), ptr: Value(2), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             Instruction::BinOp { dest: Value(12), op: IrBinOp::LShr, lhs: v(11), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 },
-            Instruction::Store { val: v(12), ptr: Value(10), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Store { val: v(12), ptr: Value(10), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
         ];
         if call {
             let info = CallInfo {

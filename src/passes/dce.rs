@@ -346,6 +346,7 @@ fn has_side_effects(inst: &Instruction) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, Terminator, Value};
 
@@ -364,8 +365,8 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(4)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
-                Instruction::Load { dest: Value(2), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::Load { dest: Value(2), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),

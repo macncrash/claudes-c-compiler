@@ -659,6 +659,7 @@ fn is_loop_invariant(val_id: u32, loop_body: &FxHashSet<usize>, func: &IrFunctio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Terminator};
 
@@ -818,7 +819,7 @@ mod tests {
                     ptr: Value(7),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::BinOp {
                     dest: Value(9),

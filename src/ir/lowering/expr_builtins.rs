@@ -7,6 +7,7 @@
 //! - expr_builtins_overflow.rs: overflow-checking arithmetic
 //! - expr_builtins_fpclass.rs: FP classification (fpclassify, isnan, isinf, etc.)
 
+use crate::common::types::AliasClass;
 use crate::frontend::parser::ast::Expr;
 use crate::frontend::sema::builtins::{self, BuiltinKind, BuiltinIntrinsic};
 use crate::ir::reexports::{
@@ -843,14 +844,14 @@ impl Lowerer {
         };
         let alloca = self.fresh_value();
         self.emit(Instruction::Alloca { dest: alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false });
-        self.emit(Instruction::Store { val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Store { val: real_val, ptr: alloca, ty: comp_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
         let imag_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
             dest: imag_ptr, base: alloca,
             offset: Operand::Const(IrConst::I64(comp_size as i64)),
             ty: IrType::I8,
         });
-        self.emit(Instruction::Store { val: imag_val, ptr: imag_ptr, ty: comp_ty, seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Store { val: imag_val, ptr: imag_ptr, ty: comp_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
         Some(Operand::Value(alloca))
     }
 

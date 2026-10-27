@@ -310,6 +310,7 @@ fn set_dest(inst: &mut Instruction, v: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::common::types::IrType;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, IrConst};
 
@@ -344,7 +345,7 @@ mod tests {
         let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
         let v = |n| Operand::Value(Value(n));
         let bound = if load {
-            Instruction::Load { dest: Value(20), ptr: Value(1), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false }
+            Instruction::Load { dest: Value(20), ptr: Value(1), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY }
         } else {
             Instruction::BinOp { dest: Value(20), op: IrBinOp::Add, lhs: v(1), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 }
         };

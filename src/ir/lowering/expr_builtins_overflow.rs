@@ -9,6 +9,7 @@
 //! variants (GCC 7+) which return 1 if the operation would overflow type T,
 //! without storing the result.
 
+use crate::common::types::AliasClass;
 use crate::frontend::parser::ast::{Expr};
 use crate::ir::reexports::{
     Instruction,
@@ -117,7 +118,7 @@ impl Lowerer {
 
                 // Store the truncated result
                 self.emit(Instruction::Store { val: Operand::Value(truncated), ptr: result_ptr, ty: result_ir_ty,
-                 seg_override: AddressSpace::Default, volatile: false });
+                 seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
                 Some(Operand::Value(overflow))
             } else if all_operands_fit && compute_ty.size() == result_ir_ty.size() && compute_ty.is_signed() && !is_signed {
@@ -161,7 +162,7 @@ impl Lowerer {
                 // Store the result (reinterpreted as unsigned)
                 let unsigned_result = self.emit_cast_val(Operand::Value(signed_result), compute_ty, result_ir_ty);
                 self.emit(Instruction::Store { val: Operand::Value(unsigned_result), ptr: result_ptr, ty: result_ir_ty,
-                 seg_override: AddressSpace::Default, volatile: false });
+                 seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
                 Some(Operand::Value(overflow))
             } else {
@@ -187,7 +188,7 @@ impl Lowerer {
                 };
 
                 self.emit(Instruction::Store { val: Operand::Value(result), ptr: result_ptr, ty: result_ir_ty,
-                 seg_override: AddressSpace::Default, volatile: false });
+                 seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
                 Some(Operand::Value(overflow))
             }
@@ -208,7 +209,7 @@ impl Lowerer {
 
             // Store the result
             self.emit(Instruction::Store { val: Operand::Value(result), ptr: result_ptr, ty: result_ir_ty,
-             seg_override: AddressSpace::Default, volatile: false });
+             seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
             Some(Operand::Value(overflow))
         }

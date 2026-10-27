@@ -17,8 +17,9 @@
 //! the end of that one, and a block with several gets a phi of what each
 //! predecessor holds at its end (when all of them hold something). Anything
 //! that may write the location stops the walk: a store through another
-//! root or overlapping it, a call that may write memory, atomics, inline
-//! asm. A walk that comes back to a block it is still answering for (a
+//! root or overlapping it (but not, with strict aliasing, one of another
+//! alias class than the load's), a call that may write memory, atomics,
+//! inline asm. A walk that comes back to a block it is still answering for (a
 //! loop) fails, and at most MAX_STEPS blocks are entered per function and
 //! MAX_SCAN instructions looked at in each.
 //! Values are found on the unchanged function and applied afterwards.
@@ -37,7 +38,7 @@
 //!       %e = cast U16->I32 %v      =>      %e = copy %w
 
 use crate::common::fx_hash::FxHashMap;
-use crate::common::types::{AddressSpace, IrType};
+use crate::common::types::{AddressSpace, AliasClass, IrType};
 use crate::ir::analysis;
 use crate::ir::reexports::{BlockId, Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value};
 use super::gvn::pointer_locations;
@@ -49,9 +50,10 @@ const MAX_STEPS: usize = 4096;
 /// Most instructions looked at walking back through one block.
 const MAX_SCAN: usize = 256;
 
-/// A location: root pointer, byte offset, type, and for a narrow one, the
-/// wide type whose truncations it is followed through (see above).
-type Loc = (u32, i64, IrType, Option<IrType>);
+/// A location: root pointer, byte offset, type, for a narrow one the wide
+/// type whose truncations it is followed through (see above), and the
+/// alias class of the load looking for it.
+type Loc = (u32, i64, IrType, Option<IrType>, AliasClass);
 /// A phi to add: block, dest, type, incoming.
 type NewPhi = (usize, Value, IrType, Vec<(Operand, BlockId)>);
 
@@ -102,9 +104,9 @@ struct Finder<'a> {
 }
 
 impl Finder<'_> {
-    fn location(&self, ptr: Value, ty: IrType) -> Loc {
+    fn location(&self, ptr: Value, ty: IrType, alias: AliasClass) -> Loc {
         let (root, off) = self.locs.get(&ptr.0).copied().unwrap_or((ptr, 0));
-        (root.0, off, ty, None)
+        (root.0, off, ty, None, alias)
     }
 
     /// The wide value a store of `val` leaves at a narrow location followed
@@ -141,22 +143,24 @@ impl Finder<'_> {
     /// location holding a known value, Some(None) when it may write it,
     /// None when it leaves it alone.
     fn effect(&mut self, inst: &Instruction, loc: Loc) -> Option<Option<Operand>> {
-        let (root, off, ty, wide) = loc;
+        let (root, off, ty, wide, class) = loc;
         let apart = |o: i64, t: IrType| o + t.size() as i64 <= off || off + ty.size() as i64 <= o;
         match inst {
-            Instruction::Load { dest, ptr, ty: t, volatile, seg_override } => {
-                let (r, o, _, _) = self.location(*ptr, *t);
+            Instruction::Load { dest, ptr, ty: t, volatile, seg_override, .. } => {
+                let (r, o, ..) = self.location(*ptr, *t, class);
                 // (A narrow load's wide value is not at hand: unknown.)
                 (r == root && o == off && *t == ty && plain(t, *volatile, seg_override))
                     .then_some(if wide.is_none() { Some(Operand::Value(*dest)) } else { None })
             }
-            Instruction::Store { val, ptr, ty: t, volatile, seg_override } => {
-                let (r, o, _, _) = self.location(*ptr, *t);
+            Instruction::Store { val, ptr, ty: t, volatile, seg_override, alias } => {
+                let (r, o, ..) = self.location(*ptr, *t, class);
                 if let (Some(w), true) = (wide, r == root && o == off && *t == ty && !*volatile && *seg_override == AddressSpace::Default) {
                     Some(self.widened(val, w))
                 } else if r == root && o == off && *t == ty && plain(t, *volatile, seg_override) {
                     Some(Some(*val))
-                } else if r == root && apart(o, *t) {
+                } else if (r == root && apart(o, *t)) || !alias.may_alias(class) {
+                    // (Strict aliasing: a store of another type cannot write
+                    // what the load reads.)
                     None
                 } else {
                     Some(None)
@@ -307,16 +311,16 @@ fn load_phis(func: &mut IrFunction, mr: &ModRef) -> usize {
     let mut widened: Vec<(Value, Operand)> = Vec::new();
     for b in 0..n {
         for (i, inst) in func.blocks[b].instructions.iter().enumerate() {
-            let Instruction::Load { dest, ptr, ty, volatile, seg_override } = inst else { continue };
+            let Instruction::Load { dest, ptr, ty, volatile, seg_override, alias } = inst else { continue };
             if plain(ty, *volatile, seg_override) {
-                let loc = finder.location(*ptr, *ty);
+                let loc = finder.location(*ptr, *ty, *alias);
                 if let Some(v) = finder.before(b, i, loc) {
                     found.push((b, i, v));
                 }
             } else if !*volatile && *seg_override == AddressSpace::Default && ty.is_integer() && ty.size() <= 2 {
                 let Some(wide) = wide_reads(*dest, *ty) else { continue };
-                let (root, off, _, _) = finder.location(*ptr, *ty);
-                if let Some(v) = finder.before(b, i, (root, off, *ty, Some(wide))) {
+                let (root, off, ..) = finder.location(*ptr, *ty, *alias);
+                if let Some(v) = finder.before(b, i, (root, off, *ty, Some(wide), *alias)) {
                     for u in uses[dest.0 as usize].iter().flatten() {
                         if let Instruction::Cast { dest: e, .. } = func.blocks[u.0].instructions[u.1] {
                             widened.push((e, v));
@@ -374,6 +378,7 @@ fn load_phis(func: &mut IrFunction, mr: &ModRef) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::ir::reexports::BasicBlock;
 
     fn field(dest: u32, base: u32, off: i64) -> Instruction {
@@ -381,11 +386,11 @@ mod tests {
     }
 
     fn load(dest: u32, ptr: u32) -> Instruction {
-        Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false }
+        Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY }
     }
 
     fn store(val: u32, ptr: u32, ty: IrType) -> Instruction {
-        Instruction::Store { val: Operand::Value(Value(val)), ptr: Value(ptr), ty, seg_override: AddressSpace::Default, volatile: false }
+        Instruction::Store { val: Operand::Value(Value(val)), ptr: Value(ptr), ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY }
     }
 
     fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
@@ -454,7 +459,7 @@ mod tests {
         let trunc = |dest, src| Instruction::Cast { dest: Value(dest), src: v(src), from_ty: IrType::I32, to_ty: IrType::U16 };
         let mut merge = vec![
             field(12, 0, 8),
-            Instruction::Load { dest: Value(20), ptr: Value(12), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Load { dest: Value(20), ptr: Value(12), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             Instruction::Cast { dest: Value(21), src: v(20), from_ty: IrType::U16, to_ty: IrType::I32 },
         ];
         if compared {

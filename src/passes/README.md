@@ -16,10 +16,11 @@ run all passes to maximize test coverage of the optimizer and catch issues early
 2. [Phase Structure](#phase-structure)
 3. [Dirty Tracking and Iteration Strategy](#dirty-tracking-and-iteration-strategy)
 4. [Shared CFG Analysis](#shared-cfg-analysis)
-5. [Pass Descriptions](#pass-descriptions)
-6. [Pass Dependency Graph](#pass-dependency-graph)
-7. [Disabling Individual Passes](#disabling-individual-passes)
-8. [Files](#files)
+5. [Strict Aliasing](#strict-aliasing)
+6. [Pass Descriptions](#pass-descriptions)
+7. [Pass Dependency Graph](#pass-dependency-graph)
+8. [Disabling Individual Passes](#disabling-individual-passes)
+9. [Files](#files)
 
 ---
 
@@ -315,6 +316,34 @@ This sharing is sound because:
 For single-block functions, only GVN runs (via a fast path that skips CFG
 analysis entirely), since LICM and IVSR require at least two blocks to form a
 loop.
+
+---
+
+## Strict Aliasing
+
+C forbids reading an object through an lvalue of an unrelated type (C11
+6.5p7), so a store of one type cannot change memory a load of another type
+reads in a program without undefined behaviour. Lowering gives each load and
+store an alias class (`AliasClass`, the `alias` field of `Load`/`Store`): the
+lvalue's scalar type, with signedness and same-size integer types merged
+(`int` and `unsigned`, `long` and `long long`), separate classes for `float`,
+`double`, `long double` and pointers. Everything else is `ANY`, which aliases
+every class: character types, aggregates, vectors, complex values, bitfields,
+anything reached through a union member (punning through a union is allowed),
+and every access the compiler makes itself (struct copies, ABI moves, va_arg,
+temporaries, the loads and stores passes create). A class that does not match
+the access's IR type (a scalar read in pieces) also becomes `ANY`.
+
+Three places use the classes: GVN keeps cached loads and forwardable stores of
+other classes across a store; load_phi walks past a store of another class;
+loop_hoist hoists a load the loop writes only with stores of other classes.
+
+Classes are dropped before optimization (every access is then `ANY`) with
+`-fno-strict-aliasing`, at `-O0` (strict aliasing is on by default from -O1,
+as in GCC), in a translation unit that mentions `may_alias` or
+`no-strict-aliasing` (neither the attribute nor a function's own
+`optimize("no-strict-aliasing")` is tracked), and with
+`CCC_DISABLE_PASSES=tbaa`.
 
 ---
 
@@ -775,9 +804,14 @@ Load value numbers use a generation counter: any memory-clobbering instruction
 bumps the generation, instantly invalidating all cached load entries, except
 that a store to a constant offset from a root carries over the loads and
 forwardable stores at that root whose bytes it cannot overlap (another field
-of the same struct: `s->bi_valid` read around a store to `s->bi_buf`). At block
-merge points (blocks with >1 predecessor), the generation is also bumped to
-conservatively invalidate inherited load entries.
+of the same struct: `s->bi_valid` read around a store to `s->bi_buf`). With
+strict aliasing (see above), a store of a known alias class also carries over
+the latest entries of the other known classes (at most 16 of each, found
+through a per-class list kept like the per-root ones); an entry carried over
+that way then serves only loads of its own class, since a byte access, say,
+may read what the store wrote. At block merge points (blocks with >1
+predecessor), the generation is also bumped to conservatively invalidate
+inherited load entries.
 
 **Store-to-load forwarding.** When a Store writes value V to pointer P, a
 subsequent Load from P (matching value number and type, same generation) is
@@ -913,8 +947,9 @@ top of a block with one predecessor the walk continues at that block's end,
 and a block with several gets a phi of the value each holds at its end, when
 all do (no phi when they all hold the same value). Anything that may write
 the location stops the walk: a store through another root or overlapping the
-bytes, a call mod_ref cannot show writes nothing, a memcpy, atomics, inline
-asm. A loop header's own back edge can take part (a field never written in
+bytes (unless strict aliasing says a store of its class cannot write what the
+load reads), a call mod_ref cannot show writes nothing, a memcpy, atomics,
+inline asm. A loop header's own back edge can take part (a field never written in
 the loop is the value from before it); a walk that comes back to a block it is
 still answering for gives up. At most 4096 blocks are entered per function and
 256 instructions looked at in each. compress_block keeps `bi_valid` in a
@@ -1130,7 +1165,11 @@ loop_hoist then moves loads every iteration makes to the guard's edge into
 the loop. GVN has run by then, so a load the guard already makes (with
 nothing since that may write memory) is reused by a copy instead:
 longest_match loaded `s->window` before its loop for the scan pointer and
-again for the hoisted `s->window + cur_match`.
+again for the hoisted `s->window + cur_match`. With strict aliasing, stores in
+the loop of another alias class do not hold a load back: deflate's hash
+insertion loop stores to the `ush` arrays `s->head` and `s->prev`, and
+`s->window`, `s->hash_mask`, `s->w_mask`, `s->head` and `s->prev` are loaded
+once before it.
 
 ### ext_elide -- Extensions Loads Already Made
 
@@ -1475,7 +1514,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`.
+`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, and `tbaa` (strict aliasing; see above).
 
 Setting the variable to `all` skips the entire optimization pipeline.
 

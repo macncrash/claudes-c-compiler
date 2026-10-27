@@ -347,6 +347,7 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Terminator};
 
@@ -375,7 +376,7 @@ mod tests {
                 Instruction::Cast { dest: Value(22), src: v(21), from_ty: IrType::I32, to_ty: IrType::I64 },
                 Instruction::BinOp { dest: Value(23), op: IrBinOp::Shl, lhs: v(22), rhs: Operand::Const(IrConst::I64(2)), ty: IrType::I64 },
                 Instruction::GetElementPtr { dest: Value(24), base: Value(0), offset: v(23), ty: IrType::Ptr },
-                Instruction::Load { dest: Value(25), ptr: Value(24), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Load { dest: Value(25), ptr: Value(24), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Cmp { dest: Value(26), op: IrCmpOp::Slt, lhs: v(25), rhs: Operand::Const(IrConst::I32(0)), ty: IrType::I32 },
             ], Terminator::CondBranch { cond: v(26), true_label: BlockId(2), false_label: BlockId(3) }),
             block(3, vec![
@@ -420,9 +421,9 @@ mod tests {
                 Instruction::BinOp { dest: Value(11), op: IrBinOp::Add, lhs: v(10), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::U32 },
                 Instruction::Cast { dest: Value(12), src: v(10), from_ty: IrType::U32, to_ty: IrType::I64 },
                 Instruction::GetElementPtr { dest: Value(13), base: Value(0), offset: v(12), ty: IrType::Ptr },
-                Instruction::Load { dest: Value(14), ptr: Value(13), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Load { dest: Value(14), ptr: Value(13), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Cast { dest: Value(17), src: v(10), from_ty: IrType::U32, to_ty: IrType::I64 },
-                Instruction::Load { dest: Value(15), ptr: Value(1), ty: IrType::U32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Load { dest: Value(15), ptr: Value(1), ty: IrType::U32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Cmp { dest: Value(16), op, lhs: v(11), rhs: v(15), ty: IrType::U32 },
             ], Terminator::CondBranch { cond: v(16), true_label: BlockId(1), false_label: BlockId(2) }),
             block(2, vec![], Terminator::Return(Some(v(17)))),

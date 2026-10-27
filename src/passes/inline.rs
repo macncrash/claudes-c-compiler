@@ -13,6 +13,7 @@ use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, GlobalInit, IrFunction, IrModule, Instruction, Operand,
     Terminator, Value, IrConst, IrBinOp, IrParam,
 };
+use crate::common::types::AliasClass;
 use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::types::{IrType, AddressSpace};
 use std::collections::HashMap;
@@ -1625,7 +1626,7 @@ fn inline_call_site(
                 ptr: param_alloca_info[i].0,
                 ty: store_ty,
                 seg_override: AddressSpace::Default,
-                volatile: false,
+                volatile: false, alias: AliasClass::ANY
             });
             if has_spans {
                 entry_block.source_spans.insert(insert_pos, crate::common::source::Span::dummy());
@@ -1833,19 +1834,21 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             size: remap_operand(size, vo),
             align: *align,
         },
-        Instruction::Store { val, ptr, ty, seg_override, volatile } => Instruction::Store {
+        Instruction::Store { val, ptr, ty, seg_override, volatile, alias } => Instruction::Store {
             val: remap_operand(val, vo),
             ptr: remap_value(*ptr, vo),
             ty: *ty,
             seg_override: *seg_override,
             volatile: *volatile,
+            alias: *alias,
         },
-        Instruction::Load { dest, ptr, ty, seg_override, volatile } => Instruction::Load {
+        Instruction::Load { dest, ptr, ty, seg_override, volatile, alias } => Instruction::Load {
             dest: remap_value(*dest, vo),
             ptr: remap_value(*ptr, vo),
             ty: *ty,
             seg_override: *seg_override,
             volatile: *volatile,
+            alias: *alias,
         },
         Instruction::BinOp { dest, op, lhs, rhs, ty } => Instruction::BinOp {
             dest: remap_value(*dest, vo),
@@ -2065,18 +2068,23 @@ fn format_operand(op: &Operand) -> String {
     }
 }
 
+/// An access's alias class, when it has one (" !tbaa2").
+fn format_alias(alias: AliasClass) -> String {
+    if alias == AliasClass::ANY { String::new() } else { format!(" !tbaa{}", alias.0) }
+}
+
 fn format_instruction(inst: &Instruction) -> String {
     match inst {
         Instruction::Alloca { dest, ty, size, align, .. } => {
             format!("v{} = alloca {:?} size={} align={}", dest.0, ty, size, align)
         }
-        Instruction::Store { val, ptr, ty, volatile, .. } => {
+        Instruction::Store { val, ptr, ty, volatile, alias, .. } => {
             let v = if *volatile { "volatile " } else { "" };
-            format!("store {}{:?} {} -> v{}", v, ty, format_operand(val), ptr.0)
+            format!("store {}{:?} {} -> v{}{}", v, ty, format_operand(val), ptr.0, format_alias(*alias))
         }
-        Instruction::Load { dest, ptr, ty, volatile, .. } => {
+        Instruction::Load { dest, ptr, ty, volatile, alias, .. } => {
             let v = if *volatile { "volatile " } else { "" };
-            format!("v{} = load {}{:?} v{}", dest.0, v, ty, ptr.0)
+            format!("v{} = load {}{:?} v{}{}", dest.0, v, ty, ptr.0, format_alias(*alias))
         }
         Instruction::BinOp { dest, op, lhs, rhs, ty } => {
             format!("v{} = {:?} {:?} {}, {}", dest.0, op, ty, format_operand(lhs), format_operand(rhs))

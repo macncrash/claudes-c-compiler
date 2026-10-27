@@ -15,10 +15,12 @@
 //! - Cast (type-to-type conversions)
 //! - GetElementPtr (base + offset address computation)
 //! - Load (redundant load elimination within dominator scope, invalidated
-//!   by stores, calls, and other memory-clobbering instructions)
+//!   by stores, calls, and other memory-clobbering instructions; a store
+//!   leaves what it cannot overlap: other fields of its struct, and with
+//!   strict aliasing loads and stores of other alias classes)
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::{AddressSpace, IrType};
+use crate::common::types::{AddressSpace, AliasClass, IrType};
 use crate::ir::reexports::{
     ConstHashKey,
     Instruction,
@@ -80,7 +82,31 @@ struct StoreFwdKey {
 /// A forwardable store: (stored operand, load generation, local generation,
 /// whether the address is local-only). Valid while the load generation is
 /// current, or for a local-only address while the local generation is.
-type StoreFwdEntry = (Operand, u32, u32, bool);
+type StoreFwdEntry = (Operand, u32, u32, bool, Tag);
+
+/// An entry's alias class, and whether it is valid only for loads of that
+/// class: one kept across a store of another class (strict aliasing) is.
+/// (An access of class ANY, such as a byte copy, may read what that store
+/// wrote.)
+type Tag = (AliasClass, bool);
+
+/// A cached load: (value, load generation, tag).
+type LoadEntry = (Value, u32, Tag);
+
+/// The most loads, and stores, of one alias class a store of another class
+/// carries over.
+const MAX_CLASS_KEPT: usize = 16;
+
+/// The key under which by_root lists the entries of an alias class (value
+/// numbers stay far below it).
+fn class_list(class: AliasClass) -> u32 {
+    u32::MAX - 256 + class.0 as u32
+}
+
+/// Whether an entry tagged tag serves a load of class class.
+fn serves(tag: Tag, class: AliasClass) -> bool {
+    !tag.1 || tag.0 == class
+}
 
 /// Mutable state for the GVN pass, threaded through the dominator-tree DFS.
 ///
@@ -99,7 +125,7 @@ struct GvnState {
     /// Load expression -> (canonical value, generation). Separated from
     /// `expr_to_value` so loads can be invalidated independently via
     /// generation bumping.
-    load_expr_to_value: FxHashMap<ExprKey, (Value, u32)>,
+    load_expr_to_value: FxHashMap<ExprKey, LoadEntry>,
     /// Generation counter for O(1) load CSE invalidation. When a memory-
     /// clobbering instruction is encountered, bump this counter; cached
     /// load entries with older generations are considered stale.
@@ -120,7 +146,7 @@ struct GvnState {
     /// Rollback log for `expr_to_value`: (key, previous_value).
     rollback_log: Vec<(ExprKey, Option<Value>)>,
     /// Rollback log for `load_expr_to_value`: (key, previous_entry).
-    load_rollback_log: Vec<(ExprKey, Option<(Value, u32)>)>,
+    load_rollback_log: Vec<(ExprKey, Option<LoadEntry>)>,
     /// Rollback log for `store_fwd_map`: (key, previous_entry).
     store_fwd_rollback_log: Vec<(StoreFwdKey, Option<StoreFwdEntry>)>,
     /// Rollback log for `value_numbers`: (index, previous_vn).
@@ -197,26 +223,67 @@ impl GvnState {
         self.by_root.entry(root).or_default()
     }
 
-    fn note_load_root(&mut self, key: &ExprKey) {
+    fn note_load_root(&mut self, key: &ExprKey, class: AliasClass) {
         if let ExprKey::Load { ptr: VNOperand::ValueNum(r), .. } = key {
             let loads = &mut self.root_keys(*r).0;
             loads.push(key.clone());
             trim_keys(loads);
         }
+        if class != AliasClass::ANY {
+            let loads = &mut self.root_keys(class_list(class)).0;
+            loads.push(key.clone());
+            trim_keys(loads);
+        }
     }
 
-    fn note_store_root(&mut self, key: &StoreFwdKey) {
+    fn note_store_root(&mut self, key: &StoreFwdKey, class: AliasClass) {
         if let VNOperand::ValueNum(r) = key.ptr_vn {
             let stores = &mut self.root_keys(r).1;
             stores.push(key.clone());
             trim_keys(stores);
         }
+        if class != AliasClass::ANY {
+            let stores = &mut self.root_keys(class_list(class)).1;
+            stores.push(key.clone());
+            trim_keys(stores);
+        }
+    }
+
+    /// The current entries of known alias classes other than class, which
+    /// a store of class class cannot write without undefined behaviour;
+    /// each is then valid only for loads of its own class.
+    #[allow(clippy::type_complexity)]
+    fn other_class_entries(&mut self, class: AliasClass) -> (Vec<(ExprKey, Value, Tag)>, Vec<(StoreFwdKey, StoreFwdEntry)>) {
+        let gen = self.load_generation;
+        let (mut loads, mut stores) = (Vec::new(), Vec::new());
+        for c in 1..=AliasClass::PTR.0 {
+            let c = AliasClass(c);
+            if c == class {
+                continue;
+            }
+            let Some((lk, sk)) = self.by_root.get(&class_list(c)) else { continue };
+            for key in lk.iter().rev().take(MAX_CLASS_KEPT) {
+                if let Some(&(v, g, t)) = self.load_expr_to_value.get(key) {
+                    if g == gen && t.0 == c {
+                        loads.push((key.clone(), v, (c, true)));
+                    }
+                }
+            }
+            for key in sk.iter().rev().take(MAX_CLASS_KEPT) {
+                if let Some(&e) = self.store_fwd_map.get(key) {
+                    if e.1 == gen && e.4.0 == c {
+                        stores.push((key.clone(), (e.0, e.1, e.2, e.3, (c, true))));
+                    }
+                }
+            }
+        }
+        (loads, stores)
     }
 
     /// The current load and store entries at the root of `ptr` whose bytes
     /// an access of `size` bytes at `ptr` cannot overlap.
     #[allow(clippy::type_complexity)]
-    fn disjoint_entries(&mut self, ptr: Value, size: i64) -> (Vec<(ExprKey, Value)>, Vec<(StoreFwdKey, StoreFwdEntry)>) {
+    fn disjoint_entries(&mut self, ptr: Value, size: i64) -> (Vec<(ExprKey, Value, Tag)>, Vec<(StoreFwdKey, StoreFwdEntry)>) {
         let (VNOperand::ValueNum(root), off) = self.location(ptr) else { return (Vec::new(), Vec::new()) };
         if !self.by_root.contains_key(&root) {
             return (Vec::new(), Vec::new());
@@ -228,9 +295,9 @@ impl GvnState {
         let mut seen: FxHashSet<ExprKey> = FxHashSet::default();
         for key in loads.into_iter().rev().take(MAX_KEPT) {
             let ExprKey::Load { off: o, ty, .. } = key else { continue };
-            if let Some(&(v, g)) = self.load_expr_to_value.get(&key) {
+            if let Some(&(v, g, t)) = self.load_expr_to_value.get(&key) {
                 if g == gen && apart(o, ty) && seen.insert(key.clone()) {
-                    kept_loads.push((key, v));
+                    kept_loads.push((key, v, t));
                 }
             }
         }
@@ -249,20 +316,20 @@ impl GvnState {
         // kept, so a run of stores to one root (a large struct copied field
         // by field) stays linear.
         let lists = self.by_root.entry(root).or_default();
-        lists.0.extend(kept_loads.iter().rev().map(|(k, _)| k.clone()));
+        lists.0.extend(kept_loads.iter().rev().map(|(k, ..)| k.clone()));
         lists.1.extend(kept_stores.iter().rev().map(|(k, _)| k.clone()));
         (kept_loads, kept_stores)
     }
 
     /// Carry entries kept across a store into the generation after it.
     #[allow(clippy::type_complexity)]
-    fn renew(&mut self, (loads, stores): (Vec<(ExprKey, Value)>, Vec<(StoreFwdKey, StoreFwdEntry)>)) {
-        for (key, v) in loads {
-            let old = self.load_expr_to_value.insert(key.clone(), (v, self.load_generation));
+    fn renew(&mut self, (loads, stores): (Vec<(ExprKey, Value, Tag)>, Vec<(StoreFwdKey, StoreFwdEntry)>)) {
+        for (key, v, t) in loads {
+            let old = self.load_expr_to_value.insert(key.clone(), (v, self.load_generation, t));
             self.load_rollback_log.push((key, old));
         }
-        for (key, (op, _, _, local)) in stores {
-            let old = self.store_fwd_map.insert(key.clone(), (op, self.load_generation, self.local_generation, local));
+        for (key, (op, _, _, local, t)) in stores {
+            let old = self.store_fwd_map.insert(key.clone(), (op, self.load_generation, self.local_generation, local, t));
             self.store_fwd_rollback_log.push((key, old));
         }
     }
@@ -364,7 +431,7 @@ impl GvnState {
             // - Float, long double, i128 types: use different register paths in
             //   codegen that complicate Copy instruction handling
             // - AtomicLoad: has ordering semantics (falls through to _ => None)
-            Instruction::Load { dest, ptr, ty, seg_override, volatile } => {
+            Instruction::Load { dest, ptr, ty, seg_override, volatile, .. } => {
                 if *volatile || *seg_override != AddressSpace::Default {
                     return None;
                 }
@@ -794,11 +861,21 @@ fn process_block(
             // A store to a constant offset from a root leaves the loads and
             // stores at other offsets from that same root, which it cannot
             // overlap.
-            let kept = match &inst {
+            let mut kept = match &inst {
                 Instruction::Store { ptr, ty, volatile: false, seg_override: AddressSpace::Default, .. } =>
                     state.disjoint_entries(*ptr, ty.size() as i64),
                 _ => (Vec::new(), Vec::new()),
             };
+            // With strict aliasing, nor those of other types.
+            if let Instruction::Store { alias, volatile: false, seg_override: AddressSpace::Default, .. } = &inst {
+                if *alias != AliasClass::ANY {
+                    let (loads, stores) = state.other_class_entries(*alias);
+                    let have: FxHashSet<ExprKey> = kept.0.iter().map(|(k, ..)| k.clone()).collect();
+                    kept.0.extend(loads.into_iter().filter(|(k, ..)| !have.contains(k)));
+                    let have: FxHashSet<StoreFwdKey> = kept.1.iter().map(|(k, _)| k.clone()).collect();
+                    kept.1.extend(stores.into_iter().filter(|(k, _)| !have.contains(k)));
+                }
+            }
             state.load_generation += 1;
             if !matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }) {
                 state.local_generation += 1;
@@ -816,15 +893,15 @@ fn process_block(
         // forwarding a ParamRef through an escaped alloca is unsound when an
         // aliased pointer may write to the same slot.
         if is_forwardable_store(&inst) {
-            if let Instruction::Store { val, ptr, ty, .. } = &inst {
+            if let Instruction::Store { val, ptr, ty, alias, .. } = &inst {
                 if !state.escaped_param_allocas.contains(&ptr.0) {
                     let (ptr_vn, off) = state.location(*ptr);
                     let fwd_key = StoreFwdKey { ptr_vn, off, ty: *ty };
                     let fwd_key_for_log = fwd_key.clone();
                     let local = state.local_only.contains(&ptr.0);
-                    let entry = (*val, state.load_generation, state.local_generation, local);
+                    let entry = (*val, state.load_generation, state.local_generation, local, (*alias, false));
                     let old_val = state.store_fwd_map.insert(fwd_key, entry);
-                    state.note_store_root(&fwd_key_for_log);
+                    state.note_store_root(&fwd_key_for_log, *alias);
                     state.store_fwd_rollback_log.push((fwd_key_for_log, old_val));
                 }
             }
@@ -833,6 +910,10 @@ fn process_block(
             continue;
         }
 
+        let load_class = match &inst {
+            Instruction::Load { alias, .. } => *alias,
+            _ => AliasClass::ANY,
+        };
         match state.make_expr_key(&inst) {
             Some((expr_key, dest)) => {
                 let is_load = expr_key.is_load();
@@ -842,8 +923,9 @@ fn process_block(
                 if is_load {
                     if let ExprKey::Load { ptr: ref ptr_vn, off, ty } = expr_key {
                         let fwd_key = StoreFwdKey { ptr_vn: ptr_vn.clone(), off, ty };
-                        if let Some(&(stored_op, gen, local_gen, local)) = state.store_fwd_map.get(&fwd_key) {
-                            if gen == state.load_generation || (local && local_gen == state.local_generation) {
+                        if let Some(&(stored_op, gen, local_gen, local, tag)) = state.store_fwd_map.get(&fwd_key) {
+                            if (gen == state.load_generation || (local && local_gen == state.local_generation))
+                                && serves(tag, load_class) {
                                 // Forward the stored value to the load destination.
                                 // Assign the dest a VN matching the stored value.
                                 let dest_idx = dest.0 as usize;
@@ -868,9 +950,9 @@ fn process_block(
                                 let load_key_for_log = expr_key.clone();
                                 let old_load = state.load_expr_to_value.insert(
                                     expr_key,
-                                    (dest, state.load_generation),
+                                    (dest, state.load_generation, (load_class, false)),
                                 );
-                                state.note_load_root(&load_key_for_log);
+                                state.note_load_root(&load_key_for_log, load_class);
                                 state.load_rollback_log.push((load_key_for_log, old_load));
                                 new_instructions.push(Instruction::Copy {
                                     dest,
@@ -885,8 +967,8 @@ fn process_block(
 
                 // Look up: check pure expr map, or load map with generation check
                 let existing = if is_load {
-                    state.load_expr_to_value.get(&expr_key).and_then(|&(val, gen)| {
-                        if gen == state.load_generation { Some(val) } else { None }
+                    state.load_expr_to_value.get(&expr_key).and_then(|&(val, gen, tag)| {
+                        if gen == state.load_generation && serves(tag, load_class) { Some(val) } else { None }
                     })
                 } else {
                     state.expr_to_value.get(&expr_key).copied()
@@ -923,8 +1005,8 @@ fn process_block(
                     // Record in appropriate map with rollback
                     if is_load {
                         let key_for_log = expr_key.clone();
-                        let old_val = state.load_expr_to_value.insert(expr_key, (dest, state.load_generation));
-                        state.note_load_root(&key_for_log);
+                        let old_val = state.load_expr_to_value.insert(expr_key, (dest, state.load_generation, (load_class, false)));
+                        state.note_load_root(&key_for_log, load_class);
                         state.load_rollback_log.push((key_for_log, old_val));
                     } else {
                         let key_for_log = expr_key.clone();
@@ -971,6 +1053,7 @@ fn should_swap(lhs: &VNOperand, rhs: &VNOperand) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrConst, IrModule, Terminator};
 
     #[test]
@@ -1602,14 +1685,14 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Load {
                     dest: Value(2),
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
@@ -1641,21 +1724,21 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Store {
                     val: Operand::Const(IrConst::I32(42)),
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Load {
                     dest: Value(2),
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
@@ -1680,7 +1763,7 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Call {
                     func: "side_effect".to_string(),
@@ -1705,7 +1788,7 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
@@ -1730,7 +1813,7 @@ mod tests {
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
-                        volatile: false,
+                        volatile: false, alias: AliasClass::ANY
                     },
                 ],
                 terminator: Terminator::Branch(BlockId(1)),
@@ -1744,7 +1827,7 @@ mod tests {
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
-                        volatile: false,
+                        volatile: false, alias: AliasClass::ANY
                     },
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
@@ -1779,7 +1862,7 @@ mod tests {
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
-                        volatile: false,
+                        volatile: false, alias: AliasClass::ANY
                     },
                 ],
                 terminator: Terminator::CondBranch {
@@ -1798,7 +1881,7 @@ mod tests {
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
-                        volatile: false,
+                        volatile: false, alias: AliasClass::ANY
                     },
                 ],
                 terminator: Terminator::Branch(BlockId(3)),
@@ -1820,7 +1903,7 @@ mod tests {
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
-                        volatile: false,
+                        volatile: false, alias: AliasClass::ANY
                     },
                 ],
                 terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
@@ -1852,14 +1935,14 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Load {
                     dest: Value(1),
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
@@ -1890,14 +1973,14 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Load {
                     dest: Value(2),
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
@@ -1928,7 +2011,7 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Call {
                     func: "foo".to_string(),
@@ -1953,7 +2036,7 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
@@ -1980,7 +2063,7 @@ mod tests {
                     ptr: Value(1),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Call {
                     func: "foo".to_string(),
@@ -2005,7 +2088,7 @@ mod tests {
                     ptr: Value(1),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
@@ -2043,21 +2126,21 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Store {
                     val: Operand::Const(IrConst::I32(99)),
                     ptr: Value(1),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Load {
                     dest: Value(2),
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
@@ -2083,21 +2166,21 @@ mod tests {
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Store {
                     val: Operand::Const(IrConst::I32(99)),
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
                 Instruction::Load {
                     dest: Value(1),
                     ptr: Value(0),
                     ty: IrType::I32,
                     seg_override: AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
@@ -2122,11 +2205,11 @@ mod tests {
     }
 
     fn load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
-        Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty, seg_override: AddressSpace::Default, volatile: false }
+        Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY }
     }
 
     fn store(val: i32, ptr: u32, ty: IrType) -> Instruction {
-        Instruction::Store { val: Operand::Const(IrConst::I32(val)), ptr: Value(ptr), ty, seg_override: AddressSpace::Default, volatile: false }
+        Instruction::Store { val: Operand::Const(IrConst::I32(val)), ptr: Value(ptr), ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY }
     }
 
     #[test]

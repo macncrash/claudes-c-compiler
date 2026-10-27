@@ -5,6 +5,7 @@
 //! __builtin_isinf_sign. Uses bit manipulation for F32/F64 and
 //! delegates to libc for F128 (long double).
 
+use crate::common::types::AliasClass;
 use crate::frontend::parser::ast::{Expr};
 use crate::ir::reexports::{
     CallInfo,
@@ -84,10 +85,10 @@ impl Lowerer {
         self.emit(Instruction::Alloca { dest: tmp_alloca, size, ty: store_ty, align: 0, volatile: false });
 
         let val_v = self.operand_to_value(val);
-        self.emit(Instruction::Store { val: Operand::Value(val_v), ptr: tmp_alloca, ty: store_ty, seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Store { val: Operand::Value(val_v), ptr: tmp_alloca, ty: store_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: tmp_alloca, ty: int_ty, seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Load { dest: result, ptr: tmp_alloca, ty: int_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
         (Operand::Value(result), int_ty)
     }

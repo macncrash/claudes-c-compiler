@@ -13,7 +13,7 @@
 /// - `Terminator`: block terminators (return, branch, switch)
 /// - `BasicBlock`: a labeled sequence of instructions ending in a terminator
 use crate::common::source::Span;
-use crate::common::types::{AddressSpace, EightbyteClass, IrType};
+use crate::common::types::{AddressSpace, AliasClass, EightbyteClass, IrType};
 use super::constants::IrConst;
 use super::intrinsics::IntrinsicOp;
 use super::ops::{AtomicOrdering, AtomicRmwOp, IrBinOp, IrCmpOp, IrUnaryOp};
@@ -119,12 +119,14 @@ pub enum Instruction {
     /// seg_override: segment register override for x86 (%gs:/%fs:) from named address spaces.
     /// volatile: the access is to a volatile object; it must happen exactly
     /// as written, so passes may not remove, merge, move, or forward it.
-    Store { val: Operand, ptr: Value, ty: IrType, seg_override: AddressSpace, volatile: bool },
+    /// alias: the access's type-based alias class (ANY unless strict
+    /// aliasing applies; see AliasClass).
+    Store { val: Operand, ptr: Value, ty: IrType, seg_override: AddressSpace, volatile: bool, alias: AliasClass },
 
     /// Load from memory: %dest = load ptr
     /// seg_override: segment register override for x86 (%gs:/%fs:) from named address spaces.
-    /// volatile: as for Store.
-    Load { dest: Value, ptr: Value, ty: IrType, seg_override: AddressSpace, volatile: bool },
+    /// volatile, alias: as for Store.
+    Load { dest: Value, ptr: Value, ty: IrType, seg_override: AddressSpace, volatile: bool, alias: AliasClass },
 
     /// Binary operation: %dest = op lhs, rhs
     BinOp { dest: Value, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType },

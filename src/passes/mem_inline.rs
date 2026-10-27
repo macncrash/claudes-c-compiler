@@ -12,6 +12,7 @@
 //! memset only on targets where unaligned 8-byte stores are fine (AArch64,
 //! x86-64). Runs once, after the main optimization loop.
 
+use crate::common::types::AliasClass;
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
@@ -108,7 +109,7 @@ fn expand(inst: &Instruction, wide_stores: bool, fresh: &mut dyn FnMut() -> Valu
                         out.push(Instruction::GetElementPtr { dest: a, base: dest, offset: Operand::Const(IrConst::I64(offset)), ty: IrType::I8 });
                         a
                     };
-                    out.push(Instruction::Store { val, ptr, ty, seg_override: AddressSpace::Default, volatile: false });
+                    out.push(Instruction::Store { val, ptr, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                     offset += width;
                 }
             }
@@ -223,9 +224,9 @@ pub(crate) fn scalarize_local_copies(func: &mut IrFunction) -> usize {
             bypassed.extend(via);
             let t = Value(next_id);
             next_id += 1;
-            block.instructions[k] = Instruction::Load { dest: t, ptr: src, ty, seg_override: AddressSpace::Default, volatile: false };
+            block.instructions[k] = Instruction::Load { dest: t, ptr: src, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
             block.instructions.insert(k + 1, Instruction::Store {
-                val: Operand::Value(t), ptr: dest, ty, seg_override: AddressSpace::Default, volatile: false,
+                val: Operand::Value(t), ptr: dest, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY
             });
             if !block.source_spans.is_empty() {
                 let span = block.source_spans[k.min(block.source_spans.len() - 1)];

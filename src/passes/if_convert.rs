@@ -46,6 +46,7 @@ use crate::ir::reexports::{
     Terminator,
     Value,
 };
+use crate::common::types::AliasClass;
 use crate::ir::analysis;
 use crate::common::types::{AddressSpace, IrType};
 use crate::common::fx_hash::FxHashMap;
@@ -260,7 +261,7 @@ fn sink_arm_loads(func: &mut IrFunction) -> usize {
         }
         let Terminator::Branch(m) = block.terminator else { return None };
         let at = block.instructions.iter().rposition(|i| matches!(i, Instruction::Load { .. }))?;
-        let Instruction::Load { dest, ptr, ty, seg_override: AddressSpace::Default, volatile: false } = block.instructions[at] else { return None };
+        let Instruction::Load { dest, ptr, ty, seg_override: AddressSpace::Default, volatile: false, .. } = block.instructions[at] else { return None };
         // After the load, only casts and copies, each of the one before.
         let mut out = dest;
         for inst in &block.instructions[at + 1..] {
@@ -360,7 +361,7 @@ fn sink_arm_loads(func: &mut IrFunction) -> usize {
         for (k, inst) in tail.into_iter().enumerate() {
             let dest = if k == n - 1 { r } else { fresh() };
             moved.push(match inst {
-                Instruction::Load { ty, .. } => Instruction::Load { dest, ptr: prev, ty, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Load { ty, .. } => Instruction::Load { dest, ptr: prev, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Cast { from_ty, to_ty, .. } => Instruction::Cast { dest, src: Operand::Value(prev), from_ty, to_ty },
                 Instruction::Copy { .. } => Instruction::Copy { dest, src: Operand::Value(prev) },
                 _ => unreachable!(),
@@ -1130,7 +1131,7 @@ mod tests {
             label: BlockId(1),
             instructions: vec![
                 // Side-effecting store!
-                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(10), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Store { val: Operand::Const(IrConst::I32(42)), ptr: Value(10), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
@@ -1263,7 +1264,7 @@ mod tests {
         let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
         let arm = |gep, load, cast, off, to| vec![
             Instruction::GetElementPtr { dest: Value(gep), base: Value(5), offset: Operand::Const(IrConst::I64(off)), ty: IrType::Ptr },
-            Instruction::Load { dest: Value(load), ptr: Value(gep), ty: IrType::I16, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::Load { dest: Value(load), ptr: Value(gep), ty: IrType::I16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             Instruction::Cast { dest: Value(cast), src: Operand::Value(Value(load)), from_ty: IrType::I16, to_ty: to },
         ];
         func.blocks = vec![

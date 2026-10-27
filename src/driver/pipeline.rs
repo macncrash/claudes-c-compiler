@@ -221,6 +221,9 @@ pub struct Driver {
     /// Signed overflow wraps (-fwrapv), so optimizations may not assume it
     /// never happens (see passes::iv_widen).
     pub(super) fwrapv: bool,
+    /// -fstrict-aliasing / -fno-strict-aliasing; by default on when
+    /// optimizing (-O1 and up), as for GCC.
+    pub(super) strict_aliasing: Option<bool>,
     /// Contract a * b + c into fused multiply-adds within an expression
     /// (-ffp-contract=on, the default, as for clang; -ffp-contract=off).
     pub(super) fp_contract: bool,
@@ -304,6 +307,7 @@ impl Driver {
             color_mode: ColorMode::Auto,
             fcommon: false,
             fwrapv: false,
+            strict_aliasing: None,
             fp_contract: true,
             regparm: 0,
             omit_frame_pointer: false,
@@ -935,6 +939,11 @@ impl Driver {
         preprocessor.set_filename(filename);
         self.process_force_includes(&mut preprocessor)?;
         let preprocessed = preprocessor.preprocess(&source);
+        // Neither the may_alias attribute nor a function's own
+        // optimize("no-strict-aliasing") (as attribute or pragma) is
+        // tracked: a translation unit naming either gets no type-based alias
+        // analysis.
+        let opts_out_of_tbaa = preprocessed.contains("may_alias") || preprocessed.contains("no-strict-aliasing");
         if time_phases { eprintln!("[TIME] preprocess: {:.3}s", t0.elapsed().as_secs_f64()); }
 
         // Create diagnostic engine for structured error/warning reporting
@@ -1103,6 +1112,10 @@ impl Driver {
 
         // Run optimization passes
         let t5 = std::time::Instant::now();
+        if !self.strict_aliasing.unwrap_or(self.optimize) || opts_out_of_tbaa
+            || std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.split(',').any(|p| p == "tbaa")) {
+            crate::passes::clear_alias_classes(&mut module);
+        }
         crate::passes::scalarize_local_copies(&mut module, self.target);
         promote_allocas(&mut module);
         if time_phases { eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64()); }

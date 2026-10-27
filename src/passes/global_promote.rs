@@ -17,6 +17,7 @@
 //! outermost such loop is used, so the value stays in a register through the
 //! whole nest. Runs once, after inlining.
 
+use crate::common::types::AliasClass;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
@@ -86,7 +87,7 @@ fn scalar_globals(module: &IrModule) -> FxHashMap<String, IrType> {
                             }
                         }
                     }
-                    Instruction::Store { val, ptr, ty, volatile, seg_override } => {
+                    Instruction::Store { val, ptr, ty, volatile, seg_override, .. } => {
                         if let Some(&name) = addr.get(&ptr.0) {
                             if *volatile || *seg_override != AddressSpace::Default || out.get(name) != Some(ty) {
                                 escaped.insert(name.to_string());
@@ -213,8 +214,8 @@ fn promote_function(func: &mut IrFunction, candidates: &FxHashMap<String, IrType
             }
             let load_in = [
                 Instruction::GlobalAddr { dest: g, name: name.clone() },
-                Instruction::Load { dest: x, ptr: g, ty, seg_override: AddressSpace::Default, volatile: false },
-                Instruction::Store { val: crate::ir::reexports::Operand::Value(x), ptr: slot, ty, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Load { dest: x, ptr: g, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::Store { val: crate::ir::reexports::Operand::Value(x), ptr: slot, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ];
             push_end(&mut func.blocks[pre], load_in);
             if writes {
@@ -222,8 +223,8 @@ fn promote_function(func: &mut IrFunction, candidates: &FxHashMap<String, IrType
                     let (g, y) = (fresh(), fresh());
                     let store_out = [
                         Instruction::GlobalAddr { dest: g, name: name.clone() },
-                        Instruction::Load { dest: y, ptr: slot, ty, seg_override: AddressSpace::Default, volatile: false },
-                        Instruction::Store { val: crate::ir::reexports::Operand::Value(y), ptr: g, ty, seg_override: AddressSpace::Default, volatile: false },
+                        Instruction::Load { dest: y, ptr: slot, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                        Instruction::Store { val: crate::ir::reexports::Operand::Value(y), ptr: g, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                     ];
                     let block = &mut func.blocks[e];
                     let at = block.instructions.iter().take_while(|i| matches!(i, Instruction::Phi { .. })).count();
@@ -267,8 +268,8 @@ mod tests {
         let mut func = IrFunction::new("f".to_string(), IrType::U64, vec![], false);
         let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
         let v = |n| Operand::Value(Value(n));
-        let st = |val, ptr| Instruction::Store { val, ptr: Value(ptr), ty: IrType::U64, seg_override: AddressSpace::Default, volatile: false };
-        let ld = |dest, ptr| Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty: IrType::U64, seg_override: AddressSpace::Default, volatile: false };
+        let st = |val, ptr| Instruction::Store { val, ptr: Value(ptr), ty: IrType::U64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
+        let ld = |dest, ptr| Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty: IrType::U64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
         func.blocks = vec![
             block(0, vec![], Terminator::Branch(BlockId(1))),
             block(1, vec![
@@ -323,7 +324,7 @@ mod tests {
             instructions: vec![
                 Instruction::GlobalAddr { dest: Value(0), name: "g".to_string() },
                 Instruction::Alloca { dest: Value(1), ty: IrType::Ptr, size: 8, align: 8, volatile: false },
-                Instruction::Store { val: Operand::Value(Value(0)), ptr: Value(1), ty: IrType::Ptr, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Store { val: Operand::Value(Value(0)), ptr: Value(1), ty: IrType::Ptr, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),

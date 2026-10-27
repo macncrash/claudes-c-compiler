@@ -5,6 +5,7 @@
 //! and emitting the dispatch chain (Switch terminator for exact cases, if-else chain
 //! for GNU case ranges).
 
+use crate::common::types::AliasClass;
 use crate::frontend::parser::ast::{Expr, Stmt};
 use crate::ir::reexports::{
     BlockId,
@@ -41,7 +42,7 @@ impl Lowerer {
         let switch_alloca = self.fresh_value();
         let switch_size = switch_expr_ty.size();
         self.emit(Instruction::Alloca { dest: switch_alloca, ty: switch_expr_ty, size: switch_size, align: 0, volatile: false });
-        self.emit(Instruction::Store { val, ptr: switch_alloca, ty: switch_expr_ty, seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Store { val, ptr: switch_alloca, ty: switch_expr_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
         let dispatch_label = self.fresh_label();
         let end_label = self.fresh_label();
@@ -126,7 +127,7 @@ impl Lowerer {
         if !cases.is_empty() && case_ranges.is_empty() {
             // Load the switch value once and use Switch terminator
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default, volatile: false });
+            self.emit(Instruction::Load { dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
             self.terminate(Terminator::Switch {
                 val: Operand::Value(loaded),
                 cases: cases.to_vec(),
@@ -141,7 +142,7 @@ impl Lowerer {
             // Switch terminator for the simple cases, with fallthrough to range checks
             let range_check_block = if !case_ranges.is_empty() { self.fresh_label() } else { fallback };
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default, volatile: false });
+            self.emit(Instruction::Load { dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
             self.terminate(Terminator::Switch {
                 val: Operand::Value(loaded),
                 cases: cases.to_vec(),
@@ -162,7 +163,7 @@ impl Lowerer {
         let make_case_const = |v: i64| -> IrConst { IrConst::from_i64(v, switch_ty) };
         for (ri, (low, high, range_label)) in case_ranges.iter().enumerate() {
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default, volatile: false });
+            self.emit(Instruction::Load { dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
             let ge_result = self.emit_cmp_val(ge_op, Operand::Value(loaded), Operand::Const(make_case_const(*low)), switch_ty);
             let le_result = self.emit_cmp_val(le_op, Operand::Value(loaded), Operand::Const(make_case_const(*high)), switch_ty);
             let and_result = self.fresh_value();

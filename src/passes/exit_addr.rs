@@ -160,6 +160,7 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::AliasClass;
     use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Terminator};
 
     /// `do i++; while (a[i] < k); a[i] = k;` with the index scaled by `shift`.
@@ -174,11 +175,11 @@ mod tests {
                 Instruction::BinOp { dest: Value(11), op: IrBinOp::Add, lhs: v(10), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 },
                 Instruction::BinOp { dest: Value(12), op: IrBinOp::Shl, lhs: v(11), rhs: Operand::Const(IrConst::I64(shift)), ty: IrType::I64 },
                 Instruction::GetElementPtr { dest: Value(13), base: Value(0), offset: v(12), ty: IrType::Ptr },
-                Instruction::Load { dest: Value(14), ptr: Value(13), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Load { dest: Value(14), ptr: Value(13), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
                 Instruction::Cmp { dest: Value(15), op: IrCmpOp::Slt, lhs: v(14), rhs: v(1), ty: IrType::I32 },
             ], Terminator::CondBranch { cond: v(15), true_label: BlockId(1), false_label: BlockId(2) }),
             block(2, vec![
-                Instruction::Store { val: v(1), ptr: Value(13), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false },
+                Instruction::Store { val: v(1), ptr: Value(13), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ], Terminator::Return(None)),
         ];
         func.next_value_id = 16;

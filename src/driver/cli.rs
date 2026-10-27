@@ -556,6 +556,8 @@ impl Driver {
                 "-fno-common" => self.fcommon = false,
                 "-fwrapv" => self.fwrapv = true,
                 "-fno-wrapv" => self.fwrapv = false,
+                "-fstrict-aliasing" => self.strict_aliasing = Some(true),
+                "-fno-strict-aliasing" => self.strict_aliasing = Some(false),
                 // -ffp-contract=fast also contracts across statements in GCC; here
                 // it contracts within expressions, like on.
                 "-ffp-contract=off" => self.fp_contract = false,

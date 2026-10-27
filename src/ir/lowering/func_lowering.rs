@@ -10,6 +10,7 @@
 //!
 //! Also handles VLA parameter stride computation and dimension collection.
 
+use crate::common::types::AliasClass;
 use crate::common::fx_hash::FxHashMap;
 use crate::frontend::parser::ast::{
     BlockItem,
@@ -301,7 +302,7 @@ impl Lowerer {
                     ptr: ir_allocas[i],
                     ty: param.ty,
                     seg_override: crate::common::types::AddressSpace::Default,
-                    volatile: false,
+                    volatile: false, alias: AliasClass::ANY
                 });
             }
         }
@@ -424,14 +425,14 @@ impl Lowerer {
         self.emit(Instruction::Alloca { dest: complex_alloca, ty: IrType::Ptr, size: complex_size, align: 0, volatile: false });
 
         let real_val = self.fresh_value();
-        self.emit(Instruction::Load { dest: real_val, ptr: real_alloca, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
-        self.emit(Instruction::Store { val: Operand::Value(real_val), ptr: complex_alloca, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Load { dest: real_val, ptr: real_alloca, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+        self.emit(Instruction::Store { val: Operand::Value(real_val), ptr: complex_alloca, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
         let imag_val = self.fresh_value();
-        self.emit(Instruction::Load { dest: imag_val, ptr: imag_alloca, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Load { dest: imag_val, ptr: imag_alloca, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
         let imag_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr { dest: imag_ptr, base: complex_alloca, offset: Operand::Const(IrConst::I64(comp_size as i64)), ty: IrType::I8 });
-        self.emit(Instruction::Store { val: Operand::Value(imag_val), ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Store { val: Operand::Value(imag_val), ptr: imag_ptr, ty: comp_ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
 
         let name = orig_param.name.clone().unwrap_or_default();
         let is_const = self.base_is_const(&orig_param.type_spec, orig_param.is_const);
@@ -455,11 +456,11 @@ impl Lowerer {
                 IrType::F32 => {
                     // Received as F64, narrow to F32
                     let f64_val = self.fresh_value();
-                    self.emit(Instruction::Load { dest: f64_val, ptr: local_info.alloca, ty: IrType::F64 , seg_override: AddressSpace::Default, volatile: false });
+                    self.emit(Instruction::Load { dest: f64_val, ptr: local_info.alloca, ty: IrType::F64 , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                     let f32_val = self.emit_cast_val(Operand::Value(f64_val), IrType::F64, IrType::F32);
                     let f32_alloca = self.fresh_value();
                     self.emit(Instruction::Alloca { dest: f32_alloca, ty: IrType::F32, size: 4, align: 0, volatile: false });
-                    self.emit(Instruction::Store { val: Operand::Value(f32_val), ptr: f32_alloca, ty: IrType::F32 , seg_override: AddressSpace::Default, volatile: false });
+                    self.emit(Instruction::Store { val: Operand::Value(f32_val), ptr: f32_alloca, ty: IrType::F32 , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                     if let Some(local) = self.func_mut().locals.get_mut(&name) {
                         local.alloca = f32_alloca; local.ty = IrType::F32; local.alloc_size = 4;
                     }
@@ -467,12 +468,12 @@ impl Lowerer {
                 IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => {
                     // Received as I32, narrow to declared type
                     let i32_val = self.fresh_value();
-                    self.emit(Instruction::Load { dest: i32_val, ptr: local_info.alloca, ty: IrType::I32 , seg_override: AddressSpace::Default, volatile: false });
+                    self.emit(Instruction::Load { dest: i32_val, ptr: local_info.alloca, ty: IrType::I32 , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                     let narrow_val = self.emit_cast_val(Operand::Value(i32_val), IrType::I32, declared_ty);
                     let narrow_alloca = self.fresh_value();
                     let size = declared_ty.size().max(1);
                     self.emit(Instruction::Alloca { dest: narrow_alloca, ty: declared_ty, size, align: 0, volatile: false });
-                    self.emit(Instruction::Store { val: Operand::Value(narrow_val), ptr: narrow_alloca, ty: declared_ty , seg_override: AddressSpace::Default, volatile: false });
+                    self.emit(Instruction::Store { val: Operand::Value(narrow_val), ptr: narrow_alloca, ty: declared_ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                     if let Some(local) = self.func_mut().locals.get_mut(&name) {
                         local.alloca = narrow_alloca; local.ty = declared_ty; local.alloc_size = size;
                     }
@@ -678,7 +679,7 @@ impl Lowerer {
         if let Some(info) = self.func_mut().locals.get(dim_name).cloned() {
             let loaded = self.fresh_value();
             self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: info.ty,
-             seg_override: AddressSpace::Default, volatile: false });
+             seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
             loaded
         } else {
             // Fallback: use constant 1

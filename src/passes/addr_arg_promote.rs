@@ -22,6 +22,7 @@
 //!
 //! A variable assigned in many places is left alone (see MAX_STORES).
 
+use crate::common::types::AliasClass;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::AddressSpace;
 use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand, Value};
@@ -121,10 +122,10 @@ fn promote_function(func: &mut IrFunction, mr: &ModRef) -> usize {
     // Each candidate's register copy.
     let slots: FxHashMap<u32, Value> = passed.keys().map(|&v| (v, fresh())).collect();
     let load = |dest: Value, ptr: Value, ty: IrType| {
-        Instruction::Load { dest, ptr, ty, seg_override: AddressSpace::Default, volatile: false }
+        Instruction::Load { dest, ptr, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY }
     };
     let store = |val: Value, ptr: Value, ty: IrType| {
-        Instruction::Store { val: Operand::Value(val), ptr, ty, seg_override: AddressSpace::Default, volatile: false }
+        Instruction::Store { val: Operand::Value(val), ptr, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY }
     };
     for block in &mut func.blocks {
         let calls = block.instructions.iter().any(|i| matches!(i, Instruction::Call { info, .. }

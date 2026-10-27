@@ -22,6 +22,7 @@ use crate::ir::reexports::{
     Operand,
     Value,
 };
+use crate::common::types::AliasClass;
 use crate::common::types::{AddressSpace, IrType, CType};
 use super::lower::Lowerer;
 use super::definitions::GlobalInfo;
@@ -135,7 +136,7 @@ impl Lowerer {
             Expr::StringLiteral(s, _) => self.lower_string_literal(s, false),
             Expr::WideStringLiteral(s, _) => self.lower_string_literal(s, true),
             Expr::Char16StringLiteral(s, _) => self.lower_char16_string_literal(s),
-            Expr::Identifier(name, _) => self.lower_identifier(name),
+            Expr::Identifier(name, _) => self.lower_identifier(expr, name),
             Expr::BinaryOp(op, lhs, rhs, _) => self.lower_binary_op(op, lhs, rhs),
             Expr::UnaryOp(op, inner, _) => self.lower_unary_op(*op, inner),
             Expr::PostfixOp(op, inner, _) => self.lower_post_inc_dec(inner, *op),
@@ -242,11 +243,11 @@ impl Lowerer {
         });
         // Load the result from the alloca
         let result = self.fresh_value();
-        self.emit(Instruction::Load { dest: result, ptr: tmp_alloca, ty , seg_override: AddressSpace::Default, volatile: false });
+        self.emit(Instruction::Load { dest: result, ptr: tmp_alloca, ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
         Operand::Value(result)
     }
 
-    fn load_global_var(&mut self, global_name: String, ginfo: &GlobalInfo) -> Operand {
+    fn load_global_var(&mut self, global_name: String, ginfo: &GlobalInfo, alias: AliasClass) -> Operand {
         let addr = self.fresh_value();
         self.emit(Instruction::GlobalAddr { dest: addr, name: global_name });
         if ginfo.is_array || ginfo.is_struct {
@@ -263,11 +264,11 @@ impl Lowerer {
             }
         }
         let dest = self.fresh_value();
-        self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.quals.space, volatile: ginfo.quals.volatile });
+        self.emit(Instruction::Load { dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.quals.space, volatile: ginfo.quals.volatile, alias });
         Operand::Value(dest)
     }
 
-    fn lower_identifier(&mut self, name: &str) -> Operand {
+    fn lower_identifier(&mut self, expr: &Expr, name: &str) -> Operand {
         if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
             let name = self.func().name.clone(); return self.lower_string_literal(&name, false);
         }
@@ -314,7 +315,8 @@ impl Lowerer {
                     return Operand::Value(addr);
                 }
                 let dest = self.fresh_value();
-                self.emit(Instruction::Load { dest, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile });
+                let alias = self.alias_class(expr);
+                self.emit(Instruction::Load { dest, ptr: addr, ty, seg_override: quals.space, volatile: quals.volatile, alias });
                 return Operand::Value(dest);
             }
             if is_array || is_struct {
@@ -324,7 +326,8 @@ impl Lowerer {
                 return Operand::Value(alloca);
             }
             let dest = self.fresh_value();
-            self.emit(Instruction::Load { dest, ptr: alloca, ty, seg_override: quals.space, volatile: quals.volatile });
+            let alias = self.alias_class(expr);
+            self.emit(Instruction::Load { dest, ptr: alloca, ty, seg_override: quals.space, volatile: quals.volatile, alias });
             return Operand::Value(dest);
         }
 
@@ -334,7 +337,7 @@ impl Lowerer {
 
         if let Some(mangled) = self.func_mut().static_local_names.get(name).cloned() {
             if let Some(ginfo) = self.globals.get(&mangled).cloned() {
-                return self.load_global_var(mangled, &ginfo);
+                return self.load_global_var(mangled, &ginfo, self.alias_class(expr));
             }
         }
 
@@ -343,7 +346,7 @@ impl Lowerer {
             if let Some(ref reg_name) = ginfo.asm_register {
                 return self.read_global_register(reg_name, ginfo.ty);
             }
-            return self.load_global_var(name.to_string(), &ginfo);
+            return self.load_global_var(name.to_string(), &ginfo, self.alias_class(expr));
         }
 
         // Note: implicit declaration warnings are emitted during sema, not here.
