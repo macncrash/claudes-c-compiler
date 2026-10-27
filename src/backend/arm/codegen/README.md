@@ -758,6 +758,18 @@ Removes `str` instructions to stack slots that are overwritten before being read
   it: `add xC, xD, wB, uxtw`, `lsr wC, wB, #k` (`s->window + cur_match` in
   longest_match's candidate loop). A may be B: `sxtw x0, w0; cbnz x0`
   after a call returning int becomes `cbnz w0`.
+- `cmp A, B; b.cc L; cmp A, B`, with nothing between but the branch: the
+  second compare goes (the flags are the first one's). `a < b || a == b &&
+  ...` (pqdownheap's `smaller`) tests one pair twice.
+- `dup vN, wR` repeating an earlier one in straight-line code, with nothing
+  between writing vN or R, goes; after the cleanup rounds, one in a
+  single-block loop (whose label only the loop's own branch targets) that
+  writes vN before the loop reads it, where nothing else writes vN or R,
+  moves before the loop. An unrolled vector loop broadcast its operand
+  once per vector, every iteration.
+- `add|sub xT, xB, #k` read only as the address of following q-register
+  loads and stores (`ldr q0, [xT]`), with T dead or rewritten after them,
+  folds into them: `ldur q0, [xB, #-16]`.
 
 **10. Jump Threading** (local cleanup)
 

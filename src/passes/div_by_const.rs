@@ -24,7 +24,10 @@
 //!
 //! **Small dividends**: an I64 dividend widened from an 8- or 16-bit
 //! integer, or masked to 16 bits, gets the smallest multiplier exact over
-//! its whole range when that fits in 16 bits (one move to materialize):
+//! its whole range when that fits in 16 bits (one move to materialize); so
+//! does any dividend simplify's value ranges bound to 16 bits (a product of
+//! two remainders), and one bounded to 32 bits takes the 32-bit path rather
+//! than a 128-bit multiply:
 //!   `x / 6` for a signed char => `t = x * 43 >> 8; t + (t >>> 63)`
 //!
 //! All transformations produce correct results for the full range of inputs,
@@ -76,20 +79,39 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
     // Values widened from 8- or 16-bit integers, or masked to 16 bits: their
     // range, for small_magic.
     let mut small_range: Vec<Option<(i64, i64)>> = vec![None; max_id + 1];
+    // And from the values' ranges: `(r % 36) * (r % 36)`, widened to 64 bits
+    // because it cannot overflow, is below 1296.
+    for (id, r) in super::simplify::value_ranges(func, max_id).into_iter().enumerate() {
+        let Some((lo, hi)) = r else { continue };
+        if lo >= 0 && hi <= u32::MAX as i128 {
+            is_known_u32[id] = true;
+        }
+        if lo >= i32::MIN as i128 && hi <= i32::MAX as i128 {
+            is_known_i32[id] = true;
+        }
+        if lo >= i16::MIN as i128 && hi <= u16::MAX as i128 {
+            small_range[id] = Some((lo as i64, hi as i64));
+        }
+    }
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
                 Instruction::Cast { dest, from_ty, .. } if dest.0 as usize <= max_id => {
-                    small_range[dest.0 as usize] = match from_ty {
+                    let r = match from_ty {
                         IrType::I8 => Some((i8::MIN as i64, i8::MAX as i64)),
                         IrType::U8 => Some((0, u8::MAX as i64)),
                         IrType::I16 => Some((i16::MIN as i64, i16::MAX as i64)),
                         IrType::U16 => Some((0, u16::MAX as i64)),
                         _ => None,
                     };
+                    if r.is_some() {
+                        small_range[dest.0 as usize] = r;
+                    }
                 }
                 Instruction::BinOp { dest, op: IrBinOp::And, rhs: Operand::Const(c), .. } if dest.0 as usize <= max_id => {
-                    small_range[dest.0 as usize] = c.to_i64().filter(|&k| (0..=u16::MAX as i64).contains(&k)).map(|k| (0, k));
+                    if let Some(k) = c.to_i64().filter(|&k| (0..=u16::MAX as i64).contains(&k)) {
+                        small_range[dest.0 as usize] = Some((0, k));
+                    }
                 }
                 _ => {}
             }

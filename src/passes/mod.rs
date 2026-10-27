@@ -765,11 +765,20 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         }
     }
 
-    // Phase 10i: Extensions of 8- and 16-bit values that their loads
-    // already made, through phis (AArch64).
+    // Phase 10i: Extensions of 8-, 16- and 32-bit values that their loads
+    // already made, through phis, and int operations whose sign extension
+    // no use reads made unsigned (AArch64).
     if target == crate::backend::Target::Aarch64 && !disabled.contains("ext_elide") {
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             ext_elide::elide_extensions(func);
+        }
+    }
+
+    // Phase 10j: Move indexed addresses down to their load or store, so
+    // the backend folds them into it (AArch64).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("addr_sink") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            step_sink::sink_addresses(func);
         }
     }
 

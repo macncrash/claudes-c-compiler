@@ -17,6 +17,9 @@
 //! end (before a compare the branch tests), which must be after the phi's
 //! last use. (Right after that use, an
 //! address computed from the counter could not fold into its access.)
+//!
+//! `sink_addresses` (addr_sink) likewise moves an indexed address down to
+//! the load or store using it.
 
 use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, Operand, Value};
 
@@ -107,11 +110,66 @@ pub(crate) fn sink_steps(func: &mut IrFunction) -> usize {
     moved
 }
 
+/// Move an indexed address (`gep p, %i`) whose only use is a load or store a
+/// few instructions later in its block down to just before that access
+/// (AArch64). `p[i] = expr` computes the address before the value, so `p`
+/// and `i` die at the GEP and the value may take their registers; then the
+/// backend can't fold the add into the access as `[p, i]`
+/// (compress_block's `s->pending_buf[s->pending++] = (Byte)(s->bi_buf >> 8)`).
+/// Not past a call, which would keep both live across it.
+pub(crate) fn sink_addresses(func: &mut IrFunction) -> usize {
+    /// How far an address moves.
+    const WINDOW: usize = 16;
+    let max_id = func.max_value_id() as usize;
+    let mut use_count = vec![0u32; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| if let Some(c) = use_count.get_mut(v as usize) { *c += 1 });
+        }
+        block.terminator.for_each_used_value(|v| if let Some(c) = use_count.get_mut(v as usize) { *c += 1 });
+    }
+    let mut moved = 0;
+    for block in &mut func.blocks {
+        // From the end, so the instructions a move shifts are already done.
+        for at in (0..block.instructions.len()).rev() {
+            let Instruction::GetElementPtr { dest, offset: Operand::Value(_), .. } = block.instructions[at] else { continue };
+            if use_count.get(dest.0 as usize) != Some(&1) {
+                continue;
+            }
+            let mut access = None;
+            for (k, inst) in block.instructions.iter().enumerate().skip(at + 1).take(WINDOW) {
+                match inst {
+                    Instruction::Load { ptr, .. } if *ptr == dest => access = Some(k),
+                    Instruction::Store { ptr, val, .. } if *ptr == dest && !matches!(val, Operand::Value(x) if *x == dest) => access = Some(k),
+                    Instruction::Call { .. } | Instruction::CallIndirect { .. } => break,
+                    _ => {
+                        let mut reads = false;
+                        inst.for_each_used_value(|v| reads |= v == dest.0);
+                        if !reads {
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            let Some(k) = access.filter(|&k| k > at + 1) else { continue };
+            let inst = block.instructions.remove(at);
+            block.instructions.insert(k - 1, inst);
+            if block.source_spans.len() == block.instructions.len() {
+                let span = block.source_spans.remove(at);
+                block.source_spans.insert(k - 1, span);
+            }
+            moved += 1;
+        }
+    }
+    moved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
-    use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, IrConst, Terminator};
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrCmpOp, IrConst, Terminator};
 
     /// `do s += p[i++]; while (i != n)`: the step first, then the index.
     fn scan(extra_use: bool) -> IrFunction {
@@ -147,5 +205,40 @@ mod tests {
         // Read before the counter's last use: it stays.
         let mut func = scan(true);
         assert_eq!(sink_steps(&mut func), 0);
+    }
+
+    /// `out[pos] = *q >> 8`: the address first, then the value it stores
+    /// (with a call between them when `call`).
+    fn store_after_value(call: bool) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let mut body = vec![
+            Instruction::GetElementPtr { dest: Value(10), base: Value(0), offset: v(1), ty: IrType::Ptr },
+            Instruction::Load { dest: Value(11), ptr: Value(2), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false },
+            Instruction::BinOp { dest: Value(12), op: IrBinOp::LShr, lhs: v(11), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 },
+            Instruction::Store { val: v(12), ptr: Value(10), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false },
+        ];
+        if call {
+            let info = CallInfo {
+                dest: None, args: vec![], arg_types: vec![], return_type: IrType::Void, is_variadic: false, num_fixed_args: 0,
+                struct_arg_sizes: vec![], struct_arg_aligns: vec![], struct_arg_classes: Vec::new(),
+                struct_arg_riscv_float_classes: Vec::new(), is_sret: false, is_fastcall: false, ret_eightbyte_classes: Vec::new(),
+            };
+            body.insert(1, Instruction::Call { func: "f".to_string(), info });
+        }
+        let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![BasicBlock { label: BlockId(0), instructions: body, terminator: Terminator::Return(None), source_spans: Vec::new() }];
+        func
+    }
+
+    #[test]
+    fn address_moves_down_to_its_store() {
+        let mut func = store_after_value(false);
+        assert_eq!(sink_addresses(&mut func), 1);
+        assert!(matches!(func.blocks[0].instructions[..], [
+            Instruction::Load { .. }, Instruction::BinOp { .. }, Instruction::GetElementPtr { .. }, Instruction::Store { .. },
+        ]), "{:?}", func.blocks[0].instructions);
+        // Not past a call.
+        let mut func = store_after_value(true);
+        assert_eq!(sink_addresses(&mut func), 0);
     }
 }

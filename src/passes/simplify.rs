@@ -48,6 +48,8 @@
 //!
 //! Comparison simplification (requires def lookup):
 //! - Cmp(Ne, cmp_result, 0) => Copy(cmp_result) -- redundant boolean test
+//!   (also of an and/or/xor of booleans, and of copies and phis of
+//!   booleans and constants 0 and 1, the value `a || b && c` merges)
 //! - Cmp(Eq, cmp_result, 0) => Cmp(inverted_op, orig_lhs, orig_rhs) -- negated comparison
 //! - Cmp(Ne, cmp_result, 1) => Cmp(inverted_op, orig_lhs, orig_rhs) -- negated boolean
 //! - Cmp(Eq, cmp_result, 1) => Copy(cmp_result) -- redundant boolean test
@@ -223,6 +225,26 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
                             is_boolean[id] = true;
                         }
                     }
+            }
+        }
+    }
+    // Then through copies and phis of booleans and constants 0 and 1 (the
+    // value a short-circuit `a || b && c` merges), to a fixpoint.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            let (dest, ok) = match inst {
+                Instruction::Copy { dest, src } => (dest, operand_is_boolean(src, &is_boolean)),
+                Instruction::Phi { dest, ty, incoming } if ty.is_integer() => (dest, incoming.iter().all(|(op, _)| match op {
+                    Operand::Const(c) => matches!(c.to_i64(), Some(0 | 1)),
+                    _ => operand_is_boolean(op, &is_boolean),
+                })),
+                _ => continue,
+            };
+            if ok && is_boolean.get(dest.0 as usize) == Some(&false) {
+                is_boolean[dest.0 as usize] = true;
+                changed = true;
             }
         }
     }
@@ -443,7 +465,7 @@ fn canonical_result_type(inst: &Instruction) -> Option<IrType> {
 /// canonical form (see canonical_result_type): then, on every 64-bit
 /// backend, the 64-bit register holds exactly that integer (32-bit signed
 /// values sign-extended, unsigned ones zero-extended).
-type Range = Option<(i128, i128)>;
+pub(crate) type Range = Option<(i128, i128)>;
 
 /// The values of an integer type.
 fn type_range(ty: IrType) -> Range {
@@ -474,7 +496,7 @@ fn range_within(r: Range, ty: IrType) -> bool {
 /// byte loads, comparisons and arithmetic on them get bounds; so does an
 /// extension of a value already in range. Empty on 32-bit targets, where I64 values take
 /// two registers.
-fn value_ranges(func: &IrFunction, max_id: usize) -> Vec<Range> {
+pub(crate) fn value_ranges(func: &IrFunction, max_id: usize) -> Vec<Range> {
     let mut ranges: Vec<Range> = vec![None; max_id + 1];
     if crate::common::types::target_is_32bit() {
         return ranges;
@@ -586,8 +608,11 @@ fn binop_range(op: IrBinOp, a: Range, b: Range, ty: IrType) -> Range {
             let a = in_ty(a).unwrap_or(tr);
             (a.0 >> k, a.1 >> k)
         }),
+        // Below the divisor whatever the dividend (and below a known
+        // non-negative dividend).
         IrBinOp::URem => match (in_ty(a), b) {
             (Some(a), Some((d, d2))) if a.0 >= 0 && d == d2 && d > 0 => Some((0, a.1.min(d - 1))),
+            (_, Some((d, d2))) if d == d2 && d > 0 => Some((0, d - 1)),
             _ => None,
         },
         _ => None,
@@ -3635,6 +3660,46 @@ mod tests {
         }];
         func.next_value_id = 4;
         func
+    }
+
+    /// `t = a < b || c` merged by a phi (of a compare and the constant
+    /// `other`), then `t != 0`.
+    fn bool_phi(other: i64) -> IrFunction {
+        use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+        let v = |n| Operand::Value(Value(n));
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(0, vec![], Terminator::CondBranch { cond: v(0), true_label: BlockId(2), false_label: BlockId(1) }),
+            block(1, vec![Instruction::Cmp { dest: Value(1), op: IrCmpOp::Slt, lhs: v(8), rhs: v(9), ty: IrType::I32 }], Terminator::Branch(BlockId(2))),
+            block(2, vec![
+                Instruction::Phi { dest: Value(2), ty: IrType::I64, incoming: vec![(Operand::Const(IrConst::I64(other)), BlockId(0)), (v(1), BlockId(1))] },
+                Instruction::Copy { dest: Value(3), src: v(2) },
+                Instruction::Cmp { dest: Value(4), op: IrCmpOp::Ne, lhs: v(3), rhs: Operand::Const(IrConst::I64(0)), ty: IrType::I64 },
+            ], Terminator::Return(Some(v(4)))),
+        ];
+        func.next_value_id = 10;
+        func
+    }
+
+    #[test]
+    fn test_unsigned_remainder_below_its_divisor() {
+        // Whatever the dividend, and below a smaller known one.
+        assert_eq!(binop_range(IrBinOp::URem, None, Some((36, 36)), IrType::U32), Some((0, 35)));
+        assert_eq!(binop_range(IrBinOp::URem, Some((0, 9)), Some((36, 36)), IrType::U64), Some((0, 9)));
+        // Not by an unknown divisor.
+        assert_eq!(binop_range(IrBinOp::URem, None, None, IrType::U32), Some((0, u32::MAX as i128)));
+    }
+
+    #[test]
+    fn test_cmp_ne_zero_of_boolean_phi_is_the_phi() {
+        let mut func = bool_phi(1);
+        simplify_function(&mut func);
+        assert!(matches!(func.blocks[2].instructions[2], Instruction::Copy { dest: Value(4), src: Operand::Value(Value(3)) }), "{:?}", func.blocks[2].instructions[2]);
+        // A 2 may come in: the test stays.
+        let mut func = bool_phi(2);
+        simplify_function(&mut func);
+        assert!(matches!(func.blocks[2].instructions[2], Instruction::Cmp { .. }), "{:?}", func.blocks[2].instructions[2]);
     }
 
     fn and_select() -> Instruction {

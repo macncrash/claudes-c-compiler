@@ -127,6 +127,10 @@ The optimizer executes in four sequential phases:
      ext_elide
          |
          v
+ Phase 10j: Addresses Down to Their Access (AArch64)
+     addr_sink (in step_sink.rs)
+         |
+         v
  Phase 11: Dead Static Elimination
      dead_statics
          |
@@ -998,6 +1002,14 @@ element, a saturating subtract of w clamped to the element's maximum. That
 is zlib's slide_hash, which shifts the hash chains each time the window
 slides (`uqsub v0.8h`, eight entries per step instead of one).
 
+In front of that, while four vectors' worth remain, a loop does four
+`VecOp`s per step (64 bytes), sharing one counter update and branch; then
+the single-vector loop, then the original one if anything is left (a block
+tests for that, since the original loop runs at least once). With the
+backend's broadcast hoisting and offset folding, slide_hash's step is
+`ldur`, `uqsub`, `stur` per 16 bytes: deflate at level 1 retires 62M (2%)
+fewer instructions, though it is no faster, the slide being memory-bound.
+
 ### pressure_hoist -- Pressure Hoisting
 
 Runs once after lftr. A pure, non-trapping instruction that is the only use of
@@ -1136,6 +1148,33 @@ values, which an 8- or 16-bit operation may leave with unspecified high
 bits). With the other longest_match changes, deflate at levels 6 and 9,
 where the candidate loop dominates, retires about 10% fewer instructions.
 
+32-bit loads count too (`ldrsw` for int, `ldr w` for unsigned), and so does
+a U32 operation, which a 32-bit instruction computes with the high half
+cleared. compress_block's `bi_valid`, loaded as int and widened for
+`bi_valid += len - 16`, and `dist - 1`, widened as a table index, each got a
+register and a `mov` of their own. (The register allocator puts such a copy
+and its source in one register even where both are live: each is defined
+once, so they hold the same bits.)
+
+Then an int add, subtract, multiply, logical operation or left shift whose
+uses, through copies and phis, read only its low 31 bits (narrower casts and
+stores, and operations that are themselves such) becomes U32: the backend
+keeps an int sign-extended with a `sxtw` after each operation, which no such
+use reads. compress_block's `s->bi_buf |= (ush)value << s->bi_valid`, an int
+shift and or for a 16-bit store and its two bytes, had one at each send.
+
+### addr_sink -- Addresses Down to Their Access
+
+Runs after ext_elide, on AArch64. `p[i] = expr` computes the address before
+the value, so `p` and `i` die at the GEP and the value may take one of their
+registers; the backend then can't fold the add into the store as `[p, i]`. A
+GEP with a variable offset whose only use is a load or store at most 16
+instructions later in its block (with no call between) moves to just before
+it. compress_block's second byte of each flush,
+`s->pending_buf[s->pending++] = (Byte)(s->bi_buf >> 8)`, was an `add` and a
+store. With the ext_elide changes, compress_block at deflate level 1 went
+from 21M instructions more than clang's to 3M fewer.
+
 ### latch_dup -- Latch Copies
 
 Runs after loop_layout (before step_to_load). A latch of at most four simple
@@ -1267,6 +1306,12 @@ successors' phis read on the edges from it (the counter of a loop condition
 edge to the branch target, giving one branch per operand instead of computing
 the boolean with `cset`/`csel` and then branching on it. Dead code is removed
 first, so copies and phi cycles that mem2reg leaves do not count as uses.
+
+Likewise a diamond or triangle whose own branch tests such a phi (its
+block's only instruction, its only use, with a constant incoming value):
+pqdownheap's `if (j < s->heap_len && smaller(...)) j++` became a `cset` of
+the test, two `cmp #0; cset ne` normalizations of it, and a `csel` of j;
+threaded, each test branches to the increment or past it.
 
 ### ipcp -- Interprocedural Constant Propagation
 
@@ -1430,7 +1475,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`.
+`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1460,7 +1505,7 @@ behavior across iterations.
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |
 | `dead_statics.rs`        | Dead static function/global elimination (BFS)          |
 | `div_by_const.rs`        | Division by constant strength reduction                |
-| `ext_elide.rs`           | Extensions of loaded bytes and halves dropped (AArch64) |
+| `ext_elide.rs`           | Extensions loads made, and unread sign extensions, dropped (AArch64) |
 | `edge_addr.rs`           | Addresses a phi reads recomputed on the edge into it   |
 | `exit_addr.rs`           | Loop addresses recomputed after the loop (AArch64)     |
 | `gep_linear.rs`          | GEP chain offsets summed and cancelled (`a[x / n][x % n]`) |
@@ -1487,5 +1532,5 @@ behavior across iterations.
 | `ret_dup.rs`             | Return blocks copied into predecessors passing constants |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |
-| `step_sink.rs`           | Counter steps moved after the counter's last use       |
+| `step_sink.rs`           | Counter steps after the counter's last use; addresses down to their access |
 | `step_to_load.rs`        | Loop pointer steps moved after their load (post-index) |

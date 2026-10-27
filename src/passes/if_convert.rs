@@ -101,7 +101,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
         let found = detect_diamond(func, pred_idx, &label_to_idx, &preds)
             .or_else(|| detect_triangle(func, pred_idx, &label_to_idx, &preds));
         if let Some(d) = found {
-            if !is_short_circuit_test(func, &d, &use_count) {
+            if !is_short_circuit_test(func, &d, &use_count) && !branches_on_threadable_phi(func, &d, &use_count) {
                 diamonds.push(d);
             }
         }
@@ -421,6 +421,19 @@ fn is_short_circuit_test(func: &IrFunction, d: &DiamondInfo, use_count: &FxHashM
         block.terminator.for_each_used_value(|v| ok &= !others.contains(&v));
     }
     ok
+}
+
+/// Whether the branch tests a phi that is its block's only instruction and
+/// its only use, with a constant incoming value: a short-circuit test
+/// (`if (j < len && smaller(...)) j++` in pqdownheap) whose constant edges
+/// cfg_simplify threads to an arm, where a select would first merge the
+/// boolean (cset) and then select on it.
+fn branches_on_threadable_phi(func: &IrFunction, d: &DiamondInfo, use_count: &FxHashMap<u32, u32>) -> bool {
+    let pred = &func.blocks[d.pred_idx];
+    let Terminator::CondBranch { cond: Operand::Value(c), .. } = &pred.terminator else { return false };
+    matches!(&pred.instructions[..], [Instruction::Phi { dest, incoming, .. }]
+        if dest == c && incoming.iter().any(|(op, _)| matches!(op, Operand::Const(_))))
+        && use_count.get(&c.0).copied() == Some(1)
 }
 
 /// Check if a block contains only simple, side-effect-free instructions
@@ -1174,6 +1187,40 @@ mod tests {
         ];
         func.next_value_id = 10;
         func
+    }
+
+    /// `if (x < 8 && c) j++`: a branch on the short-circuit phi (with a
+    /// constant incoming when `constant`) adding one to j.
+    fn and_then_increment(constant: bool) -> IrFunction {
+        let mut func = and_test(false);
+        let v = |n| Operand::Value(Value(n));
+        if !constant {
+            if let Instruction::Phi { incoming, .. } = &mut func.blocks[2].instructions[0] {
+                incoming[1].0 = v(8);
+            }
+        }
+        func.blocks[3].instructions = vec![Instruction::BinOp {
+            dest: Value(5), op: IrBinOp::Add, lhs: v(9), rhs: Operand::Const(IrConst::I32(1)), ty: IrType::I32,
+        }];
+        func.blocks[3].terminator = Terminator::Branch(BlockId(4));
+        func.blocks[4].instructions = vec![Instruction::Phi {
+            dest: Value(6), ty: IrType::I32, incoming: vec![(v(5), BlockId(3)), (v(9), BlockId(2))],
+        }];
+        func.blocks[4].terminator = Terminator::Return(Some(v(6)));
+        func
+    }
+
+    #[test]
+    fn increment_on_short_circuit_phi_left_for_threading() {
+        // The constant edge goes straight to the increment or past it.
+        let mut func = and_then_increment(true);
+        assert!(!func.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Select { .. })));
+        if_convert_function(&mut func);
+        assert!(!func.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Select { .. })));
+        // Without a constant there is nothing to thread: a select.
+        let mut func = and_then_increment(false);
+        if_convert_function(&mut func);
+        assert!(func.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Select { .. })));
     }
 
     #[test]

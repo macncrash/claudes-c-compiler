@@ -294,7 +294,7 @@ pub fn allocate_registers(
     // an unrelated value take the register in a gap between them. A group
     // with a call-spanning member (a sum carried around a loop with calls)
     // needs a callee-saved register, and is placed in phase 1.
-    let groups = copy_groups(func, &liveness, &eligible, &folded, &handoff);
+    let groups = copy_groups(func, &liveness, &eligible, &folded, &handoff, config.dest_reuses_operand_reg);
     let interval_of: FxHashMap<u32, &LiveInterval> = if groups.is_empty() {
         FxHashMap::default()
     } else {
@@ -463,6 +463,7 @@ fn copy_groups(
     eligible: &FxHashSet<u32>,
     folded: &FxHashMap<u32, u32>,
     handoff: &dyn Fn(u32, u32, u32) -> bool,
+    overlap_same: bool,
 ) -> FxHashMap<u32, Vec<u32>> {
     /// Largest group: bounds the pairwise overlap checks.
     const MAX_GROUP: usize = 16;
@@ -475,6 +476,17 @@ fn copy_groups(
             hi1 < lo2 || hi2 < lo1 || (hi1 == lo2 && handoff(a, b, hi1)) || (hi2 == lo1 && handoff(b, a, hi2))
         }))
     };
+    // A copy and its source, each defined once, hold the same bits wherever
+    // both are live, so they may overlap (a widening the load already made,
+    // which ext_elide turned into a copy, read after another use of its
+    // source took the source's register). AArch64 only, with operand reuse.
+    let mut defs: FxHashMap<u32, u32> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Some(d) = inst.dest() {
+            *defs.entry(d.0).or_default() += 1;
+        }
+    }
+    let single = |v: u32| overlap_same && defs.get(&v) == Some(&1);
     let mut root: FxHashMap<u32, u32> = FxHashMap::default();
     let mut members: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     fn find(root: &FxHashMap<u32, u32>, mut v: u32) -> u32 {
@@ -498,7 +510,8 @@ fn copy_groups(
         }
         let md = members.get(&rd).cloned().unwrap_or_else(|| vec![rd]);
         let ms = members.get(&rs).cloned().unwrap_or_else(|| vec![rs]);
-        if md.len() + ms.len() > MAX_GROUP || !md.iter().all(|&a| ms.iter().all(|&b| compatible(a, b))) {
+        let same = |a: u32, b: u32| (a, b) == (d, s) && single(d) && single(s);
+        if md.len() + ms.len() > MAX_GROUP || !md.iter().all(|&a| ms.iter().all(|&b| same(a, b) || compatible(a, b))) {
             continue;
         }
         root.insert(rs, rd);

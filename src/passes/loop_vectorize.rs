@@ -15,7 +15,9 @@
 //!                                                with %vn1 and %vp1)
 //!
 //! The vector loop does eight (16 bytes over the element size) iterations at
-//! a time while that many remain, and the original loop the rest. f is one
+//! a time while that many remain, and the original loop the rest. In front
+//! of it, a loop does UNROLL vector operations per step while that many
+//! vectors remain. f is one
 //! operation of the element against a loop-invariant value, computed in a
 //! type at least as wide as the element and stored truncated: an add, sub,
 //! multiply or bitwise op (the low bits of each depend only on the low bits
@@ -327,12 +329,15 @@ fn same(a: &Operand, b: &Operand) -> bool {
     }
 }
 
+/// Vector operations per step of the unrolled loop.
+const UNROLL: i64 = 4;
+
 fn rewrite(func: &mut IrFunction, plan: Plan, next_label: &mut u32) {
     let lanes = 16 / plan.elem.size() as i64;
     let mut next_id = func.next_value_id;
     let mut fresh = || { let v = Value(next_id); next_id += 1; v };
     let mut label = || { let l = BlockId(*next_label); *next_label += 1; l };
-    let (g, v, x) = (label(), label(), label());
+    let (g, u, g2, y, v, x) = (label(), label(), label(), label(), label(), label());
     let h_label = func.blocks[plan.header].label;
     let pre_label = func.blocks[plan.pre].label;
     let span = func.blocks[plan.header].source_spans.first().copied();
@@ -360,43 +365,71 @@ fn rewrite(func: &mut IrFunction, plan: Plan, next_label: &mut u32) {
         }
         Lane::Elem { .. } => unreachable!(),
     };
-    let go = fresh();
-    g_insts.push(Instruction::Cmp { dest: go, op: IrCmpOp::Uge, lhs: plan.counter_init, rhs: count(lanes), ty: plan.counter_ty });
+    let go4 = fresh();
+    g_insts.push(Instruction::Cmp { dest: go4, op: IrCmpOp::Uge, lhs: plan.counter_init, rhs: count(UNROLL * lanes), ty: plan.counter_ty });
 
-    // v: one vector operation per step, over the elements of `lanes`
-    // iterations (the lowest address first).
-    let (vn, vp, vn1, vp1, more) = (fresh(), fresh(), fresh(), fresh(), fresh());
+    // One vector operation (at address a) on the `lanes` iterations starting `k` vector
+    // steps from `p` (the lowest address first).
     let low = plan.access_off + if plan.step < 0 { (lanes - 1) * plan.step } else { 0 };
-    let mut v_insts = vec![
-        Instruction::Phi { dest: vn, ty: plan.counter_ty, incoming: vec![(plan.counter_init, g), (Operand::Value(vn1), v)] },
-        Instruction::Phi { dest: vp, ty: IrType::Ptr, incoming: vec![(plan.ptr_init, g), (Operand::Value(vp1), v)] },
-    ];
-    let at = if low == 0 {
-        vp
-    } else {
-        let a = fresh();
-        v_insts.push(Instruction::GetElementPtr { dest: a, base: vp, offset: count(low), ty: IrType::I8 });
-        a
+    let vec_op = |insts: &mut Vec<Instruction>, p: Value, k: i64, a: Value| {
+        let off = low + k * lanes * plan.step;
+        let at = if off == 0 {
+            p
+        } else {
+            insts.push(Instruction::GetElementPtr { dest: a, base: p, offset: count(off), ty: IrType::I8 });
+            a
+        };
+        let elems = Operand::Value(at);
+        let args = if rev { vec![inv, elems] } else { vec![elems, inv] };
+        insts.push(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::VecOp { op, elem: plan.elem, bytes: 16, splat: if rev { 1 } else { 2 } },
+            dest_ptr: Some(at),
+            args,
+        });
     };
-    let elems = Operand::Value(at);
-    let args = if rev { vec![inv, elems] } else { vec![elems, inv] };
-    v_insts.push(Instruction::Intrinsic {
-        dest: None,
-        op: IntrinsicOp::VecOp { op, elem: plan.elem, bytes: 16, splat: if rev { 1 } else { 2 } },
-        dest_ptr: Some(at),
-        args,
-    });
+
+    // u: UNROLL vector operations per step while that many remain.
+    let (un, up, un1, up1, more4) = (fresh(), fresh(), fresh(), fresh(), fresh());
+    let mut u_insts = vec![
+        Instruction::Phi { dest: un, ty: plan.counter_ty, incoming: vec![(plan.counter_init, g), (Operand::Value(un1), u)] },
+        Instruction::Phi { dest: up, ty: IrType::Ptr, incoming: vec![(plan.ptr_init, g), (Operand::Value(up1), u)] },
+    ];
+    for k in 0..UNROLL {
+        vec_op(&mut u_insts, up, k, fresh());
+    }
+    u_insts.push(Instruction::GetElementPtr { dest: up1, base: up, offset: count(UNROLL * lanes * plan.step), ty: IrType::I8 });
+    u_insts.push(Instruction::BinOp { dest: un1, op: IrBinOp::Sub, lhs: Operand::Value(un), rhs: count(UNROLL * lanes), ty: plan.counter_ty });
+    u_insts.push(Instruction::Cmp { dest: more4, op: IrCmpOp::Uge, lhs: Operand::Value(un1), rhs: count(UNROLL * lanes), ty: plan.counter_ty });
+
+    // g2: from g or u, whether a single vector step runs.
+    let (n2, p2, go) = (fresh(), fresh(), fresh());
+    let g2_insts = vec![
+        Instruction::Phi { dest: n2, ty: plan.counter_ty, incoming: vec![(plan.counter_init, g), (Operand::Value(un1), u)] },
+        Instruction::Phi { dest: p2, ty: IrType::Ptr, incoming: vec![(plan.ptr_init, g), (Operand::Value(up1), u)] },
+        Instruction::Cmp { dest: go, op: IrCmpOp::Uge, lhs: Operand::Value(n2), rhs: count(lanes), ty: plan.counter_ty },
+    ];
+
+    // v: one vector operation per step.
+    let (vn, vp, vn1, vp1, more) = (fresh(), fresh(), fresh(), fresh(), fresh());
+    let mut v_insts = vec![
+        Instruction::Phi { dest: vn, ty: plan.counter_ty, incoming: vec![(Operand::Value(n2), g2), (Operand::Value(vn1), v)] },
+        Instruction::Phi { dest: vp, ty: IrType::Ptr, incoming: vec![(Operand::Value(p2), g2), (Operand::Value(vp1), v)] },
+    ];
+    vec_op(&mut v_insts, vp, 0, fresh());
     v_insts.push(Instruction::GetElementPtr { dest: vp1, base: vp, offset: count(lanes * plan.step), ty: IrType::I8 });
     v_insts.push(Instruction::BinOp { dest: vn1, op: IrBinOp::Sub, lhs: Operand::Value(vn), rhs: count(lanes), ty: plan.counter_ty });
     v_insts.push(Instruction::Cmp { dest: more, op: IrCmpOp::Uge, lhs: Operand::Value(vn1), rhs: count(lanes), ty: plan.counter_ty });
 
-    // The header continues from g or x with the scalar loop's state.
+    // The header continues from y or x with the scalar loop's state.
     for inst in &mut func.blocks[plan.header].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
-            let from_x = if *dest == plan.ptr_phi { vp1 } else { vn1 };
-            for (_, l) in incoming.iter_mut() {
+            let is_ptr = *dest == plan.ptr_phi;
+            let (from_y, from_x) = if is_ptr { (p2, vp1) } else { (n2, vn1) };
+            for (op, l) in incoming.iter_mut() {
                 if *l == pre_label {
-                    *l = g;
+                    *l = y;
+                    *op = Operand::Value(from_y);
                 }
             }
             incoming.push((Operand::Value(from_x), x));
@@ -413,10 +446,24 @@ fn rewrite(func: &mut IrFunction, plan: Plan, next_label: &mut u32) {
         }
         _ => unreachable!("a preheader branches to its loop"),
     }
-    let (gn, vn_) = (g_insts.len(), v_insts.len());
+    let (gn, un_, g2n, vn_) = (g_insts.len(), u_insts.len(), g2_insts.len(), v_insts.len());
     func.blocks.push(BasicBlock {
         label: g, instructions: g_insts, source_spans: spans(gn),
-        terminator: Terminator::CondBranch { cond: Operand::Value(go), true_label: v, false_label: h_label },
+        terminator: Terminator::CondBranch { cond: Operand::Value(go4), true_label: u, false_label: g2 },
+    });
+    func.blocks.push(BasicBlock {
+        label: u, instructions: u_insts, source_spans: spans(un_),
+        terminator: Terminator::CondBranch { cond: Operand::Value(more4), true_label: u, false_label: g2 },
+    });
+    func.blocks.push(BasicBlock {
+        label: g2, instructions: g2_insts, source_spans: spans(g2n),
+        terminator: Terminator::CondBranch { cond: Operand::Value(go), true_label: v, false_label: y },
+    });
+    // y: the scalar loop for the rest, if any (the unrolled loop may have
+    // done them all).
+    func.blocks.push(BasicBlock {
+        label: y, instructions: Vec::new(), source_spans: Vec::new(),
+        terminator: Terminator::CondBranch { cond: Operand::Value(n2), true_label: h_label, false_label: plan.exit },
     });
     func.blocks.push(BasicBlock {
         label: v, instructions: v_insts, source_spans: spans(vn_),
@@ -471,22 +518,32 @@ mod tests {
         let mut func = slide(false);
         let mut next_label = 3;
         assert_eq!(vectorize_function(&mut func, &mut next_label), 1);
-        assert_eq!(func.blocks.len(), 6);
+        // g, u (unrolled), g2, y, v (one vector), x.
+        assert_eq!(func.blocks.len(), 9);
         assert!(matches!(func.blocks[0].terminator, Terminator::Branch(BlockId(3))));
-        // The guard clamps w to 0xffff and checks for eight elements.
+        // The guard clamps w to 0xffff and checks for four vectors.
         let g = &func.blocks[3].instructions;
         assert!(matches!(g[1], Instruction::Select { true_val: Operand::Const(IrConst::I64(0xffff)), .. }), "{g:?}");
-        assert!(matches!(g[2], Instruction::Cmp { op: IrCmpOp::Uge, rhs: Operand::Const(IrConst::I64(8)), .. }), "{g:?}");
-        // The vector step: 16 bytes below the pointer, eight halfwords.
+        assert!(matches!(g[2], Instruction::Cmp { op: IrCmpOp::Uge, rhs: Operand::Const(IrConst::I64(32)), .. }), "{g:?}");
+        // The unrolled step: four times 16 bytes below the pointer.
         let body = &func.blocks[4].instructions;
+        let offsets: Vec<i64> = body.iter().filter_map(|i| match i {
+            Instruction::GetElementPtr { offset: Operand::Const(c), .. } => c.to_i64(),
+            _ => None,
+        }).collect();
+        assert_eq!(offsets, [-16, -32, -48, -64, -64], "{body:?}");
+        // The single vector step: 16 bytes below the pointer, eight halfwords.
+        let body = &func.blocks[7].instructions;
         let Instruction::GetElementPtr { dest: at, offset: Operand::Const(IrConst::I64(-16)), .. } = body[2] else { panic!("{body:?}") };
         let Instruction::Intrinsic { op: IntrinsicOp::VecOp { op: VecOpKind::SatSub, elem: VecElem::U16, bytes: 16, splat: 2 }, dest_ptr: Some(d), .. } = body[3]
             else { panic!("{body:?}") };
         assert_eq!(d, at);
-        // The scalar loop is entered from the guard and after the vector loop.
+        // The scalar loop is entered when elements remain after the vector
+        // loops (y tests for that) and after its own iterations.
+        assert!(matches!(func.blocks[6].terminator, Terminator::CondBranch { true_label: BlockId(1), false_label: BlockId(2), .. }));
         let Instruction::Phi { incoming, .. } = &func.blocks[1].instructions[0] else { panic!() };
         let labels: Vec<u32> = incoming.iter().map(|(_, l)| l.0).collect();
-        assert_eq!(labels, [3, 1, 5]);
+        assert_eq!(labels, [6, 1, 8]);
     }
 
     #[test]

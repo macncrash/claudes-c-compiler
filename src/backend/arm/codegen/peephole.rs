@@ -487,6 +487,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_dead_writes(&lines, &mut kinds, n));
             changed2 |= pass!(eliminate_dead_writes_global(&lines, &mut kinds, n));
             changed2 |= pass!(fuse_branch_over_branch(&mut lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_repeated_compares(&lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_repeated_dups(&lines, &mut kinds, n));
+            changed2 |= pass!(fold_offset_into_vec_access(&mut lines, &mut kinds, n));
             changed2 |= pass!(thread_jumps(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_unreferenced_labels(&lines, &mut kinds, n));
             changed2 |= pass!(eliminate_unreachable_after_jumps(&lines, &mut kinds, n));
@@ -503,6 +506,13 @@ pub fn peephole_optimize(asm: String) -> String {
             kinds[i] = LineKind::Nop;
         }
     }
+
+    // Broadcasts a loop repeats with the same value, before it.
+    let (lines, kinds) = if skip.contains(&"hoist_loop_invariant_dups") {
+        (lines, kinds)
+    } else {
+        hoist_loop_invariant_dups(lines, kinds)
+    };
 
     // Phase 5: copy switch dispatches into the loop branches that reach them.
     let (lines, kinds) = if skip.contains(&"duplicate_switch_dispatch") {
@@ -809,6 +819,239 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
                 kinds[i] = LineKind::Nop;
                 changed = true;
             }
+        }
+    }
+    changed
+}
+
+/// The number of a SIMD/FP register operand (`v1.8h`, `q1`, `d1`, ...).
+fn vreg_num(op: &str) -> Option<u8> {
+    let op = op.trim().trim_start_matches('{');
+    let rest = op.strip_prefix(['v', 'q', 'd', 's', 'h', 'b'])?;
+    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    digits.parse::<u8>().ok().filter(|&r| r < 32 && (rest.len() == digits.len() || rest[digits.len()..].starts_with(['.', '}', '['])))
+}
+
+/// Whether the line writes SIMD register r (its first operand, unless a store).
+fn writes_vreg(line: &str, r: u8) -> bool {
+    let Some((m, ops)) = split_insn(line) else { return false };
+    !m.starts_with("st") && vreg_num(first_and_rest(ops).0) == Some(r)
+}
+
+/// Whether the line names SIMD register r at all.
+fn mentions_vreg(line: &str, r: u8) -> bool {
+    let Some((_, ops)) = split_insn(line) else { return false };
+    ops.split([',', ' ', '{', '}']).any(|t| vreg_num(t) == Some(r))
+}
+
+/// `dup vN.<T>, wR`: (N, R).
+fn dup_parts(line: &str) -> Option<(u8, u8)> {
+    let (m, ops) = split_insn(line)?;
+    if m != "dup" {
+        return None;
+    }
+    let (d, s) = first_and_rest(ops);
+    let s = s.trim().trim_start_matches(',').trim();
+    if !d.trim().starts_with('v') {
+        return None;
+    }
+    Some((vreg_num(d)?, gpr_operand(s)?))
+}
+
+/// A `dup vN, wR` repeating an earlier one, with no label, jump or call
+/// between and nothing writing vN or R: unrolled vector operations each
+/// broadcast the same scalar (slide_hash's window size).
+fn eliminate_repeated_dups(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((v, r)) = dup_parts(&lines[i]) else { continue };
+        for k in i + 1..n {
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            if matches!(kinds[k], LineKind::Label | LineKind::Call | LineKind::Branch | LineKind::Ret) {
+                break;
+            }
+            if lines[k].trim() == lines[i].trim() {
+                kinds[k] = LineKind::Nop;
+                changed = true;
+                continue;
+            }
+            if writes_vreg(&lines[k], v) || line_info(&lines[k], kinds[k], &|_| None).defs & (1 << r) != 0 {
+                break;
+            }
+        }
+    }
+    changed
+}
+
+/// A `dup vN, wR` in a one-block loop (a label only the loop's closing
+/// branch targets, no other branch or call in it) that writes vN before
+/// anything there reads it, where nothing else writes vN or R, moves to
+/// just before the loop.
+fn hoist_loop_invariant_dups(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<LineKind>) {
+    let n = lines.len();
+    let mut moves: Vec<(usize, usize)> = Vec::new();
+    for s in 0..n {
+        if kinds[s] != LineKind::Label {
+            continue;
+        }
+        let Some(name) = label_name(&lines[s]) else { continue };
+        let mut e = None;
+        for k in s + 1..n {
+            match kinds[k] {
+                LineKind::Nop => {}
+                LineKind::CondBranch => {
+                    if cond_branch_parts(&lines[k]).is_some_and(|(_, t)| t == name) {
+                        e = Some(k);
+                    }
+                    break;
+                }
+                LineKind::Label | LineKind::Call | LineKind::Branch | LineKind::CmpBranch | LineKind::Ret => break,
+                _ => {}
+            }
+        }
+        let Some(e) = e else { continue };
+        let mentions_label = |line: &str| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).any(|t| t == name);
+        if (0..n).any(|k| k != s && k != e && kinds[k] != LineKind::Nop && mentions_label(&lines[k])) {
+            continue;
+        }
+        for d in s + 1..e {
+            if kinds[d] == LineKind::Nop {
+                continue;
+            }
+            let Some((v, r)) = dup_parts(&lines[d]) else { continue };
+            let live = |k: usize| kinds[k] != LineKind::Nop;
+            let read_before = (s + 1..d).any(|k| live(k) && mentions_vreg(&lines[k], v));
+            let other_write = (s + 1..e).any(|k| k != d && live(k) && writes_vreg(&lines[k], v));
+            let src_written = (s + 1..e).any(|k| live(k) && line_info(&lines[k], kinds[k], &|_| None).defs & (1 << r) != 0);
+            if !read_before && !other_write && !src_written {
+                moves.push((d, s));
+            }
+        }
+    }
+    if moves.is_empty() {
+        return (lines, kinds);
+    }
+    let moved: std::collections::HashSet<usize> = moves.iter().map(|m| m.0).collect();
+    let mut before: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for &(d, s) in &moves {
+        before.entry(s).or_default().push(d);
+    }
+    let (mut out_lines, mut out_kinds) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for k in 0..n {
+        if moved.contains(&k) {
+            continue;
+        }
+        for &d in before.get(&k).into_iter().flatten() {
+            out_lines.push(lines[d].clone());
+            out_kinds.push(kinds[d]);
+        }
+        out_lines.push(lines[k].clone());
+        out_kinds.push(kinds[k]);
+    }
+    (out_lines, out_kinds)
+}
+
+/// `add|sub xT, xB, #k` whose only reads are the addresses of following
+/// q-register loads and stores (`ldr q0, [xT]`, `str q0, [xT]`), with T dead
+/// or rewritten after them and B unchanged, folds into them:
+/// `ldur q0, [xB, #-k]`. An unrolled vector loop addresses each 16 bytes
+/// from one pointer.
+fn fold_offset_into_vec_access(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((m, ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let sign = match m { "add" => 1, "sub" => -1, _ => continue };
+        let [t, b, k] = p[..] else { continue };
+        let (Some(t), Some(b)) = (gpr_operand(t), gpr_operand(b)) else { continue };
+        let Some(k) = k.strip_prefix('#').and_then(|k| k.parse::<i64>().ok()) else { continue };
+        if !p[0].starts_with('x') || !p[1].starts_with('x') || t == b || t > 28 || b > 28 {
+            continue;
+        }
+        let off = sign * k;
+        if !(-256..=255).contains(&off) {
+            continue;
+        }
+        let addr = format!("[{}]", xreg_name(t));
+        let mut uses = Vec::new();
+        let mut ok = false;
+        for j in i + 1..n {
+            if kinds[j] == LineKind::Nop {
+                continue;
+            }
+            if matches!(kinds[j], LineKind::Label | LineKind::Call | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Ret) {
+                break;
+            }
+            let Some((mj, oj)) = split_insn(&lines[j]) else { break };
+            let (reg, rest) = first_and_rest(oj);
+            let rest = rest.trim().trim_start_matches(',').trim();
+            if matches!(mj, "ldr" | "str") && reg.trim().starts_with('q') && rest == addr {
+                uses.push(j);
+                if live[j] & (1 << t) == 0 {
+                    ok = true;
+                    break;
+                }
+                continue;
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            if info.uses & (1 << t) != 0 || info.defs & (1 << b) != 0 {
+                break;
+            }
+            if info.defs & (1 << t) != 0 {
+                ok = true;
+                break;
+            }
+        }
+        if !ok || uses.is_empty() {
+            continue;
+        }
+        for &j in &uses {
+            let (mj, oj) = split_insn(&lines[j]).unwrap();
+            let reg = first_and_rest(oj).0.trim().to_string();
+            let unscaled = if mj == "ldr" { "ldur" } else { "stur" };
+            lines[j] = format!("    {} {}, [{}, #{}]", unscaled, reg, xreg_name(b), off);
+            kinds[j] = classify_line(&lines[j]);
+        }
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `cmp A, B; b.cc L; cmp A, B`: the second compare sets the flags the
+/// first left (the branch changes neither them nor A and B), and is only
+/// reached through the branch's fall-through. `a < b || a == b && ...`
+/// tests the same pair twice (pqdownheap's `smaller`).
+fn eliminate_repeated_compares(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let next = |kinds: &[LineKind], mut k: usize| {
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
+    for i in 0..n {
+        if kinds[i] != LineKind::Compare {
+            continue;
+        }
+        let j = next(kinds, i + 1);
+        if j >= n || kinds[j] != LineKind::CondBranch {
+            continue;
+        }
+        let k = next(kinds, j + 1);
+        if k < n && kinds[k] == LineKind::Compare && lines[k].trim() == lines[i].trim() {
+            kinds[k] = LineKind::Nop;
+            changed = true;
         }
     }
     changed
@@ -4270,6 +4513,42 @@ mod tests {
         // Not when the extended value is read after the branch.
         let input = ".type f, %function\nf:\n    bl g\n    sxtw x0, w0\n    cbnz x0, .LBB1\n    mov x0, #1\n.LBB1:\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("sxtw x0, w0"));
+    }
+
+    /// An unrolled saturating-subtract loop: a `dup` per vector, each
+    /// addressed by a `sub` from one pointer.
+    const UNROLLED: &str = "    cmp w13, #32\n    b.lo .L9\n.L1:\n\
+        \x20   sub x14, x11, #16\n    ldr q0, [x14]\n    dup v1.8h, w10\n    uqsub v0.8h, v0.8h, v1.8h\n    str q0, [x14]\n\
+        \x20   sub x14, x11, #32\n    ldr q0, [x14]\n    dup v1.8h, w10\n    uqsub v0.8h, v0.8h, v1.8h\n    str q0, [x14]\n\
+        \x20   sub x11, x11, #32\n    sub w13, w13, #16\n    cmp w13, #16\n    b.hs .L1\n.L9:\n";
+
+    #[test]
+    fn test_unrolled_vector_loop_broadcast_once_and_offsets_folded() {
+        let f = |body: &str| peephole_optimize(format!(".type f, %function\nf:\n{body}    ret\n.size f, .-f\n"));
+        let result = f(UNROLLED);
+        // One dup, before the loop's label.
+        assert_eq!(result.matches("dup v1.8h, w10").count(), 1, "{result}");
+        assert!(result.find("dup v1.8h").unwrap() < result.find(".L1:").unwrap(), "{result}");
+        assert!(result.contains("ldur q0, [x11, #-16]") && result.contains("stur q0, [x11, #-32]") && !result.contains("x14"), "{result}");
+        // Not when the loop writes the scalar it broadcasts.
+        let result = f(&UNROLLED.replace("    sub w13, w13, #16\n", "    sub w13, w13, #16\n    add w10, w10, #1\n"));
+        assert!(result.find("dup v1.8h").unwrap() > result.find(".L1:").unwrap(), "{result}");
+        // Nor when another branch jumps into the loop.
+        let result = f(&format!("    cbz x2, .L1\n{UNROLLED}"));
+        assert!(result.find("dup v1.8h").unwrap() > result.find(".L1:").unwrap(), "{result}");
+    }
+
+    #[test]
+    fn test_compare_repeated_after_a_branch_dropped() {
+        let f = |body: &str| peephole_optimize(format!(".type f, %function\nf:\n{body}    ret\n.size f, .-f\n"));
+        let result = f("    cmp w3, w4\n    b.lt .L1\n    cmp w3, w4\n    b.ne .L2\n    mov x0, #1\n.L1:\n.L2:\n");
+        assert_eq!(result.matches("cmp w3, w4").count(), 1, "{result}");
+        // Not past a label (another path may reach it with other flags), nor
+        // when the operands differ.
+        for body in ["    cmp w3, w4\n    b.lt .L1\n.L3:\n    cmp w3, w4\n    b.ne .L2\n    mov x0, #1\n    b .L3\n.L1:\n.L2:\n",
+                     "    cmp w3, w4\n    b.lt .L1\n    cmp w3, w5\n    b.ne .L2\n    mov x0, #1\n.L1:\n.L2:\n"] {
+            assert_eq!(f(body).matches("    cmp ").count(), 2, "{body}");
+        }
     }
 
     #[test]
