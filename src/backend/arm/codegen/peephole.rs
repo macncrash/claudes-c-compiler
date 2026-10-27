@@ -3422,19 +3422,29 @@ fn eliminate_low_half_only_extends(lines: &[String], kinds: &mut [LineKind], n: 
 }
 
 /// `lsl/lsr/asr T, S, #k` immediately followed by `add|sub|orr|and|eor D, X, T`
-/// (T dead afterwards, same width) becomes `op D, X, S, <shift> #k`.
+/// (T dead afterwards, same width) becomes `op D, X, S, <shift> #k`; so does
+/// `add T, S, S` as `lsl #1` (deflate's `head + ins_h`, a halfword table
+/// entry read and then written through the sum).
 fn fold_shift_into_operand(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     // Rewrites here only remove reads of dead registers, so liveness computed
     // up front stays a safe over-approximation.
     let live = live_out_all(lines, kinds, n);
     for i in 0..n {
-        let Some((shift @ ("lsl" | "lsr" | "asr"), ops)) = split_insn(&lines[i]) else { continue };
-        let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
-        if parts.len() != 3 || !parts[2].starts_with('#') {
+        if kinds[i] == LineKind::Nop {
             continue;
         }
-        let (t_name, s_name, amount) = (parts[0], parts[1], parts[2]);
+        let Some((mn, ops)) = split_insn(&lines[i]) else { continue };
+        let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let (shift, amount) = match mn {
+            "lsl" | "lsr" | "asr" if parts[2].starts_with('#') => (mn, parts[2]),
+            "add" if parts[1] == parts[2] => ("lsl", "#1"),
+            _ => continue,
+        };
+        let (t_name, s_name) = (parts[0], parts[1]);
         let (Some(t), Some(s)) = (gpr_operand(t_name), gpr_operand(s_name)) else { continue };
         // The user may come a few lines later, past straight-line code that
         // neither reads T nor writes T or S.
@@ -4581,6 +4591,19 @@ mod tests {
         assert!(peephole_optimize(input.to_string()).contains("lsl x11, x0, #3"));
         let input = ".type f, %function\nf:\n    lsl x11, x0, #3\n    sub x13, x11, x12\n    str x13, [x14]\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("lsl x11, x0, #3"));
+    }
+
+    #[test]
+    fn test_doubling_folded_into_operand() {
+        // A halfword table entry read and written through base + 2h.
+        let body = |after: &str| format!(
+            ".type f, %function\nf:\n    add x10, x10, x10\n    add x14, x14, x10\n    ldrh w11, [x14]\n    strh w12, [x14]\n{}    mov x0, x11\n    ret\n.size f, .-f\n", after);
+        let result = peephole_optimize(body(""));
+        assert!(result.contains("add x14, x14, x10, lsl #1"), "{}", result);
+        assert!(!result.contains("add x10, x10, x10"), "{}", result);
+        // The doubled value is read again.
+        let result = peephole_optimize(body("    str x10, [x15]\n"));
+        assert!(result.contains("add x10, x10, x10"), "{}", result);
     }
 
     #[test]

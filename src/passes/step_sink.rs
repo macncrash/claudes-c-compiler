@@ -33,26 +33,39 @@ pub(crate) fn sink_steps(func: &mut IrFunction) -> usize {
         }
         block.terminator.for_each_used_value(|v| uses[v as usize].push(None));
     }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let mut def_block = vec![usize::MAX; max_id + 1];
+    for (b, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                def_block[d.0 as usize] = b;
+            }
+        }
+    }
     let mut moved = 0;
-    for b in 0..func.blocks.len() {
-        // (phi, step) pairs in this block.
-        let mut pairs: Vec<(Value, Value)> = Vec::new();
-        for inst in &func.blocks[b].instructions {
+    for h in 0..func.blocks.len() {
+        // (phi, step, block stepping) in this block.
+        let mut pairs: Vec<(Value, Value, usize)> = Vec::new();
+        for inst in &func.blocks[h].instructions {
             let Instruction::Phi { dest, incoming, .. } = inst else { continue };
-            for (op, _) in incoming {
-                if let Operand::Value(s) = op {
-                    pairs.push((*dest, *s));
+            for (op, from) in incoming {
+                let Operand::Value(s) = op else { continue };
+                let sb = def_block[s.0 as usize];
+                if sb == h || (sb != usize::MAX && func.blocks[sb].label == *from) {
+                    pairs.push((*dest, *s, sb));
                 }
             }
         }
-        for (phi, step) in pairs {
+        for (phi, step, b) in pairs {
             let insts = &func.blocks[b].instructions;
             let Some(at) = insts.iter().position(|i| match i {
                 Instruction::BinOp { dest, op: IrBinOp::Add | IrBinOp::Sub, lhs: Operand::Value(l), rhs: Operand::Const(_), .. } => *dest == step && *l == phi,
                 Instruction::BinOp { dest, op: IrBinOp::Add, lhs: Operand::Const(_), rhs: Operand::Value(r), .. } => *dest == step && *r == phi,
                 _ => false,
             }) else { continue };
-            // Every other use of the phi: a non-phi instruction of this block.
+            // Every other use of the phi: a non-phi instruction of this block,
+            // or (for a step in the latch) one the phi's value is dead after
+            // the latch for.
             let mut last = None;
             let mut ok = true;
             for u in &uses[phi.0 as usize] {
@@ -62,9 +75,11 @@ pub(crate) fn sink_steps(func: &mut IrFunction) -> usize {
                             last = last.max(Some(ui));
                         }
                     }
+                    _ if b != h => {}
                     _ => ok = false,
                 }
             }
+            ok = ok && (b == h || dead_after(func, &cfg, phi, b, h));
             let Some(last_use) = last.filter(|&l| ok && l > at) else { continue };
             // As late as the step's own first read in the block allows (an
             // address computed from the counter then folds into its access).
@@ -108,6 +123,46 @@ pub(crate) fn sink_steps(func: &mut IrFunction) -> usize {
         }
     }
     moved
+}
+
+/// Whether the phi of block h, stepped in block b on the back edge to h,
+/// is read nowhere after b before h defines it again: a use in a block
+/// reached from b without passing h, a terminator of b, or a phi taking it
+/// from b or such a block. (zbench's `data[i++] = *p`, tested at the
+/// loop's head and stored in the latch, and read after the loop only where
+/// the head left it.)
+fn dead_after(func: &IrFunction, cfg: &crate::ir::analysis::CfgAnalysis, phi: Value, b: usize, h: usize) -> bool {
+    let mut seen = vec![false; func.blocks.len()];
+    let mut stack: Vec<usize> = cfg.succs.row(b).iter().map(|&s| s as usize).filter(|&s| s != h).collect();
+    while let Some(x) = stack.pop() {
+        if seen[x] {
+            continue;
+        }
+        seen[x] = true;
+        stack.extend(cfg.succs.row(x).iter().map(|&s| s as usize).filter(|&s| s != h));
+    }
+    if seen[b] {
+        return false;
+    }
+    seen[b] = true;
+    let label_of: crate::common::fx_hash::FxHashMap<_, _> = func.blocks.iter().enumerate().map(|(i, bl)| (bl.label, i)).collect();
+    let mut read = false;
+    for (x, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Phi { incoming, .. } => {
+                    read |= incoming.iter().any(|(op, from)| matches!(op, Operand::Value(v) if *v == phi)
+                        && label_of.get(from).is_none_or(|&p| seen[p]));
+                }
+                _ if x != b && seen[x] => inst.for_each_used_value(|v| read |= v == phi.0),
+                _ => {}
+            }
+        }
+        if seen[x] {
+            block.terminator.for_each_used_value(|v| read |= v == phi.0);
+        }
+    }
+    !read
 }
 
 /// Move an indexed address (`gep p, %i`) whose only use is a load or store a
@@ -185,6 +240,39 @@ pub(crate) fn sink_addresses(func: &mut IrFunction) -> usize {
                 moved += 1;
             }
         }
+        // Likewise a shift by a constant read only by an add, subtract or
+        // logical operation of its width: next to it, the shift's source
+        // is still live there and the backend shifts the operand
+        // (`and x12, x14, x12, lsr #16`, deflate's UPDATE_HASH). Apart, the
+        // source's register may be reused in between.
+        for at in (0..block.instructions.len()).rev() {
+            let Instruction::BinOp { dest, op: IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr, rhs: Operand::Const(_), ty, .. } = block.instructions[at] else { continue };
+            if use_count.get(dest.0 as usize) != Some(&1) {
+                continue;
+            }
+            let mut user = None;
+            for (k, inst) in block.instructions.iter().enumerate().skip(at + 1).take(WINDOW) {
+                if matches!(inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }) {
+                    break;
+                }
+                let mut reads = false;
+                inst.for_each_used_value(|v| reads |= v == dest.0);
+                if reads {
+                    user = Some(k);
+                    break;
+                }
+            }
+            let Some(k) = user else { continue };
+            let fits = match &block.instructions[k] {
+                Instruction::BinOp { op: IrBinOp::Add | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor, ty: t, .. } => (t.size() == 8) == (ty.size() == 8),
+                Instruction::BinOp { op: IrBinOp::Sub, rhs: Operand::Value(r), ty: t, .. } => *r == dest && (t.size() == 8) == (ty.size() == 8),
+                _ => false,
+            };
+            if fits && k > at + 1 {
+                move_inst(block, at, k - 1);
+                moved += 1;
+            }
+        }
     }
     moved
 }
@@ -229,6 +317,46 @@ mod tests {
         ]), "{:?}", func.blocks[1].instructions);
         // Read before the counter's last use: it stays.
         let mut func = scan(true);
+        assert_eq!(sink_steps(&mut func), 0);
+    }
+
+    /// `while (i < n) out[i++] = c` unrotated: the counter tested in the
+    /// header, stepped and stored at in the latch; the latch also leaves
+    /// to a block reading the counter when `read_after`.
+    fn latch_step(read_after: bool) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let latch_exit = if read_after {
+            Terminator::CondBranch { cond: v(2), true_label: BlockId(1), false_label: BlockId(4) }
+        } else {
+            Terminator::Branch(BlockId(1))
+        };
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![
+            BasicBlock { label: BlockId(0), instructions: vec![], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(1), instructions: vec![
+                Instruction::Phi { dest: Value(10), ty: IrType::I64, incoming: vec![(Operand::Const(IrConst::I64(0)), BlockId(0)), (v(11), BlockId(2))] },
+                Instruction::Cmp { dest: Value(14), op: IrCmpOp::Ult, lhs: v(10), rhs: v(1), ty: IrType::I64 },
+            ], terminator: Terminator::CondBranch { cond: v(14), true_label: BlockId(2), false_label: BlockId(3) }, source_spans: Vec::new() },
+            BasicBlock { label: BlockId(2), instructions: vec![
+                Instruction::BinOp { dest: Value(11), op: IrBinOp::Add, lhs: v(10), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 },
+                Instruction::GetElementPtr { dest: Value(12), base: Value(0), offset: v(10), ty: IrType::Ptr },
+                Instruction::Store { val: v(3), ptr: Value(12), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+            ], terminator: latch_exit, source_spans: Vec::new() },
+            BasicBlock { label: BlockId(3), instructions: vec![], terminator: Terminator::Return(Some(v(10))), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(4), instructions: vec![], terminator: Terminator::Return(Some(v(10))), source_spans: Vec::new() },
+        ];
+        func
+    }
+
+    #[test]
+    fn step_in_the_latch_moves_after_the_counters_last_use() {
+        let mut func = latch_step(false);
+        assert_eq!(sink_steps(&mut func), 1);
+        assert!(matches!(func.blocks[2].instructions[..], [
+            Instruction::GetElementPtr { .. }, Instruction::Store { .. }, Instruction::BinOp { dest: Value(11), .. },
+        ]), "{:?}", func.blocks[2].instructions);
+        // The old value is read after the latch: both stay live there.
+        let mut func = latch_step(true);
         assert_eq!(sink_steps(&mut func), 0);
     }
 

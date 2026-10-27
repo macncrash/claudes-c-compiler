@@ -92,14 +92,31 @@ fn left_candidate(op: &Operand) -> Option<i64> {
 }
 
 /// Instructions building a constant at a use: the weight of its loop uses.
+/// (A movz or movn and a movk for each other piece.)
 fn build_cost(k: i64) -> usize {
-    if costly(k) { 3 } else { 1 }
+    if costly(k) {
+        return 3;
+    }
+    let pieces = |skip: u64| (0..4).filter(|i| (k as u64 >> (16 * i)) & 0xffff != skip).count();
+    pieces(0).min(pieces(0xffff)).max(1)
 }
 
 /// The hoistable constant operands of an instruction.
 fn for_each_candidate(inst: &mut Instruction, left: bool, mut f: impl FnMut(&mut Operand, i64)) {
     let wide = |ty: &IrType| matches!(ty, IrType::I64 | IrType::U64);
     match inst {
+        // AArch64 multiplies and divides take no immediate: zbench's word
+        // choice `r % nw`, a multiply by 0x38e38e39 for each word. Only a
+        // constant that takes a movk too: with one `mov` saved per use,
+        // SQLite's speedtest ran 4% more instructions.
+        Instruction::BinOp { op, lhs, rhs, ty, .. } if left && ty.is_integer() && matches!(ty.size(), 4 | 8)
+            && matches!(op, IrBinOp::Mul | IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) => {
+            for o in [lhs, rhs] {
+                if let Some(k) = left_candidate(o).filter(|&k| build_cost(k) >= 2) {
+                    f(o, k);
+                }
+            }
+        }
         Instruction::BinOp { op, lhs, rhs, ty, .. } if left && !ty.is_float()
             && matches!(op, IrBinOp::Sub | IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr)
             && matches!(ty.size(), 4 | 8) && left_candidate(lhs).is_some() => {

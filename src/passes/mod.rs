@@ -45,6 +45,7 @@ pub(crate) mod loop_rotate;
 pub(crate) mod mod_ref;
 pub(crate) mod narrow;
 pub(crate) mod range_fold;
+mod phi_cmp;
 mod pressure_hoist;
 mod remat;
 mod resolve_asm;
@@ -785,20 +786,36 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         }
     }
 
-    // Phase 10h: Move each loop counter's step below the counter's last use
+    // Phase 10g2: A flag each predecessor computed with the same compare,
+    // only branched on where they meet, compared there instead.
+    if !disabled.contains("phi_cmp") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if phi_cmp::sink_compares(func) > 0 {
+                dce::eliminate_dead_code(func);
+            }
+        }
+    }
+
+    // Phase 10h: Extensions of 8-, 16- and 32-bit values that their loads
+    // already made, through phis, int operations whose sign extension
+    // no use reads made unsigned, and truncations no use reads above the
+    // kept bits dropped (AArch64).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("ext_elide") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            // (The copies left are read through, so a step reads the
+            // counter itself rather than its elided extension.)
+            if ext_elide::elide_extensions(func) > 0 {
+                copy_prop::propagate_copies(func);
+                dce::eliminate_dead_code(func);
+            }
+        }
+    }
+
+    // Phase 10i: Move each loop counter's step below the counter's last use
     // in its block, so phi elimination's back-edge copy can be coalesced.
     if !disabled.contains("step_sink") {
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             step_sink::sink_steps(func);
-        }
-    }
-
-    // Phase 10i: Extensions of 8-, 16- and 32-bit values that their loads
-    // already made, through phis, and int operations whose sign extension
-    // no use reads made unsigned (AArch64).
-    if target == crate::backend::Target::Aarch64 && !disabled.contains("ext_elide") {
-        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
-            ext_elide::elide_extensions(func);
         }
     }
 

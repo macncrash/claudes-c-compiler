@@ -29,7 +29,7 @@
 //! extension with.
 
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrFunction, Operand};
+use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, Operand};
 
 pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
     let max_id = func.max_value_id() as usize;
@@ -41,6 +41,21 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
             Instruction::Load { dest, ty, .. } if narrow(ty) => ext[dest.0 as usize] = Some(*ty),
             // A 32-bit operation (`sub w`) clears the high half.
             Instruction::BinOp { dest, ty: IrType::U32, .. } => ext[dest.0 as usize] = Some(IrType::U32),
+            // A 64-bit value shifted right by 32 or more, or masked to 32
+            // bits or fewer, is zero above them (zbench's xorshift
+            // `(unsigned)(rng >> 32)`, widened again for `% nw`).
+            Instruction::BinOp { dest, op, rhs: Operand::Const(k), ty: IrType::I64 | IrType::U64, .. }
+                if matches!((op, k.to_i64()), (IrBinOp::LShr, Some(32..=63)) | (IrBinOp::And, Some(0..=0xffff_ffff))) =>
+            {
+                let k = k.to_i64().unwrap_or(0);
+                ext[dest.0 as usize] = Some(match op {
+                    IrBinOp::And if k <= 0xff => IrType::U8,
+                    IrBinOp::And if k <= 0xffff => IrType::U16,
+                    IrBinOp::LShr if k >= 56 => IrType::U8,
+                    IrBinOp::LShr if k >= 48 => IrType::U16,
+                    _ => IrType::U32,
+                });
+            }
             // A narrowing cast extends its result its own way (`and #0xffff`,
             // `sxth`, `mov w0, w0`, `sxtw`).
             Instruction::Cast { dest, from_ty, to_ty, .. }
@@ -89,15 +104,78 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
         }
     }
     ext = assumed;
+    // Whether a register holding a value extended as `e` holds it extended
+    // as `from` too: the same, or zero-extended from fewer bits than an
+    // unsigned `from` has, or than a signed one's sign bit.
+    let covers = |e: IrType, from: IrType| {
+        e == from || (e.is_unsigned() && (e.size() < from.size() || (from.is_unsigned() && e.size() <= from.size())))
+    };
+    // (An elided extension's result is held as its source is, for a mask
+    // of it further on.)
     let mut elided = 0;
     for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
-        let Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty } = *inst else { continue };
-        if ext.get(v.0 as usize) == Some(&Some(from_ty)) && to_ty.is_integer() && to_ty.size() > from_ty.size() {
-            *inst = Instruction::Copy { dest, src: Operand::Value(v) };
-            elided += 1;
+        match *inst {
+            Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty }
+                if ext.get(v.0 as usize).copied().flatten().is_some_and(|e| covers(e, from_ty))
+                    && from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
+            {
+                *inst = Instruction::Copy { dest, src: Operand::Value(v) };
+                ext[dest.0 as usize] = ext[v.0 as usize];
+                elided += 1;
+            }
+            // A mask of the bits a zero extension already kept (division by
+            // a constant masks its 32-bit dividend).
+            Instruction::BinOp { dest, op: IrBinOp::And, lhs: Operand::Value(v), rhs: Operand::Const(k), ty: IrType::I64 | IrType::U64 }
+                if matches!(k.to_i64(), Some(0xff | 0xffff | 0xffff_ffff))
+                    && ext.get(v.0 as usize).copied().flatten().is_some_and(|e| {
+                        e.is_unsigned() && (e.size() as i64) * 8 <= 64 - k.to_i64().unwrap_or(0).leading_zeros() as i64
+                    }) =>
+            {
+                *inst = Instruction::Copy { dest, src: Operand::Value(v) };
+                ext[dest.0 as usize] = ext[v.0 as usize];
+                elided += 1;
+            }
+            _ => {}
         }
     }
-    elided + unsigned_low_ops(func)
+    elided + unsigned_low_ops(func) + unread_truncations(func)
+}
+
+/// Turn a narrowing integer cast into a copy when every use reads only the
+/// bits it keeps: deflate_fast's `(ush)(strstart - match_start)`, stored as
+/// 16 bits and decremented in 16 bits for d_code's widening (which masks
+/// again), was masked with `and #0xffff` for neither.
+fn unread_truncations(func: &mut IrFunction) -> usize {
+    let uses = use_sites(func);
+    let mut dropped = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (i, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Cast { dest, from_ty, to_ty, .. } = inst else { continue };
+            if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() < from_ty.size() && from_ty.size() <= 8
+                && low_bits_only(func, &uses, dest.0, to_ty.size() * 8, &mut Vec::new())
+            {
+                dropped.push((b, i));
+            }
+        }
+    }
+    for &(b, i) in &dropped {
+        if let Instruction::Cast { dest, src, .. } = func.blocks[b].instructions[i] {
+            func.blocks[b].instructions[i] = Instruction::Copy { dest, src };
+        }
+    }
+    dropped.len()
+}
+
+/// Each value's uses: (block, instruction), or None for a terminator.
+fn use_sites(func: &IrFunction) -> Vec<Vec<Option<(usize, usize)>>> {
+    let mut uses: Vec<Vec<Option<(usize, usize)>>> = vec![Vec::new(); func.max_value_id() as usize + 1];
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (i, inst) in block.instructions.iter().enumerate() {
+            inst.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { u.push(Some((b, i))) });
+        }
+        block.terminator.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { u.push(None) });
+    }
+    uses
 }
 
 /// Retype signed 32-bit ALU operations whose uses read only their low bits
@@ -106,15 +184,7 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
 /// `s->bi_buf |= (ush)value << s->bi_valid` shifted and or-ed in int, for a
 /// 16-bit store and its two bytes.
 fn unsigned_low_ops(func: &mut IrFunction) -> usize {
-    use crate::ir::reexports::IrBinOp;
-    let max_id = func.max_value_id() as usize;
-    let mut uses: Vec<Vec<Option<(usize, usize)>>> = vec![Vec::new(); max_id + 1];
-    for (b, block) in func.blocks.iter().enumerate() {
-        for (i, inst) in block.instructions.iter().enumerate() {
-            inst.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { u.push(Some((b, i))) });
-        }
-        block.terminator.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { u.push(None) });
-    }
+    let uses = use_sites(func);
     let mut retype = Vec::new();
     for (b, block) in func.blocks.iter().enumerate() {
         for (i, inst) in block.instructions.iter().enumerate() {
@@ -140,7 +210,6 @@ fn unsigned_low_ops(func: &mut IrFunction) -> usize {
 /// from one send to the next). Values already on the walk are taken as
 /// reading low bits: a cycle adds no other use.
 fn low_bits_only(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32, bits: usize, seen: &mut Vec<(u32, usize)>) -> bool {
-    use crate::ir::reexports::IrBinOp;
     if seen.contains(&(v, bits)) {
         return true;
     }
@@ -152,10 +221,14 @@ fn low_bits_only(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32
     uses[v as usize].iter().all(|u| {
         let Some((b, i)) = *u else { return false };
         match &func.blocks[b].instructions[i] {
-            Instruction::Cast { to_ty, .. } => fits(to_ty),
+            // A narrowing, or a widening that extends from at most `bits`
+            // (`and #0xffff` of a U16).
+            Instruction::Cast { from_ty, to_ty, .. } => fits(to_ty) || (fits(from_ty) && to_ty.is_integer() && to_ty.size() > from_ty.size()),
             Instruction::Store { val: Operand::Value(x), ptr, ty, .. } => x.0 == v && ptr.0 != v && fits(ty),
             Instruction::Copy { dest, .. } | Instruction::Phi { dest, .. } => low_bits_only(func, uses, dest.0, bits, seen),
-            Instruction::BinOp { dest, op, lhs, rhs, ty: IrType::I64 | IrType::U64 | IrType::I32 | IrType::U32 } => {
+            // The low bits of these depend only on the operands' low bits,
+            // whatever the width they are computed in.
+            Instruction::BinOp { dest, op, lhs, rhs, ty } if ty.is_integer() && ty.size() <= 8 => {
                 let low = match (op, lhs, rhs) {
                     (IrBinOp::LShr | IrBinOp::AShr, Operand::Value(l), Operand::Const(k)) if l.0 == v => {
                         return matches!(k.to_i64(), Some(k) if (0..bits as i64).contains(&k)
@@ -238,12 +311,46 @@ mod tests {
         };
         let store = Instruction::Store { val: Operand::Value(Value(3)), ptr: Value(0), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
         let mut func = int_or(store);
-        assert_eq!(elide_extensions(&mut func), 2);
+        // (And the truncation only stored becomes a copy.)
+        assert_eq!(elide_extensions(&mut func), 3);
         assert_eq!((ty(&func, 1), ty(&func, 2)), (IrType::U32, IrType::U32));
+        assert!(matches!(func.blocks[0].instructions[3], Instruction::Copy { .. }));
         // The phi's sign extension is read.
         let widen = Instruction::Cast { dest: Value(7), src: Operand::Value(Value(3)), from_ty: IrType::I32, to_ty: IrType::I64 };
         let mut func = int_or(widen);
-        assert_eq!(elide_extensions(&mut func), 0);
+        assert_eq!(elide_extensions(&mut func), 1);
         assert_eq!((ty(&func, 1), ty(&func, 2)), (IrType::I32, IrType::I32));
+    }
+
+    /// `(ush)(a - b)` stored, and decremented in 16 bits for a widening;
+    /// also compared when `compared`.
+    fn distance(compared: bool) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let mut insts = vec![
+            Instruction::BinOp { dest: Value(5), op: IrBinOp::Sub, lhs: v(1), rhs: v(2), ty: IrType::U32 },
+            Instruction::Cast { dest: Value(6), src: v(5), from_ty: IrType::U32, to_ty: IrType::U16 },
+            Instruction::Store { val: v(6), ptr: Value(0), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+            Instruction::BinOp { dest: Value(7), op: IrBinOp::Sub, lhs: v(6), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::U16 },
+            Instruction::Cast { dest: Value(8), src: v(7), from_ty: IrType::U16, to_ty: IrType::I64 },
+        ];
+        if compared {
+            insts.push(Instruction::Cmp { dest: Value(9), op: crate::ir::reexports::IrCmpOp::Ult, lhs: v(6), rhs: Operand::Const(IrConst::I64(256)), ty: IrType::U16 });
+        }
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![BasicBlock { label: BlockId(0), instructions: insts, terminator: Terminator::Return(Some(v(8))), source_spans: Vec::new() }];
+        func
+    }
+
+    #[test]
+    fn truncation_read_only_in_its_bits_dropped() {
+        let mut func = distance(false);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[0].instructions[1], Instruction::Copy { dest: Value(6), src: Operand::Value(Value(5)) }));
+        // The widening of the 16-bit difference still masks.
+        assert!(matches!(func.blocks[0].instructions[4], Instruction::Cast { from_ty: IrType::U16, .. }));
+        // A compare reads the bits above.
+        let mut func = distance(true);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[0].instructions[1], Instruction::Cast { .. }));
     }
 }

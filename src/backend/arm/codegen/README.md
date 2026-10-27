@@ -804,7 +804,9 @@ v1 and nothing between the copy and the call uses v22:
   access through it.
 - `lsl T, S, #k` folds into a later `add|sub|orr|and|eor D, X, T` past up to
   four unrelated lines, so that `fold_index_into_mem` can then make
-  `[X, S, lsl #k]` of the access through D.
+  `[X, S, lsl #k]` of the access through D. So does `add T, S, S`, as
+  `lsl #1`: deflate's `s->head + ins_h`, a halfword entry read and then
+  written through the sum, is one `add x14, x14, x10, lsl #1`.
 - `add xI, xJ, xJ` (or `lsl xI, xJ, #k`) feeding only the index of an
   access `[xB, xI]` whose size is 2^k becomes `[xB, xJ, lsl #k]`: the
   `prev[m & mask]` of a hash chain. Lines already deleted are never folded

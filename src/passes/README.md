@@ -121,12 +121,16 @@ The optimizer executes in four sequential phases:
      ret_dup
          |
          v
- Phase 10h: Counter Steps After Their Last Use
-     step_sink
+ Phase 10g2: Flags Compared Where Paths Meet
+     phi_cmp
          |
          v
- Phase 10i: Extensions Loads Already Made (AArch64)
+ Phase 10h: Extensions Loads Already Made (AArch64)
      ext_elide
+         |
+         v
+ Phase 10i: Counter Steps After Their Last Use
+     step_sink
          |
          v
  Phase 10j: Addresses Down to Their Access (AArch64)
@@ -1181,9 +1185,21 @@ it; when one predecessor is left, CFG simplification merges the block into
 it. Predecessors through a switch, or on both edges of a conditional branch,
 keep the shared block.
 
+### phi_cmp -- Flags Compared Where Paths Meet
+
+Runs after ret_dup. A phi that only its own block's conditional branch
+reads, each of whose incoming values is a compare of one kind and type
+(integer) that only the phi reads, becomes that compare of two new phis of
+the compares' operands (an operand all the paths share, the same value or
+constant, needs no phi). deflate_fast's `bflush`, set by `_tr_tally_lit` on
+the literal path and by `_tr_tally_dist` on the match path and tested once
+both meet, was materialized with `cset` on each path and tested with
+`cbz`; compared at the merge, the compare feeds the branch: about 6M fewer
+instructions at deflate level 1.
+
 ### step_sink -- Counter Steps After Their Last Use
 
-Runs last before dead_statics. `p[i++]` steps the counter before the old
+Runs after ext_elide. `p[i++]` steps the counter before the old
 value is read, so the two are live at once: phi elimination's copy on the
 back edge needs a register of its own and, when the latch branches
 conditionally, a block of its own (a move and a jump every iteration). A
@@ -1194,6 +1210,17 @@ phi's other uses, all in that block. It then takes the counter's register.
 (Right after the counter's last use, an address computed from it would no
 longer fold into its access.) compress_block's loop goes straight back to its
 header.
+
+The step may also be in the latch, the block the incoming edge comes from,
+when the counter is not read after the latch before the header defines it
+again: in no block reached from the latch without passing the header, not
+by the latch's terminator, and not by a phi taking it from the latch or
+such a block. Its uses in the latch are then the ones the step moves below.
+zbench's `data[i++] = (unsigned char)*p`, tested at the head of the
+unrotated loop and stored in its latch, kept the old counter in a register
+of its own each character. ext_elide runs first, with copy propagation
+after it, so the counter's elided extension for the index is the counter
+itself.
 
 ### loop_rotate -- Loop Rotation
 
@@ -1219,7 +1246,8 @@ once before it.
 
 ### ext_elide -- Extensions Loads Already Made
 
-Runs after step_sink, on AArch64. `ldrb`/`ldrh` zero-extend and
+Runs after phi_cmp, on AArch64, followed by copy propagation and dead code
+elimination where it changed anything. `ldrb`/`ldrh` zero-extend and
 `ldrsb`/`ldrsh` sign-extend to 64 bits, so an 8- or 16-bit value loaded is
 already extended its own way in its register. The backend sees that when the
 extension follows the load, not when the value went through a phi:
@@ -1242,7 +1270,13 @@ and its source in one register even where both are live: each is defined
 once, so they hold the same bits.) So does a narrowing cast, which extends its
 result its own way (`and #0xffff`, `sxth`, `mov w0, w0`, `sxtw`): deflate's
 `(Pos)strstart`, then widened as an index into the window, was moved to a
-second register at each hash insertion.
+second register at each hash insertion. A 64-bit value shifted right by 32
+or more, or masked with a constant below 2^32, is zero-extended from the
+bits left (zbench's xorshift `(unsigned)(rng >> 32)`, widened again for
+`% nw`). A zero extension from fewer bits than the widening's unsigned
+source type has (or than a signed one's sign bit) serves it too, and a mask
+by 0xff, 0xffff or 0xffffffff of a value zero-extended within it becomes a
+copy (division by a constant masks its 32-bit dividend that way).
 
 Then an int add, subtract, multiply, logical operation or left shift whose
 uses, through copies and phis, read only its low 31 bits (narrower casts and
@@ -1251,9 +1285,18 @@ keeps an int sign-extended with a `sxtw` after each operation, which no such
 use reads. compress_block's `s->bi_buf |= (ush)value << s->bi_valid`, an int
 shift and or for a 16-bit store and its two bytes, had one at each send.
 
+Last, a narrowing integer cast becomes a copy when every use reads only the
+bits it keeps: narrower stores and casts, widenings that extend from at most
+those bits (and so mask again), and through copies, phis and adds,
+subtracts, multiplies, logical operations and left shifts (whose low bits
+depend only on their operands' low bits, whatever width they are computed
+in). deflate_fast's `(ush)(strstart - match_start)`, stored as 16 bits and
+decremented in 16 bits for d_code's widening, was masked with
+`and #0xffff` for neither.
+
 ### addr_sink -- Addresses Down to Their Access
 
-Runs after ext_elide, on AArch64. `p[i] = expr` computes the address before
+Runs after step_sink, on AArch64. `p[i] = expr` computes the address before
 the value, so `p` and `i` die at the GEP and the value may take one of their
 registers; the backend then can't fold the add into the store as `[p, i]`. A
 GEP with a variable offset whose only use is a load or store at most 16
@@ -1265,6 +1308,13 @@ own across unrelated code. compress_block's second byte of each flush,
 `s->pending_buf[s->pending++] = (Byte)(s->bi_buf >> 8)`, was an `add` and a
 store. With the ext_elide changes, compress_block at deflate level 1 went
 from 21M instructions more than clang's to 3M fewer.
+
+A shift by a constant whose only use is an add, subtract (as its second
+operand) or logical operation of its width, at most 16 instructions later
+with no call between, moves to just before that use as well. Next to it, the
+shift's source is still live there and the peephole shifts the operand
+(`and x12, x14, x12, lsr #16`, deflate's hash update); apart, the source's
+register may be reused in between, and the shift needs its own instruction.
 
 ### latch_dup -- Latch Copies
 
@@ -1319,9 +1369,14 @@ On AArch64 a constant in a 32-bit operation also qualifies
 when both its 16-bit halves differ from 0 and 0xffff (a `movz` and a `movk`)
 and the instruction cannot encode it (no add or subtract immediate, no
 logical bitmask): deflate's hash multiplies by 66521 and adds it, rebuilt at
-every string inserted. At most four constants per function, most loop uses first, a use counted by
-the instructions building the constant there takes (three for a costly one,
-one otherwise). A cheap constant needs two loop uses: read once, it saves one
+every string inserted. So does a constant multiplied or divided by that
+takes a movz and a movk or more (AArch64 multiplies and divides take no
+immediate): zbench's word choice `r % nw` multiplies by 0x38e38e39 for each
+word. (With every nonzero constant, which a single `mov` builds, SQLite's
+speedtest ran 4% more instructions.) At most four constants per
+function, most loop uses first, a use counted by the instructions building
+the constant there takes (three for a costly one, otherwise a movz or movn
+and a movk per further piece). A cheap constant needs two loop uses: read once, it saves one
 `mov` but holds a register through the function, and longest_match lost
 more to the allocation around `MAX_MATCH - len` than it saved. The splitmix64 steps in scalar-bench's hash kernel
 drop sixteen instructions per operation, about 20% faster.
