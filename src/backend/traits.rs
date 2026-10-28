@@ -95,7 +95,7 @@ pub const MAX_JUMP_TABLE_RANGE: usize = 4096;
 /// Minimum density percentage (cases * 100 / range) for jump table eligibility.
 /// Below this threshold, the table would be mostly empty and a linear chain
 /// of compare-and-branch instructions is more efficient.
-pub const MIN_JUMP_TABLE_DENSITY_PERCENT: usize = 40;
+pub const MIN_JUMP_TABLE_DENSITY_PERCENT: usize = 10;
 
 /// Trait that each architecture implements to provide its specific code generation.
 ///

@@ -1326,7 +1326,14 @@ to choose between jump tables and compare-and-branch chains:
 |-----------|-------|-----------|
 | `MIN_JUMP_TABLE_CASES` | 4 | Below this, a linear chain is always faster |
 | `MAX_JUMP_TABLE_RANGE` | 4,096 | Larger tables waste memory for sparse switches |
-| `MIN_JUMP_TABLE_DENSITY_PERCENT` | 40% | Below this, the table is mostly empty default entries |
+| `MIN_JUMP_TABLE_DENSITY_PERCENT` | 10% | Below this, the table is mostly empty default entries |
+
+The density threshold is LLVM's at -O2. At 40%, the switch on the next
+character in SQLite's JSON parser (about 40 cases over 9..239) was a chain
+of compares tried in order on every token; as a table, speedtest ran 0.5%
+fewer instructions. A chain on AArch64 compares against a 12-bit immediate
+(`cmp w0, #123`, or `cmn` for -1..-4095) instead of loading each case
+value into a register first.
 
 When `-fno-jump-tables` is set (required by the Linux kernel with retpoline
 to avoid indirect jumps that objtool would reject), all switches use

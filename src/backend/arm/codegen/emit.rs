@@ -2114,7 +2114,14 @@ impl ArchCodegen for ArmCodegen {
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {
         let use_32bit = matches!(ty, IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8);
-        if use_32bit {
+        let v = if use_32bit { case_val as i32 as i64 } else { case_val };
+        let r = if use_32bit { "w0" } else { "x0" };
+        // A 12-bit immediate (or its negation) needs no register.
+        if (0..4096).contains(&v) {
+            self.state.emit_fmt(format_args!("    cmp {}, #{}", r, v));
+        } else if (-4095..0).contains(&v) {
+            self.state.emit_fmt(format_args!("    cmn {}, #{}", r, -v));
+        } else if use_32bit {
             self.emit_load_imm64("w1", case_val as i32 as i64);
             self.state.emit("    cmp w0, w1");
         } else {
