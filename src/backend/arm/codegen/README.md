@@ -767,6 +767,12 @@ Removes `str` instructions to stack slots that are overwritten before being read
 - A 16-bit byte swap, `rev wT, wS; lsr wD, wT, #16`, becomes `rev16 wD, wS`
   when the last write of S left its upper half zero (`ldrh`, `uxth`, a mask
   of at most 16 bits); the result then needs no `and #0xffff`.
+- A sign-extending byte or halfword load (`ldrsb`, `ldrsh`) whose result
+  is masked by the next instruction to bits the load gives
+  (`ldrsb x12, [x20, x21]; and x12, x12, #0xff`, a `char` read as
+  `unsigned char`) zero-extends instead (`ldrb w12, ...`), and a mask of
+  the whole byte or halfword goes; masking into another register needs the
+  loaded one dead there.
 - `sxtb|uxtb|sxth|uxth A, wB` (or `and A, B, #0xff` / `#0xffff`) feeding
   only a byte (or, after a halfword extension, halfword) store of wA stores
   wB instead.

@@ -484,6 +484,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_rev_into_rev16(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_signed_load_mask(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_extend_into_narrow_store(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_sxtw_into_users(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_zero_extension_into_user(&mut lines, &mut kinds, n));
@@ -2519,6 +2520,67 @@ fn fuse_rev_into_rev16(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         lines[j] = format!("    rev16 {}, {}", wreg_name(dr), wreg_name(sr));
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// A sign-extending byte or halfword load whose next instruction masks the
+/// loaded register to bits the load itself gives (`ldrsb x12, [x20, x21];
+/// and x12, x12, #0xff`, a `char` read as `unsigned char`): the load
+/// zero-extends instead, and a mask of the whole byte or halfword (or
+/// `uxtb`/`uxth`) goes. Another destination for the mask needs the loaded
+/// register dead after it, and then becomes a move.
+fn fuse_signed_load_mask(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    for i in 0..n {
+        let Some((m, ops)) = split_insn(&lines[i]) else { continue };
+        let (unsigned, full) = match m {
+            "ldrsb" => ("ldrb", 0xff),
+            "ldursb" => ("ldurb", 0xff),
+            "ldrsh" => ("ldrh", 0xffff),
+            "ldursh" => ("ldurh", 0xffff),
+            _ => continue,
+        };
+        let (d, mem) = first_and_rest(ops);
+        let Some(dr) = gpr_operand(d) else { continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((mn, jops)) = split_insn(&lines[j]) else { continue };
+        let q: Vec<&str> = jops.split(',').map(str::trim).collect();
+        let mask = match (mn, &q[..]) {
+            ("and", [_, _, k]) => parse_imm(k).filter(|&k| k <= full),
+            ("uxtb", [_, _]) => Some(0xff),
+            ("uxth", [_, _]) if full == 0xffff => Some(0xffff),
+            _ => None,
+        };
+        let Some(mask) = mask else { continue };
+        if gpr_operand(q[1]) != Some(dr) {
+            continue;
+        }
+        let Some(er) = gpr_operand(q[0]) else { continue };
+        if er != dr {
+            let live = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+            if live[j] & (1 << dr) != 0 {
+                continue;
+            }
+        }
+        lines[i] = format!("    {} {}, {}", unsigned, wreg_name(dr), mem.trim());
+        kinds[i] = classify_line(&lines[i]);
+        if mask == full {
+            if er == dr {
+                kinds[j] = LineKind::Nop;
+            } else {
+                lines[j] = format!("    mov {}, {}", wreg_name(er), wreg_name(dr));
+                kinds[j] = classify_line(&lines[j]);
+            }
+        }
         changed = true;
     }
     changed
@@ -5522,5 +5584,27 @@ f:
         let input = "    ldrh w12, [x12]\n    rev w0, w12\n    lsr w1, w0, #16\n    add x0, x0, x1\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(!result.contains("rev16"), "{}", result);
+    }
+
+    #[test]
+    fn test_signed_byte_load_masked_becomes_ldrb() {
+        // (unsigned char)z[i]: the mask goes with the sign extension.
+        let input = "    ldrsb x12, [x20, x21]\n    and x12, x12, #0xff\n    ldrb w0, [x13, x12]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldrb w12, [x20, x21]"), "{}", result);
+        assert!(!result.contains("ldrsb") && !result.contains("#0xff"), "{}", result);
+        // A narrower mask into another register, the loaded one dead, stays.
+        let result = peephole_optimize(frame("    ldrsh w12, [x1]\n    and w0, w12, #0xff0\n"));
+        assert!(result.contains("ldrh w12, [x1]") && result.contains("#0xff0"), "{}", result);
+    }
+
+    #[test]
+    fn test_signed_load_still_read_stays_signed() {
+        // The signed value is read after the mask into another register.
+        let result = peephole_optimize(frame("    ldrsb x12, [x1]\n    and x13, x12, #0xff\n    add x0, x12, x13\n"));
+        assert!(result.contains("ldrsb x12"), "{}", result);
+        // A mask wider than the loaded byte keeps sign bits.
+        let result = peephole_optimize(frame("    ldrsb x12, [x1]\n    and x0, x12, #0xfff\n"));
+        assert!(result.contains("ldrsb"), "{}", result);
     }
 }
