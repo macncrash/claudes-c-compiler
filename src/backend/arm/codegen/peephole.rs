@@ -483,6 +483,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_rev_into_rev16(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_extend_into_narrow_store(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_sxtw_into_users(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_zero_extension_into_user(&mut lines, &mut kinds, n));
@@ -2443,6 +2444,86 @@ fn fuse_shift_mask_into_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: us
     changed
 }
 
+/// Whether the last write of register `r` before line `i`, in the same
+/// straight-line run, leaves bits 16 and up of it zero (`ldrh`, `ldrb`,
+/// `uxth`, `uxtb`, a mask or field of at most 16 bits, a 32-bit shift right
+/// by 16 or more).
+fn upper16_zero_before(lines: &[String], kinds: &[LineKind], i: usize, r: u8) -> bool {
+    for k in (0..i).rev() {
+        if kinds[k] == LineKind::Nop {
+            continue;
+        }
+        match classify_access(&lines[k], kinds[k]) {
+            Access::Barrier => return false,
+            Access::Write { .. } => {}
+            _ => continue,
+        }
+        let Some((mn, ops)) = split_insn(&lines[k]) else { return false };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        if gpr_operand(p[0]) != Some(r) {
+            continue;
+        }
+        let w_form = p[0].starts_with('w');
+        return match (mn, &p[..]) {
+            ("ldrh" | "ldrb" | "ldurh" | "ldurb", _) => w_form,
+            ("uxth" | "uxtb", _) => true,
+            ("and", [_, _, m]) => parse_imm(m).is_some_and(|m| m <= 0xffff),
+            ("ubfx", [_, _, _, w]) => parse_imm(w).is_some_and(|w| w <= 16),
+            ("lsr", [_, _, s]) => w_form && parse_imm(s).is_some_and(|s| s >= 16),
+            _ => false,
+        };
+    }
+    false
+}
+
+/// `rev wT, wS` then `lsr wD, wT, #16` (or `ubfx wD, wT, #16, #16`), a
+/// 16-bit byte swap, with T dead afterwards and the upper half of S zero
+/// (get2byte's `ldrh`): `rev16 wD, wS`, which swaps the bytes of each half
+/// in place.
+fn fuse_rev_into_rev16(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    for i in 0..n {
+        let Some(("rev", ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [t, s] = p[..] else { continue };
+        if !t.starts_with('w') || !s.starts_with('w') {
+            continue;
+        }
+        let (Some(tr), Some(sr)) = (gpr_operand(t), gpr_operand(s)) else { continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((mn, sops)) = split_insn(&lines[j]) else { continue };
+        let q: Vec<&str> = sops.split(',').map(str::trim).collect();
+        let shift16 = match (mn, &q[..]) {
+            ("lsr", [_, _, k]) => parse_imm(k) == Some(16),
+            ("ubfx", [_, _, k, w]) => parse_imm(k) == Some(16) && parse_imm(w) == Some(16),
+            _ => false,
+        };
+        if !shift16 || !q[0].starts_with('w') || gpr_operand(q[1]) != Some(tr) || !q[1].starts_with('w') {
+            continue;
+        }
+        let Some(dr) = gpr_operand(q[0]) else { continue };
+        if !upper16_zero_before(lines, kinds, i, sr) {
+            continue;
+        }
+        let live = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+        if dr != tr && live[j] & (1 << tr) != 0 {
+            continue;
+        }
+        lines[j] = format!("    rev16 {}, {}", wreg_name(dr), wreg_name(sr));
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
 /// `sxtb|uxtb|sxth|uxth A, wB` immediately followed by a byte or halfword
 /// store of wA that the extension does not change (`strb` after a byte or
 /// halfword extension, `strh` after a halfword one), with A dead afterwards:
@@ -2886,6 +2967,11 @@ fn eliminate_redundant_zero_extends(lines: &mut [String], kinds: &mut [LineKind]
             ("mov", Some(s)) if srcs.split(',').count() == 1 && dest.starts_with('x') && src.starts_with('x') => bits[s as usize],
             _ => None,
         };
+        // Swapping the bytes of each half keeps a zero upper half zero.
+        let swapped = match (m, gpr_operand(src)) {
+            ("rev16", Some(s)) if dest.starts_with('w') => bits[s as usize].filter(|&b| b <= 16),
+            _ => None,
+        }.map(|_| 16);
         for (r, slot) in bits.iter_mut().enumerate() {
             if info.defs & (1 << r) != 0 {
                 *slot = None;
@@ -2897,6 +2983,7 @@ fn eliminate_redundant_zero_extends(lines: &mut [String], kinds: &mut [LineKind]
                 "ldrh" | "uxth" => Some(16),
                 _ if width.is_some() => width,
                 "mov" if copied.is_some() => copied,
+                "rev16" if swapped.is_some() => swapped,
                 _ if dest.starts_with('w') => Some(32),
                 _ => None,
             };
@@ -5412,5 +5499,28 @@ f:
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("ldr x10, [x10]\n"), "{}", result);
         assert!(result.contains("add x11, x11, #256"), "{}", result);
+    }
+
+    #[test]
+    fn test_halfword_swap_becomes_rev16() {
+        // get2byte: a halfword load, swapped, zero-extended and masked.
+        let input = "    ldrh w12, [x12, x21, lsl #1]\n    rev w0, w12\n    lsr w0, w0, #16\n    and x12, x0, #0xffff\n    and x0, x11, x12\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("rev16 w"), "{}", result);
+        assert!(!result.contains("rev w"), "{}", result);
+        assert!(!result.contains("#0xffff"), "{}", result);
+    }
+
+    #[test]
+    fn test_word_swap_not_rev16() {
+        // The upper half of a 32-bit load is not known zero: the shift
+        // drops the swapped low half, which rev16 would keep.
+        let input = "    ldr w12, [x12]\n    rev w0, w12\n    lsr w0, w0, #16\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("rev16"), "{}", result);
+        // Nor when the swap's own result is still read.
+        let input = "    ldrh w12, [x12]\n    rev w0, w12\n    lsr w1, w0, #16\n    add x0, x0, x1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("rev16"), "{}", result);
     }
 }

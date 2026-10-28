@@ -764,6 +764,9 @@ Removes `str` instructions to stack slots that are overwritten before being read
 
 - `lsr T, S, #k; and D, T, #(2^w - 1)` becomes `ubfx D, S, #k, #w` (in w form
   when the field lies in the low 32 bits).
+- A 16-bit byte swap, `rev wT, wS; lsr wD, wT, #16`, becomes `rev16 wD, wS`
+  when the last write of S left its upper half zero (`ldrh`, `uxth`, a mask
+  of at most 16 bits); the result then needs no `and #0xffff`.
 - `sxtb|uxtb|sxth|uxth A, wB` (or `and A, B, #0xff` / `#0xffff`) feeding
   only a byte (or, after a halfword extension, halfword) store of wA stores
   wB instead.
