@@ -338,7 +338,7 @@ pub fn allocate_registers(
             let from = call_points.partition_point(|&cp| cp < lo);
             for &cp in call_points[from..].iter().take_while(|&&cp| cp <= hi) {
                 let reg_args = liveness.reg_args_call_points.binary_search_by_key(&cp, |&(p, _)| p);
-                let boundary = reg_args.is_ok_and(|i| cp == iv.end || (cp == iv.start && liveness.reg_args_call_points[i].1 == Some(iv.value_id)));
+                let boundary = reg_args.is_ok_and(|i| cp == hi || (cp == iv.start && liveness.reg_args_call_points[i].1 == Some(iv.value_id)));
                 if boundary {
                     continue;
                 }
@@ -377,6 +377,20 @@ pub fn allocate_registers(
     let spans_any = |pieces: &[(u32, Vec<(u32, u32)>)]| {
         pieces.iter().any(|(m, _)| spans_clobbering_call(&liveness, interval_of[m], call_points, boundary_ok))
     };
+    // The weight of the copies between members of a group, by their dests:
+    // the moves the group leaves if its members get different registers.
+    let mut copy_weight: FxHashMap<u32, u64> = FxHashMap::default();
+    if !groups.is_empty() {
+        for (b, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                if let Instruction::Copy { dest, src: Operand::Value(s) } = inst {
+                    if groups.get(&dest.0).is_some_and(|m| m.contains(&s.0)) {
+                        *copy_weight.entry(dest.0).or_default() += block_weight(&liveness, b);
+                    }
+                }
+            }
+        }
+    }
 
     // One pass in priority order over every candidate. A call-spanning value
     // needs a callee-saved register; another tries a caller-saved register
@@ -404,8 +418,12 @@ pub fn allocate_registers(
                 let free = || (0..callee.len()).filter(|&i| fits_all(&callee_busy[i]));
                 free().find(|&i| !callee_busy[i].is_empty()).or_else(|| free().next()).map(|i| (false, i))
             } else {
+                // A fresh callee-saved register costs one save and restore,
+                // less than the copies of a group this hot (a loop phi).
+                let copies: u64 = members.iter().filter_map(|m| copy_weight.get(m)).sum();
                 (0..caller.len()).find(|&i| fits_all(&caller_busy[i])).map(|i| (true, i))
                     .or_else(|| (0..callee.len()).find(|&i| !callee_busy[i].is_empty() && fits_all(&callee_busy[i])).map(|i| (false, i)))
+                    .or_else(|| (copies > 2 * BLOCK_WEIGHT_UNIT).then(|| (0..callee.len()).find(|&i| fits_all(&callee_busy[i]))).flatten().map(|i| (false, i)))
             };
             if let Some((is_caller, i)) = pick {
                 for (m, sg) in &pieces {
@@ -1096,20 +1114,21 @@ fn remove_ineligible_operands(func: &IrFunction, eligible: &mut FxHashSet<u32>, 
 
 /// Check whether a value is live at any call point (sorted), looking only at
 /// the segments in which it is live. A call in `boundary_ok` (sorted by point)
-/// does not count when it defines the value, or when it is the value's last
-/// use: the value then needs no register while the callee runs. (An interval
-/// can also start at a call that it is live into, when the call opens a block;
-/// that call does count.)
+/// does not count when it defines the value, or when it is the last use of
+/// one of its pieces (an argument of a call that a branch ends with, the value
+/// still live in blocks laid out after it): the value then needs no register
+/// while the callee runs. (An interval can also start at a call that it is
+/// live into, when the call opens a block; that call does count.)
 fn spans_clobbering_call(liveness: &LivenessResult, iv: &LiveInterval, call_points: &[u32], boundary_ok: &[(u32, Option<u32>)]) -> bool {
-    let at_boundary = |cp: u32| match boundary_ok.binary_search_by_key(&cp, |&(p, _)| p) {
-        Ok(i) => cp == iv.end || (cp == iv.start && boundary_ok[i].1 == Some(iv.value_id)),
+    let at_boundary = |cp: u32, piece_end: u32| match boundary_ok.binary_search_by_key(&cp, |&(p, _)| p) {
+        Ok(i) => cp == piece_end || (cp == iv.start && boundary_ok[i].1 == Some(iv.value_id)),
         Err(_) => false,
     };
     liveness.segments_of(iv).iter().any(|&(lo, hi)| {
         let start_idx = call_points.partition_point(|&cp| cp < lo);
         call_points[start_idx..].iter()
             .take_while(|&&cp| cp <= hi)
-            .any(|&cp| !at_boundary(cp))
+            .any(|&cp| !at_boundary(cp, hi))
     })
 }
 

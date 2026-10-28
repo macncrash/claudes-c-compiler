@@ -480,6 +480,16 @@ the pool it may use:
   `s7`--`s11`). The ABI preserves these across calls, so no per-call
   save/restore is needed -- only the prologue and epilogue save and restore
   them.
+- On ARM a register-args-only call does not count as one a value spans
+  when it defines the value or reads it for the last time in one of its
+  live pieces: an argument of a call that a branch ends with is moved into
+  its argument register before the call and is dead in the callee, even
+  if blocks laid out after that branch still read it. SQLite's
+  btreeParseCellPtr ends its overflow branch with a call taking all three
+  of its parameters, which its varint fast paths, laid out after that
+  call, also read; counted as spanning it, the three took callee-saved
+  registers, saved and restored on every call (speedtest 1.0% fewer
+  instructions without).
 - A value no call interrupts tries the **caller-saved registers** first
   (x86: `r11`, `r10`, `r8`, `r9`; ARM: `x10`--`x15`, and `x3`--`x8` in
   leaf functions): they need no saving at all. On ARM a function whose only
@@ -546,7 +556,12 @@ a copy becomes a jump the peephole threads away. Assigned one at a time, an
 unrelated value could take the register in a gap between members. A group
 with a call-spanning member (a sum carried around a loop that calls
 functions) needs one callee-saved register; one that does not fit is
-allocated member by member.
+allocated member by member. A group with no call-spanning member takes a
+caller-saved register, or a callee-saved one already saved; failing both, it
+takes a fresh callee-saved register when the copies between its members
+weigh more than two runs of the entry (the save and restore it costs).
+deflate_fast's loop phi of its lookahead copied from a callee-saved register
+on two paths each iteration once its group no longer had to be callee-saved.
 
 Values that may hand a register to each other at an operation (`add x20,
 x20, #1`: the operand dies where the result is born) are **partners**. A
