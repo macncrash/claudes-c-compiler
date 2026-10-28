@@ -51,6 +51,17 @@ pub(super) const ARM_CALLER_SAVED: [PhysReg; 6] = [
     PhysReg(10), PhysReg(11), PhysReg(12), PhysReg(13), PhysReg(14), PhysReg(15),
 ];
 
+/// Where an indirect call reads its target at the `blr`.
+#[derive(Clone, Copy)]
+pub(super) enum FptrSource {
+    /// Pushed below the stack arguments before they are set up.
+    Spilled,
+    /// Its allocated register, which setting up the arguments leaves alone.
+    Reg(PhysReg),
+    /// Loaded into x17 from its stack slot (at this unadjusted offset).
+    Slot(i64),
+}
+
 /// Callee-saved FP registers available for allocation: d8-d15 (AAPCS64
 /// preserves their low 64 bits, which is all a scalar float needs).
 pub(super) const ARM_FP_CALLEE_SAVED: [PhysReg; 8] = [
@@ -281,6 +292,9 @@ pub struct ArmCodegen {
     /// HFA return whose sret pointer is only loaded for those copies and
     /// the Return: the loads (skipped, as are the x8 setup and its store).
     pub(super) hfa_ret_ptr_loads: Option<FxHashSet<u32>>,
+    /// Where the indirect call being emitted reads its target at the `blr`
+    /// (emit_call_prepare_fptr).
+    pub(super) fptr_source: FptrSource,
     /// Which callee-saved FP registers (d8-d15) are used (for save/restore).
     pub(super) used_fp_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved FP registers are stored.
@@ -336,6 +350,7 @@ impl ArmCodegen {
             hfa_ret_copies: FxHashSet::default(),
             hfa_ret_loaded: false,
             hfa_ret_ptr_loads: None,
+            fptr_source: FptrSource::Spilled,
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
             prestore_regs: Vec::new(),
@@ -2193,7 +2208,15 @@ impl ArchCodegen for ArmCodegen {
         self.operand_to_x0(func_ptr);
         self.state.emit("    str x0, [sp, #-16]!");
     }
-    fn emit_call_fptr_spill_size(&self) -> usize { 16 }
+    fn emit_call_prepare_fptr(&mut self, func_ptr: &Operand, arg_classes: &[CallArgClass]) {
+        self.fptr_source = self.fptr_source_for(func_ptr, arg_classes);
+        if matches!(self.fptr_source, FptrSource::Spilled) {
+            self.emit_call_spill_fptr(func_ptr);
+        }
+    }
+    fn emit_call_fptr_spill_size(&self) -> usize {
+        if matches!(self.fptr_source, FptrSource::Spilled) { 16 } else { 0 }
+    }
     fn emit_call_move_f32_to_acc(&mut self) { self.state.emit("    fmov w0, s0"); }
     fn emit_call_move_f64_to_acc(&mut self) { self.state.emit("    fmov x0, d0"); }
 

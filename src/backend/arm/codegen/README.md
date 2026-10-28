@@ -57,7 +57,7 @@ All codegen source files reside under `src/backend/arm/codegen/`.
 | `emit.rs` | Core `ArmCodegen` struct, register pool definitions (`ARM_CALLEE_SAVED`, `ARM_CALLER_SAVED`), ALU mnemonic mapping, condition code tables, immediate encoding helpers (`const_as_imm12`, `const_as_power_of_2`), prescan of inline asm for callee-saved register discovery, and integer comparison emission with optimized reg-vs-imm12 and reg-vs-reg paths. |
 | `mod.rs` | Module declarations for the codegen submodules. |
 | `prologue.rs` | Stack space calculation, prologue/epilogue emission (frame pointer/link register pair save, callee-saved register save/restore via `STP`/`LDP`), parameter store dispatch, and variadic register save area layout. |
-| `calls.rs` | Call ABI configuration (`CallAbiConfig` with 8 integer regs, 8 float regs, I128 pair alignment), stack argument marshalling (scalars, I128, F128, structs by value), GP-to-temp staging, FP register argument loading, indirect call via `BLR x17`, and post-call stack cleanup. |
+| `calls.rs` | Call ABI configuration (`CallAbiConfig` with 8 integer regs, 8 float regs, I128 pair alignment), stack argument marshalling (scalars, I128, F128, structs by value), GP-to-temp staging, FP register argument loading, indirect calls, and post-call stack cleanup. An indirect call branches to the register holding its target (callee-saved, or caller-saved when every argument goes straight into its register), loads it into x17 from its stack slot, or otherwise spills it below the stack arguments first. |
 | `memory.rs` | Load/store emission with F128 specialization, typed slot access, pointer indirection, GEP (get-element-pointer) address computation, `memcpy` helpers, dynamic alloca support (`sub sp` / `mov sp`), and alignment rounding. |
 | `alu.rs` | Integer ALU operations: binary ops (add, sub, mul, div, rem, and, or, xor, shifts) with strength-reduction for power-of-2 division/remainder, register-direct fast paths for callee-saved operands, and unary ops (neg, not, clz, ctz, bswap, popcount via NEON `CNT`/`UADDLV`). |
 | `comparison.rs` | Integer comparison (`CMP` + `CSET`), floating-point comparison (`FCMP` + `CSET`), F128 comparison via soft-float libcalls, fused compare-and-branch emission, and `CSEL`-based select. |
@@ -122,7 +122,7 @@ promoted reg_idx back to physical registers.
 | `x11` | memcpy loop counter |
 | `x12` | memcpy byte transfer |
 | `x15` | F128 large-offset scratch |
-| `x16`/`x17` | Intra-procedure-call scratch (IP0/IP1); `x17` used for indirect calls (`BLR x17`) |
+| `x16`/`x17` | Intra-procedure-call scratch (IP0/IP1); `x17` holds an indirect call target loaded from the stack |
 | `x18` | Platform-reserved (not used) |
 | `sp` | Stack pointer (must remain 16-byte aligned) |
 

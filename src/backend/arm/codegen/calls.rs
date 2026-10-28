@@ -3,7 +3,15 @@
 use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
 use crate::common::types::IrType;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
-use super::emit::{ArmCodegen, callee_saved_name, ARM_ARG_REGS};
+use crate::backend::traits::ArchCodegen;
+use super::emit::{ArmCodegen, FptrSource, callee_saved_name, ARM_ARG_REGS};
+
+/// Register arguments only (scalars, HFAs, a skipped HFA result pointer):
+/// emit_call_reg_args_impl loads each straight into its register.
+fn reg_args_only(arg_classes: &[CallArgClass]) -> bool {
+    arg_classes.iter().all(|c| matches!(c, CallArgClass::IntReg { .. } | CallArgClass::FloatReg { .. }
+        | CallArgClass::StructHfaReg { .. } | CallArgClass::ZeroSizeSkip))
+}
 
 impl ArmCodegen {
     /// Store (`str`, before) or reload (`ldr`, after) the caller-saved
@@ -240,8 +248,7 @@ impl ArmCodegen {
         // descending order (constants go through x0). Unlike staging through
         // x9-x16, this leaves the caller-saved pool intact, which
         // liveness::is_reg_args_only_call relies on.
-        if arg_classes.iter().all(|c| matches!(c, CallArgClass::IntReg { .. } | CallArgClass::FloatReg { .. }
-            | CallArgClass::StructHfaReg { .. } | CallArgClass::ZeroSizeSkip)) {
+        if reg_args_only(arg_classes) {
             self.emit_call_struct_byval_reg_args(args, arg_classes, slot_adjust, needs_adjusted_load);
             self.emit_call_fp_reg_args(args, arg_classes, arg_types, slot_adjust, needs_adjusted_load);
             let gp_args: Vec<usize> = (0..args.len())
@@ -268,9 +275,33 @@ impl ArmCodegen {
         self.state.emit_fmt(format_args!("{}{:#x}", super::peephole::CALL_USES_PREFIX, mask));
     }
 
+    /// Where an indirect call can read `func_ptr` at the `blr` without
+    /// spilling it first: a callee-saved register, a caller-saved one when
+    /// the arguments all go straight into their registers (the other paths
+    /// stage them through x9-x16), or its stack slot.
+    pub(super) fn fptr_source_for(&self, func_ptr: &Operand, arg_classes: &[CallArgClass]) -> FptrSource {
+        let Operand::Value(v) = func_ptr else { return FptrSource::Spilled };
+        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+            if reg.0 >= 19 || reg_args_only(arg_classes) {
+                return FptrSource::Reg(reg);
+            }
+            return FptrSource::Spilled;
+        }
+        match self.state.get_slot(v.0) {
+            Some(slot) if !self.state.is_alloca(v.0) => FptrSource::Slot(slot.0),
+            _ => FptrSource::Spilled,
+        }
+    }
+
     pub(super) fn emit_call_instruction_impl(&mut self, direct_name: Option<&str>, _func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) {
         if let Some(name) = direct_name {
             self.state.emit_fmt(format_args!("    bl {}", name));
+        } else if let (true, FptrSource::Reg(reg)) = (indirect, self.fptr_source) {
+            self.state.emit_fmt(format_args!("    blr {}", callee_saved_name(reg)));
+        } else if let (true, FptrSource::Slot(slot)) = (indirect, self.fptr_source) {
+            let adjust = if self.state.has_dyn_alloca { 0 } else { stack_arg_space as i64 };
+            self.emit_load_from_sp("x17", slot + adjust, "ldr");
+            self.state.emit("    blr x17");
         } else if indirect {
             let spill_offset = stack_arg_space as i64;
             if Self::is_valid_imm_offset(spill_offset, "ldr", "x17") {
@@ -285,7 +316,8 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_call_cleanup_impl(&mut self, stack_arg_space: usize, _f128_temp_space: usize, indirect: bool) {
-        let fptr_spill = if indirect { 16usize } else { 0 };
+        let fptr_spill = if indirect { self.emit_call_fptr_spill_size() } else { 0 };
+        self.fptr_source = FptrSource::Spilled;
         let total = stack_arg_space + fptr_spill;
         if total > 0 {
             self.emit_add_sp(total as i64);

@@ -245,7 +245,7 @@ several categories:
 - **Function calls**: `emit_call` (handles both direct and indirect calls
   via `direct_name: Option<&str>` and `func_ptr: Option<&Operand>`), plus
   the 8-phase hook methods (`emit_call_compute_stack_space`,
-  `emit_call_f128_pre_convert`, `emit_call_spill_fptr`,
+  `emit_call_f128_pre_convert`, `emit_call_prepare_fptr`,
   `emit_call_stack_args`, `emit_call_sret_setup`, `emit_call_reg_args`,
   `emit_call_instruction`, `emit_call_cleanup`, `emit_call_store_result`).
 - **Atomics**: `emit_atomic_load`, `emit_atomic_store`, `emit_atomic_rmw`,
@@ -281,7 +281,8 @@ Key default implementations include:
   delegates to the corresponding specialized method.
 - **`emit_call`**: Orchestrates an 8-phase call sequence (Phase 0: classify
   arguments and compute stack space, Phase 1: F128 pre-conversion, Phase 2:
-  spill function pointer, Phase 3: push stack arguments, Phase 3.5: sret
+  spill function pointer, unless the backend reads it where it lives at the
+  call, Phase 3: push stack arguments, Phase 3.5: sret
   pointer setup, Phase 4: load register arguments, Phase 5: emit the call
   instruction, Phase 6: clean up the stack and store the result). Each phase
   is a backend-supplied hook method.

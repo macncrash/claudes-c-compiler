@@ -77,9 +77,10 @@ pub struct RegAllocConfig {
     /// argument). Requires a backend whose argument setup and result copy
     /// leave the caller-saved pool untouched (AArch64).
     pub caller_saved_at_call_boundaries: bool,
-    /// Whether Memcpy pointer operands may be register-allocated. Requires a
-    /// backend whose memcpy reads register-assigned pointers (AArch64).
-    pub allow_memcpy_regalloc: bool,
+    /// Whether Memcpy pointer operands and indirect call targets may be
+    /// register-allocated. Requires a backend whose memcpy and indirect calls
+    /// read register-assigned pointers (AArch64).
+    pub allow_ptr_operand_regalloc: bool,
     /// Whether the dest of a Copy, Cast, BinOp, UnaryOp, Cmp, Select, GEP or Load
     /// may share a register with an operand whose live range ends at that
     /// instruction (`i = i + 1` in place, and a loop's latch copy becoming
@@ -1030,10 +1031,10 @@ fn remove_ineligible_operands(func: &IrFunction, eligible: &mut FxHashSet<u32>, 
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::CallIndirect { func_ptr: Operand::Value(v), .. } => {
+                Instruction::CallIndirect { func_ptr: Operand::Value(v), .. } if !config.allow_ptr_operand_regalloc => {
                     eligible.remove(&v.0);
                 }
-                Instruction::Memcpy { dest, src, .. } if !config.allow_memcpy_regalloc => {
+                Instruction::Memcpy { dest, src, .. } if !config.allow_ptr_operand_regalloc => {
                     eligible.remove(&dest.0);
                     eligible.remove(&src.0);
                 }
@@ -1238,7 +1239,7 @@ mod tests {
         ];
         let config = |save| RegAllocConfig {
             available_regs: Vec::new(), caller_saved_regs: vec![PhysReg(10), PhysReg(11)], call_free_regs: Vec::new(),
-            allow_inline_asm_regalloc: false, caller_saved_at_call_boundaries: true, allow_memcpy_regalloc: false,
+            allow_inline_asm_regalloc: false, caller_saved_at_call_boundaries: true, allow_ptr_operand_regalloc: false,
             dest_reuses_operand_reg: false, save_around_calls: save,
         };
         let r = allocate_registers(&func, &config(true));

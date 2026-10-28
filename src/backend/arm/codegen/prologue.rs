@@ -92,7 +92,7 @@ impl ArmCodegen {
             &mut self.reg_assignments, &mut self.used_callee_saved,
             false,
             true, // argument setup leaves x10-x15 intact (calls.rs)
-            true, // memcpy reads register-assigned pointers (memory.rs)
+            true, // memcpy and indirect calls read register-assigned pointers
             true, // simple ops read their operands before writing the dest
             Some(&mut call_saves), // saved around calls (save_around_call)
         );
