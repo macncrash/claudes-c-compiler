@@ -1378,7 +1378,7 @@ const LOOP_TRIPS: f64 = 10.0;
 /// step counter, read at the header and the shared latch) weighed less than
 /// ones with many uses spread over its 186 opcode handlers, each of which
 /// runs only for its own opcodes.
-fn compute_block_freq(successors: &[Vec<usize>], num_blocks: usize) -> Vec<f64> {
+pub(crate) fn compute_block_freq(successors: &[Vec<usize>], num_blocks: usize) -> Vec<f64> {
     let mut freq = vec![0.0f64; num_blocks];
     if num_blocks == 0 {
         return freq;

@@ -67,8 +67,13 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
     let mut sorted_loops = loops;
     sorted_loops.sort_by_key(|l| l.body.len());
 
+    let succs: Vec<Vec<usize>> = (0..cfg.num_blocks)
+        .map(|b| cfg.succs.row(b).iter().map(|&s| s as usize).collect())
+        .collect();
+    let freq = crate::backend::liveness::compute_block_freq(&succs, cfg.num_blocks);
+
     for natural_loop in &sorted_loops {
-        total_hoisted += hoist_loop_invariants(func, natural_loop, &cfg.preds, &alloca_info);
+        total_hoisted += hoist_loop_invariants_freq(func, natural_loop, &cfg.preds, &alloca_info, &freq);
     }
 
     total_hoisted + hoist_constant_locals(func, &sorted_loops)
@@ -802,16 +807,67 @@ fn is_load_hoistable(
     false
 }
 
+/// Share of its loop header's frequency below which a loop computes a
+/// global's address only on rare paths (see rare_globals).
+const RARE_GLOBAL_SHARE: f64 = 0.3;
+/// Most distinct global addresses a loop computes that are all hoisted.
+const FEW_GLOBALS: usize = 3;
+
+/// The globals whose addresses a loop with calls should go on computing
+/// where it needs them, given block frequencies (empty: none).
+///
+/// Hoisted out of a loop that makes calls, an address lives through them:
+/// in a callee-saved register or, once those run out, in a stack slot stored
+/// on every entry to the loop. sqlite3_str_vappendf's format loop hoisted
+/// 23 string literals and tables, most used by one conversion each, and
+/// stored them all on each of its 2.2 million calls. Left in place, each
+/// costs an adrp and add on the path that uses it. A global stays when the
+/// frequencies of the blocks computing its address add up to less than
+/// RARE_GLOBAL_SHARE of the header's, and only in a loop computing more
+/// than FEW_GLOBALS distinct ones: a few fit in registers, and deflate_slow,
+/// using its length and distance code tables only when it emits a match,
+/// ran 1% more instructions with them kept in the loop.
+fn rare_globals(func: &IrFunction, natural_loop: &NaturalLoop, freq: &[f64]) -> FxHashSet<String> {
+    let mut share: FxHashMap<&str, f64> = FxHashMap::default();
+    if freq.len() != func.blocks.len() {
+        return FxHashSet::default();
+    }
+    for &b in &natural_loop.body {
+        for inst in &func.blocks[b].instructions {
+            if let Instruction::GlobalAddr { name, .. } = inst {
+                *share.entry(name.as_str()).or_default() += freq[b];
+            }
+        }
+    }
+    if share.len() <= FEW_GLOBALS {
+        return FxHashSet::default();
+    }
+    let limit = RARE_GLOBAL_SHARE * freq[natural_loop.header];
+    share.into_iter().filter(|&(_, f)| f < limit).map(|(name, _)| name.to_string()).collect()
+}
+
 /// Hoist loop-invariant instructions from a natural loop to a preheader.
 ///
 /// Returns the number of instructions hoisted.
+#[cfg(test)]
 fn hoist_loop_invariants(
     func: &mut IrFunction,
     natural_loop: &NaturalLoop,
     preds: &analysis::FlatAdj,
     alloca_info: &AllocaAnalysis,
 ) -> usize {
+    hoist_loop_invariants_freq(func, natural_loop, preds, alloca_info, &[])
+}
+
+fn hoist_loop_invariants_freq(
+    func: &mut IrFunction,
+    natural_loop: &NaturalLoop,
+    preds: &analysis::FlatAdj,
+    alloca_info: &AllocaAnalysis,
+    freq: &[f64],
+) -> usize {
     let header = natural_loop.header;
+    let rare_globals = rare_globals(func, natural_loop, freq);
 
     // Find the preheader: the single predecessor of the header outside the loop.
     let preheader = loop_analysis::find_preheader(header, &natural_loop.body, preds);
@@ -919,7 +975,10 @@ fn hoist_loop_invariants(
                 }
 
                 // Determine if this instruction can be hoisted
-                let can_hoist = if is_hoistable(inst) {
+                let can_hoist = if matches!(inst, Instruction::GlobalAddr { name, .. }
+                    if loop_mem.has_calls && rare_globals.contains(name)) {
+                    false
+                } else if is_hoistable(inst) {
                     // Pure instruction: check all operands are loop-invariant
                     // Use callback to avoid Vec allocation in this hot loop
                     let mut all_invariant = true;

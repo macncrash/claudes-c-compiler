@@ -925,6 +925,16 @@ and entry values (e.g. `-lim` of a hoisted literal), moves there too.
 p, inv), var` when the add has no other use, so `p + j` is hoisted and each
 access indexes it by `i` (`ldrb w0, [x1, x2]`).
 
+**Rare global addresses.** A global's address hoisted out of a loop that
+makes calls lives through them, in a callee-saved register or, once those
+run out, in a stack slot stored on every entry to the loop. In a loop
+computing the addresses of more than three distinct globals, one whose
+computing blocks' estimated frequencies (`liveness::compute_block_freq`) add
+up to less than 0.3 of the header's stays where it is used.
+`sqlite3_str_vappendf`'s format loop had stored 23 string literals and
+tables, most used by one conversion each, on every call; SQLite's speedtest
+ran 0.5% fewer instructions once they stayed.
+
 ### iv_strength_reduce -- Induction Variable Strength Reduction
 
 Transforms expensive per-iteration index computations in loops into cheaper
