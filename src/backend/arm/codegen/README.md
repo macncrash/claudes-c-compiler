@@ -151,6 +151,14 @@ adjusting `__gr_offs` and `__vr_offs` so that `va_arg` skips them. When
 `-mgeneral-regs-only` is active, the FP save area is skipped entirely and `__vr_offs`
 is set to zero.
 
+Apple arm64 passes every unnamed argument on the stack and its `va_list` is a
+plain pointer, so on Darwin the save areas are neither reserved nor stored.
+
+Variadic functions get the same register pools as any other: the `va_*`
+sequences use only `x0`-`x6` and `q0`, and liveness treats them as call points
+(no caller-saved value lives across one). `va_arg` writes its result like any
+other instruction (`store_x0_to`), to a register when its dest has one.
+
 ---
 
 ## Register Allocation
@@ -253,8 +261,9 @@ The prologue uses one of three code paths depending on frame size:
 Stack probing ensures the kernel can grow the stack mapping page-by-page. Without
 probing, a single large `sub sp` can skip guard pages and cause a segfault.
 
-For variadic functions, the prologue additionally saves `x0`-`x7` (and optionally
-`q0`-`q7` unless `-mgeneral-regs-only`) to the register save areas.
+For variadic functions (except on Darwin), the prologue additionally saves
+`x0`-`x7` (and optionally `q0`-`q7` unless `-mgeneral-regs-only`) to the
+register save areas.
 
 ### Frame Organization
 
@@ -266,8 +275,8 @@ High addresses (caller's frame)
   | Callee-saved register save area  |  [sp + callee_save_offset]
   |   (x19-x28 as needed, via STP)   |
   +----------------------------------+
-  | Variadic FP save area (128 bytes)|  [sp + va_fp_save_offset]  (if variadic)
-  | Variadic GP save area (64 bytes) |  [sp + va_gp_save_offset]  (if variadic)
+  | Variadic FP save area (128 bytes)|  [sp + va_fp_save_offset]  (variadic, not Darwin)
+  | Variadic GP save area (64 bytes) |  [sp + va_gp_save_offset]  (variadic, not Darwin)
   +----------------------------------+
   | Local variables / spill slots    |  [sp + 16...]
   |   (8-byte minimum alignment,     |

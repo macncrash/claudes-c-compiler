@@ -106,9 +106,7 @@ impl ArmCodegen {
             self.state.emit_fmt(format_args!("{}:", label_done));
         }
 
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            self.emit_store_to_sp("x0", slot.0, "str");
-        }
+        self.store_x0_to(dest);
     }
 
     pub(super) fn emit_va_start_impl(&mut self, va_list_ptr: &Value) {

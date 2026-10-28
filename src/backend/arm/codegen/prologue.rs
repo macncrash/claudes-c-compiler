@@ -48,14 +48,11 @@ impl ArmCodegen {
         self.vec_consts = Self::assign_vec_const_regs(func, &free);
         (self.vec_consts_on_entry, self.vec_const_rebuilds, self.vec_const_block_rebuilds) =
             Self::vec_const_rebuilds(func, &self.vec_consts);
-        let base_regs: &[PhysReg] = if func.is_variadic { &[] } else { &ARM_CALLEE_SAVED };
-        let available_regs = crate::backend::generation::filter_available_regs(base_regs, &asm_clobbered_regs);
+        // Variadic functions too: the va_* sequences use only x0-x6 and q0
+        // and are call points, and the register save area is stored first.
+        let available_regs = crate::backend::generation::filter_available_regs(&ARM_CALLEE_SAVED, &asm_clobbered_regs);
 
-        let mut caller_saved_regs: Vec<PhysReg> = if func.is_variadic {
-            Vec::new()
-        } else {
-            ARM_CALLER_SAVED.to_vec()
-        };
+        let mut caller_saved_regs: Vec<PhysReg> = ARM_CALLER_SAVED.to_vec();
         let mut has_f128_ops = false;
         for block in &func.blocks {
             for inst in &block.instructions {
@@ -115,11 +112,10 @@ impl ArmCodegen {
             }
         }
 
-        // FP registers for F32/F64 values. Skipped for variadic functions
-        // (like the GPR pools) and under -mgeneral-regs-only.
+        // FP registers for F32/F64 values. Skipped under -mgeneral-regs-only.
         self.fp_reg_assignments.clear();
         self.used_fp_callee_saved.clear();
-        if !func.is_variadic && !self.general_regs_only {
+        if !self.general_regs_only {
             let liveness = cached_liveness.take()
                 .unwrap_or_else(|| crate::backend::liveness::compute_live_intervals(func));
             let config = crate::backend::regalloc::FpRegAllocConfig {
@@ -178,7 +174,9 @@ impl ArmCodegen {
             }
         }
 
-        if func.is_variadic {
+        // Apple arm64 passes unnamed args on the stack only, so va_start and
+        // va_arg never read a register save area there.
+        if func.is_variadic && !crate::common::types::target_is_darwin() {
             space = (space + 7) & !7;
             self.va_gp_save_offset = space;
             space += 64;
@@ -188,6 +186,8 @@ impl ArmCodegen {
                 self.va_fp_save_offset = space;
                 space += 128;
             }
+        }
+        if func.is_variadic {
 
             let config = self.call_abi_config_impl();
             let classification = crate::backend::call_abi::classify_params_full(func, &config);
@@ -441,7 +441,7 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
-        if func.is_variadic {
+        if func.is_variadic && !crate::common::types::target_is_darwin() {
             self.emit_save_variadic_regs();
         }
         // HFA return: point the sret pointer (read from x8 below) at the
