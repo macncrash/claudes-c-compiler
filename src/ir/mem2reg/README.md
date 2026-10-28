@@ -88,7 +88,13 @@ point's immediate dominator, accumulating frontier entries along the way.
 For each promotable alloca, the pass computes the **iterated dominance frontier** of its
 defining blocks (blocks containing stores to the alloca). Starting from the set of defining
 blocks, it iteratively adds dominance frontier blocks to a worklist until a fixed point is
-reached. A phi node is placed at every block in this iterated frontier.
+reached. A phi node is placed at every block in this iterated frontier where the
+alloca is **live on entry** (pruned SSA): some path from the block reaches a load before
+a store. Live-in blocks are found by walking predecessors backwards from the blocks that
+load the alloca before storing it, stopping at defining blocks. Without the pruning, an
+inlined callee's parameter that is stored and read inside one case of an interpreter's
+`switch` would get a phi at every merge back to the dispatch loop, as if it lived across
+the whole loop.
 
 **Phi cost limiting.** Each phi node with *P* predecessors generates approximately *P* copy
 instructions during phi elimination. For functions with large multi-way branches (e.g., a

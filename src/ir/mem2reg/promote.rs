@@ -5,7 +5,8 @@
 //! 2. Build CFG (from terminators and InlineAsm goto edges)
 //! 3. Compute dominator tree (Cooper-Harvey-Kennedy algorithm)
 //! 4. Compute dominance frontiers
-//! 5. Insert phi nodes at iterated dominance frontiers of defining blocks
+//! 5. Insert phi nodes at iterated dominance frontiers of defining blocks,
+//!    where the variable is live (pruned SSA)
 //! 6. Rename variables via dominator tree DFS
 //!
 //! Reference: "A Simple, Fast Dominance Algorithm" by Cooper, Harvey, Kennedy (2001)
@@ -79,6 +80,9 @@ struct AllocaInfo {
     def_blocks: FxHashSet<usize>,
     /// Block indices where this alloca is loaded from (use blocks).
     use_blocks: FxHashSet<usize>,
+    /// Use blocks that load the alloca before storing it: the value on entry
+    /// to the block is read.
+    exposed_blocks: FxHashSet<usize>,
 }
 
 /// Promote allocas in a single function to SSA form.
@@ -125,7 +129,7 @@ fn promote_function(func: &mut IrFunction, promote_params: bool) {
     // stack limit while accommodating moderately complex functions.
     const MAX_PHI_COPY_COST: usize = 50_000;
 
-    let phi_locations = insert_phis(&alloca_infos, &df, num_blocks);
+    let phi_locations = insert_phis(&alloca_infos, &df, &preds, num_blocks);
 
     // Compute per-alloca phi cost: sum of predecessor counts at all phi sites
     let total_phi_cost: usize = alloca_infos.iter().enumerate()
@@ -185,7 +189,7 @@ fn promote_function(func: &mut IrFunction, promote_params: bool) {
     }
 
     // Recompute phi locations after any cost-based filtering
-    let phi_locations = insert_phis(&alloca_infos, &df, num_blocks);
+    let phi_locations = insert_phis(&alloca_infos, &df, &preds, num_blocks);
 
     // Step 6: Rename variables
     let dom_children = analysis::build_dom_tree_children(num_blocks, &idom);
@@ -284,8 +288,10 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     let mut disqualified: FxHashSet<u32> = FxHashSet::default();
     let mut def_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
     let mut use_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+    let mut exposed_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
+        let mut stored_here: FxHashSet<u32> = FxHashSet::default();
         for inst in &block.instructions {
             match inst {
                 Instruction::Load { ptr, volatile: true, .. } | Instruction::Store { ptr, volatile: true, .. }
@@ -300,11 +306,15 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                 Instruction::Load { ptr, .. } => {
                     if candidate_set.contains(&ptr.0) && !disqualified.contains(&ptr.0) {
                         use_blocks.entry(ptr.0).or_default().insert(block_idx);
+                        if !stored_here.contains(&ptr.0) {
+                            exposed_blocks.entry(ptr.0).or_default().insert(block_idx);
+                        }
                     }
                 }
                 Instruction::Store { val, ptr, .. } => {
                     if candidate_set.contains(&ptr.0) && !disqualified.contains(&ptr.0) {
                         def_blocks.entry(ptr.0).or_default().insert(block_idx);
+                        stored_here.insert(ptr.0);
                     }
                     // If a candidate alloca value appears as the stored VALUE (not ptr),
                     // it means the alloca's address is being used as data (e.g., array-to-pointer
@@ -336,6 +346,7 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                                 disqualified.insert(ptr.0);
                             } else if !disqualified.contains(&ptr.0) {
                                 def_blocks.entry(ptr.0).or_default().insert(block_idx);
+                                stored_here.insert(ptr.0);
                             }
                         }
                     }
@@ -382,6 +393,7 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                 ty,
                 def_blocks: def_blocks.remove(&alloca_value.0).unwrap_or_default(),
                 use_blocks: use_blocks.remove(&alloca_value.0).unwrap_or_default(),
+                exposed_blocks: exposed_blocks.remove(&alloca_value.0).unwrap_or_default(),
             }
         })
         // Only promote allocas that are actually used (have loads or stores)
@@ -405,12 +417,14 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
 fn insert_phis(
     alloca_infos: &[AllocaInfo],
     df: &[FxHashSet<usize>],
+    preds: &analysis::FlatAdj,
     num_blocks: usize,
 ) -> Vec<FxHashSet<usize>> {
     // phi_locations[block_idx] = set of alloca indices that need a phi at this block
     let mut phi_locations = vec![FxHashSet::default(); num_blocks];
 
     for (alloca_idx, info) in alloca_infos.iter().enumerate() {
+        let live_in = live_in_blocks(info, preds);
         // Iterated dominance frontier algorithm
         let mut worklist: VecDeque<usize> = info.def_blocks.iter().copied().collect();
         let mut has_phi: FxHashSet<usize> = FxHashSet::default();
@@ -418,7 +432,7 @@ fn insert_phis(
 
         while let Some(block) = worklist.pop_front() {
             for &df_block in &df[block] {
-                if has_phi.insert(df_block) {
+                if live_in.contains(&df_block) && has_phi.insert(df_block) {
                     phi_locations[df_block].insert(alloca_idx);
                     if ever_in_worklist.insert(df_block) {
                         worklist.push_back(df_block);
@@ -429,6 +443,25 @@ fn insert_phis(
     }
 
     phi_locations
+}
+
+/// Blocks on entry to which the alloca's value may still be read (pruned
+/// SSA): a phi anywhere else merges values nothing reads. An inlined
+/// callee's parameter, stored and read within one case of an interpreter's
+/// switch, would otherwise get a phi at every merge back to the dispatch
+/// and count against the phi cost limit as if it lived across the loop.
+fn live_in_blocks(info: &AllocaInfo, preds: &analysis::FlatAdj) -> FxHashSet<usize> {
+    let mut live_in: FxHashSet<usize> = info.exposed_blocks.clone();
+    let mut worklist: Vec<usize> = live_in.iter().copied().collect();
+    while let Some(b) = worklist.pop() {
+        for &p in preds.row(b) {
+            let p = p as usize;
+            if !info.def_blocks.contains(&p) && live_in.insert(p) {
+                worklist.push(p);
+            }
+        }
+    }
+    live_in
 }
 
 
@@ -1125,6 +1158,68 @@ mod tests {
             .filter(|inst| matches!(inst, Instruction::Phi { .. }))
             .count();
         assert_eq!(phi_count, 2, "Loop header should have 2 phi nodes");
+    }
+
+    #[test]
+    fn test_body_local_no_header_phi() {
+        // for (;;) { int t; t = g(); use(t); }: t is stored before every load
+        // in the body, so it is not live into the header and gets no phi
+        // there, although the header is on the body's dominance frontier.
+        let mut func = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+        let st = |v: Operand, p: u32| Instruction::Store { val: v, ptr: Value(p), ty: IrType::I32,
+            seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
+        let ld = |d: u32, p: u32| Instruction::Load { dest: Value(d), ptr: Value(p), ty: IrType::I32,
+            seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false }, // i
+                Instruction::Alloca { dest: Value(1), ty: IrType::I32, size: 4, align: 0, volatile: false }, // t
+                st(Operand::Const(IrConst::I32(0)), 0),
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                ld(2, 0),
+                Instruction::Cmp { dest: Value(3), op: IrCmpOp::Slt, lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(10)), ty: IrType::I32 },
+            ],
+            terminator: Terminator::CondBranch { cond: Operand::Value(Value(3)), true_label: BlockId(2), false_label: BlockId(3) },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                st(Operand::Value(Value(2)), 1),
+                ld(4, 1),
+                Instruction::BinOp { dest: Value(5), op: IrBinOp::Add, lhs: Operand::Value(Value(4)),
+                    rhs: Operand::Const(IrConst::I32(1)), ty: IrType::I32 },
+                st(Operand::Value(Value(5)), 0),
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![ld(6, 0)],
+            terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut module = IrModule::new();
+        module.functions.push(func);
+        promote_allocas(&mut module);
+
+        let func = &module.functions[0];
+        let phi_count = func.blocks[1].instructions.iter()
+            .filter(|inst| matches!(inst, Instruction::Phi { .. }))
+            .count();
+        assert_eq!(phi_count, 1, "only i is live into the loop header");
+        assert!(!func.blocks.iter().flat_map(|b| &b.instructions)
+            .any(|inst| matches!(inst, Instruction::Alloca { .. } | Instruction::Load { .. })));
     }
 
     #[test]

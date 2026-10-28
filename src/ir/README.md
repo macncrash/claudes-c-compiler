@@ -720,7 +720,8 @@ algorithm, implemented in **6 steps** (as numbered in the implementation):
 4. **Compute dominance frontiers** -- for phi placement.
 
 5. **Insert phi nodes** -- at the iterated dominance frontiers of each alloca's
-   defining blocks (blocks containing stores to that alloca).
+   defining blocks (blocks containing stores to that alloca), where the alloca
+   is live on entry (pruned SSA).
 
 6. **Rename variables** -- via dominator-tree DFS, maintaining a stack of
    reaching definitions for each alloca. Replace loads with the current reaching
