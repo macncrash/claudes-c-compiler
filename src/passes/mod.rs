@@ -679,6 +679,16 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
         }
     }
 
+    // Phase 9d: Locals whose loads 9b and 9c turned into values (a
+    // `memcpy(&v, ...)` into one) are now only stored: drop the stores.
+    if !disabled.contains("unread_locals") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if dce::eliminate_unread_local_stores(func) > 0 {
+                dce::eliminate_dead_code(func);
+            }
+        }
+    }
+
     // Phase 10a: Move loads an exit test reads from memory the loop never
     // writes out of the loop, so iv_widen and lftr see a loop-invariant bound.
     if !disabled.contains("bound_hoist") {

@@ -77,6 +77,10 @@ The optimizer executes in four sequential phases:
      load_phi
          |
          v
+ Phase 9d: Stores to Locals Nothing Reads
+     dce::eliminate_unread_local_stores
+         |
+         v
  Phase 10a: Loop Bound Hoisting
      bound_hoist
          |
@@ -1038,6 +1042,17 @@ right after it. zlib's 16-bit `bi_buf` is or-ed into, truncated and stored, or
 shifted down 8 for its high byte, so it too stays in a register between sends,
 as clang keeps it.
 
+### Unread Local Stores (Phase 9d)
+
+A local whose address only reached a memcpy can be left with stores and no
+loads: mem2reg ran while a copy out of the middle of it (SQLite's
+OP_MakeRecord, `memcpy(zPayload, (u8*)&v + 8 - len, len)` on a branch dead
+from the start) still took its address, mem_inline turned the copy into it
+(`memcpy(&v, &pRec->u.r, 8)`) into a store, and load_phi forwarded every
+load. `dce::eliminate_unread_local_stores` removes the stores to allocas used
+only as plain stores' addresses (not parameter allocas). Disabled with
+`CCC_DISABLE_PASSES=unread_locals`.
+
 ### bound_hoist -- Loop Bound Hoisting
 
 Runs once after the main loop, before iv_widen. iv_widen and lftr need a
@@ -1678,7 +1693,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`load_phi`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
+`load_phi`, `unread_locals`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
 
 Setting the variable to `all` skips the entire optimization pipeline.
 

@@ -12,6 +12,7 @@
 //! for removal), giving O(n) complexity instead of O(n*k) where k is the
 //! maximum dead chain length.
 
+use crate::common::fx_hash::FxHashSet;
 use crate::ir::reexports::{
     Instruction,
     IrFunction,
@@ -343,6 +344,56 @@ fn has_side_effects(inst: &Instruction) -> bool {
     ) || matches!(inst, Instruction::Intrinsic { op, dest_ptr, .. } if !op.is_pure() || dest_ptr.is_some())
 }
 
+/// Remove the stores to locals nothing reads: allocas used only as the
+/// address of plain stores. mem2reg would have promoted such a local, but it
+/// can get there later (`memcpy(&v, &x, 8)` becomes a store only in Phase 9b,
+/// and its loads are forwarded after that). Parameter allocas are left alone.
+pub(crate) fn eliminate_unread_local_stores(func: &mut IrFunction) -> usize {
+    let mut unread: FxHashSet<u32> = func.blocks.iter().flat_map(|b| &b.instructions)
+        .filter_map(|i| match i {
+            Instruction::Alloca { dest, volatile: false, .. } => Some(dest.0),
+            _ => None,
+        })
+        .collect();
+    for v in &func.param_alloca_values {
+        unread.remove(&v.0);
+    }
+    if unread.is_empty() {
+        return 0;
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { .. } => {}
+                Instruction::Store { val, volatile: false, .. } => {
+                    if let Operand::Value(v) = val {
+                        unread.remove(&v.0);
+                    }
+                }
+                _ => inst.for_each_used_value(|v| { unread.remove(&v); }),
+            }
+        }
+        block.terminator.for_each_used_value(|v| { unread.remove(&v); });
+    }
+    if unread.is_empty() {
+        return 0;
+    }
+    let mut removed = 0;
+    for block in &mut func.blocks {
+        let keep: Vec<bool> = block.instructions.iter()
+            .map(|i| !matches!(i, Instruction::Store { ptr, .. } if unread.contains(&ptr.0)))
+            .collect();
+        if block.source_spans.len() == keep.len() {
+            let mut k = keep.iter();
+            block.source_spans.retain(|_| *k.next().unwrap());
+        }
+        let mut k = keep.iter();
+        block.instructions.retain(|_| *k.next().unwrap());
+        removed += keep.len() - block.instructions.len();
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +616,34 @@ mod tests {
         // Loop header should have no instructions left
         assert!(func.blocks[1].instructions.is_empty(),
                 "Phi should be removed from loop header");
+    }
+
+    #[test]
+    fn test_unread_local_stores_removed() {
+        // %0 is only stored to; %1 is also loaded; %2's address goes to a GEP.
+        let st = |v: i64, p: u32| Instruction::Store { val: Operand::Const(IrConst::I64(v)), ptr: Value(p), ty: IrType::I64,
+            seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca { dest: Value(0), ty: IrType::I64, size: 8, align: 8, volatile: false },
+                Instruction::Alloca { dest: Value(1), ty: IrType::I64, size: 8, align: 8, volatile: false },
+                Instruction::Alloca { dest: Value(2), ty: IrType::I64, size: 8, align: 8, volatile: false },
+                st(1, 0),
+                st(2, 1),
+                st(3, 2),
+                st(4, 0),
+                Instruction::GetElementPtr { dest: Value(3), base: Value(2), offset: Operand::Const(IrConst::I64(4)), ty: IrType::Ptr },
+                Instruction::Load { dest: Value(4), ptr: Value(1), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(eliminate_unread_local_stores(&mut func), 2);
+        let stored: Vec<u32> = func.blocks[0].instructions.iter()
+            .filter_map(|i| match i { Instruction::Store { ptr, .. } => Some(ptr.0), _ => None })
+            .collect();
+        assert_eq!(stored, vec![1, 2]);
     }
 }
