@@ -875,7 +875,26 @@ v1 and nothing between the copy and the call uses v22:
 - `mov xR, #0` read only by a conditional select, R dying there, becomes
   the select's `xzr`/`wzr` operand (`m >= w ? m - w : 0`).
 
-**14. Leaf Frame Records** (after the local cleanup)
+**14. Tail Calls and Leaf Frame Records** (after the local cleanup)
+
+A call whose return leads straight to the epilogue, through fallthrough
+and jumps, with nothing on the way but restores of callee-saved registers
+before the frame record's pop and `ret`, becomes a copy of that epilogue
+and a branch to the callee (`b f`, or `br xN` for an indirect call through
+a register below x19). The callee then returns to our caller. In a
+function returning a 32-bit integer (the prologue's `.ccc_ret_regs w0`
+marker), a `sxtw x0, w0` on the way is left out: it only fills the upper
+half of x0, which the caller ignores. In a function returning 64 bits the
+same instruction may be the C conversion of an `int` result, so it stays
+and the call does too. Only where the frame's address never escapes: x29
+appears only in the frame record, and sp outside an address only as
+`add/sub sp, sp, #N`. Then no pointer into the frame, which is gone when
+the callee runs, can reach it. A call with stack arguments, or an indirect
+call whose target was spilled, pops them with an `add sp` after the call,
+which no epilogue starts with. Calls to setjmp and the like stay calls. A
+function whose only calls become tail calls is then a leaf for what
+follows: SQLite's btreeParseCellPtr has no frame at all, as clang emits it,
+and speedtest ran 1.5% fewer instructions with 559 tail calls.
 
 A function that calls nothing and never touches the stack, fp or lr loses
 its frame record entirely. One that still keeps callee-saved registers or

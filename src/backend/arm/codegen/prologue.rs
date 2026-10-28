@@ -277,7 +277,8 @@ impl ArmCodegen {
             // (An HFA comes back in v0-v3, not through the sret pointer.)
             _ if self.hfa_ret.is_some() => Some(peephole::RET_NONE_MARKER),
             IrType::Void | IrType::F32 | IrType::F64 | IrType::F128 => Some(peephole::RET_NONE_MARKER),
-            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+            IrType::I32 | IrType::U32 if !func.uses_sret => Some(peephole::RET_W0_MARKER),
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
             | IrType::I64 | IrType::U64 | IrType::Ptr if !func.uses_sret => Some(peephole::RET_X0_MARKER),
             _ => None,
         };

@@ -505,12 +505,21 @@ pub fn peephole_optimize(asm: String) -> String {
         pair_adjacent_loads(&mut lines, &mut kinds, n);
     }
 
+    // Calls that return straight into the epilogue branch to the callee
+    // after it instead, which can leave a leaf for Phase 4.
+    let (mut lines, mut kinds) = if skip.contains(&"convert_tail_calls") {
+        (lines, kinds)
+    } else {
+        convert_tail_calls(lines, kinds)
+    };
+    let n = lines.len();
+
     // Phase 4: drop frame records that leaf functions no longer need.
     omit_leaf_frames(&lines, &mut kinds, n);
     drop_leaf_frame_records(&mut lines, &mut kinds, n);
 
     for i in 0..n {
-        if lines[i] == RET_NONE_MARKER || lines[i] == RET_X0_MARKER || lines[i].starts_with(CALL_USES_PREFIX) {
+        if lines[i] == RET_NONE_MARKER || lines[i] == RET_X0_MARKER || lines[i] == RET_W0_MARKER || lines[i].starts_with(CALL_USES_PREFIX) {
             kinds[i] = LineKind::Nop;
         }
     }
@@ -3133,6 +3142,187 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
     changed
 }
 
+// ── Tail calls ───────────────────────────────────────────────────────────────
+//
+// A call whose return leads straight to the epilogue (through fallthrough and
+// jumps, nothing but callee-saved restores before the frame record's pop and
+// `ret`) becomes a copy of that epilogue and a branch to the callee:
+//   bl f; ... ldp x20, x21, [sp, #16]; ldp x29, x30, [sp], #32; ret
+//   =>  ldp x20, x21, [sp, #16]; ldp x29, x30, [sp], #32; b f
+// f then returns to our caller with what it leaves in the return registers.
+// Only where the frame's address never escapes (x29 appears only in the frame
+// record, sp outside an address only as `add/sub sp, sp, #N`), so f cannot be
+// handed a pointer into the frame that is gone when it runs. Stack arguments
+// and an indirect call's spilled target are popped by an `add sp` after the
+// call, which no epilogue starts with. A function whose only calls become
+// tail calls is then a leaf whose frame Phase 4 may drop, as clang emits
+// SQLite's btreeParseCellPtr: no frame, `b btreeParseCellAdjustSizeForOverflow`.
+
+/// Callees that return twice: their caller's frame must still be there.
+const RETURNS_TWICE: &[&str] = &["setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp", "savectx", "vfork", "getcontext"];
+
+fn convert_tail_calls(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<LineKind>) {
+    let n = lines.len();
+    let mut tails: Vec<(usize, Vec<String>, String)> = Vec::new();
+    for (start, end) in function_ranges(&lines, n) {
+        if !frame_stays_private(&lines, &kinds, start, end) {
+            continue;
+        }
+        let labels: std::collections::HashMap<&str, usize> = (start..end)
+            .filter(|&k| kinds[k] == LineKind::Label)
+            .filter_map(|k| label_name(&lines[k]).map(|l| (l, k)))
+            .collect();
+        let returns_w0 = (start..end).any(|k| lines[k] == RET_W0_MARKER);
+        for i in start..end {
+            if kinds[i] != LineKind::Call {
+                continue;
+            }
+            let jump = match split_insn(&lines[i]) {
+                Some(("bl", f)) => format!("    b {f}"),
+                // A register the epilogue does not restore.
+                Some(("blr", r)) if r.strip_prefix('x').and_then(|d| d.parse::<u8>().ok()).is_some_and(|d| d < 19) => format!("    br {r}"),
+                _ => continue,
+            };
+            if let Some(epilogue) = epilogue_after(&lines, &kinds, i + 1, end, &labels, returns_w0) {
+                tails.push((i, epilogue, jump));
+            }
+        }
+    }
+    if tails.is_empty() {
+        return (lines, kinds);
+    }
+    let mut out_lines = Vec::with_capacity(n + tails.iter().map(|t| t.1.len()).sum::<usize>());
+    let mut out_kinds = Vec::with_capacity(out_lines.capacity());
+    let mut next = tails.into_iter().peekable();
+    for (i, (line, kind)) in lines.into_iter().zip(kinds).enumerate() {
+        if next.peek().is_some_and(|t| t.0 == i) {
+            let (_, epilogue, jump) = next.next().unwrap();
+            for l in epilogue {
+                out_kinds.push(classify_line(&l));
+                out_lines.push(l);
+            }
+            out_lines.push(jump);
+            out_kinds.push(LineKind::Ret);
+        } else {
+            out_lines.push(line);
+            out_kinds.push(kind);
+        }
+    }
+    (out_lines, out_kinds)
+}
+
+/// Whether nothing in the function can hold an address in its frame: x29
+/// only saved, set and restored, sp outside a memory operand only adjusted
+/// by an immediate, and no call that returns twice.
+fn frame_stays_private(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> bool {
+    for k in start..end {
+        if matches!(kinds[k], LineKind::Nop | LineKind::Label | LineKind::Directive) {
+            continue;
+        }
+        let t = lines[k].trim();
+        if t.starts_with('.') {
+            continue;
+        }
+        if let Some(("bl", f)) = split_insn(t) {
+            if RETURNS_TWICE.contains(&f) {
+                return false;
+            }
+        }
+        let tokens = |s: &str| s.split(|c: char| !c.is_ascii_alphanumeric()).map(str::to_string).collect::<Vec<_>>();
+        if tokens(t).iter().any(|w| matches!(w.as_str(), "x29" | "w29" | "fp"))
+            && !(t.starts_with("stp x29, x30, [sp") || t.starts_with("ldp x29, x30, [sp") || t == "mov x29, sp") {
+            return false;
+        }
+        // sp outside brackets.
+        let mut outside = String::new();
+        let mut depth = 0;
+        for c in t.chars() {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ if depth == 0 => outside.push(c),
+                _ => {}
+            }
+        }
+        if tokens(&outside).iter().any(|w| w == "sp" || w == "wsp") && t != "mov x29, sp"
+            && !((t.starts_with("add sp, sp, #") || t.starts_with("sub sp, sp, #")) && !t[13..].contains(',')) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The epilogue a call's return reaches from line `from`: the restores of
+/// callee-saved registers and the frame record's pop (`ldp x29, x30, [sp],
+/// #N`, or `ldp x29, x30, [sp]` and `add sp, sp, #N`), right before `ret`.
+/// In a function returning a 32-bit integer (`returns_w0`), an extension of
+/// w0 into x0 on the way is left out: it only canonicalizes the upper half,
+/// which the caller ignores.
+fn epilogue_after(lines: &[String], kinds: &[LineKind], from: usize, end: usize,
+                  labels: &std::collections::HashMap<&str, usize>, returns_w0: bool) -> Option<Vec<String>> {
+    let skip = |mut k: usize| {
+        while k < end && matches!(kinds[k], LineKind::Nop | LineKind::Label | LineKind::Directive) {
+            k += 1;
+        }
+        k
+    };
+    let restore = |t: &str| {
+        let Some((m, ops)) = split_insn(t) else { return false };
+        let regs: Vec<&str> = match m {
+            "ldp" => ops.splitn(3, ',').take(2).map(str::trim).collect(),
+            "ldr" => ops.splitn(2, ',').take(1).map(str::trim).collect(),
+            _ => return false,
+        };
+        let callee_saved = |r: &str| {
+            r.strip_prefix('x').and_then(|d| d.parse::<u8>().ok()).is_some_and(|d| (19..=28).contains(&d))
+                || r.strip_prefix('d').and_then(|d| d.parse::<u8>().ok()).is_some_and(|d| (8..=15).contains(&d))
+        };
+        regs.iter().all(|r| callee_saved(r)) && ops.contains("[sp, #") && ops.trim_end().ends_with(']')
+    };
+    let mut epilogue = Vec::new();
+    let mut k = from;
+    let mut hops = 0;
+    loop {
+        k = skip(k);
+        if k >= end {
+            return None;
+        }
+        let t = lines[k].trim();
+        if kinds[k] == LineKind::Branch {
+            hops += 1;
+            if hops > 8 {
+                return None;
+            }
+            k = *labels.get(t.strip_prefix("b ")?.trim())?;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("ldp x29, x30, [sp]") {
+            epilogue.push(lines[k].clone());
+            if rest.is_empty() {
+                k = skip(k + 1);
+                let add = lines.get(k)?.trim();
+                if k >= end || !add.starts_with("add sp, sp, #") || add[13..].contains(',') {
+                    return None;
+                }
+                epilogue.push(lines[k].clone());
+            } else if !rest.starts_with(", #") {
+                return None;
+            }
+            k = skip(k + 1);
+            return (k < end && kinds[k] == LineKind::Ret && lines[k].trim() == "ret").then_some(epilogue);
+        }
+        if returns_w0 && matches!(t, "sxtw x0, w0" | "mov w0, w0") {
+            k += 1;
+            continue;
+        }
+        if !restore(t) {
+            return None;
+        }
+        epilogue.push(lines[k].clone());
+        k += 1;
+    }
+}
+
 // ── Leaf frame omission ──────────────────────────────────────────────────────
 //
 // A function that calls nothing and, after the other passes, never touches
@@ -3999,6 +4189,10 @@ fn fold_scale_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
 pub(super) const RET_NONE_MARKER: &str = "    .ccc_ret_regs 0";
 /// Emitted by the prologue when only x0 carries the return value.
 pub(super) const RET_X0_MARKER: &str = "    .ccc_ret_regs 1";
+/// As RET_X0_MARKER, for a 32-bit integer result: the upper half of x0 at
+/// `ret` is the caller's to ignore (AAPCS64), so a `sxtw x0, w0` before the
+/// epilogue only canonicalizes it.
+pub(super) const RET_W0_MARKER: &str = "    .ccc_ret_regs w0";
 /// Emitted before a call with the GP argument registers it reads (bit N for
 /// xN): without it a call reads x0-x8. Always removed from the output.
 pub(super) const CALL_USES_PREFIX: &str = "    .ccc_call_uses ";
@@ -4222,7 +4416,7 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
     let label_index = |name: &str| labels.get(name).copied();
     let ret_mask: RegSet = if body.clone().any(|k| lines[k] == RET_NONE_MARKER) {
         !0b11
-    } else if body.clone().any(|k| lines[k] == RET_X0_MARKER) {
+    } else if body.clone().any(|k| lines[k] == RET_X0_MARKER || lines[k] == RET_W0_MARKER) {
         !0b10
     } else {
         !0
@@ -4745,8 +4939,9 @@ mod tests {
         let result = peephole_optimize(leaf);
         assert!(!result.contains("x29") && !result.contains("cfa"), "{}", result);
         assert!(result.contains("add x0, x0, x1") && result.contains("ret"), "{}", result);
-        // Calls and stack accesses keep the frame.
-        for body in ["    bl g\n", "    str x0, [sp, #8]\n", "    mov x0, x30\n"] {
+        // Calls and stack accesses keep the frame (a call returning straight
+        // into the epilogue becomes a tail call; see convert_tail_calls).
+        for body in ["    bl g\n    add x0, x0, #1\n", "    str x0, [sp, #8]\n", "    mov x0, x30\n"] {
             let result = peephole_optimize(format!("{}{}{}", frame, body, tail));
             assert!(result.contains("stp x29, x30") && result.contains("ldp x29, x30"), "{}", result);
         }
@@ -5606,5 +5801,37 @@ f:
         // A mask wider than the loaded byte keeps sign bits.
         let result = peephole_optimize(frame("    ldrsb x12, [x1]\n    and x0, x12, #0xfff\n"));
         assert!(result.contains("ldrsb"), "{}", result);
+    }
+
+    /// A function with a frame record around the given body.
+    fn framed(marker: &str, body: &str) -> String {
+        format!(".globl f\n.type f, %function\nf:\n.cfi_startproc\n    stp x29, x30, [sp, #-32]!\n    .cfi_def_cfa_offset 32\n    .cfi_offset x29, -32\n    .cfi_offset x30, -24\n    mov x29, sp\n    .cfi_def_cfa_register x29\n{marker}\n    str x20, [sp, #16]\n{body}    ldr x20, [sp, #16]\n    ldp x29, x30, [sp], #32\n    ret\n.cfi_endproc\n.size f, .-f\n")
+    }
+
+    #[test]
+    fn test_call_into_epilogue_becomes_tail_call() {
+        let body = "    mov x20, x0\n    cbz x0, .L1\n    bl g\n    b .L2\n.L1:\n    add x0, x20, #1\n.L2:\n";
+        let result = peephole_optimize(framed(RET_X0_MARKER, body));
+        assert!(result.contains("    b g\n") && !result.contains("bl g"), "{}", result);
+        // The restore comes first (Phase 4 then drops the frame record, the
+        // function being a leaf: `ldr x20, [sp], #16; b g`).
+        let b = result.find("    b g\n").unwrap();
+        assert!(result[..b].ends_with("    ldr x20, [sp], #16\n"), "{}", result);
+        // A 32-bit result's extension goes; a 64-bit one's is a conversion.
+        let body = "    mov x20, x0\n    bl g\n    sxtw x0, w0\n";
+        assert!(peephole_optimize(framed(RET_W0_MARKER, body)).contains("    b g\n"));
+        assert!(peephole_optimize(framed(RET_X0_MARKER, body)).contains("bl g"));
+    }
+
+    #[test]
+    fn test_no_tail_call_with_frame_address() {
+        // A local's address may reach the callee.
+        let body = "    add x0, sp, #24\n    bl g\n";
+        assert!(peephole_optimize(framed(RET_X0_MARKER, body)).contains("bl g"));
+        // Work after the call, a stack argument's pop, or setjmp.
+        for body in ["    bl g\n    add x0, x0, #1\n", "    sub sp, sp, #16\n    bl g\n    add sp, sp, #16\n", "    bl setjmp\n"] {
+            let result = peephole_optimize(framed(RET_X0_MARKER, body));
+            assert!(result.contains("bl "), "{}", result);
+        }
     }
 }
