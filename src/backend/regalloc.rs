@@ -4,7 +4,7 @@
 //! Values with the longest live ranges and most uses get priority for register
 //! assignment. Values that don't fit in available registers remain on the stack.
 //!
-//! Values are taken in one pass, in priority order (loop-weighted use count),
+//! Values are taken in one pass, in priority order (frequency-weighted use count),
 //! each from the pool it may use:
 //! - **Callee-saved registers** (x86: rbx, r12-r15; ARM: x19-x28; RISC-V: s1,
 //!   s7-s11) are the only ones a value live across a call may have. The ABI
@@ -134,15 +134,14 @@ pub fn allocate_registers(
     // handle loops (values live across back-edges have their intervals extended).
     let liveness = compute_live_intervals(func);
 
-    // Count uses per value for prioritization, weighted by loop depth.
+    // Count uses per value for prioritization, weighted by their blocks'
+    // estimated frequencies (LivenessResult::block_freq).
     //
     // Uses inside loops are weighted more heavily because they execute more
-    // frequently. A use inside a loop at depth D contributes 10^D to the
-    // weighted use count (so a use in a singly-nested loop counts 10x, doubly-
-    // nested counts 100x, etc.). This ensures inner-loop temporaries get
-    // priority for register allocation over values in straight-line code,
-    // which is critical for performance in compute-heavy loops like zlib's
-    // deflate_slow, longest_match, and slide_hash.
+    // frequently: a loop's body runs 10 times per entry, so inner-loop
+    // temporaries get priority for register allocation over values in
+    // straight-line code, which is critical for performance in compute-heavy
+    // loops like zlib's deflate_slow, longest_match, and slide_hash.
     let use_count = weighted_use_counts(func, &liveness);
 
     // Collect values whose types don't fit in a single GPR.
@@ -297,9 +296,28 @@ pub fn allocate_registers(
             .filter_map(|r| pool.iter().position(|x| x == r))
             .find(|&i| fits(&busy[i], segs, v))
     };
+    // The live pieces of the values with partners.
+    let partner_pieces: FxHashMap<u32, Vec<(u32, u32)>> = liveness.intervals.iter()
+        .filter(|iv| partners.contains_key(&iv.value_id) && eligible.contains(&iv.value_id))
+        .map(|iv| (iv.value_id, liveness.segments_of(iv)))
+        .collect();
+    // A register free for `v` and for its partners not yet allocated, so
+    // that they can take it too and the handoff happen: allocated first, the
+    // decremented count of zlib's longest_match took a register that values
+    // weighted between the two then filled, leaving its loop phi a copy on
+    // every iteration of the hash chain loop.
+    let room_for_partners = |v: u32, assignments: &FxHashMap<u32, PhysReg>,
+                             busy: &[Vec<(u32, u32, u32)>], segs: &[(u32, u32)], i: usize| {
+        let mut waiting = partners.get(&v).into_iter().flatten()
+            .filter(|p| !assignments.contains_key(p))
+            .filter_map(|p| partner_pieces.get(p).map(|ps| (*p, ps)))
+            .peekable();
+        waiting.peek().is_some() && fits(&busy[i], segs, v)
+            && waiting.all(|(p, ps)| fits(&busy[i], ps, p))
+    };
     let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
     let mut call_saves: FxHashMap<u32, Vec<PhysReg>> = FxHashMap::default();
-    // Each program point's block weight (10^loop depth, as use_count).
+    // Each program point's block weight (block_weight, as use_count).
     let mut point_block: Vec<u32> = Vec::new();
     if config.save_around_calls {
         for (b, block) in func.blocks.iter().enumerate() {
@@ -307,8 +325,7 @@ pub fn allocate_registers(
         }
     }
     let point_weight = |p: u32| -> u64 {
-        let depth = point_block.get(p as usize).and_then(|&b| liveness.block_loop_depth.get(b as usize)).copied().unwrap_or(0);
-        10u64.saturating_pow(depth.min(6))
+        point_block.get(p as usize).map_or(BLOCK_WEIGHT_UNIT, |&b| block_weight(&liveness, b as usize))
     };
     // The calls a value would be saved around in a caller-saved register:
     // those its pieces span (not just start or end at), all of them
@@ -404,6 +421,10 @@ pub fn allocate_registers(
         }
         if spans_clobbering_call(&liveness, interval, call_points, boundary_ok) {
             let pick = partner_reg(v, &assignments, callee, &callee_busy, &segs)
+                .or_else(|| {
+                    let room = || (0..callee.len()).filter(|&i| room_for_partners(v, &assignments, &callee_busy, &segs, i));
+                    room().find(|&i| !callee_busy[i].is_empty()).or_else(|| room().next())
+                })
                 .or_else(|| pick_callee(&callee_busy, &segs, v))
                 .filter(|&i| !weightless || !callee_busy[i].is_empty());
             if let Some(i) = pick {
@@ -437,6 +458,20 @@ pub fn allocate_registers(
             occupy(&mut caller_busy[i], &segs, v);
             assignments.insert(v, caller[i]);
         } else if let Some(i) = callee_partner.filter(|&i| !callee_busy[i].is_empty()) {
+            occupy(&mut callee_busy[i], &segs, v);
+            assignments.insert(v, callee[i]);
+        } else if let Some(i) = (0..caller.len()).find(|&i| room_for_partners(v, &assignments, &caller_busy, &segs, i)) {
+            occupy(&mut caller_busy[i], &segs, v);
+            assignments.insert(v, caller[i]);
+        } else if let Some(i) = (use_count.get(&v).copied().unwrap_or(0) > 2 * BLOCK_WEIGHT_UNIT).then(|| {
+            // No caller-saved register has room for the partners too: a
+            // callee-saved one that has costs one save and restore per
+            // call, less than a copy each time a value this hot is handed on.
+            // A fresh one only in a function without calls, where no value
+            // live across a call may need it.
+            let room = || (0..callee.len()).filter(|&i| room_for_partners(v, &assignments, &callee_busy, &segs, i));
+            room().find(|&i| !callee_busy[i].is_empty()).or_else(|| room().find(|_| call_points.is_empty()))
+        }).flatten() {
             occupy(&mut callee_busy[i], &segs, v);
             assignments.insert(v, callee[i]);
         } else if let Some(i) = (0..caller.len()).find(|&i| fits(&caller_busy[i], &segs, v)) {
@@ -625,8 +660,18 @@ fn foldable_geps(func: &IrFunction) -> FxHashMap<u32, u32> {
     geps
 }
 
-/// Count uses per value, weighted by loop depth: a use inside a loop at depth D
-/// contributes 10^D (capped at 10K), so inner-loop values get priority.
+/// The weight of one use in a block run once per call of the function.
+const BLOCK_WEIGHT_UNIT: u64 = 1000;
+
+/// A block's weight: its estimated frequency (LivenessResult::block_freq) in
+/// BLOCK_WEIGHT_UNITs, capped at 10K runs per call, at least 1.
+fn block_weight(liveness: &LivenessResult, block_idx: usize) -> u64 {
+    let freq = liveness.block_freq.get(block_idx).copied().unwrap_or(1.0);
+    ((freq.min(10_000.0) * BLOCK_WEIGHT_UNIT as f64).round() as u64).max(1)
+}
+
+/// Count uses per value, weighted by their blocks' estimated frequencies
+/// (block_weight), so values used in hot loops get priority.
 ///
 /// A use of a foldable GEP (see foldable_geps) also counts as a use of its
 /// base: codegen folds such GEPs into the loads and stores that use them
@@ -653,13 +698,7 @@ fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMa
         }
     };
     for (block_idx, block) in func.blocks.iter().enumerate() {
-        let weight: u64 = match liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0) {
-            0 => 1,
-            1 => 10,
-            2 => 100,
-            3 => 1000,
-            _ => 10_000, // cap at 10K for very deep nesting
-        };
+        let weight = block_weight(liveness, block_idx);
         // Every read value counts, including the pointers and bases that are
         // not Operands (loads, stores, GEPs, memcpy).
         for inst in &block.instructions {
@@ -1127,7 +1166,7 @@ mod tests {
             call_points: vec![call],
             reg_args_call_points: vec![(call, dest)],
             scratch_points: Vec::new(),
-            block_loop_depth: Vec::new(),
+            block_freq: Vec::new(),
             segments: FxHashMap::default(),
         }
     }

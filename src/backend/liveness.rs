@@ -54,10 +54,10 @@ pub struct LivenessResult {
     /// atomics, intrinsics, inline asm, varargs, dynamic allocas): the
     /// call-free registers are busy there, as at calls.
     pub scratch_points: Vec<u32>,
-    /// Loop nesting depth for each block (block_index -> depth).
-    /// Depth 0 = not in any loop. Depth 1 = in one loop. Depth 2 = nested, etc.
-    /// Used by the register allocator to weight uses inside loops more heavily.
-    pub block_loop_depth: Vec<u32>,
+    /// Estimated execution frequency of each block (block_index -> freq),
+    /// the entry's being 1 (compute_block_freq). The register allocator
+    /// weights uses by it.
+    pub block_freq: Vec<f64>,
     /// For values whose liveness has holes, the sorted, disjoint pieces of
     /// their interval in which they are actually live (one per run of blocks
     /// they are live in). A value missing here is live over its whole
@@ -182,7 +182,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     if num_blocks == 0 {
         return LivenessResult {
             intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), scratch_points: Vec::new(),
-            block_loop_depth: Vec::new(), segments: FxHashMap::default(),
+            block_freq: Vec::new(), segments: FxHashMap::default(),
         };
     }
 
@@ -193,7 +193,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     if num_values == 0 {
         return LivenessResult {
             intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), scratch_points: Vec::new(),
-            block_loop_depth: Vec::new(), segments: FxHashMap::default(),
+            block_freq: Vec::new(), segments: FxHashMap::default(),
         };
     }
 
@@ -211,8 +211,8 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     // Phase 2: Build successor lists for the CFG.
     let successors = build_successor_lists(func, num_blocks, &ps.block_id_to_idx);
 
-    // Phase 2b: Compute loop nesting depth per block.
-    let block_loop_depth = compute_loop_depth(&successors, num_blocks);
+    // Phase 2b: Estimate each block's execution frequency.
+    let block_freq = compute_block_freq(&successors, num_blocks);
 
     // Phase 3: Backward dataflow to compute live-in/live-out per block.
     let (live_in, live_out) = run_backward_dataflow(
@@ -248,7 +248,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         call_points: ps.call_points,
         reg_args_call_points: ps.reg_args_call_points,
         scratch_points: ps.scratch_points,
-        block_loop_depth,
+        block_freq,
         segments,
     }
 }
@@ -1348,21 +1348,180 @@ pub(super) fn for_each_operand_in_terminator(term: &Terminator, mut f: impl FnMu
     }
 }
 
-/// Compute the loop nesting depth for each block in the CFG.
+/// Loop nesting depth per block: the number of loops (find_loops) it is in.
+#[cfg(test)]
+fn compute_loop_depth(successors: &[Vec<usize>], num_blocks: usize) -> Vec<u32> {
+    let mut depth = vec![0u32; num_blocks];
+    for (_, members) in find_loops(successors, num_blocks) {
+        for b in members {
+            depth[b] += 1;
+        }
+    }
+    depth
+}
+
+/// Each loop multiplies the frequency of its body by this (a trip count).
+const LOOP_TRIPS: f64 = 10.0;
+
+/// Estimated execution frequency of each block, the entry's being 1.
+///
+/// Within a loop iteration (and the function body outside loops), mass flows
+/// from the header along forward edges, split evenly among a block's
+/// successor edges (so each case of a switch takes its share), and summed
+/// where paths merge. A loop, seen from outside, is one node: its body runs
+/// LOOP_TRIPS times per entry, and the mass that entered it leaves by its
+/// exits in the proportions the body sends there. Loops are processed
+/// innermost first, as nested regions.
+///
+/// The register allocator weights uses by this. By loop depth alone, a value
+/// used in every iteration of an interpreter's dispatch loop (sqlite3VdbeExec's
+/// step counter, read at the header and the shared latch) weighed less than
+/// ones with many uses spread over its 186 opcode handlers, each of which
+/// runs only for its own opcodes.
+fn compute_block_freq(successors: &[Vec<usize>], num_blocks: usize) -> Vec<f64> {
+    let mut freq = vec![0.0f64; num_blocks];
+    if num_blocks == 0 {
+        return freq;
+    }
+    let mut loops = find_loops(successors, num_blocks);
+    loops.sort_by_key(|(_, members)| members.len());
+    // The loops each block is in, innermost first.
+    let mut chain: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+    for (l, (_, members)) in loops.iter().enumerate() {
+        for &b in members {
+            chain[b].push(l);
+        }
+    }
+    // A region's nodes: its own blocks, and each loop directly inside it as
+    // one node (numbered num_blocks + loop index).
+    let node_in = |b: usize, region: Option<usize>| -> Option<usize> {
+        let c = &chain[b];
+        match region {
+            None => Some(c.last().map_or(b, |&l| num_blocks + l)),
+            Some(r) => {
+                let pos = c.iter().position(|&l| l == r)?;
+                Some(if pos == 0 { b } else { num_blocks + c[pos - 1] })
+            }
+        }
+    };
+    // Per loop: where its entering mass leaves (normalized), and the mass
+    // each node of its body receives per iteration.
+    let mut exits: Vec<Vec<(usize, f64)>> = vec![Vec::new(); loops.len()];
+    let mut local: Vec<Vec<(usize, f64)>> = vec![Vec::new(); loops.len() + 1];
+    for region in (0..loops.len()).map(Some).chain(std::iter::once(None)) {
+        let (entry_block, members): (usize, Vec<usize>) = match region {
+            Some(r) => (loops[r].0, loops[r].1.clone()),
+            None => (0, (0..num_blocks).collect()),
+        };
+        let Some(entry) = node_in(entry_block, region) else { continue };
+        // Out-edges of each node: Some(node) inside the region, None for
+        // the back edge to the header, or an exit to a block outside.
+        let mut nodes: Vec<usize> = members.iter().filter_map(|&b| node_in(b, region)).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        let index = |n: usize| nodes.binary_search(&n).ok();
+        let mut out: Vec<Vec<(Result<usize, usize>, f64)>> = vec![Vec::new(); nodes.len()];
+        let mut indeg = vec![0usize; nodes.len()];
+        for (i, &n) in nodes.iter().enumerate() {
+            let targets: Vec<(usize, f64)> = if n < num_blocks {
+                let s = &successors[n];
+                s.iter().map(|&t| (t, 1.0 / s.len() as f64)).collect()
+            } else {
+                exits[n - num_blocks].clone()
+            };
+            for (t, p) in targets {
+                let edge = if region.is_some() && t == entry_block {
+                    continue; // back edge: the next iteration
+                } else if let Some(j) = node_in(t, region).and_then(index) {
+                    if j == i {
+                        continue;
+                    }
+                    indeg[j] += 1;
+                    Ok(j)
+                } else {
+                    Err(t)
+                };
+                out[i].push((edge, p));
+            }
+        }
+        // Forward propagation in topological order. A cycle the loops do not
+        // cover (irreducible flow) is broken at its node with the most mass.
+        let mut mass = vec![0.0f64; nodes.len()];
+        let mut done = vec![false; nodes.len()];
+        let mut ready: Vec<usize> = Vec::new();
+        if let Some(e) = index(entry) {
+            mass[e] = 1.0;
+            ready.push(e);
+        }
+        let mut leaving: Vec<(usize, f64)> = Vec::new();
+        loop {
+            let i = match ready.pop() {
+                Some(i) => i,
+                None => match (0..nodes.len()).filter(|&i| !done[i] && mass[i] > 0.0)
+                    .max_by(|&a, &b| mass[a].total_cmp(&mass[b])) {
+                    Some(i) => i,
+                    None => break,
+                },
+            };
+            if done[i] {
+                continue;
+            }
+            done[i] = true;
+            for &(edge, p) in &out[i] {
+                let m = mass[i] * p;
+                match edge {
+                    Ok(j) => {
+                        mass[j] += m;
+                        indeg[j] -= 1;
+                        if indeg[j] == 0 && !done[j] {
+                            ready.push(j);
+                        }
+                    }
+                    Err(t) => leaving.push((t, m)),
+                }
+            }
+        }
+        if let Some(r) = region {
+            let total: f64 = leaving.iter().map(|&(_, m)| m).sum();
+            leaving.sort_unstable_by_key(|&(t, _)| t);
+            let mut dist: Vec<(usize, f64)> = Vec::new();
+            for (t, m) in leaving {
+                match dist.last_mut() {
+                    Some(last) if last.0 == t => last.1 += m / total,
+                    _ => dist.push((t, m / total)),
+                }
+            }
+            exits[r] = dist;
+        }
+        local[region.unwrap_or(loops.len())] = nodes.iter().copied().zip(mass).collect();
+    }
+    // Outermost region first: a loop node's mass, times the trips, scales
+    // its body.
+    let mut work: Vec<(usize, f64)> = vec![(loops.len(), 1.0)];
+    while let Some((r, scale)) = work.pop() {
+        for &(n, m) in &local[r] {
+            if n < num_blocks {
+                freq[n] = scale * m;
+            } else {
+                work.push((n - num_blocks, scale * m * LOOP_TRIPS));
+            }
+        }
+    }
+    freq
+}
+
+/// The natural loops of the CFG, one per header: (header, body including
+/// the header).
 ///
 /// Uses DFS-based back-edge detection: an edge src -> dst where dst is an
 /// ancestor in the DFS tree is a back edge defining a natural loop. For each
 /// back edge (src -> header), all blocks on any path from header to src form
-/// the loop body. The depth of a block is the number of loop bodies it belongs to.
-///
-/// This is used by the register allocator to weight uses inside loops more
-/// heavily, so that inner-loop temporaries get priority for register allocation.
-fn compute_loop_depth(successors: &[Vec<usize>], num_blocks: usize) -> Vec<u32> {
+/// the loop body.
+fn find_loops(successors: &[Vec<usize>], num_blocks: usize) -> Vec<(usize, Vec<usize>)> {
+    let mut loops = Vec::new();
     if num_blocks == 0 {
-        return Vec::new();
+        return loops;
     }
-
-    let mut depth = vec![0u32; num_blocks];
 
     // Build predecessor lists from successor lists.
     let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
@@ -1445,13 +1604,13 @@ fn compute_loop_depth(successors: &[Vec<usize>], num_blocks: usize) -> Vec<u32> 
                 }
             }
         }
-        for b in members.drain(..) {
-            depth[b] += 1;
+        for &b in &members {
             in_body[b] = false;
         }
+        loops.push((header, std::mem::take(&mut members)));
     }
 
-    depth
+    loops
 }
 
 #[cfg(test)]
@@ -1708,5 +1867,36 @@ mod tests {
         let succ = vec![vec![1], vec![2, 3, 4, 6], vec![1], vec![1], vec![5], vec![5, 1], vec![]];
         let depth = compute_loop_depth(&succ, 7);
         assert_eq!(depth, vec![0, 1, 1, 1, 1, 2, 0]);
+    }
+
+    /// A switch's cases share their block's frequency, the shared latch gets
+    /// it back, and the code after the loop runs once, as the entry does.
+    #[test]
+    fn test_block_freq_splits_switch_cases() {
+        // 0 -> 1 (header, switch to 2, 3, 4, 5); 2, 3, 4 -> 6 (latch) -> 1;
+        // 5 leaves the loop -> 7; 7 -> 8, 9 (each half) -> 10 (merge).
+        let succ = vec![vec![1], vec![2, 3, 4, 5], vec![6], vec![6], vec![6], vec![7], vec![1],
+                        vec![8, 9], vec![10], vec![10], vec![]];
+        let freq = compute_block_freq(&succ, 11);
+        let want = [1.0, 10.0, 2.5, 2.5, 2.5, 1.0, 7.5, 1.0, 0.5, 0.5, 1.0];
+        for (b, (&got, &w)) in freq.iter().zip(&want).enumerate() {
+            assert!((got - w).abs() < 1e-9, "block {b}: {got} != {w}");
+        }
+    }
+
+    /// A loop inside a loop runs LOOP_TRIPS times per run of its parent's
+    /// body, scaled by how often that body reaches it.
+    #[test]
+    fn test_block_freq_nested_loops() {
+        // 0 -> 1 (outer header) -> 2, 4; 2 (inner header) -> 3 -> 2 / 4;
+        // 4 (outer latch) -> 1 / 5 (exit).
+        let succ = vec![vec![1], vec![2, 4], vec![3], vec![2, 4], vec![1, 5], vec![]];
+        let freq = compute_block_freq(&succ, 6);
+        // Outer body: 10 per entry; half of it enters the inner loop, which
+        // multiplies by 10 again; the latch gets everything back.
+        let want = [1.0, 10.0, 50.0, 50.0, 10.0, 1.0];
+        for (b, (&got, &w)) in freq.iter().zip(&want).enumerate() {
+            assert!((got - w).abs() < 1e-9, "block {b}: {got} != {w}");
+        }
     }
 }

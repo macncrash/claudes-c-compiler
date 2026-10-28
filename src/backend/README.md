@@ -499,7 +499,7 @@ the pool it may use:
   reloaded after each call it spans (six save slots in the frame, one per
   register; `save_around_call` in calls.rs), when every such call is a
   register-args-only call and two accesses per spanned call, weighted by
-  the call's loop depth, cost less than the stack slot's store and loads.
+  the call's block frequency, cost less than the stack slot's store and loads.
   A loop variable read several times an iteration, across a call on a
   rarely taken path, is then in a register. In SQLite's speedtest most
   values left on the stack span many calls of the interpreter loop, and
@@ -515,16 +515,19 @@ low-priority value live across the whole function is what stays on the stack.
 ### Priority Scoring
 
 Candidates are sorted by a priority score that combines live range length
-and use count. Uses inside loops are weighted exponentially by nesting
-depth: a use at loop depth D contributes 10^D to the weighted count
-(depth 1 = 10x, depth 2 = 100x, depth 3 = 1000x, capped at 10,000 for
-very deep nesting). This ensures inner-loop temporaries receive registers
-ahead of straight-line code values, which is critical for compute-heavy
-loops like zlib's `deflate_slow`, `longest_match`, and `slide_hash`. A
-loop is the union of the bodies of its header's back edges, so a block
-counts each enclosing loop once: counted per back edge, sqlite3VdbeExec's
-dispatch loop, which every opcode's handler jumps back to, made its
-blocks hundreds deep, unevenly.
+and use count. Each use is weighted by its block's estimated execution
+frequency (`LivenessResult::block_freq`, the entry's being 1; 1000 per run,
+capped at 10,000 runs): a loop's body runs 10 times per entry, so
+inner-loop temporaries receive registers ahead of straight-line code values,
+which is critical for compute-heavy loops like zlib's `deflate_slow`,
+`longest_match`, and `slide_hash`. Within an iteration a branch splits its
+block's frequency among its successors, a switch evenly among its cases, and
+paths that merge add up again. Weighted by loop depth alone, a value used in
+every iteration of an interpreter's dispatch loop (sqlite3VdbeExec's step
+counter, read at the header and at the latch every handler jumps back to)
+weighed less than values with many uses spread over the 186 opcode handlers,
+each of which runs for its own opcodes only, and stayed on the stack; SQLite's
+speedtest ran 3.0% fewer instructions once it did not.
 
 A GEP with a constant offset that is only used as a load or store address
 (see GEP Constant Offset Folding) counts its uses toward its base instead,
@@ -543,6 +546,16 @@ unrelated value could take the register in a gap between members. A group
 with a call-spanning member (a sum carried around a loop that calls
 functions) needs one callee-saved register; one that does not fit is
 allocated member by member.
+
+Values that may hand a register to each other at an operation (`add x20,
+x20, #1`: the operand dies where the result is born) are **partners**. A
+candidate first tries its assigned partners' registers, then a register free
+for its partners not yet allocated too, so they can take it when their turn
+comes. Lacking a caller-saved one with that room, a hot value (weighing more
+than two runs of the entry) takes a callee-saved register that has it,
+already saved or, in a function without calls, a fresh one. zlib's
+`longest_match` otherwise copied its chain count from the decrement back to
+its loop phi on every link of the hash chain.
 
 ### Eligibility Filtering
 
@@ -615,9 +628,16 @@ The liveness result includes:
   `Call`/`CallIndirect` instructions, used by the register allocator to
   identify which values span calls and therefore need callee-saved
   registers.
-- **Loop nesting depth** (`block_loop_depth`): per-block depth computed via
-  DFS-based back-edge detection. Depth 0 = not in any loop, depth 1 = one
-  loop, etc. Used for priority weighting in the register allocator.
+- **Block frequency** (`block_freq`): each block's estimated execution
+  frequency, the entry's being 1, used for priority weighting in the
+  register allocator. Loops come from DFS back-edge detection, one per
+  header (the union of its back edges' bodies). Processed innermost first,
+  each loop's body is a region: mass 1 enters at the header and flows along
+  forward edges, split evenly among each block's successor edges and summed
+  where they merge. Seen from its parent, a loop is one node whose body runs
+  10 times per entry and whose entering mass leaves by its exits in the
+  proportions the body reaches them, so code after a loop runs as often as
+  code before it.
 
 ### Canonical Operand Iterators
 
