@@ -483,6 +483,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(reuse_constants(&mut lines, &mut kinds, n));
             changed2 |= pass!(zero_reg_into_select(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_redundant_zero_extend(&mut lines, &mut kinds, n));
+            changed2 |= pass!(narrow_load_for_copy(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
@@ -2380,6 +2381,127 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
             continue;
         }
         lines[i] = format!("    tst {}", tst);
+        kinds[i] = classify_line(&lines[i]);
+        kinds[j] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `ldr|ldrsw xA, [m]` then `mov wB, wA`, A dead after it or B itself: the
+/// copy keeps the low 32 bits, which a 32-bit load of the same address
+/// gives (little-endian) with the upper half cleared, as `mov wB` leaves
+/// it: `ldr wB, [m]`. (`ldrsw x11, [x26, #8]; mov w11, w11` and a spilled
+/// `int` reloaded through x0 in sqlite3VdbeExec.)
+fn narrow_load_for_copy(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        let load = lines[i].clone();
+        let Some(("ldr" | "ldrsw", ops)) = split_insn(&load) else { continue };
+        let (dst, mem) = first_and_rest(ops);
+        let mem = mem.trim();
+        // One plain address: no writeback, no pair.
+        if !dst.starts_with('x') || !mem.starts_with('[') || !mem.ends_with(']') || mem.contains('!') {
+            continue;
+        }
+        // A 32-bit load scales a register index by 4 at most and reaches
+        // 16380 (or -256 unscaled) with an immediate.
+        let parts: Vec<&str> = mem[1..mem.len() - 1].split(',').map(str::trim).collect();
+        let fits = match parts[..] {
+            [_] => true,
+            [_, off] if off.starts_with('#') => {
+                off[1..].parse::<i64>().is_ok_and(|k| (-256..=255).contains(&k) || (0..=16380).contains(&k) && k % 4 == 0)
+            }
+            [_, idx] => gpr_operand(idx).is_some(),
+            [_, _, ext] => ext.ends_with("#2") || matches!(ext, "sxtw" | "uxtw"),
+            _ => false,
+        };
+        if !fits {
+            continue;
+        }
+        let Some(a) = gpr_operand(dst) else { continue };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some(("mov", mops)) = split_insn(&lines[j]) else { continue };
+        let (d, s) = first_and_rest(mops);
+        let (Some(b), Some(sr)) = (gpr_operand(d), gpr_operand(s.trim())) else { continue };
+        if !d.starts_with('w') || !s.trim().starts_with('w') || sr != a {
+            continue;
+        }
+        // A still read after the copy: those reads take wB instead when
+        // each reads only wA, before A dies or is written, with B unchanged.
+        // A reload of the same address into A on the way is dropped.
+        let mut renames = Vec::new();
+        let mut drops = Vec::new();
+        if b != a {
+            let x_mention = |text: &str| text.split([',', ' ', '\t', '[', ']', '!', '{', '}'])
+                .any(|t| t.starts_with('x') && gpr_operand(t) == Some(a));
+            let addr = regs_in(mem);
+            // The copy writes B, and the load A: either in the address
+            // makes a reload read elsewhere.
+            let mut same = addr & ((1 << a) | (1 << b)) == 0;
+            let mut k = j + 1;
+            let ok = loop {
+                if k >= n {
+                    break false;
+                }
+                if kinds[k] == LineKind::Nop {
+                    k += 1;
+                    continue;
+                }
+                if same && lines[k] == lines[i] {
+                    drops.push(k);
+                    if live[k] & (1 << a) == 0 {
+                        break true;
+                    }
+                    k += 1;
+                    continue;
+                }
+                if matches!(kinds[k], LineKind::Label | LineKind::Call | LineKind::Ret | LineKind::Branch
+                    | LineKind::CondBranch | LineKind::CmpBranch) {
+                    break false;
+                }
+                let info = line_info(&lines[k], kinds[k], &|_| None);
+                if info.uses == ALL_REGS || !matches!(info.flow, Flow::Next) || info.defs & (1 << b) != 0 {
+                    break false;
+                }
+                let reads = info.uses & (1 << a) != 0;
+                if reads && (x_mention(&lines[k]) || info.defs & (1 << a) != 0) {
+                    break false;
+                }
+                if reads {
+                    renames.push(k);
+                } else if info.defs & (1 << a) != 0 {
+                    break true;
+                }
+                if live[k] & (1 << a) == 0 {
+                    break true;
+                }
+                // A store, or a new address, ends the reloads that can go.
+                let m = split_insn(&lines[k]).map_or("", |(m, _)| m);
+                if m.starts_with("st") || info.defs & addr != 0 {
+                    same = false;
+                }
+                k += 1;
+            };
+            if !ok {
+                continue;
+            }
+        }
+        for &k in &renames {
+            lines[k] = rename_gpr(&lines[k], a, b);
+            kinds[k] = classify_line(&lines[k]);
+        }
+        for &k in &drops {
+            kinds[k] = LineKind::Nop;
+        }
+        lines[i] = format!("    ldr {}, {}", wreg_name(b), mem);
         kinds[i] = classify_line(&lines[i]);
         kinds[j] = LineKind::Nop;
         changed = true;
@@ -5776,6 +5898,31 @@ mod tests {
         let input = format!(".globl f\n.type f, %function\nf:\n{RET_X0_MARKER}\n    and x9, x0, #4\n    cbz x9, .L3\n{dispatch}.L3:\n    mov x1, #0\n{dispatch}    .p2align 2\n.Ljt:\n    .word .La - .Ljt\n    .word .Lb - .Ljt\n.La:\n    mov x0, #1\n    ret\n.Lb:\n    ret\n.size f, .-f\n");
         let result = peephole_optimize(input);
         assert!(result.contains("tbz w0, #2, .L3"), "{}", result);
+    }
+
+    #[test]
+    fn test_load_copied_to_w_register_loads_it() {
+        let run = |body: &str| peephole_optimize(ret_x0(body));
+        // Sign extension undone by the zero extension: a 32-bit load.
+        let result = run("    ldrsw x11, [x2, #8]\n    mov w11, w11\n    str x11, [x3]\n");
+        assert!(result.contains("ldr w11, [x2, #8]") && !result.contains("mov w11"), "{}", result);
+        // A spilled int reloaded through x0, read again as w0, reloaded once more.
+        let result = run("    ldr x0, [sp, #2728]\n    mov w14, w0\n    ldr x0, [sp, #2728]\n    add w15, w0, #1\n    str x14, [x3]\n    str x15, [x3, #8]\n    mov x0, #0\n");
+        assert!(result.contains("ldr w14, [sp, #2728]") && result.contains("add w15, w14, #1"), "{}", result);
+        assert!(!result.contains("ldr x0, [sp, #2728]"), "{}", result);
+        // Not when A is read whole later, nor for offsets or index scales a
+        // 32-bit load cannot encode.
+        let keep = [
+            "    ldr x0, [x2, #16]\n    mov w14, w0\n    str x0, [x3]\n    str x14, [x3, #8]\n",
+            "    ldr x9, [x2, #20000]\n    mov w14, w9\n    str x14, [x3]\n",
+            "    ldr x9, [x2, x4, lsl #3]\n    mov w14, w9\n    str x14, [x3]\n",
+        ];
+        for body in keep {
+            assert!(run(body).contains("mov w14"), "{}", run(body));
+        }
+        // A reload through the register the copy wrote reads elsewhere.
+        let result = run("    ldr x0, [x14]\n    mov w14, w0\n    ldr x0, [x14]\n    add w15, w0, #1\n    str x14, [x3]\n    str x15, [x3, #8]\n    mov x0, #0\n");
+        assert!(result.contains("ldr x0, [x14]"), "{}", result);
     }
 
     #[test]

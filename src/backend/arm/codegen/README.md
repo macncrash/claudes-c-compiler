@@ -818,6 +818,17 @@ folding into its user.
   it: `add xC, xD, wB, uxtw`, `lsr wC, wB, #k` (`s->window + cur_match` in
   longest_match's candidate loop). A may be B: `sxtw x0, w0; cbnz x0`
   after a call returning int becomes `cbnz w0`.
+- `ldr|ldrsw xA, [m]` then `mov wB, wA` loads 32 bits: `ldr wB, [m]` (the
+  low half of the value, little-endian, with the upper half cleared as the
+  copy leaves it). An `int` or `long` field passed as an `unsigned`
+  argument (`ldrsw x3, [x0]; mov w3, w3`), or a spilled `int` reloaded
+  through x0. When A is read again before it dies, each read must be of
+  wA and takes wB instead, with B unchanged meanwhile; a reload of the
+  same address into A on the way, with no store or address change since,
+  goes too (`ldr x0, [sp, #2728]; mov w14, w0; ldr x0, [sp, #2728]; add
+  w15, w0, #1` is `ldr w14, [sp, #2728]; add w15, w14, #1`). Only offsets
+  and index scales a 32-bit load encodes. In sqlite3VdbeExec, 65M fewer
+  instructions run in speedtest (0.29%).
 - `cmp A, B; b.cc L; cmp A, B`, with nothing between but the branch: the
   second compare goes (the flags are the first one's). `a < b || a == b &&
   ...` (pqdownheap's `smaller`) tests one pair twice.
