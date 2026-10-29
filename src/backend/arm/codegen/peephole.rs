@@ -469,7 +469,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_repeated_frame_addrs(&lines, &mut kinds, n));
             changed2 |= pass!(propagate_w_copies(&mut lines, &mut kinds, n));
             changed2 |= pass!(eliminate_low_half_only_extends(&lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_dead_upper_extends(&lines, &mut kinds, n));
+            changed2 |= pass!(eliminate_dead_upper_extends(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_shift_into_operand(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_index_into_mem(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_scale_into_mem(&mut lines, &mut kinds, n));
@@ -504,6 +504,13 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(eliminate_unreachable_after_jumps(&lines, &mut kinds, n));
             rounds2 += 1;
         }
+    }
+
+    // Again: the cleanup turns extensions into copies (`sxtw x10, w0` whose
+    // upper half nothing reads is `mov x10, x0`), and its folds leave
+    // writeback accesses the first round did not see.
+    if !skip.contains(&"coalesce_arg_copies") && coalesce_arg_copies(&mut lines, &mut kinds, n) {
+        eliminate_self_moves(&mut kinds, n);
     }
 
     if !skip.contains(&"pair_adjacent_loads") {
@@ -3535,6 +3542,17 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
         if kinds[i] == LineKind::Nop {
             continue;
         }
+        // `cbz xR` of a sign-extended R tests wR: R's upper half goes unread.
+        if kinds[i] == LineKind::CmpBranch {
+            if let Some((m @ ("cbz" | "cbnz"), ops)) = split_insn(&lines[i]) {
+                let (r, target) = first_and_rest(ops);
+                if let Some(x) = gpr_operand(r).filter(|&x| r.starts_with('x') && x <= 28 && sext[x as usize]) {
+                    lines[i] = format!("    {} {}, {}", m, wreg_name(x), target.trim());
+                    kinds[i] = classify_line(&lines[i]);
+                    changed = true;
+                }
+            }
+        }
         let access = classify_access(&lines[i], kinds[i]);
         if access == Access::Barrier {
             sext = [false; 29];
@@ -4761,25 +4779,26 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
         }
     }
     // Pair loads/stores and writeback forms (callee-saved register saves and
-    // restores, memcpy loops). The writeback base stays live; it is never
-    // treated as killed.
+    // restores, memcpy loops). A writeback base is read and written: it
+    // stays live, and nothing else may hold a value in it across the access.
     let has_symbol = ops.contains(':') || ops.contains('@') || ops.contains('=');
     if !has_symbol {
         if let Some(bracket) = ops.find('[') {
             let (regs, addr) = (&ops[..bracket], &ops[bracket..]);
             let writeback = addr.contains("]!") || addr.contains("],");
+            let base = if writeback { regs_in(addr) } else { 0 };
             match mnemonic {
                 "ldp" | "ldpsw" => {
                     let (a, rest) = first_and_rest(regs);
                     let b = first_and_rest(rest).0;
                     let defs = regs_in(a) | regs_in(b);
-                    return simple(regs_in(addr), defs & !regs_in(addr));
+                    return simple(regs_in(addr), (defs & !regs_in(addr)) | base);
                 }
-                "stp" => return simple(regs_in(ops), 0),
+                "stp" => return simple(regs_in(ops), base),
                 "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" if writeback => {
-                    return simple(regs_in(addr), regs_in(dest) & !regs_in(addr));
+                    return simple(regs_in(addr), (regs_in(dest) & !regs_in(addr)) | base);
                 }
-                "str" | "strb" | "strh" if writeback => return simple(regs_in(ops), 0),
+                "str" | "strb" | "strh" if writeback => return simple(regs_in(ops), base),
                 _ => {}
             }
         }
@@ -5225,7 +5244,8 @@ impl LineRegs {
             return false;
         };
         for k in d..=u {
-            if mentions_reg(&lines[k], a) {
+            // (Not a deleted line: classifying it again would bring it back.)
+            if kinds[k] != LineKind::Nop && mentions_reg(&lines[k], a) {
                 undo.push((k, lines[k].clone(), kinds[k]));
                 lines[k] = rename_gpr(&lines[k], a, r);
                 kinds[k] = classify_line(&lines[k]);
@@ -5356,6 +5376,14 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
     for info in infos.iter_mut().filter(|i| matches!(i.flow, Flow::Exit)) {
         info.uses &= ret_mask;
     }
+    // A 32-bit result's upper half is the caller's to ignore.
+    if upper && body.clone().any(|k| lines[k] == RET_W0_MARKER) {
+        for (info, k) in infos.iter_mut().zip(body.clone()) {
+            if kinds[k] == LineKind::Ret {
+                info.uses &= !1;
+            }
+        }
+    }
     // A call reads only the argument registers its marker names.
     for k in body.clone() {
         if kinds[k] == LineKind::Call {
@@ -5448,21 +5476,29 @@ fn x_form_reads(line: &str, kind: LineKind) -> Option<RegSet> {
 }
 
 /// `sxtw xA, wA` (or `mov wA, wA`) whose upper half nothing reads before A
-/// is written again, on any path: the low half is all that is used.
-fn eliminate_dead_upper_extends(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+/// is written again, on any path: the low half is all that is used. Into
+/// another register, `sxtw xD, wS` is then the whole-register copy
+/// `mov xD, xS`, which copy coalescing can remove.
+fn eliminate_dead_upper_extends(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     for (start, end) in function_ranges(lines, n) {
         let Some((upper_live, _)) = function_liveness_with(lines, kinds, start, end, true) else { continue };
         for k in start..end {
-            let a = match kinds[k] {
-                LineKind::Sxtw { dst, src } if dst == src => dst,
-                LineKind::Move { dst, src, is_32bit: true } if dst == src => dst,
+            let (a, b) = match kinds[k] {
+                LineKind::Sxtw { dst, src } => (dst, src),
+                LineKind::Move { dst, src, is_32bit: true } if dst == src => (dst, src),
                 _ => continue,
             };
-            if a <= 28 && upper_live[k - start] & (1 << a) == 0 {
-                kinds[k] = LineKind::Nop;
-                changed = true;
+            if a > 28 || b > 28 || upper_live[k - start] & (1 << a) != 0 {
+                continue;
             }
+            if a == b {
+                kinds[k] = LineKind::Nop;
+            } else {
+                lines[k] = format!("    mov {}, {}", xreg_name(a), xreg_name(b));
+                kinds[k] = classify_line(&lines[k]);
+            }
+            changed = true;
         }
     }
     changed
@@ -6099,7 +6135,8 @@ mod tests {
         // the target may be beyond +/-32KB.
         assert!(peephole_optimize(f("and x0, x1, #4", "cbz x0, .LBB1", 0)).contains("and x0, x1, #4"));
         assert!(peephole_optimize(f("and x9, x0, #0x10000000000", "cbz w9, .LBB1", 0)).contains("cbz w9"));
-        assert!(peephole_optimize(f("and x9, x0, #4", "cbz x9, .LBB1", 8000)).contains("cbz x9"));
+        let far = peephole_optimize(f("and x9, x0, #4", "cbz x9, .LBB1", 8000));
+        assert!(far.contains("cbz w9") && !far.contains("tbz"));
         assert!(peephole_optimize(f("and x9, x0, #4", "cbz x9, .LBB1", 7900)).contains("tbz w0, #2"));
     }
 
@@ -6430,6 +6467,47 @@ f:
         let body = "    add w10, w10, w1\n    mov x0, x10\n";
         let result = peephole_optimize(ret_x0(body));
         assert!(result.contains("w10, w1"), "{}", result);
+    }
+
+    #[test]
+    fn test_int_result_extension_before_ret_goes() {
+        // getAndInitPage: an int callee's result tested and returned. The
+        // test reads w0, and an int return leaves x0's upper half unread.
+        let body = "    bl g\n    sxtw x0, w0\n    cbz x0, .LBB1\n    str xzr, [x19]\n    ret\n.LBB1:\n    mov x0, #7\n";
+        let input = format!(".globl f\n.type f, %function\nf:\n{RET_W0_MARKER}\n{body}    ret\n.size f, .-f\n");
+        let result = peephole_optimize(input);
+        assert!(!result.contains("sxtw") && result.contains("cbz w0"), "{}", result);
+        // Returning 64 bits, the extension stays.
+        let result = peephole_optimize(ret_x0(body));
+        assert!(result.contains("sxtw x0, w0"), "{}", result);
+    }
+
+    #[test]
+    fn test_extension_with_unread_upper_half_is_a_copy() {
+        // x10's upper half is never read: the sxtw is a copy, and the
+        // copy coalesces (vdbeRecordCompareString's memcmp result).
+        let body = "    bl g\n    sxtw x10, w0\n    cmp w0, #0\n    b.le .LBB1\n    ldrsb x0, [x19, #33]\n    ret\n.LBB1:\n    cmp w10, #0\n    cset x0, ge\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(!result.contains("sxtw") && !result.contains("x10"), "{}", result);
+    }
+
+    #[test]
+    fn test_writeback_base_keeps_its_own_value() {
+        // The loop's post-index stores advance x4; the copy after it needs
+        // the pointer x15 still holds, so x15 cannot become x4.
+        let body = "    ldr x15, [x1]\n    mov x4, x15\n.LBB1:\n    str x2, [x4], #8\n    subs x3, x3, #1\n    b.ne .LBB1\n    mov x4, x15\n    bl g\n    mov x0, #0\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(!result.contains("ldr x4, [x1]"), "{}", result);
+    }
+
+    #[test]
+    fn test_moved_piece_leaves_deleted_lines_deleted() {
+        // The sxtw becomes `mov x10, x0` after the multiply fused into madd;
+        // coalescing it moves x0's 24 to a temporary, and the deleted mul
+        // that named x0 stays deleted.
+        let body = "    sxtw x10, w0\n    ldrsw x11, [x1]\n    mov x0, #24\n    mul x11, x11, x0\n    add x11, x11, x2\n    str x11, [x1]\n    str w10, [x1, #8]\n    mov x0, #0\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(!result.contains("mul"), "{}", result);
     }
 
     #[test]

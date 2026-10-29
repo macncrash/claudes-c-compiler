@@ -807,6 +807,16 @@ first. Static copies between x0-x7 and x9-x15 in SQLite went from 3646 to
 1415, and speedtest ran 1.2% fewer instructions (block counts, no function
 slower by more than 0.7M); compiling sqlite3.c took 2.5% longer.
 
+Coalescing runs a second time after the local cleanup, followed only by
+dropping the self-moves it leaves, for the copies the cleanup makes from
+extensions. The cleanup also folds pointer steps into writeback accesses
+(`str x5, [x4], #8`), so a writeback base counts as written: OP_VFilter
+fills apArg[] through a stepped copy of the array pointer and then passes
+the pointer itself, which must not share the stepped register. A piece of
+an argument register moved aside leaves deleted lines that name it alone,
+since renaming one would bring it back (a `mul` already fused into
+`smaddl`).
+
 **9. Extension and Field Folds** (local cleanup)
 
 - `lsr T, S, #k; and D, T, #(2^w - 1)` becomes `ubfx D, S, #k, #w` (in w form
@@ -927,6 +937,15 @@ v1 and nothing between the copy and the call uses v22:
 - In the liveness of registers' upper halves, `mov xD, xS` reads S's upper
   half only where D's is live afterwards, so an `sxtw` of an `int` that is
   only copied and then read as a w register goes away.
+- A `ret` in a function returning a 32-bit integer (`.ccc_ret_regs w0`)
+  does not read x0's upper half, and `cbz|cbnz xR` of an R known to hold
+  its own sign extension tests wR. getAndInitPage's `rc = xGet(...); if
+  (rc) return rc;` then keeps no `sxtw x0, w0`. An `sxtw xD, wS` whose
+  D upper half nothing reads becomes `mov xD, xS`, a copy that argument
+  register coalescing (run again after the cleanup) can remove:
+  vdbeRecordCompareString's memcmp result, tested in two blocks. Static
+  `sxtw` in SQLite went from 4468 to 3558; speedtest ran 0.41% fewer
+  instructions (block counts, no function slower).
 
 **13. Constants and Zero** (local cleanup)
 
