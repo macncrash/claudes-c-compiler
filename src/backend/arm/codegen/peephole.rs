@@ -554,6 +554,12 @@ pub fn peephole_optimize(asm: String) -> String {
     };
     let n = lines.len();
 
+    // Last, once no code moves: single-bit tests branch on the bit.
+    let (mut lines, mut kinds) = (lines, kinds);
+    if !skip.contains(&"fuse_bit_test_into_tbz") {
+        fuse_bit_test_into_tbz(&mut lines, &mut kinds, n);
+    }
+
     // Build result, filtering out Nop lines
     let align = small_loop_alignment(&lines, &kinds, n);
     let mut result = String::with_capacity(asm.len());
@@ -2162,6 +2168,101 @@ fn flags_read_from(lines: &[String], kinds: &[LineKind], mut k: usize, n: usize)
     true
 }
 
+/// Bytes a `tbz`/`tbnz` may reach, a little inside its +/-32KB.
+const TBZ_SAFE_BYTES: usize = 32000;
+
+/// `and D, A, #2^b` then `cbz`/`cbnz D` (D dead afterwards): `tbz`/`tbnz A,
+/// #b` (`and x0, x0, #1; cbz x0, L` in sqlite3PcacheRelease). Runs after
+/// everything that copies code, with the target within reach by an upper
+/// bound on the bytes between: 16 for a `mov` of an immediate (the
+/// assembler's movz/movk expansion), 4 for any other instruction, the
+/// data directives' sizes, an alignment's whole span, and 64 at each label
+/// a later branch jumps back to, for the loop alignment emitted after this.
+/// The built-in assembler does not check the range of a resolved `tbz`, so
+/// any other directive in between rules the fold out.
+fn fuse_bit_test_into_tbz(lines: &mut [String], kinds: &mut [LineKind], n: usize) {
+    // A macro (from inline asm) makes one line any number of instructions.
+    if lines.iter().any(|l| l.trim_start().starts_with(".macro")) {
+        return;
+    }
+    let live = live_out_all(lines, kinds, n);
+    let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for k in 0..n {
+        if kinds[k] == LineKind::Label {
+            if let Some(name) = label_name(&lines[k]) {
+                labels.insert(name.to_string(), k);
+            }
+        }
+    }
+    let mut loop_heads = std::collections::HashSet::new();
+    for j in 0..n {
+        if matches!(kinds[j], LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch) {
+            if let Some(&i) = split_insn(&lines[j]).and_then(|(_, ops)| labels.get(last_operand(ops))) {
+                if i < j {
+                    loop_heads.insert(i);
+                }
+            }
+        }
+    }
+    // Upper bound on the bytes before each line.
+    const UNKNOWN: usize = 1 << 30;
+    let mut at = vec![0usize; n + 1];
+    for k in 0..n {
+        let t = lines[k].trim_start();
+        let directive = t.split_whitespace().next().unwrap_or("");
+        let arg = || t[directive.len()..].split(',').next().unwrap_or("").trim().parse::<u32>().ok();
+        let size = match kinds[k] {
+            LineKind::Nop => 0,
+            LineKind::Label => if loop_heads.contains(&k) { 64 } else { 0 },
+            // Several statements on one line (inline asm).
+            _ if t.contains(';') => UNKNOWN,
+            _ if directive.starts_with(".cfi") => 0,
+            _ if matches!(directive, ".loc" | ".file" | ".size" | ".type" | ".globl" | ".global" | ".hidden" | ".private_extern") => 0,
+            _ if matches!(directive, ".word" | ".long" | ".4byte") => 4,
+            _ if matches!(directive, ".quad" | ".xword" | ".8byte") => 8,
+            _ if matches!(directive, ".p2align" | ".align") => arg().filter(|&p| p < 16).map_or(UNKNOWN, |p| 1 << p),
+            _ if directive == ".balign" => arg().map_or(UNKNOWN, |b| b as usize),
+            _ if directive.starts_with('.') => UNKNOWN,
+            _ if directive == "mov" && t.contains('#') => 16,
+            _ => 4,
+        };
+        at[k + 1] = at[k] + size;
+    }
+    for i in 0..n {
+        let Some(("and", ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [d, a, imm] = p[..] else { continue };
+        let (Some(dr), Some(ar), Some(v)) = (gpr_operand(d), gpr_operand(a), parse_imm(imm)) else { continue };
+        if !v.is_power_of_two() || d.as_bytes()[0] != a.as_bytes()[0] {
+            continue;
+        }
+        let bit = v.trailing_zeros();
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((m @ ("cbz" | "cbnz"), bops)) = split_insn(&lines[j]) else { continue };
+        let (reg, target) = first_and_rest(bops);
+        let target = target.trim();
+        // A 32-bit test of a bit in the upper half sees zero: left alone.
+        if gpr_operand(reg) != Some(dr) || (reg.starts_with('w') && bit >= 32) || live[j] & (1 << dr) != 0 {
+            continue;
+        }
+        let Some(&t) = labels.get(target) else { continue };
+        if at[t.max(j)] - at[t.min(j)] > TBZ_SAFE_BYTES {
+            continue;
+        }
+        let src = if bit < 32 { wreg_name(ar).to_string() } else { a.to_string() };
+        let op = if m == "cbz" { "tbz" } else { "tbnz" };
+        lines[j] = format!("    {} {}, #{}, {}", op, src, bit, target);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+    }
+}
+
 /// `and D, A, B` then `cmp D, #0` (D dead afterwards): `tst A, B`. cmp #0
 /// sets C and tst clears it, so every read of these flags (selects in the
 /// same block, or a final `b.cc` whose paths read them no further) must
@@ -2207,7 +2308,10 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
         if j >= n || live[j] & (1 << d) != 0 {
             continue;
         }
-        let tst = if lines[j].trim() == format!("cmp {}, #0", dest) {
+        // A 64-bit compare of a 32-bit `and` has N clear where the 32-bit
+        // test copies bit 31: then only Z may be read.
+        let z_only = dest.starts_with('w') && lines[j].trim() == format!("cmp x{}, #0", d);
+        let tst = if z_only || lines[j].trim() == format!("cmp {}, #0", dest) {
             srcs.trim().to_string()
         } else if dest.starts_with('x') && lines[j].trim() == format!("cmp {}, #0", wreg_name(d)) {
             // The low halves: x registers, or a 64-bit mask within the low
@@ -2224,6 +2328,7 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
             continue;
         };
         // Every read of the flags up to the next write must ignore C.
+        let carry_free = |cc: &str| if z_only { matches!(cc, "eq" | "ne") } else { carry_free(cc) };
         let mut k = j + 1;
         let ok = loop {
             if k >= n {
@@ -2247,6 +2352,15 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
             }
             if m == "b" {
                 break target_quiet;
+            }
+            // A register test branches without the flags: on along the
+            // fallthrough, if its target leaves them unread too.
+            if kinds[k] == LineKind::CmpBranch {
+                if labels.get(last_operand(o)).is_none_or(|&t| flags_read_from(lines, kinds, t + 1, n)) {
+                    break false;
+                }
+                k += 1;
+                continue;
             }
             if reads_flags(m) {
                 let cc = o.rsplit(',').next().unwrap_or("").trim();
@@ -4806,19 +4920,47 @@ fn eliminate_dead_writes_global(lines: &[String], kinds: &mut [LineKind], n: usi
 /// The target lines of `br xN` at line `k` when the jump table it indexes
 /// follows it (as the switch lowering emits it): an alignment directive, the
 /// table's label, then one `.word|.long target - table` per entry, every
-/// target a label of this function.
+/// target a label of this function. A copy of the dispatch (Phase 5) finds
+/// its table from the `adr` into the `br`'s register a few lines before:
+/// `adr x17, Ljt_12; ldr w16, [x17, x10, lsl #2]; add x17, x17, w16, sxtw`.
 fn jump_table_targets(lines: &[String], kinds: &[LineKind], k: usize, end: usize,
                       label_index: &dyn Fn(&str) -> Option<usize>) -> Option<Vec<usize>> {
-    if !matches!(split_insn(&lines[k]), Some(("br", _))) {
-        return None;
-    }
+    let Some(("br", reg)) = split_insn(&lines[k]) else { return None };
     let mut j = k + 1;
     while j < end && (kinds[j] == LineKind::Nop || lines[j].trim_start().starts_with(".p2align")) {
         j += 1;
     }
-    if j >= end || kinds[j] != LineKind::Label {
+    if j < end && kinds[j] == LineKind::Label {
+        if let Some(targets) = table_entries(lines, j, end, label_index) {
+            return Some(targets);
+        }
+    }
+    // The three lines before, exactly.
+    let mut prev = Vec::new();
+    let mut i = k;
+    while i > 0 && prev.len() < 3 {
+        i -= 1;
+        if kinds[i] != LineKind::Nop {
+            prev.push(lines[i].trim());
+        }
+    }
+    let r = reg.trim();
+    let [add, ldr, adr] = prev[..] else { return None };
+    let (Some(("add", add_ops)), Some(("ldr", ldr_ops)), Some(("adr", adr_ops))) = (split_insn(add), split_insn(ldr), split_insn(adr)) else { return None };
+    let (idx, table) = first_and_rest(adr_ops);
+    let (off, mem) = first_and_rest(ldr_ops);
+    if idx != r || add_ops != format!("{}, {}, {}, sxtw", r, r, off) || !mem.trim().starts_with(&format!("[{}, ", r)) {
         return None;
     }
+    let t = label_index(table.trim())?;
+    if t >= end || kinds[t] != LineKind::Label {
+        return None;
+    }
+    table_entries(lines, t, end, label_index)
+}
+
+/// The target lines of the jump table whose label is line `j`.
+fn table_entries(lines: &[String], j: usize, end: usize, label_index: &dyn Fn(&str) -> Option<usize>) -> Option<Vec<usize>> {
     let table = label_name(&lines[j])?;
     let mut targets = Vec::new();
     for line in &lines[j + 1..end] {
@@ -5600,6 +5742,40 @@ mod tests {
         assert!(peephole_optimize(body("cmp x14, #0", "hi")).contains("cmp x14, #0"));
         let wide = body("cmp w14, #0", "ne").replace("#128", "#0xff00000000");
         assert!(peephole_optimize(wide).contains("cmp w14, #0"));
+        // A 64-bit compare of a 32-bit mask: Z only (its N is clear).
+        let narrow = |cc: &str| body("cmp x14, #0", cc).replace("and x14, x14", "and w14, w14");
+        assert!(peephole_optimize(narrow("eq")).contains("tst w14, #128"));
+        assert!(peephole_optimize(narrow("lt")).contains("cmp x14, #0"));
+        // Past a register test whose target leaves the flags unread.
+        let past = |tail: &str| format!(".type f, %function\nf:\n    and x14, x14, #128\n    cmp x14, #0\n    cbz x3, .LBB2\n    csel x0, x0, x1, ne\n    ret\n.LBB2:\n{tail}    ret\n.size f, .-f\n");
+        assert!(peephole_optimize(past("    mov x0, #3\n")).contains("tst x14, #128"));
+        assert!(peephole_optimize(past("    cset x0, hs\n")).contains("cmp x14, #0"));
+    }
+
+    #[test]
+    fn test_single_bit_test_branches_on_the_bit() {
+        // `gap` stores between the branch and its target.
+        let f = |and: &str, br: &str, gap: usize| ret_x0(&format!("    {and}\n    {br}\n{}    mov x0, #2\n.LBB1:\n", "    str x3, [x2], #8\n".repeat(gap)));
+        let result = peephole_optimize(f("and x9, x0, #4", "cbz x9, .LBB1", 0));
+        assert!(result.contains("tbz w0, #2, .LBB1") && !result.contains("and x9"), "{}", result);
+        let result = peephole_optimize(f("and x9, x0, #0x10000000000", "cbnz x9, .LBB1", 0));
+        assert!(result.contains("tbnz x0, #40, .LBB1"), "{}", result);
+        // Not when the mask stays live, a 32-bit test reads an upper bit, or
+        // the target may be beyond +/-32KB.
+        assert!(peephole_optimize(f("and x0, x1, #4", "cbz x0, .LBB1", 0)).contains("and x0, x1, #4"));
+        assert!(peephole_optimize(f("and x9, x0, #0x10000000000", "cbz w9, .LBB1", 0)).contains("cbz w9"));
+        assert!(peephole_optimize(f("and x9, x0, #4", "cbz x9, .LBB1", 8000)).contains("cbz x9"));
+        assert!(peephole_optimize(f("and x9, x0, #4", "cbz x9, .LBB1", 7900)).contains("tbz w0, #2"));
+    }
+
+    #[test]
+    fn test_copied_dispatch_finds_its_table() {
+        // The first `br` (a copy of the dispatch) has no table after it; its
+        // targets come from the adr, so x9 is dead on that path too.
+        let dispatch = "    adr x17, .Ljt\n    ldr w16, [x17, x1, lsl #2]\n    add x17, x17, w16, sxtw\n    br x17\n";
+        let input = format!(".globl f\n.type f, %function\nf:\n{RET_X0_MARKER}\n    and x9, x0, #4\n    cbz x9, .L3\n{dispatch}.L3:\n    mov x1, #0\n{dispatch}    .p2align 2\n.Ljt:\n    .word .La - .Ljt\n    .word .Lb - .Ljt\n.La:\n    mov x0, #1\n    ret\n.Lb:\n    ret\n.size f, .-f\n");
+        let result = peephole_optimize(input);
+        assert!(result.contains("tbz w0, #2, .L3"), "{}", result);
     }
 
     #[test]

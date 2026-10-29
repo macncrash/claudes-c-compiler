@@ -913,10 +913,13 @@ v1 and nothing between the copy and the call uses v22:
   N, Z and V alike, but `cmp #0` sets C and `tst` clears it, so every read
   of these flags must test only N, Z or V: selects up to the next flag
   write, a call or `ret`, or a final branch whose paths read the flags no
-  further. Up to four lines that leave D and the flags alone may come
-  between (`and x14, x14, #128; mov x9, #1; cmp x14, #0`), and a 32-bit
-  compare of a 64-bit `and` becomes a 32-bit `tst` when B is a register or
-  a mask within the low half. In SQLite's vdbeSorterCompareInt
+  further, past `cbz`/`tbz` tests whose targets do not read them. Up to
+  four lines that leave D and the flags alone may come between (`and x14,
+  x14, #128; mov x9, #1; cmp x14, #0`). A 32-bit compare of a 64-bit `and`
+  becomes a 32-bit `tst` when B is a register or a mask within the low
+  half; a 64-bit compare of a 32-bit `and` has N clear where the 32-bit
+  `tst` copies bit 31, so it qualifies only when every read tests `eq` or
+  `ne`. In SQLite's vdbeSorterCompareInt
   (`res = a[0] & 0x80 ? -1 : +1` when the sign bits differ) the block that
   settles a differing byte goes from 14 instructions to 10; speedtest ran
   0.19% fewer.
@@ -969,7 +972,24 @@ copy of the block, so that every case ends in its own indirect branch. A
 single shared dispatch branch has to predict every transition and on Apple
 M-series cores mispredicts most of them; scalar-bench's bytecode interpreter
 ran twice as fast with copies (1.6x clang -O2, which keeps one shared
-branch). At most 64 copies are made per function.
+branch). At most 64 copies are made per function. A copy's `br` has no
+table after it; liveness finds its table from the `adr` into the `br`'s
+register, three lines before.
+
+**16. Single-Bit Tests** (last, after the copies)
+
+`and D, A, #2^b` then `cbz`/`cbnz D`, D dead after, is `tbz`/`tbnz A, #b`
+(`if (pPage->flags & PGHDR_DIRTY)`): 1344 such branches in SQLite, and
+speedtest ran 0.47% fewer instructions. A `tbz` reaches only +/-32KB and
+the built-in assembler does not check a resolved one, so the fold runs
+after everything that copies code and takes the target only when an upper
+bound on the bytes between is within 32000: 16 for a `mov` of an immediate
+(which the assembler may expand to movz/movk), 4 for any other instruction,
+the data directives' sizes, an alignment's whole span, and 64 at each label
+a later branch jumps back to, for the loop alignment emitted after this.
+Any other directive between, a line holding several statements, or a
+`.macro` in the file rules the fold out. A 32-bit test of a bit in the
+upper half (always zero) is left alone.
 
 ---
 
