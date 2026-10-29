@@ -904,6 +904,13 @@ save, right above the record, takes the sp update (`stp x20, x21, [sp,
 moves down by 16, as clang lays out such leaves. Otherwise the record's
 `stp` and `ldp` become `sub` and `add` of sp.
 
+Then a `b label` to a short block that returns, straight-line code of at
+most 8 instructions ending in `ret` or a tail call with no other branches,
+calls or directives, becomes a copy of that block, as clang duplicates
+return blocks: a shared epilogue, or the `and x0, x10, #0xffff; ret` where
+SQLite's cellSizePtrIdxLeaf's paths meet. Speedtest ran 0.4% fewer
+instructions (0.2% with a limit of 4; 12 was no better than 8).
+
 **15. Switch Dispatch Duplication** (after the local cleanup)
 
 A `switch` with a jump table ends in `adr x17, .Ljt; ldr w16, [x17, idx,

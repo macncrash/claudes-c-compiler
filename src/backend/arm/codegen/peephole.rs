@@ -513,6 +513,8 @@ pub fn peephole_optimize(asm: String) -> String {
         convert_tail_calls(lines, kinds)
     };
     let n = lines.len();
+    // What followed a converted call (the `sxtw` and `ret` it returned to).
+    eliminate_unreachable_after_jumps(&lines, &mut kinds, n);
 
     // Phase 4: drop frame records that leaf functions no longer need.
     omit_leaf_frames(&lines, &mut kinds, n);
@@ -523,6 +525,16 @@ pub fn peephole_optimize(asm: String) -> String {
             kinds[i] = LineKind::Nop;
         }
     }
+
+    // Jumps to short blocks that return become copies of them.
+    let (lines, mut kinds) = if skip.contains(&"duplicate_return_tails") {
+        (lines, kinds)
+    } else {
+        duplicate_return_tails(lines, kinds)
+    };
+    let n = lines.len();
+    eliminate_unreferenced_labels(&lines, &mut kinds, n);
+    eliminate_unreachable_after_jumps(&lines, &mut kinds, n);
 
     // Broadcasts a loop repeats with the same value, before it.
     let (lines, kinds) = if skip.contains(&"hoist_loop_invariant_dups") {
@@ -645,6 +657,87 @@ fn duplicate_switch_dispatch(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<S
         return (lines, kinds);
     }
     let mut out_lines = Vec::with_capacity(n + replace.len() * MAX_DISPATCH);
+    let mut out_kinds = Vec::with_capacity(out_lines.capacity());
+    for i in 0..n {
+        match replace.get(&i) {
+            Some(body) => {
+                for &k in body {
+                    out_lines.push(lines[k].clone());
+                    out_kinds.push(kinds[k]);
+                }
+            }
+            None => {
+                out_lines.push(lines[i].clone());
+                out_kinds.push(kinds[i]);
+            }
+        }
+    }
+    (out_lines, out_kinds)
+}
+
+// ── Return tail duplication ──────────────────────────────────────────────────
+//
+// Paths that end the same way jump to one shared block: the epilogue, or the
+// `and x0, x10, #0xffff; ret` where SQLite's cellSizePtrIdxLeaf's fast and
+// slow paths meet. As clang does, each `b label` to a short block that returns
+// becomes a copy of that block, which runs the same instructions without the
+// jump. The block is the straight-line code from the label to a `ret` or a
+// tail call, at most MAX_RET_TAIL instructions before it, with no other
+// branches, calls or directives (CFI); labels are not copied.
+
+/// Most instructions before the `ret` in a copied return block.
+const MAX_RET_TAIL: usize = 8;
+
+fn duplicate_return_tails(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<LineKind>) {
+    let n = lines.len();
+    // Line index -> the instruction lines to put in its place.
+    let mut replace: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for (start, end) in function_ranges(&lines, n) {
+        let mut tails: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+        for k in start..end {
+            if kinds[k] != LineKind::Label {
+                continue;
+            }
+            let Some(name) = label_name(&lines[k]) else { continue };
+            let mut body = Vec::new();
+            let mut j = k + 1;
+            let returns = loop {
+                if j == end {
+                    break false;
+                }
+                let line = lines[j].trim();
+                match kinds[j] {
+                    LineKind::Nop | LineKind::Label => {}
+                    LineKind::Ret => {
+                        body.push(j);
+                        break true;
+                    }
+                    LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Call => break false,
+                    _ if line.starts_with('.') || body.len() == MAX_RET_TAIL => break false,
+                    _ if matches!(split_insn(line), Some(("br" | "blr" | "tbz" | "tbnz" | "cbz" | "cbnz" | "brk", _)))
+                        || line.starts_with("b.") => break false,
+                    _ => body.push(j),
+                }
+                j += 1;
+            };
+            if returns {
+                tails.insert(name, body);
+            }
+        }
+        for b in start..end {
+            if kinds[b] != LineKind::Branch {
+                continue;
+            }
+            let Some(("b", target)) = split_insn(&lines[b]) else { continue };
+            if let Some(body) = tails.get(target.trim()) {
+                replace.insert(b, body.clone());
+            }
+        }
+    }
+    if replace.is_empty() {
+        return (lines, kinds);
+    }
+    let mut out_lines = Vec::with_capacity(n + replace.len() * MAX_RET_TAIL);
     let mut out_kinds = Vec::with_capacity(out_lines.capacity());
     for i in 0..n {
         match replace.get(&i) {
@@ -5833,5 +5926,15 @@ f:
             let result = peephole_optimize(framed(RET_X0_MARKER, body));
             assert!(result.contains("bl "), "{}", result);
         }
+    }
+
+    #[test]
+    fn test_jump_to_return_block_copied() {
+        let asm = ".globl f\n.type f, %function\nf:\n    cbz x0, .L1\n    add x1, x1, #1\n    b .L2\n.L1:\n    sub x1, x1, #1\n.L2:\n    and x0, x1, #0xffff\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(asm.to_string());
+        assert!(!result.contains("b .L2") && result.matches("and x0, x1, #0xffff\n    ret").count() == 2, "{}", result);
+        // Not a block with a branch in it.
+        let asm = asm.replace("    and x0", "    cbz x1, .L1\n    and x0");
+        assert!(peephole_optimize(asm).contains("b .L2"));
     }
 }
