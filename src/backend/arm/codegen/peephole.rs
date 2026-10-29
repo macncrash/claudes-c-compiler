@@ -450,6 +450,9 @@ pub fn peephole_optimize(asm: String) -> String {
             !skip.contains(&stringify!($name)) && $name($($arg),*)
         };
     }
+    if !skip.contains(&"coalesce_arg_copies") {
+        coalesce_arg_copies(&mut lines, &mut kinds, n);
+    }
     {
         let mut changed2 = true;
         let mut rounds2 = 0;
@@ -4434,6 +4437,147 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
     }
 }
 
+// ── Argument register coalescing ─────────────────────────────────────────────
+//
+// The register allocator does not hand out x0-x7, so a parameter is copied
+// out of its argument register at entry (`mov x11, x0`), an argument is
+// computed in a temporary and copied in before the call (`mov x1, x10`),
+// and a result is computed in one and copied to x0 before `ret`. SQLite ran
+// about 900M more such copies than clang's code. Where a temporary T (x9-x15)
+// is copied to or from an argument register A (a 64-bit copy: renaming a
+// `mov wT, wA` leaves a zero-extension) and the two are never live at once,
+// every T in the function becomes A and the copies become `mov xA, xA`,
+// which the cleanup drops. Speedtest ran 1.0% fewer instructions.
+//
+// They interfere when a line writes one while the other is live after it,
+// except a 64-bit copy between them (both then hold the same value), or
+// when T is live into the function. A call writes x0-x18. A line liveness
+// does not understand (it uses and writes everything) may not name either,
+// nor may a pair or writeback access, or an exclusive store, name both.
+
+/// The registers a call may change (x0-x18).
+const CALLER_SAVED: RegSet = (1 << 19) - 1;
+
+/// `text` with every `xN`/`wN` operand naming register `from` naming `to`
+/// instead, at the same width (operands only: not part of a symbol).
+fn rename_gpr(text: &str, from: u8, to: u8) -> String {
+    let is_delim = |c: char| matches!(c, ',' | ' ' | '\t' | '[' | ']' | '!' | '{' | '}');
+    let mut out = String::with_capacity(text.len() + 2);
+    let mut tok_start = None;
+    for (i, c) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+        if !is_delim(c) {
+            tok_start.get_or_insert(i);
+            continue;
+        }
+        if let Some(s) = tok_start.take() {
+            let tok = &text[s..i];
+            match tok.as_bytes()[0] {
+                b'x' | b'w' if gpr_operand(tok) == Some(from) => {
+                    out.push(tok.as_bytes()[0] as char);
+                    out.push_str(&to.to_string());
+                }
+                _ => out.push_str(tok),
+            }
+        }
+        if i < text.len() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn coalesce_arg_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for (start, end) in function_ranges(lines, n) {
+        // Copies between a temporary and an argument register, by pair.
+        let mut pairs: Vec<((u8, u8), usize)> = Vec::new();
+        for kind in &kinds[start..end] {
+            let LineKind::Move { dst, src, is_32bit: false } = *kind else { continue };
+            let pair = match (dst, src) {
+                (9..=15, 0..=7) => (dst, src),
+                (0..=7, 9..=15) => (src, dst),
+                _ => continue,
+            };
+            match pairs.iter_mut().find(|p| p.0 == pair) {
+                Some(p) => p.1 += 1,
+                None => pairs.push((pair, 1)),
+            }
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        let Some((mut live, _)) = function_liveness(lines, kinds, start, end) else { continue };
+        let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for k in start..end {
+            if kinds[k] == LineKind::Label {
+                if let Some(name) = label_name(&lines[k]) {
+                    labels.insert(name, k);
+                }
+            }
+        }
+        let label_index = |name: &str| labels.get(name).copied();
+        let mut defs: Vec<RegSet> = Vec::with_capacity(end - start);
+        let mut opaque: Vec<bool> = Vec::with_capacity(end - start);
+        for k in start..end {
+            let info = line_info(&lines[k], kinds[k], &label_index);
+            let call = kinds[k] == LineKind::Call;
+            defs.push(if call { info.defs | CALLER_SAVED } else { info.defs });
+            opaque.push(info.uses == ALL_REGS && info.defs == ALL_REGS);
+        }
+        // Live into the function: after its label.
+        let Some(entry) = (start..end).find(|&k| kinds[k] == LineKind::Label) else { continue };
+        drop(labels);
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.1));
+        let mut renamed: RegSet = 0;
+        for ((t, a), _) in pairs {
+            if renamed & (1 << t) != 0 {
+                continue;
+            }
+            let (bt, ba) = (1 << t, 1 << a);
+            if live[entry - start] & bt != 0 {
+                continue;
+            }
+            let interferes = (start..end).any(|k| {
+                let i = k - start;
+                let copy = matches!(kinds[k], LineKind::Move { dst, src, is_32bit: false }
+                    if (dst, src) == (t, a) || (dst, src) == (a, t));
+                if !copy && ((defs[i] & bt != 0 && live[i] & ba != 0) || (defs[i] & ba != 0 && live[i] & bt != 0)) {
+                    return true;
+                }
+                if kinds[k] == LineKind::Nop || (!mentions_reg(&lines[k], t) && !mentions_reg(&lines[k], a)) {
+                    return false;
+                }
+                if opaque[i] {
+                    return true;
+                }
+                let both = mentions_reg(&lines[k], t) && mentions_reg(&lines[k], a);
+                let (mnemonic, ops) = split_insn(&lines[k]).unwrap_or(("", ""));
+                both && !copy && (matches!(mnemonic, "ldp" | "ldpsw" | "stp" | "ldnp" | "stnp")
+                    || ops.contains("]!") || ops.contains("],") || mnemonic.contains("xr") || mnemonic.contains("xp"))
+            });
+            if interferes {
+                continue;
+            }
+            for k in start..end {
+                let i = k - start;
+                if kinds[k] != LineKind::Nop && mentions_reg(&lines[k], t) {
+                    lines[k] = rename_gpr(&lines[k], t, a);
+                    kinds[k] = classify_line(&lines[k]);
+                }
+                if live[i] & bt != 0 {
+                    live[i] = (live[i] & !bt) | ba;
+                }
+                if defs[i] & bt != 0 {
+                    defs[i] = (defs[i] & !bt) | ba;
+                }
+            }
+            renamed |= bt;
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn is_function_start(line: &str) -> bool {
     let t = line.trim();
     t.starts_with(".type ") && t.ends_with("%function")
@@ -5936,5 +6080,29 @@ f:
         // Not a block with a branch in it.
         let asm = asm.replace("    and x0", "    cbz x1, .L1\n    and x0");
         assert!(peephole_optimize(asm).contains("b .L2"));
+    }
+
+    fn ret_x0(body: &str) -> String {
+        format!(".globl f\n.type f, %function\nf:\n{RET_X0_MARKER}\n{body}    ret\n.size f, .-f\n")
+    }
+
+    #[test]
+    fn test_temporary_takes_argument_register() {
+        // The parameter stays in x0 and the result is computed there.
+        let body = "    mov x11, x0\n    ldr x12, [x11]\n    add x11, x11, x12\n    mov x0, x11\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(!result.contains("x11") && result.contains("add x0, x0, x12"), "{}", result);
+        assert_eq!(rename_gpr("ldr w11, [x11, #8]", 11, 1), "ldr w1, [x1, #8]");
+        assert_eq!(rename_gpr("adrp x11, _x11@PAGE", 11, 1), "adrp x1, _x11@PAGE");
+    }
+
+    #[test]
+    fn test_live_temporary_keeps_its_register() {
+        // x0 changes while x11 still holds the parameter, or the call
+        // changes it.
+        for body in ["    mov x11, x0\n    mov x0, #5\n    add x0, x0, x11\n",
+                     "    mov x11, x0\n    ldp x11, x0, [x11]\n    add x0, x0, x11\n"] {
+            assert!(peephole_optimize(ret_x0(body)).contains("x11"), "{}", body);
+        }
     }
 }

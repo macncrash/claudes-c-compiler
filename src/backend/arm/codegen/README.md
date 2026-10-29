@@ -688,7 +688,8 @@ The optimizer runs in three phases:
 1. **Iterative local passes** (up to 8 rounds): all core pattern elimination passes
    (store/load elimination, redundant branches, self-moves, move chains,
    branch-over-branch fusion)
-2. **Global passes**: register copy propagation and dead store elimination
+2. **Global passes**: register copy propagation, dead store elimination, and
+   argument register coalescing
 3. **Local cleanup** (up to 4 rounds): a subset of the local passes (same as Phase 1
    but without branch-over-branch fusion) to mop up patterns exposed by global passes
 
@@ -759,6 +760,26 @@ with the original source when the source is still live.
 **8. Dead Store Elimination** (global)
 
 Removes `str` instructions to stack slots that are overwritten before being read.
+
+**Argument Register Coalescing** (global, before the local cleanup)
+
+The register allocator does not hand out x0-x7, so parameters are copied
+out of their argument registers at entry (`mov x11, x0`), arguments are
+computed in a temporary and copied in before the call (`mov x1, x10`), and
+results are copied to x0 before `ret`. When a temporary x9-x15 and an
+argument register are joined by a 64-bit copy and are never live at once,
+every use of the temporary in the function is renamed to the argument
+register, and the copies become self-moves that the cleanup drops. Liveness
+is the function-wide one the dead-write passes use. The two interfere when
+a line writes one while the other is live after it, except for the copy
+between them. A call writes x0-x18. The pairs with the most copies go
+first. Lines liveness does not understand may not name either register,
+and pair, writeback or exclusive accesses may not name both. Before it,
+SQLite ran about 985M register copies between x0-x7 and x9-x15 where
+clang's build ran about 100M. Speedtest ran 1.0% fewer instructions.
+Copies of 32-bit values are left alone: renaming one leaves a
+`mov wA, wA`, a zero-extension that stays and keeps the extension from
+folding into its user.
 
 **9. Extension and Field Folds** (local cleanup)
 
