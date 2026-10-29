@@ -792,6 +792,21 @@ Copies of 32-bit values are left alone: renaming one leaves a
 `mov wA, wA`, a zero-extension that stays and keeps the extension from
 folding into its user.
 
+Renaming is per value, not per register. A temporary holds many values in
+one function, and one long-lived value kept every other one out of the
+argument register: in sqlite3BtreeIndexMoveto x11 holds an address across
+branches while x0 is still a parameter, then the cell count that `mov x0,
+x11` passes to the comparison. The value a copy reads or writes is its
+web: the writes of the temporary that reach the copy, the reads they reach,
+the writes reaching those, until closed, over the function's control flow
+(jump tables included), with the lines after which it is live. Only that
+web's lines are checked against the argument register and renamed; a web
+live into the function, or reaching a jump whose targets are unknown, is
+left alone. Each copy is tried in turn, those of the most frequent pairs
+first. Static copies between x0-x7 and x9-x15 in SQLite went from 3646 to
+1415, and speedtest ran 1.2% fewer instructions (block counts, no function
+slower by more than 0.7M); compiling sqlite3.c took 2.5% longer.
+
 **9. Extension and Field Folds** (local cleanup)
 
 - `lsr T, S, #k; and D, T, #(2^w - 1)` becomes `ubfx D, S, #k, #w` (in w form

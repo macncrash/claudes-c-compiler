@@ -4765,16 +4765,23 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
 // and a result is computed in one and copied to x0 before `ret`. SQLite ran
 // about 900M more such copies than clang's code. Where a temporary T (x9-x15)
 // is copied to or from an argument register A (a 64-bit copy: renaming a
-// `mov wT, wA` leaves a zero-extension) and the two are never live at once,
-// every T in the function becomes A and the copies become `mov xA, xA`,
-// which the cleanup drops. Speedtest ran 1.0% fewer instructions.
+// `mov wT, wA` leaves a zero-extension) and the value of T that the copy
+// reads or writes is never live at once with A, that value's lines name A
+// instead and the copy becomes `mov xA, xA`, which the cleanup drops.
+//
+// The value is a web: the writes of T that reach the copy, every read they
+// reach, the writes reaching those reads, and so on, over the function's
+// control flow, with the lines after which it is live. Other values T holds
+// elsewhere in the function keep T: in sqlite3BtreeIndexMoveto x11 holds an
+// address across branches while x0 is still a parameter, and later the cell
+// count that `mov x0, x11` passes to the comparison. Not a value live into
+// the function, nor one reaching a jump whose targets are unknown.
 //
 // They interfere when a line writes one while the other is live after it,
-// except a 64-bit copy between them (both then hold the same value), or
-// when T is live into the function. A call changes both, so there only when
-// both are read after it. A line liveness does not understand (it uses and
-// writes everything) may not name either, nor may a pair or writeback
-// access, or an exclusive store, name both.
+// except a 64-bit copy between them (both then hold the same value). A call
+// changes both, so there only when both are read after it. A line liveness
+// does not understand (it uses and writes everything) may not name either,
+// nor may a pair or writeback access, or an exclusive store, name both.
 //
 // Most conflicts are the code generator's scratch uses of x0 while a
 // parameter waits in a temporary: `adrp x0, sym; add x0, x0, :lo12:sym;
@@ -4854,26 +4861,63 @@ fn coalesce_arg_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
             uses.push(info.uses);
             opaque.push(info.uses == ALL_REGS && info.defs == ALL_REGS);
         }
+        // Each line's successors, None for a jump whose targets are unknown.
+        let mut succs: Vec<Option<Vec<usize>>> = Vec::with_capacity(end - start);
+        for k in start..end {
+            let i = k - start;
+            let next = if k + 1 < end { vec![i + 1] } else { Vec::new() };
+            if let Some(targets) = jump_table_targets(lines, kinds, k, end, &label_index) {
+                succs.push(Some(targets.iter().map(|t| t - start).collect()));
+                continue;
+            }
+            succs.push(match line_info(&lines[k], kinds[k], &label_index).flow {
+                Flow::Next => Some(next),
+                Flow::Exit => Some(Vec::new()),
+                Flow::Jump { target: Some(t), falls_through } => {
+                    Some(if falls_through { vec![t - start, i + 1] } else { vec![t - start] })
+                }
+                // A branch to a symbol outside the function leaves it.
+                Flow::Jump { target: None, falls_through } if matches!(split_insn(&lines[k]), Some(("b", _))) => {
+                    Some(if falls_through { next } else { Vec::new() })
+                }
+                Flow::Jump { .. } => None,
+            });
+        }
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); end - start];
+        for (i, s) in succs.iter().enumerate() {
+            for &j in s.iter().flatten() {
+                preds[j].push(i);
+            }
+        }
         let mut regs = LineRegs { live, defs, uses, opaque, start };
-        // Live into the function: after its label.
-        let Some(entry) = (start..end).find(|&k| kinds[k] == LineKind::Label) else { continue };
         drop(labels);
+        // The copies, those of the most frequent pairs first.
         pairs.sort_by_key(|p| (std::cmp::Reverse(p.1), (p.0).1));
-        let mut renamed: RegSet = 0;
-        for ((t, a), _) in pairs {
-            if renamed & (1 << t) != 0 {
+        let mut copies: Vec<(usize, u8, u8)> = Vec::new();
+        for &((t, a), _) in &pairs {
+            for (i, kind) in kinds[start..end].iter().enumerate() {
+                if let LineKind::Move { dst, src, is_32bit: false } = *kind {
+                    if (dst, src) == (t, a) || (dst, src) == (a, t) {
+                        copies.push((start + i, t, a));
+                    }
+                }
+            }
+        }
+        let mut seen = WalkMarks { mark: vec![0; end - start], gen: 0 };
+        for (k0, t, a) in copies {
+            // Still the copy (an earlier web may have renamed it).
+            let LineKind::Move { dst, src, is_32bit: false } = kinds[k0] else { continue };
+            if (dst, src) != (t, a) && (dst, src) != (a, t) {
                 continue;
             }
-            if regs.live[entry - start] & (1 << t) != 0 {
-                continue;
-            }
+            let Some(web) = value_web(&regs, &succs, &preds, &mut seen, k0 - start, t, dst == t) else { continue };
             // A short piece of A's value in the way moves to a free temporary.
             // They are undone when T and A still conflict.
             let mut undo: Vec<(usize, String, LineKind)> = Vec::new();
             let mut saved: Option<(Vec<RegSet>, Vec<RegSet>, Vec<RegSet>)> = None;
             let mut splits = 0;
             let clear = loop {
-                match regs.conflict(lines, kinds, end, t, a) {
+                match regs.conflict(lines, kinds, &web, t, a) {
                     Conflict::None => break true,
                     Conflict::Fixed => break false,
                     Conflict::At(c) => {
@@ -4898,18 +4942,139 @@ fn coalesce_arg_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
                 }
                 continue;
             }
-            for k in start..end {
-                if kinds[k] != LineKind::Nop && mentions_reg(&lines[k], t) {
+            let (bt, ba) = (1 << t, 1 << a);
+            let swap = |set: &mut RegSet| *set = (*set & !bt) | ba;
+            for &i in &web.lines {
+                let k = start + i;
+                if web.defs[i] || web.uses[i] {
                     lines[k] = rename_gpr(&lines[k], t, a);
                     kinds[k] = classify_line(&lines[k]);
                 }
+                if web.live[i] {
+                    swap(&mut regs.live[i]);
+                }
+                if web.defs[i] {
+                    swap(&mut regs.defs[i]);
+                }
+                if web.uses[i] {
+                    swap(&mut regs.uses[i]);
+                }
             }
-            regs.rename(start..end, t, a);
-            renamed |= 1 << t;
             changed = true;
         }
     }
     changed
+}
+
+/// One value of a register: the lines (index `k - start`) that write it,
+/// read it, and after which it is live, and all of those in order.
+struct Web {
+    defs: Vec<bool>,
+    uses: Vec<bool>,
+    live: Vec<bool>,
+    lines: Vec<usize>,
+}
+
+/// Visit marks for the walks of value_web, one generation per walk.
+struct WalkMarks {
+    mark: Vec<u32>,
+    gen: u32,
+}
+
+impl WalkMarks {
+    fn next(&mut self) {
+        self.gen += 1;
+    }
+    /// Whether `i` is new to this walk (marking it).
+    fn visit(&mut self, i: usize) -> bool {
+        let new = self.mark[i] != self.gen;
+        self.mark[i] = self.gen;
+        new
+    }
+}
+
+/// The value of T that line `i0` writes (`def`) or reads, as a web: the
+/// writes reaching each read, the reads each write reaches, until closed.
+/// A line reading and writing T joins both. None when the value is live
+/// into the function or reaches a jump whose targets are unknown.
+#[allow(clippy::too_many_arguments)]
+fn value_web(regs: &LineRegs, succs: &[Option<Vec<usize>>], preds: &[Vec<usize>], seen: &mut WalkMarks,
+             i0: usize, t: u8, def: bool) -> Option<Web> {
+    let len = regs.live.len();
+    let bt: RegSet = 1 << t;
+    let mut web = Web { defs: vec![false; len], uses: vec![false; len], live: vec![false; len], lines: Vec::new() };
+    let (mut use_work, mut def_work) = (Vec::new(), Vec::new());
+    if def {
+        web.defs[i0] = true;
+        def_work.push(i0);
+    } else {
+        web.uses[i0] = true;
+        use_work.push(i0);
+    }
+    while !use_work.is_empty() || !def_work.is_empty() {
+        if let Some(u) = use_work.pop() {
+            // Back from the read to each write reaching it.
+            // No predecessor: the function's start (live in), or code
+            // reached only in ways the model does not see.
+            if preds[u].is_empty() {
+                return None;
+            }
+            seen.next();
+            let mut stack = preds[u].clone();
+            while let Some(p) = stack.pop() {
+                if !seen.visit(p) {
+                    continue;
+                }
+                if regs.defs[p] & bt != 0 {
+                    if !web.defs[p] {
+                        web.defs[p] = true;
+                        def_work.push(p);
+                    }
+                    if regs.uses[p] & bt != 0 && !web.uses[p] {
+                        web.uses[p] = true;
+                        use_work.push(p);
+                    }
+                    continue;
+                }
+                if preds[p].is_empty() {
+                    return None;
+                }
+                stack.extend_from_slice(&preds[p]);
+            }
+            continue;
+        }
+        let Some(d) = def_work.pop() else { break };
+        // On from the write to every read it reaches.
+        if regs.live[d] & bt == 0 {
+            continue;
+        }
+        web.live[d] = true;
+        seen.next();
+        let mut stack = succs[d].clone()?;
+        while let Some(s) = stack.pop() {
+            if !seen.visit(s) {
+                continue;
+            }
+            if regs.uses[s] & bt != 0 && !web.uses[s] {
+                web.uses[s] = true;
+                use_work.push(s);
+            }
+            if regs.defs[s] & bt != 0 {
+                if regs.uses[s] & bt != 0 && !web.defs[s] {
+                    web.defs[s] = true;
+                    def_work.push(s);
+                }
+                continue;
+            }
+            if regs.live[s] & bt == 0 {
+                continue;
+            }
+            web.live[s] = true;
+            stack.extend_from_slice(succs[s].as_ref()?);
+        }
+    }
+    web.lines = (0..len).filter(|&i| web.defs[i] || web.uses[i] || web.live[i]).collect();
+    Some(web)
 }
 
 /// Most pieces of an argument register's values moved aside for one temporary.
@@ -4946,28 +5111,30 @@ impl LineRegs {
         }
     }
 
-    /// The first line where T and A cannot share a register.
-    fn conflict(&self, lines: &[String], kinds: &[LineKind], end: usize, t: u8, a: u8) -> Conflict {
-        let (bt, ba) = (1 << t, 1 << a);
-        for k in self.start..end {
-            let i = k - self.start;
+    /// The first line where T's value `web` and A cannot share a register.
+    /// (Only the web's lines: elsewhere the value is not there.)
+    fn conflict(&self, lines: &[String], kinds: &[LineKind], web: &Web, t: u8, a: u8) -> Conflict {
+        let ba: RegSet = 1 << a;
+        for &i in &web.lines {
+            let k = self.start + i;
             let copy = matches!(kinds[k], LineKind::Move { dst, src, is_32bit: false }
                 if (dst, src) == (t, a) || (dst, src) == (a, t));
             if kinds[k] == LineKind::Call {
                 // It changes both: they conflict only if both are read after it.
-                if self.live[i] & (bt | ba) == bt | ba {
+                if web.live[i] && self.live[i] & ba != 0 {
                     return Conflict::Fixed;
                 }
-            } else if !copy && ((self.defs[i] & bt != 0 && self.live[i] & ba != 0) || (self.defs[i] & ba != 0 && self.live[i] & bt != 0)) {
+            } else if !copy && ((web.defs[i] && self.live[i] & ba != 0) || (self.defs[i] & ba != 0 && web.live[i])) {
                 return Conflict::At(k);
             }
-            if kinds[k] == LineKind::Nop || (!mentions_reg(&lines[k], t) && !mentions_reg(&lines[k], a)) {
+            if kinds[k] == LineKind::Nop {
                 continue;
             }
-            if self.opaque[i] {
+            let names_t = web.defs[i] || web.uses[i];
+            if self.opaque[i] && (names_t || web.live[i] || mentions_reg(&lines[k], a)) {
                 return Conflict::Fixed;
             }
-            let both = mentions_reg(&lines[k], t) && mentions_reg(&lines[k], a);
+            let both = names_t && mentions_reg(&lines[k], a);
             let (mnemonic, ops) = split_insn(&lines[k]).unwrap_or(("", ""));
             if both && !copy && (matches!(mnemonic, "ldp" | "ldpsw" | "stp" | "ldnp" | "stnp")
                 || ops.contains("]!") || ops.contains("],") || mnemonic.contains("xr") || mnemonic.contains("xp")) {
@@ -6184,12 +6351,27 @@ f:
     }
 
     #[test]
+    fn test_one_value_of_a_temporary_takes_the_argument_register() {
+        // x11 first holds an address across a branch while x0 is still the
+        // parameter, then the count passed in x0: only the count moves.
+        let body = "    add x11, x0, #144\n    ldrb w9, [x0, #8]\n    cbz w9, .LBB1\n    ldr x9, [x0, #16]\n    str x9, [x11]\n.LBB1:\n    ldr x2, [x0, #24]\n    ldr x9, [x11, #8]\n    str x9, [x2]\n    ldrb w11, [x2, #4]\n    add x1, x2, #8\n    mov x0, x11\n    bl g\n    mov x0, #0\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(result.contains("add x11, x0, #144") && result.contains("ldrb w0, [x2, #4]"), "{}", result);
+        assert!(!result.contains("mov x0, x11"), "{}", result);
+        // A value live into the function stays (the incoming x10 is read).
+        let body = "    add w10, w10, w1\n    mov x0, x10\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(result.contains("w10, w1"), "{}", result);
+    }
+
+    #[test]
     fn test_global_dead_write_across_blocks() {
         // x11 is written before a branch and overwritten on both paths.
         let input = ".type f, %function\nf:\n    mov x11, x1\n    cbz x0, .LBB1\n    mov x11, #1\n    b .LBB2\n.LBB1:\n    mov x11, #2\n.LBB2:\n    mov x0, x11\n    ret\n.size f, .-f\n";
         let result = peephole_optimize(input.to_string());
-        assert!(!result.contains("mov x11, x1"), "{}", result);
-        assert!(result.contains("mov x11, #1") && result.contains("mov x11, #2"), "{}", result);
+        // (x11 then takes x0, whose value it returns.)
+        assert!(!result.contains(", x1\n"), "{}", result);
+        assert!(result.contains("mov x0, #1") && result.contains("mov x0, #2"), "{}", result);
     }
 
     #[test]
