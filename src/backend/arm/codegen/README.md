@@ -826,8 +826,15 @@ slower by more than 0.7M); compiling sqlite3.c took 2.5% longer.
 - `sxtw xA, wB` whose reads, until A dies, can all take wB with the
   extension folded in (`add xC, xD, wB, sxtw #s`, `[xD, wB, sxtw #s]`,
   `smaddl` for a `madd` by a 32-bit constant, `cbz`/`cbnz wB` as A's last
-  read, `and wC, wB, #k` for a mask within the low 32 bits, or a 32-bit
-  read) goes away.
+  read, `and wC, wB, #k` for a mask within the low 32 bits, `sbfx xC, xB,
+  #k, #(32 - k)` for `asr xC, xA, #k` and `sbfiz xC, xB, #k, #32` for `lsl
+  xC, xA, #k` (k from 1 to 31), or a 32-bit read) goes away. The midpoint
+  `(lo + hi) >> 1` of sqlite3BtreeIndexMoveto's binary search is one
+  `sbfx`: 40M fewer instructions in speedtest (0.18%).
+- `sxtw xA, wA` right after a write of wA that leaves bit 31 clear (a byte
+  or halfword load or zero extension, a mask below 2^31, a logical right
+  shift, a field narrower than 32 bits) goes: the value is its own sign
+  extension.
 - `mov wA, wB` (a zero extension) whose one read is the next instruction,
   `add|sub xC, xD, xA` or `lsr xC, xA, #k`, with A dead after it, folds into
   it: `add xC, xD, wB, uxtw`, `lsr wC, wB, #k` (`s->window + cur_match` in

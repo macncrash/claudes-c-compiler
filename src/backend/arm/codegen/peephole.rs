@@ -483,6 +483,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(reuse_constants(&mut lines, &mut kinds, n));
             changed2 |= pass!(zero_reg_into_select(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_redundant_zero_extend(&mut lines, &mut kinds, n));
+            changed2 |= pass!(drop_sxtw_of_nonnegative(&lines, &mut kinds, n));
             changed2 |= pass!(narrow_load_for_copy(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
@@ -2509,6 +2510,40 @@ fn narrow_load_for_copy(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
     changed
 }
 
+/// `sxtw xA, wA` right after a write of wA that leaves bit 31 clear, so the
+/// value is already its own sign extension: a byte or halfword load or
+/// zero extension, a mask below 2^31, a logical right shift, or a field
+/// narrower than 32 bits (`ldrh w12, [x0, #24]; sxtw x12, w12`).
+fn drop_sxtw_of_nonnegative(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut prev: Option<usize> = None;
+    for (i, kind) in kinds.iter_mut().enumerate().take(n) {
+        if *kind == LineKind::Nop {
+            continue;
+        }
+        if let (LineKind::Sxtw { dst, src }, Some(p)) = (*kind, prev) {
+            let clear = dst == src && split_insn(&lines[p]).is_some_and(|(m, ops)| {
+                let o: Vec<&str> = ops.split(',').map(str::trim).collect();
+                let imm = |k: usize| o.get(k).and_then(|s| parse_imm(s));
+                o.first() == Some(&wreg_name(dst)) && match m {
+                    "ldrb" | "ldrh" | "uxtb" | "uxth" => true,
+                    "and" => o.len() == 3 && imm(2).is_some_and(|k| k <= 0x7fff_ffff),
+                    "lsr" => o.len() == 3 && imm(2).is_some_and(|k| k >= 1),
+                    "ubfx" => o.len() == 4 && imm(3).is_some_and(|w| w <= 31),
+                    _ => false,
+                }
+            });
+            if clear {
+                *kind = LineKind::Nop;
+                changed = true;
+                continue;
+            }
+        }
+        prev = (*kind != LineKind::Label).then_some(i);
+    }
+    changed
+}
+
 /// `mov wA, wA` (a zero extension) right after a 32-bit write of wA, which
 /// has already cleared the upper half: `sub w13, w13, w10; mov w13, w13`.
 fn drop_redundant_zero_extend(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
@@ -3160,6 +3195,17 @@ fn rewrite_sxtw_use(mnemonic: &str, ops: &str, first_is_dest: bool, a: u8, b: u8
         "cbz" | "cbnz" => {
             let [x, target] = p[..] else { return None };
             (x == xa).then(|| format!("    {} {}, {}", mnemonic, wb, target))
+        }
+        // A shift of the extended value is a signed field of B: bits k..31
+        // for `asr #k` (`(lo + hi) >> 1` of ints), B placed at k for `lsl #k`.
+        "asr" | "lsl" if p.len() == 3 && p[1] == xa && p[0].starts_with('x') => {
+            let k = parse_imm(p[2]).filter(|&k| (1..32).contains(&k))?;
+            let xb = xreg_name(b);
+            Some(if mnemonic == "asr" {
+                format!("    sbfx {}, {}, #{}, #{}", p[0], xb, k, 32 - k)
+            } else {
+                format!("    sbfiz {}, {}, #{}, #32", p[0], xb, k)
+            })
         }
         // A mask within the low 32 bits clears the extension anyway (the
         // 32-bit and zeroes the high half).
@@ -6090,6 +6136,28 @@ mod tests {
         // A reload through the register the copy wrote reads elsewhere.
         let result = run("    ldr x0, [x14]\n    mov w14, w0\n    ldr x0, [x14]\n    add w15, w0, #1\n    str x14, [x3]\n    str x15, [x3, #8]\n    mov x0, #0\n");
         assert!(result.contains("ldr x0, [x14]"), "{}", result);
+    }
+
+    #[test]
+    fn test_shift_of_sign_extension_is_signed_field() {
+        let run = |op: &str| peephole_optimize(ret_x0(&format!("    add w10, w1, w2\n    sxtw x10, w10\n    {op}\n    str x3, [x4]\n")));
+        let result = run("asr x3, x10, #1");
+        assert!(result.contains("sbfx x3, x10, #1, #31") && !result.contains("sxtw"), "{}", result);
+        let result = run("lsl x3, x10, #3");
+        assert!(result.contains("sbfiz x3, x10, #3, #32") && !result.contains("sxtw"), "{}", result);
+        // Not a shift past the 32-bit value.
+        assert!(run("asr x3, x10, #40").contains("sxtw x10, w10"));
+    }
+
+    #[test]
+    fn test_sign_extension_of_nonnegative_goes() {
+        let run = |def: &str| peephole_optimize(ret_x0(&format!("    {def}\n    sxtw x12, w12\n    str x12, [x4]\n")));
+        for def in ["ldrh w12, [x0, #24]", "ldrb w12, [x0]", "and w12, w1, #0x7fffffff", "lsr w12, w1, #1"] {
+            assert!(!run(def).contains("sxtw"), "{def}");
+        }
+        for def in ["ldrsh w12, [x0, #24]", "ldr w12, [x0]", "and w12, w1, #0x80000000", "lsr w12, w1, #0"] {
+            assert!(run(def).contains("sxtw x12, w12"), "{def}");
+        }
     }
 
     #[test]
