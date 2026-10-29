@@ -2162,9 +2162,11 @@ fn flags_read_from(lines: &[String], kinds: &[LineKind], mut k: usize, n: usize)
     true
 }
 
-/// `and D, A, B` then `cmp D, #0` and `b.eq`/`b.ne` (D dead afterwards):
-/// `tst A, B`. (cmp #0 sets C and tst clears it, so only zero tests qualify,
-/// and neither path may read the flags further.)
+/// `and D, A, B` then `cmp D, #0` (D dead afterwards): `tst A, B`. cmp #0
+/// sets C and tst clears it, so every read of these flags (selects in the
+/// same block, or a final `b.cc` whose paths read them no further) must
+/// test only N, Z or V: `and x13, x13, #128; cmp w13, #0; cset x10, ne`.
+/// A 32-bit compare of a 64-bit `and` tests the low halves.
 fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
@@ -2182,22 +2184,88 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
         }
         k
     };
+    let carry_free = |cc: &str| matches!(cc, "eq" | "ne" | "mi" | "pl" | "vs" | "vc" | "ge" | "lt" | "gt" | "le");
     for i in 0..n {
         let Some(("and", ops)) = split_insn(&lines[i]) else { continue };
         let (dest, srcs) = first_and_rest(ops);
         let Some(d) = gpr_operand(dest) else { continue };
-        let j = next(kinds, i + 1);
-        let b = next(kinds, j + 1);
-        if b >= n || lines[j].trim() != format!("cmp {}, #0", dest) {
+        // The compare may follow a few lines that leave D and the flags be
+        // (`and x14, x14, #128; mov x9, #1; cmp x14, #0`).
+        let mut j = next(kinds, i + 1);
+        for _ in 0..4 {
+            if j >= n || lines[j].trim_start().starts_with("cmp ") {
+                break;
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            let m = split_insn(&lines[j]).map_or("", |(m, _)| m);
+            if (info.uses | info.defs) & (1 << d) != 0 || !matches!(info.flow, Flow::Next) || info.uses == ALL_REGS
+                || matches!(kinds[j], LineKind::Label | LineKind::Call) || sets_flags(m) || reads_flags(m) {
+                break;
+            }
+            j = next(kinds, j + 1);
+        }
+        if j >= n || live[j] & (1 << d) != 0 {
             continue;
         }
-        let Some(("b.eq" | "b.ne", target)) = split_insn(&lines[b]) else { continue };
-        let target_line = labels.get(target.trim()).copied();
-        if live[j] & (1 << d) != 0 || flags_read_from(lines, kinds, b + 1, n)
-            || target_line.is_none_or(|t| flags_read_from(lines, kinds, t + 1, n)) {
+        let tst = if lines[j].trim() == format!("cmp {}, #0", dest) {
+            srcs.trim().to_string()
+        } else if dest.starts_with('x') && lines[j].trim() == format!("cmp {}, #0", wreg_name(d)) {
+            // The low halves: x registers, or a 64-bit mask within the low
+            // 32 bits (one run of ones, so also a 32-bit one unless all ones).
+            let p: Vec<&str> = srcs.split(',').map(str::trim).collect();
+            let [a, b] = p[..] else { continue };
+            let narrow = |x: &str| match gpr_operand(x) {
+                Some(r) if x.starts_with('x') => Some(wreg_name(r).to_string()),
+                _ => parse_imm(x).filter(|&v| v < 0xffff_ffff).map(|_| x.to_string()),
+            };
+            let (Some(a), Some(b)) = (narrow(a), narrow(b)) else { continue };
+            format!("{}, {}", a, b)
+        } else {
+            continue;
+        };
+        // Every read of the flags up to the next write must ignore C.
+        let mut k = j + 1;
+        let ok = loop {
+            if k >= n {
+                break false;
+            }
+            if kinds[k] == LineKind::Nop {
+                k += 1;
+                continue;
+            }
+            if matches!(kinds[k], LineKind::Call | LineKind::Ret) {
+                break true;
+            }
+            if kinds[k] == LineKind::Label {
+                break false;
+            }
+            let Some((m, o)) = split_insn(&lines[k]) else { break false };
+            let target_line = labels.get(o.trim()).copied();
+            let target_quiet = target_line.is_some_and(|t| !flags_read_from(lines, kinds, t + 1, n));
+            if let Some(cc) = m.strip_prefix("b.") {
+                break carry_free(cc) && !flags_read_from(lines, kinds, k + 1, n) && target_quiet;
+            }
+            if m == "b" {
+                break target_quiet;
+            }
+            if reads_flags(m) {
+                let cc = o.rsplit(',').next().unwrap_or("").trim();
+                if !carry_free(cc) || matches!(m, "adc" | "adcs" | "sbc" | "sbcs" | "ngc" | "ngcs") {
+                    break false;
+                }
+            }
+            if sets_flags(m) {
+                break true;
+            }
+            if !matches!(line_info(&lines[k], kinds[k], &|_| None).flow, Flow::Next) {
+                break false;
+            }
+            k += 1;
+        };
+        if !ok {
             continue;
         }
-        lines[i] = format!("    tst {}", srcs.trim());
+        lines[i] = format!("    tst {}", tst);
         kinds[i] = classify_line(&lines[i]);
         kinds[j] = LineKind::Nop;
         changed = true;
@@ -2237,7 +2305,9 @@ fn drop_redundant_zero_extend(lines: &mut [String], kinds: &mut [LineKind], n: u
 
 /// `mov xR, #0` whose only read, R dying there, is an operand of a
 /// conditional select: the select reads the zero register instead
-/// (`csel x0, x13, xzr, hs`, as for `m >= w ? m - w : 0`).
+/// (`csel x0, x13, xzr, hs`, as for `m >= w ? m - w : 0`). `#1` or `#-1`
+/// as a `csel` source becomes the increment or inverse of the zero register:
+/// `mov x9, #1; csel x14, x2, x9, ne` is `csinc x14, x2, xzr, ne`.
 fn zero_reg_into_select(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
@@ -2247,7 +2317,8 @@ fn zero_reg_into_select(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
         }
         let Some(("mov", ops)) = split_insn(&lines[i]) else { continue };
         let (r, imm) = first_and_rest(ops);
-        if imm.trim() != "#0" {
+        let imm = imm.trim();
+        if !matches!(imm, "#0" | "#1" | "#-1") {
             continue;
         }
         let Some(rn) = gpr_operand(r) else { continue };
@@ -2280,6 +2351,19 @@ fn zero_reg_into_select(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
         let swap = |x: &str| if gpr_operand(x) == Some(rn) { zero.to_string() } else { x.to_string() };
         if gpr_operand(d) == Some(rn) || gpr_operand(cond).is_some() || (gpr_operand(a) != Some(rn) && gpr_operand(b) != Some(rn))
             || live[j] & (1 << rn) != 0 {
+            continue;
+        }
+        if imm != "#0" {
+            let op = if imm == "#1" { "csinc" } else { "csinv" };
+            let (Some(inv), "csel") = (invert_condition(cond), m) else { continue };
+            lines[j] = match (gpr_operand(a) == Some(rn), gpr_operand(b) == Some(rn)) {
+                (false, true) => format!("    {} {}, {}, {}, {}", op, d, a, zero, cond),
+                (true, false) => format!("    {} {}, {}, {}, {}", op, d, b, zero, inv),
+                _ => continue,
+            };
+            kinds[j] = classify_line(&lines[j]);
+            kinds[i] = LineKind::Nop;
+            changed = true;
             continue;
         }
         lines[j] = format!("    {} {}, {}, {}, {}", m, d, swap(a), swap(b), cond);
@@ -5502,6 +5586,29 @@ mod tests {
         // Not for a carry test, nor when the flags are read again.
         assert!(peephole_optimize(body("b.hs", "")).contains("cmp x11, #0"));
         assert!(peephole_optimize(body("b.ne", "    cset x0, hi\n")).contains("cmp x11, #0"));
+    }
+
+    #[test]
+    fn test_and_compare_zero_feeding_selects_becomes_tst() {
+        // A 32-bit compare of a 64-bit mask, with a constant built in between,
+        // read by selects up to a jump.
+        let body = |cmp: &str, cc: &str| format!(".type f, %function\nf:\n    and x14, x14, #128\n    mov x9, #3\n    {cmp}\n    csel x0, x9, x1, {cc}\n    b .LBB2\n.LBB2:\n    ret\n.size f, .-f\n");
+        let result = peephole_optimize(body("cmp w14, #0", "ne"));
+        assert!(result.contains("tst w14, #128") && !result.contains("cmp"), "{}", result);
+        assert!(peephole_optimize(body("cmp x14, #0", "lt")).contains("tst x14, #128"));
+        // Not for a select on the carry, nor a mask beyond the low half.
+        assert!(peephole_optimize(body("cmp x14, #0", "hi")).contains("cmp x14, #0"));
+        let wide = body("cmp w14, #0", "ne").replace("#128", "#0xff00000000");
+        assert!(peephole_optimize(wide).contains("cmp w14, #0"));
+    }
+
+    #[test]
+    fn test_one_and_minus_one_select_from_zero_register() {
+        let body = |a: &str, b: &str| format!(".type f, %function\nf:\n    mov x2, #-1\n    mov x9, #1\n    cmp x0, x1\n    csel x0, {a}, {b}, ne\n    ret\n.size f, .-f\n");
+        let result = peephole_optimize(body("x3", "x9"));
+        assert!(result.contains("csinc x0, x3, xzr, ne") && !result.contains("#1"), "{}", result);
+        let result = peephole_optimize(body("x2", "x3"));
+        assert!(result.contains("csinv x0, x3, xzr, eq") && !result.contains("#-1"), "{}", result);
     }
 
     #[test]

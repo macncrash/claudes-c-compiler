@@ -905,7 +905,21 @@ v1 and nothing between the copy and the call uses v22:
   none, it let the second `mov x1, #0` of pr85095 go once the reload
   between them did.
 - `mov xR, #0` read only by a conditional select, R dying there, becomes
-  the select's `xzr`/`wzr` operand (`m >= w ? m - w : 0`).
+  the select's `xzr`/`wzr` operand (`m >= w ? m - w : 0`). `#1` and `#-1`
+  as a `csel` source become `csinc` and `csinv` of the zero register, the
+  condition inverted when the constant was the first source:
+  `mov x2, #-1; csel x14, x2, x9, ne` is `csinv x14, x9, xzr, eq`.
+- `and D, A, B` then `cmp D, #0`, D dead after, is `tst A, B`. The two set
+  N, Z and V alike, but `cmp #0` sets C and `tst` clears it, so every read
+  of these flags must test only N, Z or V: selects up to the next flag
+  write, a call or `ret`, or a final branch whose paths read the flags no
+  further. Up to four lines that leave D and the flags alone may come
+  between (`and x14, x14, #128; mov x9, #1; cmp x14, #0`), and a 32-bit
+  compare of a 64-bit `and` becomes a 32-bit `tst` when B is a register or
+  a mask within the low half. In SQLite's vdbeSorterCompareInt
+  (`res = a[0] & 0x80 ? -1 : +1` when the sign bits differ) the block that
+  settles a differing byte goes from 14 instructions to 10; speedtest ran
+  0.19% fewer.
 
 **14. Tail Calls and Leaf Frame Records** (after the local cleanup)
 
