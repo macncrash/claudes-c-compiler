@@ -772,11 +772,22 @@ every use of the temporary in the function is renamed to the argument
 register, and the copies become self-moves that the cleanup drops. Liveness
 is the function-wide one the dead-write passes use. The two interfere when
 a line writes one while the other is live after it, except for the copy
-between them. A call writes x0-x18. The pairs with the most copies go
-first. Lines liveness does not understand may not name either register,
-and pair, writeback or exclusive accesses may not name both. Before it,
-SQLite ran about 985M register copies between x0-x7 and x9-x15 where
-clang's build ran about 100M. Speedtest ran 1.0% fewer instructions.
+between them. A call changes both, so it is a conflict only when both are
+read after it. The pairs with the most copies go first (the lower argument
+register on a tie). Lines liveness does not understand may not name either
+register, and pair, writeback or exclusive accesses may not name both.
+Before it, SQLite ran about 985M register copies between x0-x7 and x9-x15
+where clang's build ran about 100M. Speedtest ran 1.0% fewer instructions.
+
+Most remaining conflicts were the code generator's scratch uses of x0
+while a parameter waited in a temporary (`adrp x0, sym; add x0, x0,
+:lo12:sym; ldrb w14, [x0, x12]` in vdbeRecordCompareInt). A piece of the
+argument register's value that is written and last read within
+straight-line code (no labels, branches, calls or returns) moves to a free
+temporary first, up to 128 pieces per pair, and the pieces are put back if
+the pair still conflicts. Another 0.4% (26.83G to 26.71G instructions);
+moving pieces without putting them back made speedtest slower. Weighting
+copies by loop depth when choosing pairs made no difference.
 Copies of 32-bit values are left alone: renaming one leaves a
 `mov wA, wA`, a zero-extension that stays and keeps the extension from
 folding into its user.

@@ -4451,9 +4451,17 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
 //
 // They interfere when a line writes one while the other is live after it,
 // except a 64-bit copy between them (both then hold the same value), or
-// when T is live into the function. A call writes x0-x18. A line liveness
-// does not understand (it uses and writes everything) may not name either,
-// nor may a pair or writeback access, or an exclusive store, name both.
+// when T is live into the function. A call changes both, so there only when
+// both are read after it. A line liveness does not understand (it uses and
+// writes everything) may not name either, nor may a pair or writeback
+// access, or an exclusive store, name both.
+//
+// Most conflicts are the code generator's scratch uses of x0 while a
+// parameter waits in a temporary: `adrp x0, sym; add x0, x0, :lo12:sym;
+// ldrb w14, [x0, x12]` in SQLite's vdbeRecordCompareInt. Such a piece of A,
+// written and last read within straight-line code, first moves to a free
+// temporary (split_piece); the pieces moved for a pair are put back when
+// the pair still conflicts. Another 0.4% of speedtest's instructions.
 
 /// The registers a call may change (x0-x18).
 const CALLER_SAVED: RegSet = (1 << 19) - 1;
@@ -4506,7 +4514,7 @@ fn coalesce_arg_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         if pairs.is_empty() {
             continue;
         }
-        let Some((mut live, _)) = function_liveness(lines, kinds, start, end) else { continue };
+        let Some((live, _)) = function_liveness(lines, kinds, start, end) else { continue };
         let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for k in start..end {
             if kinds[k] == LineKind::Label {
@@ -4517,65 +4525,182 @@ fn coalesce_arg_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         }
         let label_index = |name: &str| labels.get(name).copied();
         let mut defs: Vec<RegSet> = Vec::with_capacity(end - start);
+        let mut uses: Vec<RegSet> = Vec::with_capacity(end - start);
         let mut opaque: Vec<bool> = Vec::with_capacity(end - start);
         for k in start..end {
             let info = line_info(&lines[k], kinds[k], &label_index);
             let call = kinds[k] == LineKind::Call;
             defs.push(if call { info.defs | CALLER_SAVED } else { info.defs });
+            uses.push(info.uses);
             opaque.push(info.uses == ALL_REGS && info.defs == ALL_REGS);
         }
+        let mut regs = LineRegs { live, defs, uses, opaque, start };
         // Live into the function: after its label.
         let Some(entry) = (start..end).find(|&k| kinds[k] == LineKind::Label) else { continue };
         drop(labels);
-        pairs.sort_by_key(|p| std::cmp::Reverse(p.1));
+        pairs.sort_by_key(|p| (std::cmp::Reverse(p.1), (p.0).1));
         let mut renamed: RegSet = 0;
         for ((t, a), _) in pairs {
             if renamed & (1 << t) != 0 {
                 continue;
             }
-            let (bt, ba) = (1 << t, 1 << a);
-            if live[entry - start] & bt != 0 {
+            if regs.live[entry - start] & (1 << t) != 0 {
                 continue;
             }
-            let interferes = (start..end).any(|k| {
-                let i = k - start;
-                let copy = matches!(kinds[k], LineKind::Move { dst, src, is_32bit: false }
-                    if (dst, src) == (t, a) || (dst, src) == (a, t));
-                if !copy && ((defs[i] & bt != 0 && live[i] & ba != 0) || (defs[i] & ba != 0 && live[i] & bt != 0)) {
-                    return true;
+            // A short piece of A's value in the way moves to a free temporary.
+            // They are undone when T and A still conflict.
+            let mut undo: Vec<(usize, String, LineKind)> = Vec::new();
+            let mut saved: Option<(Vec<RegSet>, Vec<RegSet>, Vec<RegSet>)> = None;
+            let mut splits = 0;
+            let clear = loop {
+                match regs.conflict(lines, kinds, end, t, a) {
+                    Conflict::None => break true,
+                    Conflict::Fixed => break false,
+                    Conflict::At(c) => {
+                        if splits == MAX_SPLITS {
+                            break false;
+                        }
+                        saved.get_or_insert_with(|| (regs.live.clone(), regs.defs.clone(), regs.uses.clone()));
+                        if !regs.split_piece(lines, kinds, end, c, a, &mut undo) {
+                            break false;
+                        }
+                        splits += 1;
+                    }
                 }
-                if kinds[k] == LineKind::Nop || (!mentions_reg(&lines[k], t) && !mentions_reg(&lines[k], a)) {
-                    return false;
+            };
+            if !clear {
+                for (k, line, kind) in undo.into_iter().rev() {
+                    lines[k] = line;
+                    kinds[k] = kind;
                 }
-                if opaque[i] {
-                    return true;
+                if let Some((live, defs, uses)) = saved {
+                    (regs.live, regs.defs, regs.uses) = (live, defs, uses);
                 }
-                let both = mentions_reg(&lines[k], t) && mentions_reg(&lines[k], a);
-                let (mnemonic, ops) = split_insn(&lines[k]).unwrap_or(("", ""));
-                both && !copy && (matches!(mnemonic, "ldp" | "ldpsw" | "stp" | "ldnp" | "stnp")
-                    || ops.contains("]!") || ops.contains("],") || mnemonic.contains("xr") || mnemonic.contains("xp"))
-            });
-            if interferes {
                 continue;
             }
             for k in start..end {
-                let i = k - start;
                 if kinds[k] != LineKind::Nop && mentions_reg(&lines[k], t) {
                     lines[k] = rename_gpr(&lines[k], t, a);
                     kinds[k] = classify_line(&lines[k]);
                 }
-                if live[i] & bt != 0 {
-                    live[i] = (live[i] & !bt) | ba;
-                }
-                if defs[i] & bt != 0 {
-                    defs[i] = (defs[i] & !bt) | ba;
-                }
             }
-            renamed |= bt;
+            regs.rename(start..end, t, a);
+            renamed |= 1 << t;
             changed = true;
         }
     }
     changed
+}
+
+/// Most pieces of an argument register's values moved aside for one temporary.
+const MAX_SPLITS: usize = 128;
+
+/// Per-line registers of one function (index `k - start`): live after, written,
+/// read, and whether liveness understands the line at all.
+struct LineRegs {
+    live: Vec<RegSet>,
+    defs: Vec<RegSet>,
+    uses: Vec<RegSet>,
+    opaque: Vec<bool>,
+    start: usize,
+}
+
+enum Conflict {
+    None,
+    /// One A's value can be moved out of the way of, at this line.
+    At(usize),
+    /// One that cannot.
+    Fixed,
+}
+
+impl LineRegs {
+    fn rename(&mut self, range: std::ops::Range<usize>, from: u8, to: u8) {
+        let (bf, bt) = (1 << from, 1 << to);
+        for k in range {
+            let i = k - self.start;
+            for set in [&mut self.live[i], &mut self.defs[i], &mut self.uses[i]] {
+                if *set & bf != 0 {
+                    *set = (*set & !bf) | bt;
+                }
+            }
+        }
+    }
+
+    /// The first line where T and A cannot share a register.
+    fn conflict(&self, lines: &[String], kinds: &[LineKind], end: usize, t: u8, a: u8) -> Conflict {
+        let (bt, ba) = (1 << t, 1 << a);
+        for k in self.start..end {
+            let i = k - self.start;
+            let copy = matches!(kinds[k], LineKind::Move { dst, src, is_32bit: false }
+                if (dst, src) == (t, a) || (dst, src) == (a, t));
+            if kinds[k] == LineKind::Call {
+                // It changes both: they conflict only if both are read after it.
+                if self.live[i] & (bt | ba) == bt | ba {
+                    return Conflict::Fixed;
+                }
+            } else if !copy && ((self.defs[i] & bt != 0 && self.live[i] & ba != 0) || (self.defs[i] & ba != 0 && self.live[i] & bt != 0)) {
+                return Conflict::At(k);
+            }
+            if kinds[k] == LineKind::Nop || (!mentions_reg(&lines[k], t) && !mentions_reg(&lines[k], a)) {
+                continue;
+            }
+            if self.opaque[i] {
+                return Conflict::Fixed;
+            }
+            let both = mentions_reg(&lines[k], t) && mentions_reg(&lines[k], a);
+            let (mnemonic, ops) = split_insn(&lines[k]).unwrap_or(("", ""));
+            if both && !copy && (matches!(mnemonic, "ldp" | "ldpsw" | "stp" | "ldnp" | "stnp")
+                || ops.contains("]!") || ops.contains("],") || mnemonic.contains("xr") || mnemonic.contains("xp")) {
+                return Conflict::Fixed;
+            }
+        }
+        Conflict::None
+    }
+
+    /// Moves the value of A that line `c` writes or lies within to a free
+    /// temporary x9-x15, when it lives in straight-line code (no labels,
+    /// branches, calls or returns, written once, by a line that does not
+    /// read A): `adrp x0, sym; add x0, x0, :lo12:sym; ldrb w14, [x0, x12]`,
+    /// the code generator's scratch use of x0 while a parameter waits in a
+    /// temporary for x0 to be free.
+    fn split_piece(&mut self, lines: &mut [String], kinds: &mut [LineKind], end: usize, c: usize, a: u8,
+                   undo: &mut Vec<(usize, String, LineKind)>) -> bool {
+        let ba: RegSet = 1 << a;
+        let s = self.start;
+        let straight = |k: usize| !self.opaque[k - s] && !matches!(kinds[k], LineKind::Label | LineKind::Branch
+            | LineKind::CondBranch | LineKind::CmpBranch | LineKind::Ret | LineKind::Call);
+        // The line that writes the value: `c`, or the last before it.
+        let mut d = c;
+        while self.defs[d - s] & ba == 0 {
+            if d == s || !straight(d) {
+                return false;
+            }
+            d -= 1;
+        }
+        if !straight(d) || self.uses[d - s] & ba != 0 {
+            return false;
+        }
+        // The last line that reads it.
+        let mut u = d;
+        while self.live[u - s] & ba != 0 {
+            u += 1;
+            if u == end || !straight(u) {
+                return false;
+            }
+        }
+        let Some(r) = (9..=15u8).find(|&r| (d..=u).all(|k| self.live[k - s] & (1 << r) == 0 && !mentions_reg(&lines[k], r))) else {
+            return false;
+        };
+        for k in d..=u {
+            if mentions_reg(&lines[k], a) {
+                undo.push((k, lines[k].clone(), kinds[k]));
+                lines[k] = rename_gpr(&lines[k], a, r);
+                kinds[k] = classify_line(&lines[k]);
+            }
+        }
+        self.rename(d..u + 1, a, r);
+        true
+    }
 }
 
 fn is_function_start(line: &str) -> bool {
@@ -6094,6 +6219,17 @@ f:
         assert!(!result.contains("x11") && result.contains("add x0, x0, x12"), "{}", result);
         assert_eq!(rename_gpr("ldr w11, [x11, #8]", 11, 1), "ldr w1, [x1, #8]");
         assert_eq!(rename_gpr("adrp x11, _x11@PAGE", 11, 1), "adrp x1, _x11@PAGE");
+    }
+
+    #[test]
+    fn test_scratch_piece_moves_aside_for_parameter() {
+        // x0's table address moves to a free temporary; the parameter stays.
+        let body = "    mov x11, x0\n    adrp x0, tbl\n    add x0, x0, :lo12:tbl\n    ldrb w12, [x0, x1]\n    ldr x13, [x11, x12]\n    mov x0, x13\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(!result.contains("x11") && result.contains("adrp x9, tbl") && result.contains("[x0, x12]"), "{}", result);
+        // Not a piece that crosses a label.
+        let body = "    mov x11, x0\n    adrp x0, tbl\n.L1:\n    add x0, x0, :lo12:tbl\n    ldrb w12, [x0, x1]\n    ldr x13, [x11, x12]\n    cbz x13, .L1\n    mov x0, x13\n";
+        assert!(peephole_optimize(ret_x0(body)).contains("adrp x0, tbl"));
     }
 
     #[test]
