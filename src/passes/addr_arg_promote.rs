@@ -17,8 +17,9 @@
 //! The callee must be one `ModRef` summarizes and must not capture that
 //! parameter, so nothing can reach the slot outside the call. The copy back
 //! is left out when the callee does not write through the parameter. Only
-//! register-sized allocas, other than the parameters', accessed directly
-//! with their own type and not volatile. Runs once, after inlining.
+//! register-sized allocas accessed directly with their own type and not
+//! volatile; a parameter's only when the IR stores its value into it (not
+//! one the backend fills in the prologue). Runs once, after inlining.
 //!
 //! A variable assigned in many places is left alone (see MAX_STORES).
 
@@ -53,7 +54,21 @@ pub(crate) fn promote_module(module: &mut IrModule) -> usize {
 }
 
 fn promote_function(func: &mut IrFunction, mr: &ModRef) -> usize {
-    let params: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
+    // A parameter's alloca whose value the IR stores itself (ParamRef, then
+    // a store into it: a scalar parameter whose address is taken) is like
+    // any other local; one the backend fills in the prologue is not.
+    let param_refs: FxHashSet<u32> = func.blocks.iter().flat_map(|b| &b.instructions)
+        .filter_map(|i| match i { Instruction::ParamRef { dest, .. } => Some(dest.0), _ => None })
+        .collect();
+    let stored_params: FxHashSet<u32> = func.blocks.iter().flat_map(|b| &b.instructions)
+        .filter_map(|i| match i {
+            Instruction::Store { val: Operand::Value(v), ptr, .. } if param_refs.contains(&v.0) => Some(ptr.0),
+            _ => None,
+        })
+        .collect();
+    let params: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0)
+        .filter(|a| !stored_params.contains(a))
+        .collect();
     let mut candidates: FxHashMap<u32, (IrType, usize, usize)> = FxHashMap::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         if let Instruction::Alloca { dest, ty, size, align, volatile: false } = inst {

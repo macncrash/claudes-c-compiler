@@ -542,6 +542,22 @@ impl ArmCodegen {
             }
         }
 
+        // A parameter whose address is taken keeps its alloca, and lowering
+        // stores its ParamRef there at the top of the entry block; the
+        // argument register was stored there just above, the same bits.
+        self.param_restores.clear();
+        let entry_run = func.blocks.first().into_iter()
+            .flat_map(|b| &b.instructions)
+            .take_while(|i| matches!(i, Instruction::Alloca { .. } | Instruction::ParamRef { .. } | Instruction::Store { .. }));
+        for inst in entry_run {
+            let Instruction::Store { val: Operand::Value(v), ptr, ty, volatile: false, .. } = inst else { continue };
+            let Some(i) = paramref_dests.iter().position(|d| *d == Some(*v)) else { continue };
+            let reg_param = matches!(param_classes[i], ParamClass::IntReg { reg_idx } if !(sret_shift > 0 && reg_idx == 0 && i == 0));
+            if reg_param && self.resolve_param_slot(func, i).is_some_and(|(_, aty, a)| a == *ptr && aty == *ty) {
+                self.param_restores.insert((ptr.0, v.0));
+            }
+        }
+
         self.emit_store_gp_params(func, &param_classes);
         self.emit_store_fp_params(func, &param_classes);
         self.emit_store_stack_params(func, &param_classes);

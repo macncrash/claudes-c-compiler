@@ -199,7 +199,11 @@ code:
    (only if the callee may write it). `n = 0; get_varint(p, &n)` no longer
    puts every read of `n` through the stack. A variable stored in more than
    32 places is left alone: as one value live across a large function (an
-   interpreter's `rc`) it held a register the hot paths needed.
+   interpreter's `rc`) it held a register the hot paths needed. A scalar
+   parameter passed on by address counts as a local (its value is stored
+   into its slot by the IR): SQLite's patternCompare advances `zPattern` and
+   `zString` inline for ASCII and through `sqlite3Utf8Read(&zString)`
+   otherwise, and loaded and stored them on every character.
 10. **global_promote** -- a `static` variable whose address the module uses
    only for direct loads and stores of its type, accessed in a loop with no
    calls, inline assembly or other unseen memory effects, is kept in a

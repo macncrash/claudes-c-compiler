@@ -292,6 +292,10 @@ pub struct ArmCodegen {
     /// HFA return whose sret pointer is only loaded for those copies and
     /// the Return: the loads (skipped, as are the x8 setup and its store).
     pub(super) hfa_ret_ptr_loads: Option<FxHashSet<u32>>,
+    /// Entry-block stores of a parameter's ParamRef into its own alloca,
+    /// as (ptr, value): emit_store_gp_params already stored the argument
+    /// register there, so they are skipped.
+    pub(super) param_restores: FxHashSet<(u32, u32)>,
     /// Where the indirect call being emitted reads its target at the `blr`
     /// (emit_call_prepare_fptr).
     pub(super) fptr_source: FptrSource,
@@ -350,6 +354,7 @@ impl ArmCodegen {
             hfa_ret_copies: FxHashSet::default(),
             hfa_ret_loaded: false,
             hfa_ret_ptr_loads: None,
+            param_restores: FxHashSet::default(),
             fptr_source: FptrSource::Spilled,
             used_fp_callee_saved: Vec::new(),
             fp_callee_save_offset: 0,
@@ -1774,7 +1779,7 @@ impl ArmCodegen {
     }
 
     /// Resolve param alloca to (slot, type) for parameter `i`.
-    fn resolve_param_slot(&self, func: &IrFunction, i: usize) -> Option<(StackSlot, IrType, Value)> {
+    pub(super) fn resolve_param_slot(&self, func: &IrFunction, i: usize) -> Option<(StackSlot, IrType, Value)> {
         let (dest, ty) = find_param_alloca(func, i)?;
         let slot = self.state.get_slot(dest.0)?;
         Some((slot, ty, dest))
@@ -2039,6 +2044,11 @@ impl ArchCodegen for ArmCodegen {
     fn state_ref(&self) -> &CodegenState { &self.state }
 
     fn before_instruction(&mut self, inst: &Instruction) -> bool {
+        if let Instruction::Store { val: Operand::Value(v), ptr, .. } = inst {
+            if self.param_restores.contains(&(ptr.0, v.0)) {
+                return true;
+            }
+        }
         self.save_around_call(inst, "str");
         self.vec_before_instruction(inst)
     }
