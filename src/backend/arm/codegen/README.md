@@ -1043,6 +1043,13 @@ Any other directive between, a line holding several statements, or a
 `.macro` in the file rules the fold out. A 32-bit test of a bit in the
 upper half (always zero) is left alone.
 
+`cmp R, #0` then `b.lt`/`b.ge` (or `b.mi`/`b.pl`) with the flags read on
+neither path (up to the next flag write, call or jump) is `tbnz`/`tbz R,
+#31` (`#63` for an x register), under the same reach bound: the sign of a
+comparison result, `if (c < 0) lo = idx + 1;` in sqlite3BtreeIndexMoveto's
+binary search. 315 such branches in SQLite, and speedtest ran 0.33% fewer
+instructions (block counts, no function slower).
+
 ---
 
 ## Codegen Options

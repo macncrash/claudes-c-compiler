@@ -2270,6 +2270,39 @@ fn fuse_bit_test_into_tbz(lines: &mut [String], kinds: &mut [LineKind], n: usize
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
     }
+    // `cmp R, #0` then `b.lt`/`b.ge` (`b.mi`/`b.pl`), the flags read on
+    // neither path: a test of R's sign bit (`if (rc < 0)`).
+    for i in 0..n {
+        let Some(("cmp", ops)) = split_insn(&lines[i]) else { continue };
+        let (r, imm) = first_and_rest(ops);
+        if gpr_operand(r).is_none_or(|x| x > 30) || imm.trim() != "#0" {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((m, target)) = split_insn(&lines[j]) else { continue };
+        let op = match m {
+            "b.lt" | "b.mi" => "tbnz",
+            "b.ge" | "b.pl" => "tbz",
+            _ => continue,
+        };
+        let target = target.trim();
+        let Some(&t) = labels.get(target) else { continue };
+        if flags_read_from(lines, kinds, j + 1, n) || flags_read_from(lines, kinds, t, n)
+            || at[t.max(j)] - at[t.min(j)] > TBZ_SAFE_BYTES
+        {
+            continue;
+        }
+        let bit = if r.starts_with('w') { 31 } else { 63 };
+        lines[j] = format!("    {} {}, #{}, {}", op, r, bit, target);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+    }
 }
 
 /// `and D, A, B` then `cmp D, #0` (D dead afterwards): `tst A, B`. cmp #0
@@ -6121,6 +6154,20 @@ mod tests {
         let past = |tail: &str| format!(".type f, %function\nf:\n    and x14, x14, #128\n    cmp x14, #0\n    cbz x3, .LBB2\n    csel x0, x0, x1, ne\n    ret\n.LBB2:\n{tail}    ret\n.size f, .-f\n");
         assert!(peephole_optimize(past("    mov x0, #3\n")).contains("tst x14, #128"));
         assert!(peephole_optimize(past("    cset x0, hs\n")).contains("cmp x14, #0"));
+    }
+
+    #[test]
+    fn test_sign_test_branches_on_the_sign_bit() {
+        let f = |cmp: &str, br: &str, fall: &str, at: &str| ret_x0(&format!("    {cmp}\n    {br}\n{fall}    mov x0, #2\n    ret\n.LBB1:\n{at}    mov x0, #3\n"));
+        let result = peephole_optimize(f("cmp w3, #0", "b.lt .LBB1", "", ""));
+        assert!(result.contains("tbnz w3, #31, .LBB1") && !result.contains("cmp"), "{}", result);
+        let result = peephole_optimize(f("cmp x3, #0", "b.ge .LBB1", "", "    cmp x4, #5\n    cset x0, eq\n"));
+        assert!(result.contains("tbz x3, #63, .LBB1") && !result.contains("cmp x3"), "{}", result);
+        // Not when either path reads the flags, nor for other conditions.
+        assert!(peephole_optimize(f("cmp w3, #0", "b.lt .LBB1", "", "    cset x5, eq\n    str x5, [x1]\n")).contains("cmp w3, #0"));
+        assert!(peephole_optimize(f("cmp w3, #0", "b.lt .LBB1", "    csel x5, x1, x2, eq\n    str x5, [x1]\n", "")).contains("cmp w3, #0"));
+        assert!(peephole_optimize(f("cmp w3, #0", "b.le .LBB1", "", "")).contains("cmp w3, #0"));
+        assert!(peephole_optimize(f("cmp w3, #1", "b.lt .LBB1", "", "")).contains("cmp w3, #1"));
     }
 
     #[test]
