@@ -902,6 +902,14 @@ since renaming one would bring it back (a `mul` already fused into
   makes it `ldrh; rev16; sxth`. freeSpace and pageFindSlot walk the free
   list with it, now as clang does; speedtest ran 0.34% fewer instructions.
 
+- `and xD, xS, #0xffff` (or `#0xff`) read only by a register compare up
+  to three lines on, D dead after it, is the compare's own zero extension:
+  `cmp wX, wS, uxth`. The extended operand must come second, so when the
+  mask is compared first the operands swap and the one conditional branch
+  reading the flags (read on neither path after) mirrors its condition.
+  sqlite3BtreeNext's `++pCur->ix >= pPage->nCell`; speedtest ran 0.10%
+  fewer instructions, sqlite3BtreeNext level with clang.
+
 **10. Jump Threading** (local cleanup)
 
 A branch to a label whose block is only `b .L2` goes to `.L2` directly, and

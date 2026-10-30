@@ -486,6 +486,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fold_neg_into_cneg(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_redundant_zero_extend(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_byte_mask_before_compare(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_mask_into_compare(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_sxtw_of_nonnegative(&lines, &mut kinds, n));
             changed2 |= pass!(narrow_load_for_copy(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
@@ -2843,6 +2844,103 @@ fn drop_byte_mask_before_compare(lines: &mut [String], kinds: &mut [LineKind], n
         kinds[c] = classify_line(&lines[c]);
         lines[j] = format!("    b.{} {}", ucc, target);
         kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `and xD, xS, #0xffff` (or `#0xff`) read only by a register compare
+/// a few lines on, D dead after it: the compare zero-extends S itself,
+/// `cmp wX, wS, uxth`. sqlite3BtreeNext's `pCur->ix` bump, `add x10, x12,
+/// #1; strh w10, [x20, #86]; and x10, x10, #0xffff; ldrh w13, [x11, #24];
+/// cmp w10, w13; b.lt L`. The extended operand must be the second, so a
+/// mask compared first swaps the operands, and the one conditional branch
+/// reading the flags (on neither path read again) mirrors its condition.
+fn fold_mask_into_compare(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for k in 0..n {
+        if kinds[k] == LineKind::Label {
+            if let Some(name) = label_name(&lines[k]) {
+                labels.insert(name.to_string(), k);
+            }
+        }
+    }
+    let next = |kinds: &[LineKind], mut k: usize| {
+        k += 1;
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
+    for i in 0..n {
+        let Some(("and", aops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = aops.split(',').map(str::trim).collect();
+        let [dd, ss, mask] = p[..] else { continue };
+        let ext = match parse_imm(mask) {
+            Some(0xff) => "uxtb",
+            Some(0xffff) => "uxth",
+            _ => continue,
+        };
+        let (Some(d), Some(sr)) = (gpr_operand(dd), gpr_operand(ss)) else { continue };
+        if d > 28 || sr > 30 {
+            continue;
+        }
+        // Up to three straight-line lines on, leaving D and S alone.
+        let mut c = next(kinds, i);
+        let mut seen = 0;
+        while c < n && seen < 3 && !lines[c].trim_start().starts_with("cmp ") {
+            let info = line_info(&lines[c], kinds[c], &|_| None);
+            if (info.uses | info.defs) & (1 << d) != 0 || info.defs & (1 << sr) != 0
+                || !matches!(info.flow, Flow::Next) || info.uses == ALL_REGS || matches!(kinds[c], LineKind::Label | LineKind::Call) {
+                c = n;
+                break;
+            }
+            seen += 1;
+            c = next(kinds, c);
+        }
+        if c >= n {
+            continue;
+        }
+        let Some(("cmp", cops)) = split_insn(&lines[c]) else { continue };
+        let q: Vec<&str> = cops.split(',').map(str::trim).collect();
+        let [x, y] = q[..] else { continue };
+        if !x.starts_with('w') || !y.starts_with('w') || live[c] & (1 << d) != 0 {
+            continue;
+        }
+        let (Some(xn), Some(yn)) = (gpr_operand(x), gpr_operand(y)) else { continue };
+        let ws = wreg_name(sr);
+        if yn == d && xn != d {
+            lines[c] = format!("    cmp {}, {}, {}", x, ws, ext);
+        } else if xn == d && yn != d {
+            // Swapped: the branch right after mirrors its condition.
+            let j = next(kinds, c);
+            if j >= n {
+                continue;
+            }
+            let branch = lines[j].clone();
+            let Some((bm, target)) = split_insn(&branch) else { continue };
+            let Some(cc) = bm.strip_prefix("b.") else { continue };
+            let mirrored = match cc {
+                "eq" | "ne" => cc,
+                "lt" => "gt", "gt" => "lt", "le" => "ge", "ge" => "le",
+                "lo" => "hi", "hi" => "lo", "ls" => "hs", "hs" => "ls",
+                _ => continue,
+            };
+            let target = target.trim();
+            let Some(&t) = labels.get(target) else { continue };
+            if flags_read_from(lines, kinds, j + 1, n) || flags_read_from(lines, kinds, t, n) {
+                continue;
+            }
+            lines[c] = format!("    cmp {}, {}, {}", y, ws, ext);
+            lines[j] = format!("    b.{} {}", mirrored, target);
+            kinds[j] = classify_line(&lines[j]);
+        } else {
+            continue;
+        }
+        kinds[c] = classify_line(&lines[c]);
         kinds[i] = LineKind::Nop;
         changed = true;
     }
@@ -6681,6 +6779,20 @@ mod tests {
         // Not for a carry test, nor when the flags are read again.
         assert!(peephole_optimize(body("b.hs", "")).contains("cmp x11, #0"));
         assert!(peephole_optimize(body("b.ne", "    cset x0, hi\n")).contains("cmp x11, #0"));
+    }
+
+    #[test]
+    fn test_mask_folds_into_register_compare() {
+        let f = |cmp: &str, cc: &str| ret_x0(&format!("    add x10, x12, #1\n    strh w10, [x20, #86]\n    and x10, x10, #0xffff\n    ldrh w13, [x11, #24]\n    {cmp}\n    b.{cc} .LBB1\n    mov x0, #1\n    ret\n.LBB1:\n    mov x0, #2\n"));
+        // The mask second: extended in place.
+        let result = peephole_optimize(f("cmp w13, w10", "hi"));
+        assert!(result.contains("cmp w13, w10, uxth") && result.contains("b.hi .LBB1") && !result.contains("and x10"), "{}", result);
+        // The mask first: operands swapped, the condition mirrored.
+        let result = peephole_optimize(f("cmp w10, w13", "lt"));
+        assert!(result.contains("cmp w13, w10, uxth") && result.contains("b.gt .LBB1"), "{}", result);
+        // Not when the masked value is read again.
+        let body = "    and x10, x10, #0xffff\n    cmp w13, w10\n    b.hi .LBB1\n    mov x0, x10\n    ret\n.LBB1:\n    mov x0, #2\n";
+        assert!(peephole_optimize(ret_x0(body)).contains("and x10, x10, #0xffff"));
     }
 
     #[test]
