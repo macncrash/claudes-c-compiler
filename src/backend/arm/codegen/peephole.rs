@@ -483,6 +483,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fuse_and_into_tst(&mut lines, &mut kinds, n));
             changed2 |= pass!(reuse_constants(&mut lines, &mut kinds, n));
             changed2 |= pass!(zero_reg_into_select(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_neg_into_cneg(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_redundant_zero_extend(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_sxtw_of_nonnegative(&lines, &mut kinds, n));
             changed2 |= pass!(narrow_load_for_copy(&mut lines, &mut kinds, n));
@@ -1722,7 +1723,7 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
         | "eon" | "lsl" | "lsr" | "asr" | "ror" | "mul" | "madd" | "msub" | "smull"
         | "umull" | "smulh" | "umulh" | "sdiv" | "udiv" | "neg" | "mvn" | "sxtw" | "sxth"
         | "sxtb" | "uxtb" | "uxth" | "cset" | "csetm" | "csel" | "csinc" | "csinv"
-        | "csneg" | "cinc" | "clz" | "rbit" | "rev" | "rev16" | "rev32" | "ubfx" | "sbfx"
+        | "csneg" | "cinc" | "cneg" | "clz" | "rbit" | "rev" | "rev16" | "rev32" | "ubfx" | "sbfx"
         | "ubfiz" | "sbfiz" | "smaddl" | "smsubl" | "fmov" | "fcvtzs" | "fcvtzu" | "umov" if !has_symbol => {
             Access::Write { deletable: true }
         }
@@ -2366,8 +2367,14 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
         let Some(("and", ops)) = split_insn(&lines[i]) else { continue };
         let (dest, srcs) = first_and_rest(ops);
         let Some(d) = gpr_operand(dest) else { continue };
-        // The compare may follow a few lines that leave D and the flags be
-        // (`and x14, x14, #128; mov x9, #1; cmp x14, #0`).
+        // The compare may follow a few lines that leave D be (`and x14, x14,
+        // #128; mov x9, #1; cmp x14, #0`). The test then takes the `and`'s
+        // place, or, when those lines use the flags themselves, the compare's,
+        // which needs the `and`'s sources unchanged until there
+        // (vdbeSorterCompareInt's `and x13, x13, #128; tst x14, #128; mov x9,
+        // #1; csinv x14, x9, xzr, eq; cmp w13, #0`).
+        let src_regs = regs_in(srcs);
+        let (mut flags_used, mut srcs_written) = (false, false);
         let mut j = next(kinds, i + 1);
         for _ in 0..4 {
             if j >= n || lines[j].trim_start().starts_with("cmp ") {
@@ -2376,12 +2383,14 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
             let info = line_info(&lines[j], kinds[j], &|_| None);
             let m = split_insn(&lines[j]).map_or("", |(m, _)| m);
             if (info.uses | info.defs) & (1 << d) != 0 || !matches!(info.flow, Flow::Next) || info.uses == ALL_REGS
-                || matches!(kinds[j], LineKind::Label | LineKind::Call) || sets_flags(m) || reads_flags(m) {
+                || matches!(kinds[j], LineKind::Label | LineKind::Call) {
                 break;
             }
+            flags_used |= sets_flags(m) || reads_flags(m);
+            srcs_written |= info.defs & src_regs != 0;
             j = next(kinds, j + 1);
         }
-        if j >= n || live[j] & (1 << d) != 0 {
+        if j >= n || live[j] & (1 << d) != 0 || (flags_used && srcs_written) {
             continue;
         }
         // A 64-bit compare of a 32-bit `and` has N clear where the 32-bit
@@ -2455,9 +2464,10 @@ fn fuse_and_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
         if !ok {
             continue;
         }
-        lines[i] = format!("    tst {}", tst);
-        kinds[i] = classify_line(&lines[i]);
-        kinds[j] = LineKind::Nop;
+        let (at, gone) = if flags_used { (j, i) } else { (i, j) };
+        lines[at] = format!("    tst {}", tst);
+        kinds[at] = classify_line(&lines[at]);
+        kinds[gone] = LineKind::Nop;
         changed = true;
     }
     changed
@@ -2732,6 +2742,69 @@ fn zero_reg_into_select(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
             continue;
         }
         lines[j] = format!("    {} {}, {}, {}, {}", m, d, swap(a), swap(b), cond);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `neg A, B` whose only read, A dying there, is a `csel` between A and
+/// B: a conditional negation, `cneg D, B, cc` (the condition inverted
+/// when B is the first source). vdbeSorterCompareInt's `neg x0, x12;
+/// cmp x10, #0; csel x12, x0, x12, ne` for `if (desc) res = -res`.
+fn fold_neg_into_cneg(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some(("neg", ops)) = split_insn(&lines[i]) else { continue };
+        let (a, b) = first_and_rest(ops);
+        let b = b.trim();
+        let (Some(an), Some(bn)) = (gpr_operand(a), gpr_operand(b)) else { continue };
+        if an == bn || an > 28 || bn > 30 || a.as_bytes()[0] != b.as_bytes()[0] {
+            continue;
+        }
+        // Up to four straight-line lines that leave A and B alone.
+        let mut j = i + 1;
+        let mut skipped = 0;
+        while j < n && skipped < 4 {
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            if info.uses & (1 << an) != 0 || !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call) {
+                break;
+            }
+            if info.defs & ((1 << an) | (1 << bn)) != 0 {
+                j = n;
+                break;
+            }
+            skipped += 1;
+            j += 1;
+        }
+        if j >= n || skipped >= 4 {
+            continue;
+        }
+        let Some(("csel", sops)) = split_insn(&lines[j]) else { continue };
+        let p: Vec<&str> = sops.split(',').map(str::trim).collect();
+        let [d, x, y, cond] = p[..] else { continue };
+        if d.as_bytes()[0] != a.as_bytes()[0] || x.as_bytes()[0] != a.as_bytes()[0] || y.as_bytes()[0] != a.as_bytes()[0]
+            || (live[j] & (1 << an) != 0 && gpr_operand(d) != Some(an)) {
+            continue;
+        }
+        let cc = match (gpr_operand(x), gpr_operand(y)) {
+            (Some(xn), Some(yn)) if xn == an && yn == bn => cond.to_string(),
+            (Some(xn), Some(yn)) if xn == bn && yn == an => match invert_condition(cond) {
+                Some(c) => c.to_string(),
+                None => continue,
+            },
+            _ => continue,
+        };
+        lines[j] = format!("    cneg {}, {}, {}", d, b, cc);
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
         changed = true;
@@ -6279,6 +6352,33 @@ mod tests {
         // Not for a carry test, nor when the flags are read again.
         assert!(peephole_optimize(body("b.hs", "")).contains("cmp x11, #0"));
         assert!(peephole_optimize(body("b.ne", "    cset x0, hi\n")).contains("cmp x11, #0"));
+    }
+
+    #[test]
+    fn test_neg_selected_against_its_source_is_cneg() {
+        let f = |sel: &str| ret_x0(&format!("    neg x0, x12\n    cmp x10, #0\n    {sel}\n    mov x0, x12\n"));
+        let result = peephole_optimize(f("csel x12, x0, x12, ne"));
+        assert!(result.contains("cneg") && result.contains(", x12, ne") && !result.contains("    neg "), "{}", result);
+        let result = peephole_optimize(f("csel x12, x12, x0, ne"));
+        assert!(result.contains("cneg") && result.contains(", x12, eq"), "{}", result);
+        // Not when the negation is read again, or B changes in between.
+        let body = "    neg x9, x12\n    cmp x10, #0\n    csel x13, x9, x12, ne\n    str x9, [x1]\n    mov x0, x13\n";
+        assert!(peephole_optimize(ret_x0(body)).contains("neg x9, x12"));
+        let body = "    neg x9, x12\n    add x12, x12, #1\n    cmp x10, #0\n    csel x13, x9, x12, ne\n    mov x0, x13\n";
+        assert!(peephole_optimize(ret_x0(body)).contains("neg x9, x12"));
+    }
+
+    #[test]
+    fn test_mask_test_moves_to_compare_past_own_flags() {
+        // Lines between that set and read flags of their own: the test goes
+        // where the compare was, the mask's register unchanged until there.
+        let body = "    and x13, x13, #128\n    tst x14, #128\n    mov x9, #1\n    csinv x14, x9, xzr, eq\n    cmp w13, #0\n    csel x12, x14, x12, ne\n    mov x0, x12\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(result.contains("tst w13, #128") && !result.contains("and x13") && !result.contains("cmp"), "{}", result);
+        assert!(result.find("csinv").unwrap() < result.find("tst w13").unwrap(), "{}", result);
+        // Not when those lines write the mask's source.
+        let body = "    and x9, x13, #128\n    tst x14, #128\n    csinv x13, x14, xzr, eq\n    cmp w9, #0\n    csel x12, x13, x12, ne\n    mov x0, x12\n";
+        assert!(peephole_optimize(ret_x0(body)).contains("cmp w9, #0"));
     }
 
     #[test]

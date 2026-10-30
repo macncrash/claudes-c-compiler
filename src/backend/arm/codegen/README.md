@@ -971,14 +971,21 @@ v1 and nothing between the copy and the call uses v22:
   the select's `xzr`/`wzr` operand (`m >= w ? m - w : 0`). `#1` and `#-1`
   as a `csel` source become `csinc` and `csinv` of the zero register, the
   condition inverted when the constant was the first source:
-  `mov x2, #-1; csel x14, x2, x9, ne` is `csinv x14, x9, xzr, eq`.
+  `mov x2, #-1; csel x14, x2, x9, ne` is `csinv x14, x9, xzr, eq`. A
+  `neg A, B` read only by a `csel` between A and B is a conditional
+  negation: `neg x0, x12; cmp x10, #0; csel x12, x0, x12, ne` is `cmp x10,
+  #0; cneg x12, x12, ne` (`if (desc) res = -res` in the sorter's
+  comparisons). With the test above moved to its compare, 13M fewer
+  instructions in speedtest (0.06%).
 - `and D, A, B` then `cmp D, #0`, D dead after, is `tst A, B`. The two set
   N, Z and V alike, but `cmp #0` sets C and `tst` clears it, so every read
   of these flags must test only N, Z or V: selects up to the next flag
   write, a call or `ret`, or a final branch whose paths read the flags no
   further, past `cbz`/`tbz` tests whose targets do not read them. Up to
-  four lines that leave D and the flags alone may come between (`and x14,
-  x14, #128; mov x9, #1; cmp x14, #0`). A 32-bit compare of a 64-bit `and`
+  four lines that leave D alone may come between (`and x14, x14, #128;
+  mov x9, #1; cmp x14, #0`); the test then takes the `and`'s place, or,
+  when those lines set or read flags of their own, the compare's, provided
+  they leave the `and`'s sources unchanged. A 32-bit compare of a 64-bit `and`
   becomes a 32-bit `tst` when B is a register or a mask within the low
   half; a 64-bit compare of a 32-bit `and` has N clear where the 32-bit
   `tst` copies bit 31, so it qualifies only when every read tests `eq` or
