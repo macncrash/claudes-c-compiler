@@ -606,7 +606,7 @@ pub fn peephole_optimize(asm: String) -> String {
 /// Most instructions in a copied dispatch block.
 const MAX_DISPATCH: usize = 16;
 /// Most dispatch copies per function.
-const MAX_DISPATCH_COPIES: usize = 64;
+const MAX_DISPATCH_COPIES: usize = 512;
 
 fn duplicate_switch_dispatch(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<LineKind>) {
     let n = lines.len();

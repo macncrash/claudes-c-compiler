@@ -1033,7 +1033,10 @@ copy of the block, so that every case ends in its own indirect branch. A
 single shared dispatch branch has to predict every transition and on Apple
 M-series cores mispredicts most of them; scalar-bench's bytecode interpreter
 ran twice as fast with copies (1.6x clang -O2, which keeps one shared
-branch). At most 64 copies are made per function. A copy's `br` has no
+branch). At most 512 copies are made per function: with 64, a third of
+sqlite3VdbeExec's 148M dispatches still went through the shared block,
+and copying into all of its cases ran speedtest 1% faster (0.17% fewer
+instructions, 0.24% more assembly). A copy's `br` has no
 table after it; liveness finds its table from the `adr` into the `br`'s
 register, three lines before.
 
