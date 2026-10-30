@@ -885,6 +885,14 @@ since renaming one would bring it back (a `mul` already fused into
   loads and stores (`ldr q0, [xT]`), with T dead or rewritten after them,
   folds into them: `ldur q0, [xB, #-16]`.
 
+- A byte (last written by `ldrb`, `uxtb` or a mask by 0xff) less k,
+  masked to a byte and compared with m just before a conditional branch,
+  needs no mask when k + m is below 256, the comparison made unsigned: X - k
+  then runs from -k to 255 - k, and a negative difference is above m both
+  as itself and masked. lengthFunc's ASCII test `(u8)(z[0]-1) < 0x80-1`
+  is `sub x13, x11, #1; cmp x13, #127; b.lo`; speedtest ran 0.12% fewer
+  instructions, lengthFunc 8% fewer than clang's.
+
 **10. Jump Threading** (local cleanup)
 
 A branch to a label whose block is only `b .L2` goes to `.L2` directly, and

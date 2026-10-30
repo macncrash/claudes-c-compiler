@@ -485,6 +485,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(zero_reg_into_select(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_neg_into_cneg(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_redundant_zero_extend(&mut lines, &mut kinds, n));
+            changed2 |= pass!(drop_byte_mask_before_compare(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_sxtw_of_nonnegative(&lines, &mut kinds, n));
             changed2 |= pass!(narrow_load_for_copy(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
@@ -2644,6 +2645,119 @@ fn drop_sxtw_of_nonnegative(lines: &[String], kinds: &mut [LineKind], n: usize) 
             }
         }
         prev = (*kind != LineKind::Label).then_some(i);
+    }
+    changed
+}
+
+/// A byte X (last written by `ldrb`/`uxtb` or a mask by 0xff) less k,
+/// masked to a byte and compared with m before a conditional branch:
+/// `sub xT, xX, #k; and xT, xT, #0xff; cmp wT, #m; b.lt L`, T dead after.
+/// With k + m below 256, X - k (from -k to 255 - k) compares with m as
+/// its masked value does once the comparison is unsigned (a negative X - k
+/// is above m both ways), so the mask goes: lengthFunc's ASCII scan, the
+/// test 1 <= c <= 127 as `(u8)(c - 1) < 127`.
+fn drop_byte_mask_before_compare(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    let next = |kinds: &[LineKind], mut k: usize| {
+        k += 1;
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
+    for i in 0..n {
+        let Some(("and", aops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = aops.split(',').map(str::trim).collect();
+        let [td, ts, mask] = p[..] else { continue };
+        let (Some(t), Some(t2)) = (gpr_operand(td), gpr_operand(ts)) else { continue };
+        if t != t2 || !td.starts_with('x') || !ts.starts_with('x') || parse_imm(mask) != Some(0xff) {
+            continue;
+        }
+        // The subtraction right before.
+        let mut s = i;
+        while s > 0 && kinds[s - 1] == LineKind::Nop {
+            s -= 1;
+        }
+        if s == 0 {
+            continue;
+        }
+        s -= 1;
+        let Some(("sub", sops)) = split_insn(&lines[s]) else { continue };
+        let q: Vec<&str> = sops.split(',').map(str::trim).collect();
+        let [sd, sx, kimm] = q[..] else { continue };
+        let (Some(sdn), Some(x), Some(k)) = (gpr_operand(sd), gpr_operand(sx), parse_imm(kimm)) else { continue };
+        if sdn != t || x == t || !sd.starts_with('x') || !(0..256).contains(&k) {
+            continue;
+        }
+        // X's last write, a few straight-line lines back, makes it a byte.
+        let mut b = s;
+        let mut seen = 0;
+        let byte = loop {
+            if b == 0 || seen == 8 {
+                break false;
+            }
+            b -= 1;
+            if kinds[b] == LineKind::Nop {
+                continue;
+            }
+            seen += 1;
+            if !matches!(classify_access(&lines[b], kinds[b]), Access::Write { .. } | Access::ReadOnly) {
+                break false;
+            }
+            let info = line_info(&lines[b], kinds[b], &|_| None);
+            if info.defs & (1 << x) == 0 {
+                continue;
+            }
+            let Some((m, o)) = split_insn(&lines[b]) else { break false };
+            let (d, rest) = first_and_rest(o);
+            break gpr_operand(d) == Some(x) && match m {
+                "ldrb" => !o.contains("]!") && !o.contains("],"),
+                "uxtb" => true,
+                "and" => parse_imm(last_operand(rest)).is_some_and(|v| (0..=0xff).contains(&v)),
+                _ => false,
+            };
+        };
+        if !byte {
+            continue;
+        }
+        // The compare and its branch.
+        let c = next(kinds, i);
+        if c >= n {
+            continue;
+        }
+        let Some(("cmp", cops)) = split_insn(&lines[c]) else { continue };
+        let (cr, cimm) = first_and_rest(cops);
+        let Some(m) = parse_imm(cimm.trim()) else { continue };
+        if gpr_operand(cr) != Some(t) || !cr.starts_with('w') || !(0..256).contains(&m) || k + m >= 256 || live[c] & (1 << t) != 0 {
+            continue;
+        }
+        let j = next(kinds, c);
+        if j >= n {
+            continue;
+        }
+        let branch = lines[j].clone();
+        let Some((bm, target)) = split_insn(&branch) else { continue };
+        let Some(cc) = bm.strip_prefix("b.") else { continue };
+        let ucc = match cc {
+            "lt" | "lo" => "lo",
+            "ge" | "hs" => "hs",
+            "le" | "ls" => "ls",
+            "gt" | "hi" => "hi",
+            "eq" | "ne" => cc,
+            _ => continue,
+        };
+        let target = target.trim();
+        let Some(tl) = (0..n).find(|&l| kinds[l] == LineKind::Label && label_name(&lines[l]) == Some(target)) else { continue };
+        if flags_read_from(lines, kinds, j + 1, n) || flags_read_from(lines, kinds, tl, n) {
+            continue;
+        }
+        lines[c] = format!("    cmp {}, #{}", xreg_name(t), m);
+        kinds[c] = classify_line(&lines[c]);
+        lines[j] = format!("    b.{} {}", ucc, target);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
     }
     changed
 }
@@ -6352,6 +6466,19 @@ mod tests {
         // Not for a carry test, nor when the flags are read again.
         assert!(peephole_optimize(body("b.hs", "")).contains("cmp x11, #0"));
         assert!(peephole_optimize(body("b.ne", "    cset x0, hi\n")).contains("cmp x11, #0"));
+    }
+
+    #[test]
+    fn test_byte_range_check_needs_no_mask() {
+        let f = |k: &str, m: &str, cc: &str| ret_x0(&format!("    ldrb w11, [x1]\n    sub x13, x11, #{k}\n    and x13, x13, #0xff\n    cmp w13, #{m}\n    b.{cc} .LBB1\n    mov x0, #1\n    ret\n.LBB1:\n    mov x0, #2\n"));
+        let result = peephole_optimize(f("1", "127", "lt"));
+        assert!(!result.contains("and x13") && result.contains("cmp x13, #127") && result.contains("b.lo .LBB1"), "{}", result);
+        assert!(peephole_optimize(f("1", "127", "ge")).contains("b.hs .LBB1"));
+        // Not when k + m reaches 256 (a negative difference would mask to
+        // at most m), nor for a value not known to be a byte.
+        assert!(peephole_optimize(f("200", "100", "lt")).contains("and x13, x13, #0xff"));
+        let body = "    ldrh w11, [x1]\n    sub x13, x11, #1\n    and x13, x13, #0xff\n    cmp w13, #127\n    b.lt .LBB1\n    mov x0, #1\n    ret\n.LBB1:\n    mov x0, #2\n";
+        assert!(peephole_optimize(ret_x0(body)).contains("and x13, x13, #0xff"));
     }
 
     #[test]
