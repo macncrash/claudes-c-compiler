@@ -954,6 +954,14 @@ v1 and nothing between the copy and the call uses v22:
   `s->match_start`. Up to four lines may come between, none of them a
   store, a branch, a label or a call, none writing B and none reading or
   writing the second load's register.
+- Likewise two `str`s of one width to `[B, #k]` and `[B, #k + size]`, in
+  either order, become an `stp` where the later one was, B a register or
+  sp (locals and stack buffers: sqlite3Int64ToText, sqlite3FpDecode). Up
+  to four lines may come between, none loading or storing (a load between
+  may read what the first store wrote), branching or calling, writing B or
+  the first store's register, or naming sp when B is sp. Registers
+  x19-x30 never pair, so the prologue's saves stay as they are. 1555
+  pairs in SQLite; speedtest ran 0.30% fewer instructions.
 - A GEP by a multiple of 4096 up to 0xfff000 is an add of the shifted
   immediate (`add x22, x12, #1, lsl #12`) rather than a movz and an add.
 - A call reads the GP argument registers its codegen names in a

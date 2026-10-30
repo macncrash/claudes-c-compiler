@@ -520,6 +520,9 @@ pub fn peephole_optimize(asm: String) -> String {
     if !skip.contains(&"pair_adjacent_loads") {
         pair_adjacent_loads(&mut lines, &mut kinds, n);
     }
+    if !skip.contains(&"pair_adjacent_stores") {
+        pair_adjacent_stores(&mut lines, &mut kinds, n);
+    }
 
     // Calls that return straight into the epilogue branch to the callee
     // after it instead, which can leave a leaf for Phase 4.
@@ -1899,6 +1902,81 @@ fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         } else {
             i += 1;
         }
+    }
+    changed
+}
+
+/// `str A, [B, #k]` and `str C, [B, #k + size]` (both x or both w, in
+/// either order, at most four lines apart) become `stp A, C, [B, #k]` at
+/// the later store: sqlite3Int64ToText and sqlite3FpDecode filling their
+/// stack buffers and locals. Nothing between may load or store, branch,
+/// call, write B, or write the earlier store's register, which the pair
+/// reads later than the store did. Registers x19-x30 stay out, so a
+/// prologue's saves never pair with the body's stores; k must fit stp's
+/// scaled 7-bit offset.
+fn pair_adjacent_stores(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    // (source, base, offset, size) of a plain `str` through a register or sp.
+    let parse = |line: &str| -> Option<(String, String, i64, i64)> {
+        let ("str", ops) = split_insn(line)? else { return None };
+        let (src, addr) = first_and_rest(ops);
+        let size = match src.chars().next()? { 'x' => 8, 'w' => 4, _ => return None };
+        if !matches!(src, "xzr" | "wzr") && gpr_operand(src).is_none_or(|r| r >= 19) {
+            return None;
+        }
+        let inner = addr.trim().strip_prefix('[')?.strip_suffix(']')?;
+        let (base, off) = match inner.split_once(',') {
+            Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i64>().ok()?),
+            None => (inner.trim(), 0),
+        };
+        if base != "sp" && !(base.starts_with('x') && gpr_operand(base).is_some()) {
+            return None;
+        }
+        Some((src.to_string(), base.to_string(), off, size))
+    };
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        if kinds[i] == LineKind::Nop {
+            i += 1;
+            continue;
+        }
+        let Some((a, b, k, size)) = parse(&lines[i]) else { i += 1; continue };
+        let reg_b = if b == "sp" { None } else { gpr_operand(&b) };
+        let reg_a = gpr_operand(&a);
+        let mut j = i + 1;
+        let mut skipped = 0;
+        let pair = loop {
+            while j < n && kinds[j] == LineKind::Nop {
+                j += 1;
+            }
+            if j >= n {
+                break None;
+            }
+            if let Some(p) = parse(&lines[j]).filter(|p| p.1 == b && p.3 == size && (p.2 == k + size || p.2 == k - size)) {
+                break Some(p);
+            }
+            let info = line_info(&lines[j], kinds[j], &|_| None);
+            let mem = split_insn(&lines[j]).is_none_or(|(m, _)| m.starts_with("st") || m.starts_with("ld"));
+            let writes = |r: Option<u8>| r.is_some_and(|r| info.defs & (1 << r) != 0);
+            if skipped == 4 || mem || !matches!(info.flow, Flow::Next) || info.uses == ALL_REGS
+                || matches!(kinds[j], LineKind::Label | LineKind::Call) || writes(reg_b) || writes(reg_a)
+                || (b == "sp" && lines[j].contains("sp")) {
+                break None;
+            }
+            skipped += 1;
+            j += 1;
+        };
+        let Some((c, _, k2, _)) = pair else { i += 1; continue };
+        let (lo, first, second) = if k2 > k { (k, &a, &c) } else { (k2, &c, &a) };
+        if lo % size != 0 || !(-64 * size..=63 * size).contains(&lo) {
+            i += 1;
+            continue;
+        }
+        lines[j] = format!("    stp {}, {}, [{}, #{}]", first, second, b, lo);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+        i = j + 1;
     }
     changed
 }
@@ -6589,6 +6667,28 @@ mod tests {
     }
 
     #[test]
+    fn test_neighbouring_stores_pair() {
+        let run = |body: &str| peephole_optimize(ret_x0(&format!("{body}    bl g\n    ldr x0, [sp, #48]\n    ldr x1, [sp, #56]\n    ldr x2, [x9]\n")));
+        // To the stack, in either order, with an unrelated line between.
+        let result = run("    str x3, [sp, #56]\n    add x4, x4, #1\n    str x5, [sp, #48]\n");
+        assert!(result.contains("stp x5, x3, [sp, #48]") && !result.contains("str x3"), "{}", result);
+        // Through a register, 32-bit, the zero register included.
+        let result = run("    str wzr, [x9, #8]\n    str w6, [x9, #12]\n");
+        assert!(result.contains("stp wzr, w6, [x9, #8]"), "{}", result);
+        // Not past a load or a write of the first register, nor a callee-saved
+        // register, nor an offset stp cannot encode.
+        let keep = [
+            "    str x3, [sp, #48]\n    ldr x7, [x8]\n    str x5, [sp, #56]\n",
+            "    str x3, [sp, #48]\n    add x3, x3, #1\n    str x5, [sp, #56]\n",
+            "    str x19, [sp, #48]\n    str x5, [sp, #56]\n",
+            "    str x3, [x9, #600]\n    str x5, [x9, #608]\n",
+        ];
+        for body in keep {
+            assert!(!run(body).contains("stp x3") && !run(body).contains("stp x19"), "{}", run(body));
+        }
+    }
+
+    #[test]
     fn test_big_endian_byte_pair_is_one_halfword_load() {
         let run = |body: &str| peephole_optimize(ret_x0(body));
         let result = run("    ldrb w11, [x10, #2]\n    ldrb w20, [x10, #3]\n    orr x20, x20, x11, lsl #8\n    str x20, [x1]\n");
@@ -6679,7 +6779,8 @@ mod tests {
         // Interleaved with another slot's pair, as a prologue leaves them.
         let body = "    str x2, [sp, #96]\n    str x3, [sp, #104]\n    str x2, [sp, #96]\n    str x3, [sp, #104]\n    bl g\n    ldr x0, [sp, #96]\n    ldr x1, [sp, #104]\n";
         let result = peephole_optimize(ret_x0(body));
-        assert!(result.matches("str x2, [sp, #96]").count() == 1 && result.matches("str x3, [sp, #104]").count() == 1, "{}", result);
+        // (The two left then pair.)
+        assert!(result.matches("stp x2, x3, [sp, #96]").count() == 1 && !result.contains("str x"), "{}", result);
         // A narrower store over part of the slot, or a read between, keeps it.
         let body = "    str x2, [sp, #96]\n    str w2, [sp, #96]\n    bl g\n    ldr x0, [sp, #96]\n";
         let result = peephole_optimize(ret_x0(body));
