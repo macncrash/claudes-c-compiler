@@ -220,6 +220,10 @@ pub struct ArmCodegen {
     pub(super) asm_fp_scratch_idx: usize,
     /// Register allocator: value ID -> physical callee-saved register.
     pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
+    /// Values known to be below 256 (byte loads and their zero extensions,
+    /// masks by at most 0xff): a jump table indexed by one covers every
+    /// value and needs no bounds check.
+    pub(super) byte_values: FxHashSet<u32>,
     /// Which callee-saved registers are actually used (for save/restore).
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved registers are stored.
@@ -330,6 +334,7 @@ impl ArmCodegen {
             asm_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),
+            byte_values: FxHashSet::default(),
             used_callee_saved: Vec::new(),
             callee_save_offset: 0,
             fp_reg_assignments: FxHashMap::default(),
@@ -2147,6 +2152,20 @@ impl ArchCodegen for ArmCodegen {
     fn emit_switch_jump_table(&mut self, val: &Operand, cases: &[(i64, BlockId)], default: &BlockId, _ty: IrType) {
         use crate::backend::traits::build_jump_table;
         let (table, min_val, range) = build_jump_table(cases, default);
+        // A byte index whose cases span at least 64 values: the table covers
+        // all 256 (the rest going to the default), indexed by the byte
+        // itself, so there is nothing to subtract or check. sqlite3VdbeExec's
+        // dispatch on pOp->opcode runs one compare and branch fewer per opcode.
+        let byte_index = min_val >= 0 && range >= 64 && min_val as usize + range <= 256
+            && matches!(val, Operand::Value(v) if self.byte_values.contains(&v.0));
+        let (table, min_val, range) = if byte_index {
+            let mut t = vec![*default; min_val as usize];
+            t.extend(table);
+            t.resize(256, *default);
+            (t, 0, 256)
+        } else {
+            (table, min_val, range)
+        };
         let table_label = self.state.fresh_label("jt");
         let default_label = default.as_label();
         // Index from the value's own register when nothing needs subtracting.
@@ -2171,16 +2190,18 @@ impl ArchCodegen for ArmCodegen {
                 self.state.emit("    sub x0, x0, x17");
             }
         }
-        if range <= 4095 {
-            self.state.emit_fmt(format_args!("    cmp {}, #{}", idx, range));
-        } else {
-            self.load_large_imm("x17", range as i64);
-            self.state.emit_fmt(format_args!("    cmp {}, x17", idx));
+        if !byte_index {
+            if range <= 4095 {
+                self.state.emit_fmt(format_args!("    cmp {}, #{}", idx, range));
+            } else {
+                self.load_large_imm("x17", range as i64);
+                self.state.emit_fmt(format_args!("    cmp {}, x17", idx));
+            }
+            let range_skip = self.state.fresh_label("range_ok");
+            self.state.emit_fmt(format_args!("    b.lo {}", range_skip));
+            self.state.emit_fmt(format_args!("    b {}", default_label));
+            self.state.emit_fmt(format_args!("{}:", range_skip));
         }
-        let range_skip = self.state.fresh_label("range_ok");
-        self.state.emit_fmt(format_args!("    b.lo {}", range_skip));
-        self.state.emit_fmt(format_args!("    b {}", default_label));
-        self.state.emit_fmt(format_args!("{}:", range_skip));
         // The table sits in the text section right after the `br`, where one
         // `adr` reaches it (an `adrp` + `add` pair into .rodata cost an extra
         // instruction on every dispatch).

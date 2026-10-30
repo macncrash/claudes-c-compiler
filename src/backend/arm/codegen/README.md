@@ -1037,6 +1037,16 @@ branch). At most 64 copies are made per function. A copy's `br` has no
 table after it; liveness finds its table from the `adr` into the `br`'s
 register, three lines before.
 
+The code generator checks the index against the table's size first
+(`cmp idx, #n; b.hs default`), except for a switch on a value known to be
+a byte (an unsigned byte load, a zero extension of one, a mask by at most
+0xff, or a copy of such a value) whose cases span at least 64 values below
+256: its table has all 256 entries, the ones no case names going to the
+default, and is indexed by the byte itself, with nothing subtracted or
+checked. sqlite3VdbeExec's dispatch on `pOp->opcode` runs two
+instructions fewer per opcode in each of its copies; speedtest ran 0.98%
+fewer instructions.
+
 **16. Single-Bit Tests** (last, after the copies)
 
 `and D, A, #2^b` then `cbz`/`cbnz D`, D dead after, is `tbz`/`tbnz A, #b`

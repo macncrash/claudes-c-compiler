@@ -1,6 +1,6 @@
 //! ArmCodegen: prologue/epilogue and stack frame operations.
 
-use crate::ir::reexports::{IrFunction, Instruction, Operand, Terminator, Value};
+use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Operand, Terminator, Value};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -267,6 +267,7 @@ impl ArmCodegen {
     // ---- emit_prologue ----
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
+        self.byte_values = byte_values(func);
         self.current_return_type = func.return_type;
         self.current_frame_size = frame_size;
         self.frame_base_offset = None;
@@ -659,6 +660,38 @@ impl ArmCodegen {
             IrType::I32 => "ldrsw",
             IrType::U32 | IrType::F32 => "ldr32",
             _ => "ldr64",
+        }
+    }
+}
+
+/// The values of `func` known to be below 256: unsigned byte loads, zero
+/// extensions of them, masks by a constant of at most 0xff, and copies of
+/// those (a phi's incoming values), to a fixed point.
+fn byte_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut bytes: FxHashSet<u32> = FxHashSet::default();
+    let is_byte = |bytes: &FxHashSet<u32>, op: &Operand| match op {
+        Operand::Value(v) => bytes.contains(&v.0),
+        Operand::Const(c) => c.to_i64().is_some_and(|k| (0..256).contains(&k)),
+    };
+    loop {
+        let before = bytes.len();
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            let dest = match inst {
+                Instruction::Load { dest, ty: IrType::U8, .. } => Some(dest),
+                Instruction::Cast { dest, src, from_ty, to_ty }
+                    if to_ty.is_integer() && (to_ty.size() > 1 || *to_ty == IrType::U8)
+                        && (*from_ty == IrType::U8 || (from_ty.is_unsigned() && is_byte(&bytes, src))) => Some(dest),
+                Instruction::BinOp { dest, op: IrBinOp::And, lhs, rhs, ty } if ty.is_integer()
+                    && (matches!(lhs, Operand::Const(_)) && is_byte(&bytes, lhs) || matches!(rhs, Operand::Const(_)) && is_byte(&bytes, rhs)) => Some(dest),
+                Instruction::Copy { dest, src } if is_byte(&bytes, src) => Some(dest),
+                _ => None,
+            };
+            if let Some(d) = dest {
+                bytes.insert(d.0);
+            }
+        }
+        if bytes.len() == before {
+            return bytes;
         }
     }
 }
