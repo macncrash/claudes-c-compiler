@@ -474,6 +474,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fold_index_into_mem(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_scale_into_mem(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_offset_into_global_addr(&mut lines, &mut kinds, n));
+            changed2 |= pass!(sink_compare_past_selects(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_cset_into_csel(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_cmp_sub_into_subs(&mut lines, &mut kinds, n));
             changed2 |= pass!(forward_copy_propagation(&mut lines, &mut kinds, n));
@@ -4178,6 +4179,94 @@ fn flags_dead_after(lines: &[String], kinds: &[LineKind], start: usize, n: usize
     false
 }
 
+/// `cmp A; cset C, cc`, then code that sets and reads flags of its own,
+/// then `cmp C, #0`: the compare and cset move down past that code, where
+/// fuse_cset_into_csel can read the compare's flags directly. In
+/// sqlite3VdbeExec: `cmp w13, w14; cset x14, gt; cmp w11, #0; csel x15,
+/// xzr, x11, lt; cmp x14, #0; csel x14, x15, x13, ne`. The code passed over
+/// may not write the compare's registers or C, read C, or read flags it did
+/// not set.
+fn sink_compare_past_selects(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some(("cmp", ops)) = split_insn(&lines[i]) else { continue };
+        let (creg, imm) = first_and_rest(ops);
+        let Some(c) = gpr_operand(creg).filter(|&c| c <= 28) else { continue };
+        if imm.trim() != "#0" {
+            continue;
+        }
+        // Back to the cset of C, over plain code.
+        let mut k = i;
+        let mut found = None;
+        while k > 0 {
+            k -= 1;
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            if !matches!(classify_access(&lines[k], kinds[k]), Access::Write { .. } | Access::ReadOnly) {
+                break;
+            }
+            let Some((m, o)) = split_insn(&lines[k]) else { break };
+            if m == "cset" && gpr_operand(first_and_rest(o).0) == Some(c) {
+                found = Some(k);
+                break;
+            }
+            if mentions_reg(&lines[k], c) {
+                break;
+            }
+        }
+        let Some(k) = found else { continue };
+        // The compare right before it.
+        let mut f = k;
+        while f > 0 && kinds[f - 1] == LineKind::Nop {
+            f -= 1;
+        }
+        if f == 0 {
+            continue;
+        }
+        f -= 1;
+        let Some(("cmp" | "cmn" | "tst", fops)) = split_insn(&lines[f]) else { continue };
+        let f_regs = regs_in(fops) | (1 << c);
+        // What lies between sets its own flags before reading any, and
+        // leaves the compare's registers and C alone.
+        let mut own_flags = false;
+        let mut ok = true;
+        for b in k + 1..i {
+            if kinds[b] == LineKind::Nop {
+                continue;
+            }
+            let Some((m, o)) = split_insn(&lines[b]) else { ok = false; break };
+            if reads_flags(m) && !own_flags {
+                ok = false;
+                break;
+            }
+            own_flags |= sets_flags(m);
+            let writes = match classify_access(&lines[b], kinds[b]) {
+                Access::Write { .. } if !m.starts_with("st") => regs_in(first_and_rest(o).0),
+                Access::ReadOnly => 0,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            };
+            if writes & f_regs != 0 || mentions_reg(&lines[b], c) {
+                ok = false;
+                break;
+            }
+        }
+        if !ok || !own_flags {
+            continue;
+        }
+        lines[f..i].rotate_left(k + 1 - f);
+        kinds[f..i].rotate_left(k + 1 - f);
+        changed = true;
+    }
+    changed
+}
+
 fn fuse_cset_into_csel(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     for i in 0..n {
@@ -5913,8 +6002,13 @@ mod tests {
 
     #[test]
     fn test_cset_condition_not_reused_across_flag_writes() {
-        // Another compare between the cset and the select.
+        // Another compare between the cset and the select: the first
+        // compare moves past it, to the select.
         let input = "    cmp w1, #2\n    cset x10, le\n    cmp w1, #7\n    cset x11, eq\n    cmp x10, #0\n    csel x0, x2, x11, ne\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("cmp w1, #7\n    cset x11, eq\n    cmp w1, #2") && result.contains("csel x0, x2, x11, le"), "{}", result);
+        // Not when that compare's code writes the first compare's register.
+        let input = "    cmp w1, #2\n    cset x10, le\n    cmp w2, #7\n    cset x1, eq\n    cmp x10, #0\n    csel x0, x2, x1, ne\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("cmp x10, #0"), "{}", result);
         // A later reader of the flags from `cmp x10, #0`.
@@ -6154,6 +6248,17 @@ mod tests {
         let past = |tail: &str| format!(".type f, %function\nf:\n    and x14, x14, #128\n    cmp x14, #0\n    cbz x3, .LBB2\n    csel x0, x0, x1, ne\n    ret\n.LBB2:\n{tail}    ret\n.size f, .-f\n");
         assert!(peephole_optimize(past("    mov x0, #3\n")).contains("tst x14, #128"));
         assert!(peephole_optimize(past("    cset x0, hs\n")).contains("cmp x14, #0"));
+    }
+
+    #[test]
+    fn test_compare_sinks_past_other_select_to_its_reader() {
+        let f = |between: &str| ret_x0(&format!("    cmp w13, w14\n    cset x14, gt\n{between}    cmp x14, #0\n    csel x14, x15, x13, ne\n    str x14, [x1]\n    str x15, [x2]\n"));
+        let result = peephole_optimize(f("    cmp w11, #0\n    csel x15, xzr, x11, lt\n"));
+        assert!(!result.contains("cset") && result.contains("csel x14, x15, x13, gt"), "{}", result);
+        assert!(result.find("csel x15").unwrap() < result.find("cmp w13, w14").unwrap(), "{}", result);
+        // Not past code writing the compare's registers, or reading its flags.
+        assert!(peephole_optimize(f("    cmp w11, #0\n    csel x13, xzr, x11, lt\n")).contains("cset x14, gt"));
+        assert!(peephole_optimize(f("    csel x15, xzr, x11, lt\n    cmp w11, #0\n")).contains("cset x14, gt"));
     }
 
     #[test]

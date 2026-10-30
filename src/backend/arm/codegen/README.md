@@ -975,6 +975,15 @@ v1 and nothing between the copy and the call uses v22:
   (`res = a[0] & 0x80 ? -1 : +1` when the sign bits differ) the block that
   settles a differing byte goes from 14 instructions to 10; speedtest ran
   0.19% fewer.
+- `cset C, cc` re-tested by `cmp C, #0` before an `ne`/`eq` select is the
+  select on `cc` directly. When code that sets and reads flags of its own
+  comes between (another select, computed before the one that uses C), the
+  compare and the `cset` first move down past it, provided it leaves the
+  compare's registers and C alone and reads no flags it did not set:
+  sqlite3VdbeExec's `cmp w13, w14; cset x14, gt; cmp w11, #0; csel x15,
+  xzr, x11, lt; cmp x14, #0; csel x14, x15, x13, ne` becomes `cmp w11, #0;
+  csel x15, xzr, x11, lt; cmp w13, w14; csel x14, x15, x13, gt`. Speedtest
+  ran 0.20% fewer instructions (block counts, no function slower).
 
 **14. Tail Calls and Leaf Frame Records** (after the local cleanup)
 
