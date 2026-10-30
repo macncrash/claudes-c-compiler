@@ -487,6 +487,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(drop_redundant_zero_extend(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_byte_mask_before_compare(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_mask_into_compare(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_bit_test_into_extract(&mut lines, &mut kinds, n));
+            changed2 |= pass!(drop_mask_of_narrow_value(&mut lines, &mut kinds, n));
             changed2 |= pass!(drop_sxtw_of_nonnegative(&lines, &mut kinds, n));
             changed2 |= pass!(narrow_load_for_copy(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
@@ -2942,6 +2944,137 @@ fn fold_mask_into_compare(lines: &mut [String], kinds: &mut [LineKind], n: usize
         }
         kinds[c] = classify_line(&lines[c]);
         kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `tst R, #2^k` whose one reader is the `cset D, ne` right after: D is bit
+/// k of R, `ubfx wD, wR, #k, #1` (`and wD, wR, #1` for bit 0). getPageNormal's
+/// `noContent = (flags & PAGER_GET_NOCONTENT)!=0`.
+fn fold_bit_test_into_extract(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let Some(("tst", tops)) = split_insn(&lines[i]) else { continue };
+        let (r, imm) = first_and_rest(tops);
+        let Some(bit) = parse_imm(imm.trim()).filter(|b| b.is_power_of_two()) else { continue };
+        let Some(rn) = gpr_operand(r) else { continue };
+        let mut c = i + 1;
+        while c < n && kinds[c] == LineKind::Nop {
+            c += 1;
+        }
+        if c >= n {
+            continue;
+        }
+        let Some(("cset", cops)) = split_insn(&lines[c]) else { continue };
+        let (d, cc) = first_and_rest(cops);
+        let Some(dn) = gpr_operand(d) else { continue };
+        if cc.trim() != "ne" || !flags_dead_after(lines, kinds, c + 1, n) {
+            continue;
+        }
+        let k = bit.trailing_zeros();
+        let (dd, rr) = if r.starts_with('w') { (wreg_name(dn), wreg_name(rn)) } else { (xreg_name(dn), xreg_name(rn)) };
+        lines[i] = if k == 0 { format!("    and {}, {}, #1", dd, rr) } else { format!("    ubfx {}, {}, #{}, #1", dd, rr, k) };
+        kinds[i] = classify_line(&lines[i]);
+        kinds[c] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// Bits a line that writes R (its first operand) may leave set in R, when
+/// that is narrower than the register: a byte or halfword load or
+/// extension, `cset`, a mask, a bitfield extract, and any 32-bit write.
+fn narrow_bits(line: &str, r: u8) -> Option<u64> {
+    let (m, ops) = split_insn(line)?;
+    if m.starts_with("st") {
+        return None;
+    }
+    let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+    if gpr_operand(p[0]) != Some(r) {
+        return None;
+    }
+    let word = if p[0].starts_with('w') { 0xffff_ffff } else { u64::MAX };
+    let bits = match (m, &p[..]) {
+        ("ldrb" | "ldurb" | "uxtb", _) => 0xff,
+        ("ldrh" | "ldurh" | "uxth", _) => 0xffff,
+        ("cset", _) => 1,
+        ("and", [_, _, k]) => parse_imm(k).unwrap_or(u64::MAX),
+        ("ubfx", [_, _, _, w]) => parse_imm(w).filter(|&w| w < 64).map_or(u64::MAX, |w| (1 << w) - 1),
+        _ => u64::MAX,
+    };
+    Some(bits & word).filter(|&b| b != u64::MAX)
+}
+
+/// A zero-extending mask (`and D, S, #M`, `uxtb`, `uxth`, `mov wD, wS`) of
+/// a value whose straight-line def leaves no bit outside M set: `and x10,
+/// x10, #15; and x10, x10, #0xff`, or `cset x0, ne; and x26, x0, #0xff`.
+/// The mask goes when D is S; else the def writes D instead when S dies at
+/// the mask and nothing between names either; else it is a copy.
+fn drop_mask_of_narrow_value(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    for i in 0..n {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let Some((m, ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let (dd, ss, mask) = match (m, &p[..]) {
+            ("and", [d, s, k]) => match parse_imm(k) {
+                Some(k) => (*d, *s, if d.starts_with('w') { k & 0xffff_ffff } else { k }),
+                None => continue,
+            },
+            ("uxtb", [d, s]) => (*d, *s, 0xff),
+            ("uxth", [d, s]) => (*d, *s, 0xffff),
+            ("mov", [d, s]) if d.starts_with('w') && s.starts_with('w') => (*d, *s, 0xffff_ffff),
+            _ => continue,
+        };
+        let (Some(d), Some(s)) = (gpr_operand(dd), gpr_operand(ss)) else { continue };
+        if d > 28 || s > 28 {
+            continue;
+        }
+        // S's def, back through straight-line code that leaves S alone.
+        let mut between: RegSet = 0;
+        let mut def = None;
+        let mut k = i;
+        let mut seen = 0;
+        while k > 0 && seen < 8 {
+            k -= 1;
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            let info = line_info(&lines[k], kinds[k], &|_| None);
+            if !matches!(info.flow, Flow::Next) || info.uses == ALL_REGS || matches!(kinds[k], LineKind::Label | LineKind::Call) {
+                break;
+            }
+            if info.defs & (1 << s) != 0 {
+                def = Some(k);
+                break;
+            }
+            between |= info.uses | info.defs;
+            seen += 1;
+        }
+        let Some(k) = def else { continue };
+        if narrow_bits(&lines[k], s).is_none_or(|b| b & !mask != 0) {
+            continue;
+        }
+        if d == s {
+            kinds[i] = LineKind::Nop;
+        } else {
+            let live = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+            let (km, kops) = split_insn(&lines[k]).unwrap();
+            let (kd, krest) = first_and_rest(kops);
+            if live[i] & (1 << s) == 0 && between & ((1 << s) | (1 << d)) == 0 {
+                let name = if kd.starts_with('w') { wreg_name(d) } else { xreg_name(d) };
+                lines[k] = format!("    {} {},{}", km, name, krest);
+                kinds[k] = classify_line(&lines[k]);
+                kinds[i] = LineKind::Nop;
+            } else {
+                lines[i] = format!("    mov {}, {}", xreg_name(d), xreg_name(s));
+                kinds[i] = classify_line(&lines[i]);
+            }
+        }
         changed = true;
     }
     changed
@@ -6793,6 +6926,35 @@ mod tests {
         // Not when the masked value is read again.
         let body = "    and x10, x10, #0xffff\n    cmp w13, w10\n    b.hi .LBB1\n    mov x0, x10\n    ret\n.LBB1:\n    mov x0, #2\n";
         assert!(peephole_optimize(ret_x0(body)).contains("and x10, x10, #0xffff"));
+    }
+
+    #[test]
+    fn test_bit_test_set_is_an_extract() {
+        let run = |body: &str| peephole_optimize(ret_x0(&format!("{body}    str x0, [x9]\n    str x26, [x9, #8]\n")));
+        let result = run("    tst w26, #4\n    cset x0, ne\n");
+        assert!(result.contains("ubfx w0, w26, #2, #1") && !result.contains("cset"), "{}", result);
+        // Bit 0, then masked to a byte it already fits: one and, written
+        // straight to the mask's register.
+        let result = run("    tst w26, #1\n    cset x0, ne\n    and x26, x0, #0xff\n    mov x0, #3\n");
+        assert!(result.contains("and w26, w26, #1") && !result.contains("0xff") && !result.contains("cset"), "{}", result);
+        // Not for eq, nor when the flags are read again.
+        assert!(run("    tst w26, #4\n    cset x0, eq\n").contains("cset x0, eq"));
+        assert!(run("    tst w26, #4\n    cset x0, ne\n    csel x1, x2, x3, ne\n    str x1, [x9, #16]\n").contains("cset x0, ne"));
+    }
+
+    #[test]
+    fn test_mask_of_narrow_value_goes() {
+        let run = |body: &str| peephole_optimize(ret_x0(&format!("{body}    str x10, [x9]\n    str x11, [x9, #8]\n")));
+        let result = run("    ldrb w10, [x1]\n    and x10, x10, #15\n    and x10, x10, #0xff\n");
+        assert!(result.contains("and x10, x10, #15") && !result.contains("0xff"), "{}", result);
+        let result = run("    ldrh w11, [x1]\n    uxth w10, w11\n");
+        assert!(!result.contains("uxth"), "{}", result);
+        // Bits the mask clears are kept: and #0x1ff then #0xff, a 32-bit
+        // load under a halfword mask.
+        assert!(run("    ldrh w10, [x1]\n    and x10, x10, #0x1ff\n    and x10, x10, #0xff\n").contains("#0xff"));
+        assert!(run("    ldr w10, [x1]\n    and x10, x10, #0xffff\n").contains("#0xffff"));
+        // Not past a label.
+        assert!(run("    cbz x2, .LBB3\n    ldrb w10, [x1]\n.LBB3:\n    and x10, x10, #0xff\n").contains("#0xff"));
     }
 
     #[test]

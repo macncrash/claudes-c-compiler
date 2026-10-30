@@ -909,6 +909,15 @@ since renaming one would bring it back (a `mul` already fused into
   reading the flags (read on neither path after) mirrors its condition.
   sqlite3BtreeNext's `++pCur->ix >= pPage->nCell`; speedtest ran 0.10%
   fewer instructions, sqlite3BtreeNext level with clang.
+- `tst R, #2^k; cset D, ne`, the flags read by nothing after, is bit k of
+  R: `ubfx wD, wR, #k, #1` (`and wD, wR, #1` for bit 0). A zero-extending
+  mask (`and #M`, `uxtb`, `uxth`, `mov wD, wS`) of a value whose
+  straight-line def already leaves no bit outside M set (a byte or
+  halfword load or extension, `cset`, a narrower mask, `ubfx`, any 32-bit
+  write under `mov wD, wS`) goes; the def writes D itself when S dies at
+  the mask. getPageNormal's `(flags & PAGER_GET_NOCONTENT)!=0` into a u8,
+  three instructions to one, and `(z[i] & 15)` kept in a u8 in
+  jsonTranslateTextToBlob; speedtest ran 0.11% fewer instructions.
 
 **10. Jump Threading** (local cleanup)
 
