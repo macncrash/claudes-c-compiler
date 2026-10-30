@@ -96,7 +96,8 @@ pub(super) fn collect_used_values(func: &IrFunction) -> FxHashSet<u32> {
 
 /// Find param allocas that can safely skip stack slot allocation.
 ///
-/// A param alloca is dead when BOTH conditions hold:
+/// A param alloca is dead when nothing references it and nothing reads the
+/// parameter (no ParamRef: an unused parameter), or when BOTH of these hold:
 /// 1. No instruction references the alloca value (mem2reg promoted it away)
 /// 2. The corresponding ParamRef dest IS assigned to one of `prestore_regs`
 ///    (callee-saved registers, plus on AArch64 caller-saved registers that are
@@ -132,6 +133,12 @@ pub(super) fn find_dead_param_allocas(
 
     for (idx, pv) in func.param_alloca_values.iter().enumerate() {
         if !used_values.contains(&pv.0) {
+            // A parameter nothing reads at all (no ParamRef left, as for
+            // sqlite3BtreeNext's `flags`) needs neither a slot nor a store.
+            if paramref_dests.get(idx).copied().flatten().is_none() {
+                dead.insert(pv.0);
+                continue;
+            }
             // Only eliminate the alloca if the ParamRef dest is assigned to a
             // pre-storable register. Caller-saved registers on most targets
             // overlap with ABI argument registers, so using them would clobber
