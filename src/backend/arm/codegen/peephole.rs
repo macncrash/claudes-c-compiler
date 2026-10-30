@@ -494,6 +494,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_overflow_test_into_flags(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fold_sign_into_halving(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_byte_pair_into_halfword(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_rev_into_rev16(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_signed_load_mask(&mut lines, &mut kinds, n));
@@ -577,6 +579,10 @@ pub fn peephole_optimize(asm: String) -> String {
     let (mut lines, mut kinds) = (lines, kinds);
     if !skip.contains(&"fuse_bit_test_into_tbz") {
         fuse_bit_test_into_tbz(&mut lines, &mut kinds, n);
+    }
+    // Again for the overflow tests the line above made a tbz/tbnz.
+    if !skip.contains(&"fuse_overflow_test_into_flags") {
+        fuse_overflow_test_into_flags(&mut lines, &mut kinds, n);
     }
 
     // Build result, filtering out Nop lines
@@ -3456,12 +3462,14 @@ fn fold_zero_extension_into_user(lines: &mut [String], kinds: &mut [LineKind], n
 
 /// `lsr T, S, #k` immediately followed by `and D, T, #(2^w - 1)` (T dead
 /// afterwards unless it is D) becomes `ubfx D, S, #k, #w`: a bit-field
-/// extraction (`(m >> 6) & 63`) in one instruction.
+/// extraction (`(m >> 6) & 63`) in one instruction. An `asr` the same,
+/// as the field lies below the sign copies it brings in (jsonTranslateBlobToText's
+/// `(x >> 4) & 0xff` of a signed value).
 fn fuse_shift_mask_into_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
     for i in 0..n {
-        let Some(("lsr", ops)) = split_insn(&lines[i]) else { continue };
+        let Some(("lsr" | "asr", ops)) = split_insn(&lines[i]) else { continue };
         let p: Vec<&str> = ops.split(',').map(str::trim).collect();
         let [t, s, k] = p[..] else { continue };
         let (Some(tr), Some(sr), Some(k)) = (gpr_operand(t), gpr_operand(s), parse_imm(k)) else { continue };
@@ -3497,6 +3505,150 @@ fn fuse_shift_mask_into_ubfx(lines: &mut [String], kinds: &mut [LineKind], n: us
         // clears the upper half), so 32-bit copies of S can feed it.
         let (d, src) = if k + w <= 32 { (wreg_name(dr), wreg_name(sr)) } else { (xreg_name(dr), xreg_name(sr)) };
         lines[j] = format!("    ubfx {}, {}, #{}, #{}", d, src, k, w);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// The signed overflow test of an add or subtract, branched on, as the
+/// overflow builtins lower it, six lines in a row:
+///   add S, A, B; eor P, S, A; eor Q, S, B; and T, P, Q; asr T, T, #63; tbnz wT, #0, L
+///   sub S, A, B; eor P, A, B; eor Q, S, A; ...
+/// (the eors either way round) is the add or subtract's own overflow flag:
+/// `adds S, A, B; b.vs L` (`b.vc` for tbz). P, Q and T must die there and
+/// nothing after read the flags. sqlite3AddInt64 in OP_Add.
+fn fuse_overflow_test_into_flags(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    for i in 0..n {
+        let Some((op @ ("add" | "sub"), ops)) = split_insn(&lines[i]) else { continue };
+        let regs = |ops: &str| -> Option<Vec<u8>> { ops.split(',').map(|o| gpr_operand(o.trim())).collect() };
+        let Some(r) = regs(ops) else { continue };
+        let [s, a, b] = r[..] else { continue };
+        let x = ops.trim_start().starts_with('x');
+        if s == a || s == b || a == b || s > 28 {
+            continue;
+        }
+        // The five lines after, Nops aside.
+        let mut at = [0usize; 5];
+        let mut k = i;
+        for slot in at.iter_mut() {
+            k += 1;
+            while k < n && kinds[k] == LineKind::Nop {
+                k += 1;
+            }
+            *slot = k.min(n);
+        }
+        if at[3] >= n {
+            continue;
+        }
+        let insn = |k: usize| split_insn(&lines[k]).filter(|(_, o)| o.trim_start().starts_with(if x { 'x' } else { 'w' }));
+        let (Some(("eor", e1)), Some(("eor", e2)), Some(("and", an)), Some((mn @ ("asr" | "ubfx" | "lsr"), sh))) =
+            (insn(at[0]), insn(at[1]), insn(at[2]), insn(at[3])) else { continue };
+        let (Some(e1), Some(e2), Some(an)) = (regs(e1), regs(e2), regs(an)) else { continue };
+        let (&[p, p1, p2], &[q, q1, q2], &[t, t1, t2]) = (&e1[..], &e2[..], &an[..]) else { continue };
+        let pair = |u: u8, v: u8, (y, z): (u8, u8)| (u, v) == (y, z) || (u, v) == (z, y);
+        // Each eor reads S, A and B as the add left them.
+        if q1 == p || q2 == p || p == q {
+            continue;
+        }
+        let want = if op == "add" { [(s, a), (s, b)] } else { [(a, b), (s, a)] };
+        let fits = (pair(p1, p2, want[0]) && pair(q1, q2, want[1])) || (pair(p1, p2, want[1]) && pair(q1, q2, want[0]));
+        if !fits || !pair(t1, t2, (p, q)) {
+            continue;
+        }
+        let top = if x { "#63" } else { "#31" };
+        // The sign bit of T: kept in place (asr) for a tbz/tbnz of bit 0, or
+        // extracted to D (ubfx #63, #1 or lsr #63) for a cbz/cbnz or a value.
+        let shift = sh.split(',').map(str::trim).collect::<Vec<_>>();
+        let (d, test) = match (mn, &shift[..]) {
+            ("asr", &[dd, _, k]) if gpr_operand(dd) == Some(t) && k == top => (t, ["tbz", "tbnz"]),
+            ("ubfx", &[dd, _, k, "#1"]) | ("lsr", &[dd, _, k]) if k == top => match gpr_operand(dd) {
+                Some(d) => (d, ["cbz", "cbnz"]),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if gpr_operand(shift[1]) != Some(t) {
+            continue;
+        }
+        let head = format!("    {}s {}", op, ops.trim());
+        let live = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+        let temps: RegSet = 1 << p | 1 << q | 1 << t;
+        let branch = lines.get(at[4]).and_then(|l| split_insn(l)).and_then(|(m, o)| {
+            let tp: Vec<&str> = o.split(',').map(str::trim).collect();
+            let target = match (&tp[..], test[0] == "tbz") {
+                (&[r, "#0", target], true) | (&[r, target], false) if gpr_operand(r) == Some(d) => target,
+                _ => return None,
+            };
+            let cc = if m == test[1] { "vs" } else if m == test[0] { "vc" } else { return None };
+            (live[at[4]] & (temps | 1 << d) == 0 && flags_dead_after(lines, kinds, at[4] + 1, n))
+                .then(|| format!("    b.{} {}", cc, target))
+        });
+        let last = match branch {
+            Some(b) => {
+                lines[at[4]] = b;
+                at[4]
+            }
+            // The flag as a value: cset.
+            None if mn != "asr" && live[at[3]] & temps & !(1 << d) == 0 && flags_dead_after(lines, kinds, at[3] + 1, n) => {
+                lines[at[3]] = format!("    cset {}, vs", wreg_name(d));
+                at[3]
+            }
+            None => continue,
+        };
+        kinds[last] = classify_line(&lines[last]);
+        lines[i] = head;
+        kinds[i] = classify_line(&lines[i]);
+        for &k in &at[..4] {
+            if k != last {
+                kinds[k] = LineKind::Nop;
+            }
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// `asr T, A, #63; add D, A, T, lsr #63` (T dead after unless it is D), the
+/// rounding of a signed halving, adds A's sign bit, which is `A, lsr #63`
+/// itself: `add D, A, A, lsr #63` (32-bit: #31). vdbeRecordCompareString's
+/// `(serial_type - 12) / 2`.
+fn fold_sign_into_halving(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    for i in 0..n {
+        let Some(("asr", ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [tt, aa, k] = p[..] else { continue };
+        let top = if tt.starts_with('x') { "#63" } else { "#31" };
+        let (Some(t), Some(a)) = (gpr_operand(tt), gpr_operand(aa)) else { continue };
+        if k != top || t == a || tt.starts_with('x') != aa.starts_with('x') {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some(("add", aops)) = split_insn(&lines[j]) else { continue };
+        let q: Vec<&str> = aops.split(',').map(str::trim).collect();
+        let [d, x, y, sh] = q[..] else { continue };
+        let Some(dr) = gpr_operand(d) else { continue };
+        if gpr_operand(x) != Some(a) || x != aa || y != tt || sh != format!("lsr {}", top) {
+            continue;
+        }
+        if dr != t {
+            let live = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+            if live[j] & (1 << t) != 0 {
+                continue;
+            }
+        }
+        lines[j] = format!("    add {}, {}, {}, {}", d, x, x, sh);
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
         changed = true;
@@ -6926,6 +7078,49 @@ mod tests {
         // Not when the masked value is read again.
         let body = "    and x10, x10, #0xffff\n    cmp w13, w10\n    b.hi .LBB1\n    mov x0, x10\n    ret\n.LBB1:\n    mov x0, #2\n";
         assert!(peephole_optimize(ret_x0(body)).contains("and x10, x10, #0xffff"));
+    }
+
+    #[test]
+    fn test_overflow_test_is_the_flag() {
+        let run = |body: &str| peephole_optimize(ret_x0(&format!("{body}    str x13, [x20, #16]\n    mov x0, #0\n    ret\n.LBB9:\n    mov x0, #1\n")));
+        let add = "    add x13, x12, x11\n    eor x12, x13, x12\n    eor x11, x13, x11\n    and x12, x12, x11\n    asr x12, x12, #63\n    tbnz w12, #0, .LBB9\n";
+        let result = run(add);
+        assert!(result.contains("adds x13, x12, x11") && result.contains("b.vs .LBB9") && !result.contains("eor") && !result.contains("asr"), "{}", result);
+        let sub = "    sub x13, x12, x11\n    eor x11, x12, x11\n    eor x10, x13, x12\n    and x11, x11, x10\n    asr x11, x11, #63\n    tbz w11, #0, .LBB9\n";
+        let result = run(sub);
+        assert!(result.contains("subs x13, x12, x11") && result.contains("b.vc .LBB9") && !result.contains("eor"), "{}", result);
+        // 32-bit.
+        let result = run("    add w13, w12, w11\n    eor w12, w13, w12\n    eor w11, w13, w11\n    and w12, w12, w11\n    asr w12, w12, #31\n    tbnz w12, #0, .LBB9\n");
+        assert!(result.contains("adds w13, w12, w11") && result.contains("b.vs"), "{}", result);
+        // The sign bit extracted, then branched on or kept as the value.
+        let result = run("    add x13, x12, x11\n    eor x12, x13, x12\n    eor x11, x13, x11\n    and x12, x12, x11\n    ubfx x12, x12, #63, #1\n    cbz w12, .LBB9\n");
+        assert!(result.contains("adds x13, x12, x11") && result.contains("b.vc .LBB9") && !result.contains("ubfx"), "{}", result);
+        let result = run("    add x13, x12, x11\n    eor x12, x13, x12\n    eor x11, x13, x11\n    and x12, x12, x11\n    ubfx x14, x12, #63, #1\n    str x14, [x20]\n");
+        assert!(result.contains("adds x13, x12, x11") && result.contains("cset w14, vs") && !result.contains("eor"), "{}", result);
+        // Not a subtract's add-shaped test, nor when the second eor reads the
+        // first's result, nor with an intermediate still read.
+        let keep = [
+            "    sub x13, x12, x11\n    eor x12, x13, x12\n    eor x11, x13, x11\n    and x12, x12, x11\n    asr x12, x12, #63\n    tbnz w12, #0, .LBB9\n",
+            "    add x13, x12, x11\n    eor x11, x13, x11\n    eor x10, x13, x11\n    and x12, x11, x10\n    asr x12, x12, #63\n    tbnz w12, #0, .LBB9\n",
+            "    add x13, x12, x11\n    eor x12, x13, x12\n    eor x11, x13, x11\n    and x12, x12, x11\n    asr x12, x12, #63\n    tbnz w12, #0, .LBB9\n    str x11, [x20]\n",
+        ];
+        for body in keep {
+            assert!(!run(body).contains("b.v"), "{}", run(body));
+        }
+    }
+
+    #[test]
+    fn test_halving_rounds_with_the_sign_bit() {
+        let result = peephole_optimize(ret_x0("    asr x12, x0, #63\n    add x0, x0, x12, lsr #63\n    asr x0, x0, #1\n"));
+        assert!(result.contains("add x0, x0, x0, lsr #63") && !result.contains("#63\n    add"), "{}", result);
+        let result = peephole_optimize(ret_x0("    asr w12, w0, #31\n    add w0, w0, w12, lsr #31\n    asr w0, w0, #1\n"));
+        assert!(result.contains("add w0, w0, w0, lsr #31"), "{}", result);
+        // Not when the sign mask is read again.
+        let result = peephole_optimize(ret_x0("    asr x12, x0, #63\n    add x0, x0, x12, lsr #63\n    str x12, [x1]\n"));
+        assert!(result.contains("asr x12, x0, #63"), "{}", result);
+        // An arithmetic shift then a low mask is a field extract.
+        let result = peephole_optimize(ret_x0("    asr x13, x13, #4\n    and x0, x13, #0xff\n"));
+        assert!(result.contains("ubfx w0, w13, #4, #8"), "{}", result);
     }
 
     #[test]

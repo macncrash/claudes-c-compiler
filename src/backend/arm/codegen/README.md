@@ -918,6 +918,15 @@ since renaming one would bring it back (a `mul` already fused into
   the mask. getPageNormal's `(flags & PAGER_GET_NOCONTENT)!=0` into a u8,
   three instructions to one, and `(z[i] & 15)` kept in a u8 in
   jsonTranslateTextToBlob; speedtest ran 0.11% fewer instructions.
+- The overflow builtins' signed test, `add S, A, B; eor P, S, A; eor Q,
+  S, B; and T, P, Q` (a subtract's `eor P, A, B; eor Q, S, A`) then the
+  sign bit of T branched on (`asr #63; tbnz #0`, `ubfx #63, #1; cbnz`) or
+  kept (`ubfx`/`lsr #63`), is the add's own overflow flag: `adds S, A, B`
+  then `b.vs`/`b.vc` or `cset D, vs`, six instructions to two
+  (sqlite3AddInt64 in OP_Add, sumStep). Also: a signed halving's rounding
+  `asr T, A, #63; add D, A, T, lsr #63` is `add D, A, A, lsr #63`, and an
+  `asr` before a low mask extracts a field like `lsr` (`ubfx`).
+  speedtest ran 0.24% fewer instructions.
 
 **10. Jump Threading** (local cleanup)
 
