@@ -1834,8 +1834,10 @@ fn fuse_cmp_sub_into_subs(lines: &mut [String], kinds: &mut [LineKind], n: usize
 
 /// `ldr A, [B, #k]` then `ldr C, [B, #k + size]` (both x or both w, at most
 /// four lines apart, see below) become `ldp A, C, [B, #k]`: deflate's `s->prev` and
-/// `s->head`, `s->strstart` and `s->match_start`. Neither A nor C may be
-/// B, nor A be C; k must fit ldp's scaled 7-bit offset.
+/// `s->head`, `s->strstart` and `s->match_start`. The second may load the
+/// lower word (sqlite3BtreeIndexMoveto's `pPage->aDataEnd` and `aCellIdx`), and
+/// B may be sp for loads into x0-x18. Neither A nor C may be B, nor A be C;
+/// the lower offset must fit ldp's scaled 7-bit offset.
 fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     // (dest, base, offset, size) of a plain `ldr` through a register.
     let parse = |line: &str| -> Option<(String, String, i64, i64)> {
@@ -1848,7 +1850,10 @@ fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
             Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i64>().ok()?),
             None => (inner.trim(), 0),
         };
-        if !base.starts_with('x') || gpr_operand(base).is_none() {
+        // From the stack only into registers no prologue saves, so that
+        // a pair never looks like a restore before an epilogue.
+        let stack = base == "sp" && gpr_operand(dest).is_some_and(|r| r < 19);
+        if !stack && (!base.starts_with('x') || gpr_operand(base).is_none()) {
             return None;
         }
         Some((dest.to_string(), base.to_string(), off, size))
@@ -1864,7 +1869,7 @@ fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         // The partner may come up to four lines later, past lines that
         // neither store, nor write B, nor touch its destination (the
         // braided CRC loads each word next to the eor of the one before).
-        let (reg_b, mut between) = (gpr_operand(&b).unwrap_or(255), 0u64);
+        let (reg_b, mut between) = (if b == "sp" { 255 } else { gpr_operand(&b).unwrap_or(255) }, 0u64);
         let mut j = i + 1;
         let mut skipped = 0;
         let pair = loop {
@@ -1874,13 +1879,13 @@ fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
             if j >= n {
                 break None;
             }
-            if let Some(p) = parse(&lines[j]).filter(|p| p.1 == b && p.2 == k + size) {
+            if let Some(p) = parse(&lines[j]).filter(|p| p.1 == b && (p.2 == k + size || p.2 == k - size)) {
                 break Some(p);
             }
             let info = line_info(&lines[j], kinds[j], &|_| None);
             let stores = split_insn(&lines[j]).is_none_or(|(m, _)| m.starts_with("st"));
             if skipped == 4 || stores || !matches!(info.flow, Flow::Next) || matches!(kinds[j], LineKind::Label | LineKind::Call)
-                || info.defs & (1 << reg_b) != 0 {
+                || (reg_b != 255 && info.defs & (1 << reg_b) != 0) || (b == "sp" && lines[j].contains("sp")) {
                 break None;
             }
             between |= (info.uses | info.defs) as u64;
@@ -1889,12 +1894,15 @@ fn pair_adjacent_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         };
         let Some((c, b2, k2, size2)) = pair else { i += 1; continue };
         let reg = |r: &str| gpr_operand(r);
-        let fits = k % size == 0 && (-64 * size..=63 * size).contains(&k);
+        let lo = k.min(k2);
+        let fits = lo % size == 0 && (-64 * size..=63 * size).contains(&lo);
         let clear = reg(&c).is_some_and(|r| between & (1 << r) == 0);
-        if b2 == b && size2 == size && k2 == k + size && fits && clear
-            && reg(&a) != reg(&b) && reg(&c) != reg(&b) && reg(&a) != reg(&c)
+        let base_reg = if b == "sp" { None } else { reg(&b) };
+        if b2 == b && size2 == size && (k2 == k + size || k2 == k - size) && fits && clear
+            && reg(&a) != base_reg && reg(&c) != base_reg && reg(&a) != reg(&c)
         {
-            lines[i] = format!("    ldp {}, {}, [{}, #{}]", a, c, b, k);
+            let (first, second) = if k2 > k { (&a, &c) } else { (&c, &a) };
+            lines[i] = format!("    ldp {}, {}, [{}, #{}]", first, second, b, lo);
             kinds[i] = classify_line(&lines[i]);
             kinds[j] = LineKind::Nop;
             changed = true;
@@ -6400,6 +6408,15 @@ mod tests {
         assert!(result.contains("ldp x3, x4, [x0, #16]"), "{}", result);
         assert!(!peephole_optimize(body("    str x5, [x1]\n")).contains("ldp"));
         assert!(!peephole_optimize(body("    eor x5, x5, x4\n")).contains("ldp"));
+        // The higher word first, past a halfword load (sqlite3BtreeIndexMoveto).
+        let input = "    ldr x1, [x20, #104]\n    ldrh w12, [x20, #26]\n    ldr x0, [x20, #96]\n    add x0, x0, x1\n    add x0, x0, x12\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldp x0, x1, [x20, #96]"), "{}", result);
+        // From the stack into temporaries; not into callee-saved registers.
+        let input = "    ldr x3, [sp, #48]\n    ldr x4, [sp, #56]\n    add x0, x3, x4\n    ret\n";
+        assert!(peephole_optimize(input.to_string()).contains("ldp x3, x4, [sp, #48]"));
+        let input = "    ldr x20, [sp, #48]\n    ldr x21, [sp, #56]\n    add x0, x20, x21\n    ret\n";
+        assert!(!peephole_optimize(input.to_string()).contains("ldp"));
     }
 
     #[test]

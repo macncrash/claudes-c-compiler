@@ -953,7 +953,11 @@ v1 and nothing between the copy and the call uses v22:
   load one register): `s->prev` and `s->head`, `s->strstart` and
   `s->match_start`. Up to four lines may come between, none of them a
   store, a branch, a label or a call, none writing B and none reading or
-  writing the second load's register.
+  writing the second load's register. The second may load the lower word
+  (sqlite3BtreeIndexMoveto's `pPage->aDataEnd`, then `aCellIdx` below
+  it), and B may be sp for loads into x0-x18 (never a callee-saved
+  register, so that a pair never passes for an epilogue's restore); with
+  both, speedtest ran 0.24% fewer instructions.
 - Likewise two `str`s of one width to `[B, #k]` and `[B, #k + size]`, in
   either order, become an `stp` where the later one was, B a register or
   sp (locals and stack buffers: sqlite3Int64ToText, sqlite3FpDecode). Up
