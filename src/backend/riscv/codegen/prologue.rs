@@ -60,6 +60,7 @@ impl RiscvCodegen {
             false,
             false,
             None,
+            Default::default(),
         );
 
         let space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {

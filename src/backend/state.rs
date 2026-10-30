@@ -165,6 +165,9 @@ pub struct CodegenState {
     /// Used by resolve_slot_addr to return a dummy Indirect slot for these values,
     /// which is safe because all Indirect codepaths check reg_assignments first.
     pub reg_assigned_values: FxHashSet<u32>,
+    /// Values whose instructions the backend emits as nothing (the 128-bit
+    /// steps of an ARM multiply-high): no stack slot.
+    pub codeless_values: FxHashSet<u32>,
     /// Values that are promoted InlineAsm output results. Like allocas, their
     /// stack slot holds the value directly (not a pointer). The asm emitter
     /// stores the output register to this slot after the asm, and subsequent
@@ -236,6 +239,7 @@ impl CodegenState {
             weak_extern_symbols: FxHashSet::default(),
             small_slot_values: FxHashSet::default(),
             reg_assigned_values: FxHashSet::default(),
+            codeless_values: FxHashSet::default(),
             asm_output_values: FxHashSet::default(),
             debug_info: false,
             param_classes: Vec::new(),

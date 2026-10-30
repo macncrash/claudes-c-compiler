@@ -1,6 +1,6 @@
 //! ArmCodegen: prologue/epilogue and stack frame operations.
 
-use crate::ir::reexports::{IrBinOp, IrFunction, Instruction, Operand, Terminator, Value};
+use crate::ir::reexports::{IrBinOp, IrConst, IrFunction, Instruction, Operand, Terminator, Value};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
@@ -17,6 +17,8 @@ impl ArmCodegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
         use crate::ir::reexports::Instruction;
         use crate::backend::regalloc::PhysReg;
+        (self.mul_highs, self.mul_high_parts) = mul_high_chains(func);
+        self.state.codeless_values = self.mul_high_parts.clone();
 
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
@@ -95,6 +97,7 @@ impl ArmCodegen {
             true, // memcpy and indirect calls read register-assigned pointers
             true, // simple ops read their operands before writing the dest
             Some(&mut call_saves), // saved around calls (save_around_call)
+            self.mul_highs.keys().copied().collect(), // computed with umulh/smulh
         );
         // The calls, by program point (one per instruction and terminator,
         // as liveness numbers them), to their instructions' addresses.
@@ -667,6 +670,56 @@ impl ArmCodegen {
 /// The values of `func` known to be below 256: unsigned byte loads, zero
 /// extensions of them, masks by a constant of at most 0xff, and copies of
 /// those (a phi's incoming values), to a fixed point.
+/// The multiply-high division by a 64-bit constant becomes (div_by_const):
+/// four lines in a row of one block,
+///   e = Cast(x, I64 -> I128 | U64 -> U128); p = Mul(e, C);
+///   h = AShr|LShr(p, 64); t = Cast(h, -> I64|U64)
+/// with e, p and h read only by the next. With C in the extension's 64-bit
+/// range, t is the high half of x * C: smulh for a sign extension, umulh for
+/// a zero one. Returns t -> (x, C, signed), and e, p, h.
+fn mul_high_chains(func: &IrFunction) -> (super::emit::MulHighs, FxHashSet<u32>) {
+    let mut highs = FxHashMap::default();
+    let mut parts = FxHashSet::default();
+    let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+        }
+        block.terminator.for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+    }
+    let once = |v: &Value| uses.get(&v.0) == Some(&1);
+    let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128);
+    for block in &func.blocks {
+        for w in block.instructions.windows(4) {
+            let Instruction::Cast { dest: e, src: x @ Operand::Value(_), from_ty, to_ty } = &w[0] else { continue };
+            let signed = match (from_ty, to_ty) {
+                (IrType::I64, IrType::I128) => true,
+                (IrType::U64, IrType::U128) => false,
+                _ => continue,
+            };
+            let Instruction::BinOp { dest: p, op: IrBinOp::Mul, lhs, rhs, ty } = &w[1] else { continue };
+            let c = match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v)) if v == e && wide(ty) => c,
+                _ => continue,
+            };
+            let c = match c {
+                IrConst::I128(c) => *c,
+                IrConst::I64(c) => *c as i128,
+                _ => continue,
+            };
+            let fits = if signed { i64::try_from(c).is_ok() } else { u64::try_from(c).is_ok() };
+            let Instruction::BinOp { dest: h, op: IrBinOp::AShr | IrBinOp::LShr, lhs: Operand::Value(pv), rhs: Operand::Const(k), ty } = &w[2] else { continue };
+            let Instruction::Cast { dest: t, src: Operand::Value(hv), from_ty, to_ty: IrType::I64 | IrType::U64 } = &w[3] else { continue };
+            if !fits || pv != p || hv != h || !wide(ty) || !wide(from_ty) || k.to_i64() != Some(64) || !once(e) || !once(p) || !once(h) {
+                continue;
+            }
+            highs.insert(t.0, (*x, c as i64, signed));
+            parts.extend([e.0, p.0, h.0]);
+        }
+    }
+    (highs, parts)
+}
+
 fn byte_values(func: &IrFunction) -> FxHashSet<u32> {
     let mut bytes: FxHashSet<u32> = FxHashSet::default();
     let is_byte = |bytes: &FxHashSet<u32>, op: &Operand| match op {

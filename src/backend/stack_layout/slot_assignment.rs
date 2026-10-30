@@ -429,6 +429,11 @@ fn classify_value(
         return;
     }
 
+    // Skip values the backend emits no code for.
+    if state.codeless_values.contains(&dest.0) {
+        return;
+    }
+
     // Skip copy-aliased values (they'll share root's slot). Not for i128/f128.
     if !is_i128 && !is_f128 && ctx.copy_alias.contains_key(&dest.0) {
         return;

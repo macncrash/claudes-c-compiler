@@ -435,6 +435,20 @@ or as two adjacent 8-byte stack slots.
 | Not | `mvn x0, x0` / `mvn x1, x1` |
 | And/Or/Xor | Parallel per-half operations |
 
+### Multiply-High
+
+Division by a 64-bit constant (`div_by_const`) spells its multiply-high in
+128 bits: extend x to 128, multiply by the magic constant, shift right by 64,
+truncate. When those four instructions are in a row and each 128-bit step is
+read only by the next (`mul_high_chains`, computed with the stack layout),
+the truncation emits one `umulh` (zero extension, constant below 2^64) or
+`smulh` (sign extension, constant in i64 range) and the three 128-bit steps
+emit nothing and get no stack slot (`CodegenState::codeless_values`). The
+result is a plain 64-bit value the register allocator may take
+(`RegAllocConfig::gpr_casts`). sqlite3Int64ToText's `v/100` and `v%100`
+went from about 25 instructions, with four stack stores, to five; speedtest
+ran 0.62% fewer instructions.
+
 ### Shifts
 
 128-bit shifts use branching sequences that handle three cases: shift amount is zero,

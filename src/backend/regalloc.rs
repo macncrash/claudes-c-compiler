@@ -93,6 +93,10 @@ pub struct RegAllocConfig {
     /// register-args-only calls and the saves cost less than keeping the
     /// value on the stack. Requires a backend that does the saving (AArch64).
     pub save_around_calls: bool,
+    /// Casts from a 128-bit value that the backend computes straight into a
+    /// 64-bit register rather than through the 128-bit path (AArch64's
+    /// multiply-high truncations): eligible like any 64-bit result.
+    pub gpr_casts: FxHashSet<u32>,
 }
 
 /// Run the linear scan register allocator on a function.
@@ -176,7 +180,7 @@ pub fn allocate_registers(
                     eligible.insert(dest.0);
                 }
                 Instruction::Cast { dest, to_ty, from_ty, .. } => {
-                    if !is_non_gpr_type(to_ty) && !is_non_gpr_type(from_ty) {
+                    if !is_non_gpr_type(to_ty) && (!is_non_gpr_type(from_ty) || config.gpr_casts.contains(&dest.0)) {
                         eligible.insert(dest.0);
                     }
                 }
@@ -1259,7 +1263,7 @@ mod tests {
         let config = |save| RegAllocConfig {
             available_regs: Vec::new(), caller_saved_regs: vec![PhysReg(10), PhysReg(11)], call_free_regs: Vec::new(),
             allow_inline_asm_regalloc: false, caller_saved_at_call_boundaries: true, allow_ptr_operand_regalloc: false,
-            dest_reuses_operand_reg: false, save_around_calls: save,
+            dest_reuses_operand_reg: false, save_around_calls: save, gpr_casts: FxHashSet::default(),
         };
         let r = allocate_registers(&func, &config(true));
         let reg = r.assignments.get(&1).copied();

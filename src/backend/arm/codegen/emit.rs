@@ -192,6 +192,9 @@ pub(super) fn arm_invert_cond_code(cc: &str) -> &'static str {
     }
 }
 
+/// A multiply-high's truncation -> (the 64-bit operand, the multiplier, signed).
+pub(super) type MulHighs = FxHashMap<u32, (Operand, i64, bool)>;
+
 /// AArch64 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses AAPCS64 calling convention with stack-based allocation.
 pub struct ArmCodegen {
@@ -224,6 +227,12 @@ pub struct ArmCodegen {
     /// masks by at most 0xff): a jump table indexed by one covers every
     /// value and needs no bounds check.
     pub(super) byte_values: FxHashSet<u32>,
+    /// The 64-bit multiply-highs division by a constant spells in 128 bits:
+    /// the truncation's value -> (the 64-bit operand, the multiplier, signed),
+    /// emitted there as one umulh/smulh.
+    pub(super) mul_highs: MulHighs,
+    /// The 128-bit extension, product and shift of those, which emit nothing.
+    pub(super) mul_high_parts: FxHashSet<u32>,
     /// Which callee-saved registers are actually used (for save/restore).
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// SP offset where callee-saved registers are stored.
@@ -335,6 +344,8 @@ impl ArmCodegen {
             asm_fp_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),
             byte_values: FxHashSet::default(),
+            mul_highs: FxHashMap::default(),
+            mul_high_parts: FxHashSet::default(),
             used_callee_saved: Vec::new(),
             callee_save_offset: 0,
             fp_reg_assignments: FxHashMap::default(),
@@ -2224,6 +2235,11 @@ impl ArchCodegen for ArmCodegen {
     // ---- Standard trait methods (kept inline - arch-specific) ----
     fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_x0(op); }
     fn emit_store_result(&mut self, dest: &Value) { self.store_x0_to(dest); }
+    fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        if !self.mul_high_parts.contains(&dest.0) {
+            crate::backend::traits::emit_binop_default(self, dest, op, lhs, rhs, ty);
+        }
+    }
     fn emit_gep(&mut self, dest: &Value, base: &Value, offset: &Operand) {
         if !self.try_emit_gpr_gep(dest, base, offset) {
             crate::backend::traits::emit_gep_default(self, dest, base, offset);

@@ -354,17 +354,7 @@ pub trait ArchCodegen {
 
     /// Emit a binary operation. Default: dispatches i128/float/integer ops.
     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        if is_i128_type(ty) {
-            self.emit_i128_binop(dest, op, lhs, rhs);
-            return;
-        }
-        if ty.is_float() {
-            let float_op = classify_float_binop(op)
-                .unwrap_or_else(|| panic!("unsupported float binop: {:?} on type {:?}", op, ty));
-            self.emit_float_binop(dest, float_op, lhs, rhs, ty);
-            return;
-        }
-        self.emit_int_binop(dest, op, lhs, rhs, ty);
+        emit_binop_default(self, dest, op, lhs, rhs, ty);
     }
 
     /// Emit a float binary operation (add/sub/mul/div).
@@ -1617,6 +1607,21 @@ pub fn emit_load_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, ptr
         }
         cg.emit_store_result(dest);
     }
+}
+
+/// The default binary operation dispatch: i128, float or integer.
+pub fn emit_binop_default(cg: &mut (impl ArchCodegen + ?Sized), dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    if is_i128_type(ty) {
+        cg.emit_i128_binop(dest, op, lhs, rhs);
+        return;
+    }
+    if ty.is_float() {
+        let float_op = classify_float_binop(op)
+            .unwrap_or_else(|| panic!("unsupported float binop: {:?} on type {:?}", op, ty));
+        cg.emit_float_binop(dest, float_op, lhs, rhs, ty);
+        return;
+    }
+    cg.emit_int_binop(dest, op, lhs, rhs, ty);
 }
 
 /// Default cast implementation: handles i128 widening/narrowing/copy,

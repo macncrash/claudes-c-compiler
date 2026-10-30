@@ -131,6 +131,26 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+        if self.mul_high_parts.contains(&dest.0) {
+            return;
+        }
+        if let Some(&(x, m, signed)) = self.mul_highs.get(&dest.0) {
+            let src = match self.operand_reg(&x) {
+                Some(r) => callee_saved_name(r),
+                None => {
+                    self.operand_to_x0(&x);
+                    "x0"
+                }
+            };
+            self.emit_load_imm64("x1", m);
+            let d = self.dest_reg(dest).map_or("x0", callee_saved_name);
+            self.state.emit_fmt(format_args!("    {} {}, {}, x1", if signed { "smulh" } else { "umulh" }, d, src));
+            self.state.reg_cache.invalidate_acc();
+            if d == "x0" {
+                self.store_x0_to(dest);
+            }
+            return;
+        }
         if crate::backend::f128_softfloat::f128_emit_cast(self, dest, src, from_ty, to_ty) {
             return;
         }
