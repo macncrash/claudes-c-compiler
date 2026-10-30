@@ -714,6 +714,14 @@ through a pointer may write a slot whose address was taken), anything
 moving sp, and any line not known to write no memory; a register's entries
 when it is written. SQLite's speedtest ran 0.7% fewer instructions.
 
+A store to a slot that a later store of the same width overwrites, with
+only straight-line code between that names sp nowhere else (so nothing
+reads the slot), goes. A parameter whose value is spilled shares its slot
+with the parameter, and the prologue wrote the argument register there
+twice (`str x2, [sp, #96]; str x3, [sp, #104]` twice in
+sqlite3BtreeIndexMoveto); 326 such stores in SQLite, 0.06% of speedtest's
+instructions.
+
 **2. Redundant Branch Elimination**
 
 An unconditional `b .label` where `.label:` is the immediately next non-empty line

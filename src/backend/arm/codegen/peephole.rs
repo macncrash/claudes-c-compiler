@@ -835,6 +835,7 @@ fn small_loop_alignment(lines: &[String], kinds: &[LineKind], n: usize) -> Vec<O
 // The load is redundant since the value is already in the register.
 // Also: str xN, [sp, #off]  →  ldr xM, [sp, #off]  → replace load with mov xM, xN
 // Also handles: str wN, [sp, #off]  →  ldrsw xN, [sp, #off]
+// And a store stored over before any read of the slot: it goes.
 
 fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
@@ -875,6 +876,38 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
                     }
                     _ => {}
                 }
+            }
+            // Stored again, at the same width, before anything reads the
+            // slot (a parameter's slot written by the prologue and by its
+            // value's spill, `str x2, [sp, #96]; str x3, [sp, #104]` twice):
+            // the first store goes. Only straight-line code, and nothing
+            // else naming sp, may come between.
+            let mut k = i + 1;
+            while k < n {
+                match kinds[k] {
+                    LineKind::Nop => {}
+                    LineKind::StoreSp { offset, is_word, .. } if offset == store_off && is_word == store_word => {
+                        kinds[i] = LineKind::Nop;
+                        changed = true;
+                        break;
+                    }
+                    LineKind::StoreSp { offset, is_word, .. } => {
+                        let (a, b) = (offset, offset + if is_word { 4 } else { 8 });
+                        let (c, d) = (store_off, store_off + if store_word { 4 } else { 8 });
+                        if a < d && c < b {
+                            break;
+                        }
+                    }
+                    LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                    | LineKind::Call | LineKind::Ret => break,
+                    _ => {
+                        let t = &lines[k];
+                        if t.contains("sp") || classify_access(t, kinds[k]) == Access::Barrier {
+                            break;
+                        }
+                    }
+                }
+                k += 1;
             }
         }
         i += 1;
@@ -6268,6 +6301,24 @@ mod tests {
         let past = |tail: &str| format!(".type f, %function\nf:\n    and x14, x14, #128\n    cmp x14, #0\n    cbz x3, .LBB2\n    csel x0, x0, x1, ne\n    ret\n.LBB2:\n{tail}    ret\n.size f, .-f\n");
         assert!(peephole_optimize(past("    mov x0, #3\n")).contains("tst x14, #128"));
         assert!(peephole_optimize(past("    cset x0, hs\n")).contains("cmp x14, #0"));
+    }
+
+    #[test]
+    fn test_same_stack_store_twice_stored_once() {
+        let body = "    str x2, [sp, #96]\n    str x2, [sp, #96]\n    bl g\n    ldr x0, [sp, #96]\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert_eq!(result.matches("str x2, [sp, #96]").count(), 1, "{}", result);
+        // Interleaved with another slot's pair, as a prologue leaves them.
+        let body = "    str x2, [sp, #96]\n    str x3, [sp, #104]\n    str x2, [sp, #96]\n    str x3, [sp, #104]\n    bl g\n    ldr x0, [sp, #96]\n    ldr x1, [sp, #104]\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(result.matches("str x2, [sp, #96]").count() == 1 && result.matches("str x3, [sp, #104]").count() == 1, "{}", result);
+        // A narrower store over part of the slot, or a read between, keeps it.
+        let body = "    str x2, [sp, #96]\n    str w2, [sp, #96]\n    bl g\n    ldr x0, [sp, #96]\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(result.contains("str x2, [sp, #96]") && result.contains("str w2, [sp, #96]"), "{}", result);
+        let body = "    str x2, [sp, #96]\n    ldr x4, [sp, #96]\n    str x3, [sp, #96]\n    str x4, [x5]\n    bl g\n    ldr x0, [sp, #96]\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(result.contains("str x2, [x5]") || result.contains("str x2, [sp, #96]"), "{}", result);
     }
 
     #[test]
