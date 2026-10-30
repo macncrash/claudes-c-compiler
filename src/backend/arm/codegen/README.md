@@ -893,6 +893,15 @@ since renaming one would bring it back (a `mul` already fused into
   is `sub x13, x11, #1; cmp x13, #127; b.lo`; speedtest ran 0.12% fewer
   instructions, lengthFunc 8% fewer than clang's.
 
+- get2byte's two byte loads merged high byte first, `ldrb wA, [B, #k];
+  ldrb wC, [B, #k+1]; orr D, C, A, lsl #8`, with A and C read only by the
+  `orr` and dead after it, are one halfword load and a byte swap:
+  `ldrh wC, [B, #k]; rev16 wD, wC` (an odd or negative k assembles as
+  `ldurh`). Nothing between the loads and the `orr` may store or write B.
+  A sign-extended high byte (`sxtb xA, wA`, OP_Column's 2-byte integer)
+  makes it `ldrh; rev16; sxth`. freeSpace and pageFindSlot walk the free
+  list with it, now as clang does; speedtest ran 0.34% fewer instructions.
+
 **10. Jump Threading** (local cleanup)
 
 A branch to a label whose block is only `b .L2` goes to `.L2` directly, and

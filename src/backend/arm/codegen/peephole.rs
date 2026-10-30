@@ -491,6 +491,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
+            changed2 |= pass!(fuse_byte_pair_into_halfword(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_rev_into_rev16(&mut lines, &mut kinds, n));
             changed2 |= pass!(fuse_signed_load_mask(&mut lines, &mut kinds, n));
             changed2 |= pass!(fold_extend_into_narrow_store(&mut lines, &mut kinds, n));
@@ -3216,6 +3217,125 @@ fn upper16_zero_before(lines: &[String], kinds: &[LineKind], i: usize, r: u8) ->
         };
     }
     false
+}
+
+/// get2byte's two byte loads, merged high byte first:
+///   ldrb wA, [B, #k]; ldrb wC, [B, #k+1]; orr D, C, A, lsl #8
+/// with A and C read by the `orr` only, and dead after it: one halfword
+/// load and a byte swap, `ldrh wC, [B, #k]; rev16 wD, wC` (freeSpace and
+/// pageFindSlot walking a page's free-block list). The halfword load goes
+/// where the later byte load was, so nothing between the two may store,
+/// write B, or touch A or C.
+fn fuse_byte_pair_into_halfword(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    // `ldrb wR, [B]` or `[B, #k]`: (R, B, k).
+    let byte_load = |line: &str| -> Option<(u8, u8, i64)> {
+        let ("ldrb", ops) = split_insn(line)? else { return None };
+        let (r, mem) = first_and_rest(ops);
+        let mem = mem.trim().strip_prefix('[')?.strip_suffix(']')?;
+        let (b, k) = match mem.split_once(',') {
+            Some((b, k)) => (b.trim(), parse_imm(k.trim())?),
+            None => (mem.trim(), 0),
+        };
+        (r.starts_with('w') && b.starts_with('x')).then_some(())?;
+        Some((gpr_operand(r)?, gpr_operand(b)?, i64::try_from(k).ok()?))
+    };
+    for o in 0..n {
+        let orr = lines[o].clone();
+        let Some(("orr", ops)) = split_insn(&orr) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [d, c, a, "lsl #8"] = p[..] else { continue };
+        let (Some(dn), Some(cn), Some(an)) = (gpr_operand(d), gpr_operand(c), gpr_operand(a)) else { continue };
+        if cn == an || dn > 28 {
+            continue;
+        }
+        // The two loads, a few straight-line lines back, and for a signed
+        // high byte (OP_Column's 2-byte integer) its `sxtb A, wA`.
+        let mut sx: Option<usize> = None;
+        let (mut la, mut lc) = (None, None);
+        let mut k = o;
+        let mut seen = 0;
+        while k > 0 && seen < 6 && (la.is_none() || lc.is_none()) {
+            k -= 1;
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            seen += 1;
+            if !matches!(classify_access(&lines[k], kinds[k]), Access::Write { .. } | Access::ReadOnly) {
+                break;
+            }
+            match byte_load(&lines[k]) {
+                Some((r, b, off)) if r == an && la.is_none() => la = Some((k, b, off)),
+                Some((r, b, off)) if r == cn && lc.is_none() => lc = Some((k, b, off)),
+                _ => {
+                    if la.is_none() && sx.is_none() {
+                        if let Some(("sxtb", so)) = split_insn(&lines[k]) {
+                            let (sd, ss) = first_and_rest(so);
+                            if gpr_operand(sd) == Some(an) && gpr_operand(ss.trim()) == Some(an) && ss.trim().starts_with('w') {
+                                sx = Some(k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (Some((ka, ba, offa)), Some((kc, bc, offc))) = (la, lc) else { continue };
+        if ba != bc || offc != offa + 1 || ba == an || ba == cn {
+            continue;
+        }
+        let (first, last) = (ka.min(kc), ka.max(kc));
+        // Between the first load and the `orr`: no store, nothing writing B,
+        // and A and C left to the loads and the `orr`.
+        let regs = (1u32 << an) | (1 << cn);
+        let ok = (first + 1..o).filter(|&l| l != ka && l != kc && Some(l) != sx && kinds[l] != LineKind::Nop).all(|l| {
+            let info = line_info(&lines[l], kinds[l], &|_| None);
+            let m = split_insn(&lines[l]).map_or("", |(m, _)| m);
+            !m.starts_with("st") && info.defs & (1 << ba) == 0 && (info.uses | info.defs) & regs == 0
+                && matches!(info.flow, Flow::Next) && info.uses != ALL_REGS
+        });
+        let dead = |r: u8| r == dn || live[o] & (1 << r) == 0;
+        if !ok || !dead(an) || !dead(cn) {
+            continue;
+        }
+        let mem = if offa == 0 {
+            format!("[{}]", xreg_name(ba))
+        } else {
+            format!("[{}, #{}]", xreg_name(ba), offa)
+        };
+        // (An odd or negative offset assembles to the unscaled ldurh.)
+        if !(offa >= 0 && offa % 2 == 0 && offa <= 8190 || (-256..=255).contains(&offa)) {
+            continue;
+        }
+        let load = "ldrh";
+        if let Some(ks) = sx {
+            // Signed: the halfword at the first load (nothing between
+            // stores or moves B), swapped at the next of the sign extension
+            // and the other load, and sign-extended by the `orr`.
+            if ks < ka {
+                continue;
+            }
+            let (mid, other) = (ks.min(last), ks.max(last));
+            lines[first] = format!("    {} {}, {}", load, wreg_name(cn), mem);
+            kinds[first] = classify_line(&lines[first]);
+            lines[mid] = format!("    rev16 {}, {}", wreg_name(cn), wreg_name(cn));
+            kinds[mid] = classify_line(&lines[mid]);
+            kinds[other] = LineKind::Nop;
+            lines[o] = format!("    sxth {}, {}", d, wreg_name(cn));
+            kinds[o] = classify_line(&lines[o]);
+            changed = true;
+            continue;
+        }
+        // The halfword goes into the register of the later load.
+        let r = if last == kc { cn } else { an };
+        lines[last] = format!("    {} {}, {}", load, wreg_name(r), mem);
+        kinds[last] = classify_line(&lines[last]);
+        kinds[first] = LineKind::Nop;
+        lines[o] = format!("    rev16 {}, {}", wreg_name(dn), wreg_name(r));
+        kinds[o] = classify_line(&lines[o]);
+        changed = true;
+    }
+    changed
 }
 
 /// `rev wT, wS` then `lsr wD, wT, #16` (or `ubfx wD, wT, #16, #16`), a
@@ -6466,6 +6586,27 @@ mod tests {
         // Not for a carry test, nor when the flags are read again.
         assert!(peephole_optimize(body("b.hs", "")).contains("cmp x11, #0"));
         assert!(peephole_optimize(body("b.ne", "    cset x0, hi\n")).contains("cmp x11, #0"));
+    }
+
+    #[test]
+    fn test_big_endian_byte_pair_is_one_halfword_load() {
+        let run = |body: &str| peephole_optimize(ret_x0(body));
+        let result = run("    ldrb w11, [x10, #2]\n    ldrb w20, [x10, #3]\n    orr x20, x20, x11, lsl #8\n    str x20, [x1]\n");
+        assert!(result.contains("ldrh w20, [x10, #2]") && result.contains("rev16 w20, w20") && !result.contains("ldrb"), "{}", result);
+        // An odd offset (assembled as the unscaled ldurh).
+        let result = run("    ldrb w11, [x10, #5]\n    ldrb w20, [x10, #6]\n    orr x20, x20, x11, lsl #8\n    str x20, [x1]\n");
+        assert!(result.contains("ldrh w20, [x10, #5]"), "{}", result);
+        // A signed high byte: sign-extended halfword.
+        let result = run("    ldrb w12, [x1]\n    sxtb x12, w12\n    ldrb w13, [x1, #1]\n    orr x12, x13, x12, lsl #8\n    str x12, [x11]\n");
+        assert!(result.contains("ldrh w13, [x1]") && result.contains("rev16 w13, w13") && result.contains("sxth x12, w13"), "{}", result);
+        // Not across a store, nor when a byte is read again.
+        let keep = [
+            "    ldrb w11, [x10, #2]\n    str x3, [x4]\n    ldrb w20, [x10, #3]\n    orr x20, x20, x11, lsl #8\n    str x20, [x1]\n",
+            "    ldrb w11, [x10, #2]\n    ldrb w20, [x10, #3]\n    orr x21, x20, x11, lsl #8\n    str x21, [x1]\n    str x11, [x2]\n",
+        ];
+        for body in keep {
+            assert!(run(body).contains("ldrb w11"), "{}", run(body));
+        }
     }
 
     #[test]
