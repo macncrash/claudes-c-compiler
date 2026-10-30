@@ -858,7 +858,10 @@ since renaming one would bring it back (a `mul` already fused into
   wA and takes wB instead, with B unchanged meanwhile; a reload of the
   same address into A on the way, with no store or address change since,
   goes too (`ldr x0, [sp, #2728]; mov w14, w0; ldr x0, [sp, #2728]; add
-  w15, w0, #1` is `ldr w14, [sp, #2728]; add w15, w14, #1`). Only offsets
+  w15, w0, #1` is `ldr w14, [sp, #2728]; add w15, w14, #1`). The last read
+  may also rewrite wA, reading wB in its place (`mov w14, w0; add w0, w0,
+  #1` is `add w0, w14, #1`; 26M fewer instructions in speedtest's
+  sqlite3VdbeExec). Only offsets
   and index scales a 32-bit load encodes. In sqlite3VdbeExec, 65M fewer
   instructions run in speedtest (0.29%).
 - `cmp A, B; b.cc L; cmp A, B`, with nothing between but the branch: the

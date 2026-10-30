@@ -2481,6 +2481,9 @@ fn narrow_load_for_copy(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
         // A reload of the same address into A on the way is dropped.
         let mut renames = Vec::new();
         let mut drops = Vec::new();
+        // A last read that also rewrites wA (`add w0, w0, #1`): its sources
+        // take wB, its destination stays.
+        let mut last_update = None;
         if b != a {
             let x_mention = |text: &str| text.split([',', ' ', '\t', '[', ']', '!', '{', '}'])
                 .any(|t| t.starts_with('x') && gpr_operand(t) == Some(a));
@@ -2514,6 +2517,16 @@ fn narrow_load_for_copy(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
                     break false;
                 }
                 let reads = info.uses & (1 << a) != 0;
+                if reads && !x_mention(&lines[k]) && info.defs & (1 << a) != 0 {
+                    let updates = matches!(classify_access(&lines[k], kinds[k]), Access::Write { .. })
+                        && split_insn(&lines[k]).is_some_and(|(m, o)| {
+                            !m.starts_with("st") && !o.contains('[') && gpr_operand(first_and_rest(o).0) == Some(a)
+                        });
+                    if updates {
+                        last_update = Some(k);
+                        break true;
+                    }
+                }
                 if reads && (x_mention(&lines[k]) || info.defs & (1 << a) != 0) {
                     break false;
                 }
@@ -2539,6 +2552,13 @@ fn narrow_load_for_copy(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
         for &k in &renames {
             lines[k] = rename_gpr(&lines[k], a, b);
             kinds[k] = classify_line(&lines[k]);
+        }
+        if let Some(k) = last_update {
+            if let Some((m, o)) = split_insn(&lines[k]) {
+                let (dest, srcs) = first_and_rest(o);
+                lines[k] = format!("    {} {},{}", m, dest, rename_gpr(srcs, a, b));
+                kinds[k] = classify_line(&lines[k]);
+            }
         }
         for &k in &drops {
             kinds[k] = LineKind::Nop;
@@ -6312,6 +6332,13 @@ mod tests {
         let result = run("    ldr x0, [sp, #2728]\n    mov w14, w0\n    ldr x0, [sp, #2728]\n    add w15, w0, #1\n    str x14, [x3]\n    str x15, [x3, #8]\n    mov x0, #0\n");
         assert!(result.contains("ldr w14, [sp, #2728]") && result.contains("add w15, w14, #1"), "{}", result);
         assert!(!result.contains("ldr x0, [sp, #2728]"), "{}", result);
+        // Read last by its own update (`i + 1` into the same register): the
+        // update reads wB and still writes A.
+        let result = run("    ldr x0, [sp, #2728]\n    mov w14, w0\n    add w0, w0, #1\n    str x14, [x3]\n    str x0, [x3, #8]\n    mov x0, #0\n");
+        assert!(result.contains("ldr w14, [sp, #2728]") && result.contains("add w0, w14, #1"), "{}", result);
+        // Not when that update reads A whole.
+        let result = run("    ldr x0, [sp, #2728]\n    mov w14, w0\n    add x0, x0, #1\n    str x14, [x3]\n    str x0, [x3, #8]\n    mov x0, #0\n");
+        assert!(result.contains("mov w14, w0"), "{}", result);
         // Not when A is read whole later, nor for offsets or index scales a
         // 32-bit load cannot encode.
         let keep = [
