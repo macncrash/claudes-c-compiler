@@ -401,6 +401,23 @@ Inlining SQLite's `sqlite3_free` and `sqlite3_value_type`, API functions its
 own code calls tens of millions of times in speedtest, cut 0.3% of its
 instructions.
 
+**Cleaned-up size.** A function too large by its raw size (up to 24 blocks
+and 120 instructions before mem2reg) is inlined where, specialized on the
+call's constant arguments and cleaned up, it has at most 40 instructions
+in 6 blocks. Outside callers past the absolute cap, blocks that only return
+don't count, as inlined they become jumps to the caller's continuation:
+`sqlite3PagerWrite`, five tests and five returns, is 19 raw blocks and 10
+cleaned up. In the largest callers (SQLite's `sqlite3VdbeExec`) the
+stricter limits stay, raw blocks at 12 and every block counted: there, the
+wider raw limit added cold code to opcode handlers and made it run 4% more
+instructions, mostly spills on the dispatch path, and counting only
+non-return blocks everywhere cost speedtest 4% as a whole. A cleaned-up size counts only
+the small callees inlined into the callee, so a call arriving with a body
+inlined this way is not inlined by this rule: `sqlite3DbNNFreeNN`, 21
+instructions, otherwise brought `sqlite3_free` and its statistics into each
+of its 82 callers. Together these cut speedtest's instructions 0.4%, for
+8% more code.
+
 **Heuristics.** The inliner uses a tiered size-based heuristic:
 
 | Category | Instruction limit | Block limit | Notes |
