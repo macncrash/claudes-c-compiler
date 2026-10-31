@@ -710,6 +710,12 @@ The optimizer runs in three phases:
 3. **Local cleanup** (up to 4 rounds): a subset of the local passes (same as Phase 1
    but without branch-over-branch fusion) to mop up patterns exposed by global passes
 
+The three phases run one function at a time (`local_chunks`), so a function
+stops being scanned once a round leaves it unchanged. If some function's `.L`
+label is used outside it, such as a computed goto's label table in data, or code
+lies outside any function, the whole file runs as one instead. The passes after
+Phase 3 still see the whole file.
+
 ### Optimization Catalog
 
 **1. Adjacent Store/Load Elimination**
@@ -1248,8 +1254,11 @@ come from a label map and running instruction counts built once per pass
 (`BranchDistances`), or are skipped where nothing could change. Liveness
 (`function_liveness`) is computed about a hundred times per file, and each
 line's parsed uses and definitions are cached between runs by line index,
-reparsed when the line's text or kind has changed. SQLite now compiles in 13
-seconds, to the same assembly.
+reparsed when the line's text or kind has changed. Phases 1 to 3 then ran their
+rounds over the whole file while few functions still changed (70 of SQLite's
+1,909 in the third round, 2 in the fourth); running them a function at a time
+stops at each function's own fixed point. SQLite now compiles in 9.5 seconds,
+to the same assembly.
 
 ### Conservative Scratch Register Partitioning
 

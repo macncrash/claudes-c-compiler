@@ -417,103 +417,20 @@ pub fn peephole_optimize(asm: String) -> String {
         return asm;
     }
 
-    // Phase 1: Iterative local passes (up to 8 rounds)
-    let mut changed = true;
-    let mut rounds = 0;
-    while changed && rounds < 8 {
-        changed = false;
-        changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
-        changed |= eliminate_redundant_branches(&lines, &mut kinds, n);
-        changed |= eliminate_self_moves(&mut kinds, n);
-        changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
-        changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
-        changed |= eliminate_unreferenced_labels(&lines, &mut kinds, n);
-        rounds += 1;
-    }
-
-    // Phase 2: Global passes
-    //
-    // Global store forwarding is disabled: same-register NOP elimination has a
-    // remaining correctness bug in complex float-array code (test 0036_0041).
-    // The root cause is not yet identified — it appears correct within a basic
-    // block but produces wrong output. Until this is fixed, GSF is skipped.
-    //
-    // Copy propagation and dead store elimination are independent and safe.
-    propagate_register_copies(&mut lines, &mut kinds, n);
-    global_dead_store_elimination(&lines, &mut kinds, n);
-
-    // Phase 3: Local cleanup after global passes (up to 4 rounds)
     // CCC_PEEPHOLE_SKIP=name,name skips the listed passes (for bisecting).
     let skip = std::env::var("CCC_PEEPHOLE_SKIP").unwrap_or_default();
     let skip: Vec<&str> = skip.split(',').filter(|s| !s.is_empty()).collect();
-    macro_rules! pass {
-        ($name:ident($($arg:expr),*)) => {
-            !skip.contains(&stringify!($name)) && $name($($arg),*)
-        };
-    }
-    if !skip.contains(&"coalesce_arg_copies") {
-        coalesce_arg_copies(&mut lines, &mut kinds, n);
-    }
-    {
-        let mut changed2 = true;
-        let mut rounds2 = 0;
-        while changed2 && rounds2 < 4 {
-            changed2 = false;
-            changed2 |= pass!(eliminate_adjacent_store_load(&mut lines, &mut kinds, n));
-            changed2 |= pass!(forward_held_slots(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_redundant_branches(&lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_self_moves(&mut kinds, n));
-            changed2 |= pass!(eliminate_move_chains(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_redundant_sxtw(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_redundant_narrow_extends(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_redundant_zero_extends(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_repeated_frame_addrs(&lines, &mut kinds, n));
-            changed2 |= pass!(propagate_w_copies(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_low_half_only_extends(&lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_dead_upper_extends(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_shift_into_operand(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_index_into_mem(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_scale_into_mem(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_offset_into_global_addr(&mut lines, &mut kinds, n));
-            changed2 |= pass!(sink_compare_past_selects(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_cset_into_csel(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_cmp_sub_into_subs(&mut lines, &mut kinds, n));
-            changed2 |= pass!(forward_copy_propagation(&mut lines, &mut kinds, n));
-            changed2 |= pass!(retarget_results(&mut lines, &mut kinds, n));
-            changed2 |= pass!(build_vec_args_in_place(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_and_into_tst(&mut lines, &mut kinds, n));
-            changed2 |= pass!(reuse_constants(&mut lines, &mut kinds, n));
-            changed2 |= pass!(zero_reg_into_select(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_neg_into_cneg(&mut lines, &mut kinds, n));
-            changed2 |= pass!(drop_redundant_zero_extend(&mut lines, &mut kinds, n));
-            changed2 |= pass!(drop_byte_mask_before_compare(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_mask_into_compare(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_bit_test_into_extract(&mut lines, &mut kinds, n));
-            changed2 |= pass!(drop_mask_of_narrow_value(&mut lines, &mut kinds, n));
-            changed2 |= pass!(drop_sxtw_of_nonnegative(&lines, &mut kinds, n));
-            changed2 |= pass!(narrow_load_for_copy(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_mul_into_madd(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_step_into_access(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_shift_mask_into_ubfx(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_overflow_test_into_flags(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_sign_into_halving(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_byte_pair_into_halfword(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_rev_into_rev16(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fuse_signed_load_mask(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_extend_into_narrow_store(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_sxtw_into_users(&mut lines, &mut kinds, n));
-            changed2 |= pass!(fold_zero_extension_into_user(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_dead_writes(&lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_dead_writes_global(&lines, &mut kinds, n));
-            changed2 |= pass!(fuse_branch_over_branch(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_repeated_compares(&lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_repeated_dups(&lines, &mut kinds, n));
-            changed2 |= pass!(fold_offset_into_vec_access(&mut lines, &mut kinds, n));
-            changed2 |= pass!(thread_jumps(&mut lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_unreferenced_labels(&lines, &mut kinds, n));
-            changed2 |= pass!(eliminate_unreachable_after_jumps(&lines, &mut kinds, n));
-            rounds2 += 1;
+
+    // Phases 1 to 3 run to a fixed point one function at a time, so a
+    // function that stops changing stops being scanned (in SQLite, 70 of
+    // 1,909 functions still change in the third round).
+    match local_chunks(&lines, &kinds, n) {
+        Some(chunks) => {
+            for (a, b) in chunks {
+                local_phases(&mut lines[a..b], &mut kinds[a..b], &skip);
+            }
         }
+        None => local_phases(&mut lines, &mut kinds, &skip),
     }
 
     // Again: the cleanup turns extensions into copies (`sxtw x10, w0` whose
@@ -608,6 +525,147 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
     result
+}
+
+/// The functions Phases 1 to 3 can optimize one at a time: each function's
+/// lines from its `.type` line to its end, when no function's `.L` label
+/// is used outside it (a computed goto's label table in data, a branch into
+/// another function); data labels (`.Lstr5`) may be used anywhere. Lines
+/// outside the functions, which must be data, are left alone. None when
+/// some label crosses or code lies outside a function: then the whole file
+/// is one.
+fn local_chunks(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<(usize, usize)>> {
+    let ranges = function_ranges(lines, n);
+    // Line -> its function's number + 1 (0 outside functions).
+    let mut owner = vec![0u32; n];
+    for (f, &(start, end)) in ranges.iter().enumerate() {
+        owner[start - 1..end].fill(f as u32 + 1);
+    }
+    // Code outside the functions (a fragment without `.type` lines).
+    if (0..n).any(|k| owner[k] == 0 && !matches!(kinds[k], LineKind::Nop | LineKind::Label | LineKind::Directive)) {
+        return None;
+    }
+    let mut defined: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    for k in 0..n {
+        if kinds[k] == LineKind::Label && owner[k] != 0 {
+            if let Some(name) = label_name(&lines[k]) {
+                defined.insert(name, owner[k]);
+            }
+        }
+    }
+    // As eliminate_unreferenced_labels finds its references.
+    let is_sym_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$';
+    for k in 0..n {
+        if matches!(kinds[k], LineKind::Nop | LineKind::Label) {
+            continue;
+        }
+        for t in lines[k].split(|c: char| !is_sym_char(c)).filter(|t| t.starts_with(".L")) {
+            if defined.get(t).is_some_and(|&f| f != owner[k]) {
+                return None;
+            }
+        }
+    }
+    Some(ranges.iter().map(|&(start, end)| (start - 1, end)).collect())
+}
+
+/// Phases 1 to 3 over `lines`, the whole file or one function.
+fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
+    let n = lines.len();
+    // Phase 1: Iterative local passes (up to 8 rounds)
+    let mut changed = true;
+    let mut rounds = 0;
+    while changed && rounds < 8 {
+        changed = false;
+        changed |= eliminate_adjacent_store_load(lines, kinds, n);
+        changed |= eliminate_redundant_branches(lines, kinds, n);
+        changed |= eliminate_self_moves(kinds, n);
+        changed |= eliminate_move_chains(lines, kinds, n);
+        changed |= fuse_branch_over_branch(lines, kinds, n);
+        changed |= eliminate_unreferenced_labels(lines, kinds, n);
+        rounds += 1;
+    }
+
+    // Phase 2: Global passes
+    //
+    // Global store forwarding is disabled: same-register NOP elimination has a
+    // remaining correctness bug in complex float-array code (test 0036_0041).
+    // The root cause is not yet identified — it appears correct within a basic
+    // block but produces wrong output. Until this is fixed, GSF is skipped.
+    //
+    // Copy propagation and dead store elimination are independent and safe.
+    propagate_register_copies(lines, kinds, n);
+    global_dead_store_elimination(lines, kinds, n);
+
+    // Phase 3: Local cleanup after global passes (up to 4 rounds)
+    macro_rules! pass {
+        ($name:ident($($arg:expr),*)) => {
+            !skip.contains(&stringify!($name)) && $name($($arg),*)
+        };
+    }
+    if !skip.contains(&"coalesce_arg_copies") {
+        coalesce_arg_copies(lines, kinds, n);
+    }
+    {
+        let mut changed2 = true;
+        let mut rounds2 = 0;
+        while changed2 && rounds2 < 4 {
+            changed2 = false;
+            changed2 |= pass!(eliminate_adjacent_store_load(lines, kinds, n));
+            changed2 |= pass!(forward_held_slots(lines, kinds, n));
+            changed2 |= pass!(eliminate_redundant_branches(lines, kinds, n));
+            changed2 |= pass!(eliminate_self_moves(kinds, n));
+            changed2 |= pass!(eliminate_move_chains(lines, kinds, n));
+            changed2 |= pass!(eliminate_redundant_sxtw(lines, kinds, n));
+            changed2 |= pass!(eliminate_redundant_narrow_extends(lines, kinds, n));
+            changed2 |= pass!(eliminate_redundant_zero_extends(lines, kinds, n));
+            changed2 |= pass!(eliminate_repeated_frame_addrs(lines, kinds, n));
+            changed2 |= pass!(propagate_w_copies(lines, kinds, n));
+            changed2 |= pass!(eliminate_low_half_only_extends(lines, kinds, n));
+            changed2 |= pass!(eliminate_dead_upper_extends(lines, kinds, n));
+            changed2 |= pass!(fold_shift_into_operand(lines, kinds, n));
+            changed2 |= pass!(fold_index_into_mem(lines, kinds, n));
+            changed2 |= pass!(fold_scale_into_mem(lines, kinds, n));
+            changed2 |= pass!(fold_offset_into_global_addr(lines, kinds, n));
+            changed2 |= pass!(sink_compare_past_selects(lines, kinds, n));
+            changed2 |= pass!(fuse_cset_into_csel(lines, kinds, n));
+            changed2 |= pass!(fuse_cmp_sub_into_subs(lines, kinds, n));
+            changed2 |= pass!(forward_copy_propagation(lines, kinds, n));
+            changed2 |= pass!(retarget_results(lines, kinds, n));
+            changed2 |= pass!(build_vec_args_in_place(lines, kinds, n));
+            changed2 |= pass!(fuse_and_into_tst(lines, kinds, n));
+            changed2 |= pass!(reuse_constants(lines, kinds, n));
+            changed2 |= pass!(zero_reg_into_select(lines, kinds, n));
+            changed2 |= pass!(fold_neg_into_cneg(lines, kinds, n));
+            changed2 |= pass!(drop_redundant_zero_extend(lines, kinds, n));
+            changed2 |= pass!(drop_byte_mask_before_compare(lines, kinds, n));
+            changed2 |= pass!(fold_mask_into_compare(lines, kinds, n));
+            changed2 |= pass!(fold_bit_test_into_extract(lines, kinds, n));
+            changed2 |= pass!(drop_mask_of_narrow_value(lines, kinds, n));
+            changed2 |= pass!(drop_sxtw_of_nonnegative(lines, kinds, n));
+            changed2 |= pass!(narrow_load_for_copy(lines, kinds, n));
+            changed2 |= pass!(fuse_mul_into_madd(lines, kinds, n));
+            changed2 |= pass!(fold_step_into_access(lines, kinds, n));
+            changed2 |= pass!(fuse_shift_mask_into_ubfx(lines, kinds, n));
+            changed2 |= pass!(fuse_overflow_test_into_flags(lines, kinds, n));
+            changed2 |= pass!(fold_sign_into_halving(lines, kinds, n));
+            changed2 |= pass!(fuse_byte_pair_into_halfword(lines, kinds, n));
+            changed2 |= pass!(fuse_rev_into_rev16(lines, kinds, n));
+            changed2 |= pass!(fuse_signed_load_mask(lines, kinds, n));
+            changed2 |= pass!(fold_extend_into_narrow_store(lines, kinds, n));
+            changed2 |= pass!(fold_sxtw_into_users(lines, kinds, n));
+            changed2 |= pass!(fold_zero_extension_into_user(lines, kinds, n));
+            changed2 |= pass!(eliminate_dead_writes(lines, kinds, n));
+            changed2 |= pass!(eliminate_dead_writes_global(lines, kinds, n));
+            changed2 |= pass!(fuse_branch_over_branch(lines, kinds, n));
+            changed2 |= pass!(eliminate_repeated_compares(lines, kinds, n));
+            changed2 |= pass!(eliminate_repeated_dups(lines, kinds, n));
+            changed2 |= pass!(fold_offset_into_vec_access(lines, kinds, n));
+            changed2 |= pass!(thread_jumps(lines, kinds, n));
+            changed2 |= pass!(eliminate_unreferenced_labels(lines, kinds, n));
+            changed2 |= pass!(eliminate_unreachable_after_jumps(lines, kinds, n));
+            rounds2 += 1;
+        }
+    }
 }
 
 // ── Switch dispatch duplication ──────────────────────────────────────────────
@@ -8110,6 +8168,24 @@ f:
         let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
         let (live, _) = function_liveness(&lines, &kinds, 0, 4).unwrap();
         assert!(live[0] & (1 << 3) != 0 && live[0] & (1 << 2) == 0);
+    }
+
+    /// Functions are optimized one at a time, unless a function's label is
+    /// used outside it: a computed goto's label table keeps its blocks.
+    #[test]
+    fn test_functions_optimized_one_at_a_time() {
+        let f = ".type f, %function\nf:\n    adrp x0, .Lstr0\n    ret\n.size f, .-f\n";
+        let g = ".type g, %function\ng:\n    ldr x0, [x0]\n    br x0\n.LBB2:\n    mov x0, #20\n    ret\n.size g, .-g\n";
+        let data = ".section .rodata\n.Lstr0:\n    .byte 0\n";
+        let chunks = |asm: &str| {
+            let lines: Vec<String> = asm.lines().map(String::from).collect();
+            let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            local_chunks(&lines, &kinds, lines.len())
+        };
+        assert_eq!(chunks(&format!("{f}{g}{data}")), Some(vec![(0, 4), (5, 12)]));
+        let table = format!("{f}{g}{data}g.labels:\n    .quad .LBB2\n");
+        assert_eq!(chunks(&table), None);
+        assert!(peephole_optimize(table).contains(".LBB2:\n    mov x0, #20"));
     }
 
     #[test]
