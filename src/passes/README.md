@@ -391,6 +391,16 @@ call along, which was inlined again up to the round limit (SQLite's
 22-instruction `sqlite3BitvecDestroy` became 5,000 instructions in each of its
 callers, and the whole file took twice as long to compile).
 
+**Linkage.** A function with external linkage is a candidate too, judged by
+its cleaned-up size (after mem2reg and folding, as for larger static
+functions): a call in the same file may use the definition it sees, as
+clang's does, and the function keeps its own copy for other callers and
+function pointers. Weak functions are excluded (the linker may choose
+another definition), as are naked ones and ones in a section of their own.
+Inlining SQLite's `sqlite3_free` and `sqlite3_value_type`, API functions its
+own code calls tens of millions of times in speedtest, cut 0.3% of its
+instructions.
+
 **Heuristics.** The inliner uses a tiered size-based heuristic:
 
 | Category | Instruction limit | Block limit | Notes |

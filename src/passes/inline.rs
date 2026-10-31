@@ -1330,8 +1330,16 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             && inst_count_for_static <= MAX_INLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_INLINE_BLOCKS;
         // Larger static functions (often small loops, whose blocks inflate the
-        // raw count) are considered only by their cleaned-up size.
-        let cleaned_only = func.is_static && !func.is_inline && !is_always_inline
+        // raw count) are considered only by their cleaned-up size, as are
+        // functions with external linkage: a call in this file may use the
+        // definition it sees (as clang does, the function keeps its own
+        // copy), unless it is weak and the linker may pick another, or naked
+        // or placed in a section of its own. SQLite's sqlite3_free and
+        // sqlite3_value_type are API functions its own code calls millions
+        // of times.
+        let linkable = func.is_static
+            || (!func.is_weak && !func.is_naked && func.section.is_none());
+        let cleaned_only = linkable && !func.is_inline && !is_always_inline
             && !is_trivially_empty && !is_small_static && !is_medium_static
             && inst_count_for_static <= 2 * MAX_INLINE_INSTRUCTIONS && func.blocks.len() <= 2 * MAX_INLINE_BLOCKS;
         if !is_always_inline && !is_trivially_empty && !is_small_static && !is_medium_static && !cleaned_only
