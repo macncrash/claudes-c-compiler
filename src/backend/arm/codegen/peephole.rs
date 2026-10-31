@@ -573,6 +573,13 @@ pub fn peephole_optimize(asm: String) -> String {
     } else {
         duplicate_switch_dispatch(lines, kinds)
     };
+
+    // Jumps to short blocks that test and branch become copies of them.
+    let (lines, kinds) = if skip.contains(&"duplicate_test_blocks") {
+        (lines, kinds)
+    } else {
+        duplicate_test_blocks(lines, kinds)
+    };
     let n = lines.len();
 
     // Last, once no code moves: single-bit tests branch on the bit.
@@ -703,6 +710,165 @@ fn duplicate_switch_dispatch(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<S
             None => {
                 out_lines.push(lines[i].clone());
                 out_kinds.push(kinds[i]);
+            }
+        }
+    }
+    (out_lines, out_kinds)
+}
+
+// ── Test block duplication ───────────────────────────────────────────────────
+//
+// A `b label` to a short block that only tests and branches (a rotated
+// loop's `sub x1, x1, #1; cmp x1, #0; b.le` latch in SQLite's substrFunc,
+// sqlite3VdbeExec's `cmp; b.lo` back to its dispatch) becomes a copy of the
+// block and its branch, then a `b` to where the block falls through (given a
+// label if it has none). Whichever way the test goes, one path no longer
+// runs the jump and the other runs as many instructions as before. As
+// predictors assume, a branch back is the one taken: one whose target is
+// before the copy is copied as it is, followed by `b` to the fall-through;
+// any other is inverted to the fall-through, followed by `b` to its target
+// (a rotated loop's exit). When the copy is directly followed by one of the
+// two labels, it falls through to that one and both paths lose the jump.
+//
+// The block is at most MAX_TEST_BLOCK instructions with no calls, branches
+// or directives before a `b.cc`, `cbz` or `cbnz`, or a `tbz`/`tbnz` in a
+// function of at most TBZ_SAFE_SIZE instructions (their reach is 32KB).
+// Functions of more than COND_BRANCH_SAFE_DISTANCE instructions are left
+// alone.
+
+/// Most instructions before the branch in a copied test block.
+const MAX_TEST_BLOCK: usize = 3;
+/// Most test block copies per function.
+const MAX_TEST_COPIES: usize = 512;
+/// Most instructions in a function whose `tbz`/`tbnz` blocks are copied:
+/// with every copy made, still well inside their 8192-instruction reach.
+const TBZ_SAFE_SIZE: usize = 4096;
+
+/// `line`'s conditional branch inverted and sent to `target`, `tbz` and
+/// `tbnz` included.
+fn invert_test_branch(line: &str, target: &str) -> Option<String> {
+    if let Some(inv) = invert_branch(line, target) {
+        return Some(inv);
+    }
+    let (mnemonic, ops) = split_insn(line)?;
+    let inv = match mnemonic {
+        "tbz" => "tbnz",
+        "tbnz" => "tbz",
+        _ => return None,
+    };
+    let (reg, rest) = first_and_rest(ops);
+    let (bit, _) = first_and_rest(rest);
+    Some(format!("    {} {}, {}, {}", inv, reg, bit, target))
+}
+
+fn duplicate_test_blocks(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<LineKind>) {
+    let n = lines.len();
+    // Line index -> the lines to put in its place.
+    let mut replace: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
+    // Line index -> a label to put before it.
+    let mut fresh: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+    for (start, end) in function_ranges(&lines, n) {
+        let size = (start..end).filter(|&k| !matches!(kinds[k], LineKind::Nop | LineKind::Label)).count();
+        if size > COND_BRANCH_SAFE_DISTANCE {
+            continue;
+        }
+        let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for k in start..end {
+            if kinds[k] == LineKind::Label {
+                if let Some(name) = label_name(&lines[k]) {
+                    labels.insert(name, k);
+                }
+            }
+        }
+        // The test block at a label line: its instructions, its branch, and
+        // the line it falls through to.
+        let test_block = |at: usize| -> Option<(Vec<usize>, usize, usize)> {
+            let mut body = Vec::new();
+            for j in at + 1..end {
+                let line = lines[j].trim();
+                match kinds[j] {
+                    LineKind::Nop | LineKind::Label => {}
+                    LineKind::CondBranch | LineKind::CmpBranch => {
+                        let tbz = matches!(split_insn(line), Some(("tbz" | "tbnz", _)));
+                        if !(cond_target(line).is_some() || tbz && size <= TBZ_SAFE_SIZE) {
+                            return None;
+                        }
+                        return (j + 1..end).find(|&k| kinds[k] != LineKind::Nop).map(|y| (body, j, y));
+                    }
+                    LineKind::Branch | LineKind::Call | LineKind::Ret => return None,
+                    _ if line.starts_with('.') || body.len() == MAX_TEST_BLOCK => return None,
+                    _ if matches!(split_insn(line), Some(("br" | "blr" | "tbz" | "tbnz" | "cbz" | "cbnz" | "brk", _)))
+                        || line.starts_with("b.") => return None,
+                    _ => body.push(j),
+                }
+            }
+            None
+        };
+        let mut copies = 0;
+        for b in start..end {
+            if copies == MAX_TEST_COPIES {
+                break;
+            }
+            if kinds[b] != LineKind::Branch {
+                continue;
+            }
+            let Some(("b", target)) = split_insn(&lines[b]) else { continue };
+            let Some((body, br, fall)) = labels.get(target.trim()).and_then(|&at| test_block(at)) else { continue };
+            let x = last_operand(split_insn(&lines[br]).map_or("", |(_, ops)| ops));
+            if invert_test_branch(&lines[br], x).is_none() {
+                continue;
+            }
+            let y = match kinds[fall] {
+                LineKind::Label => label_name(&lines[fall]).unwrap_or_default().to_string(),
+                _ => {
+                    let id = fresh.len();
+                    fresh.entry(fall).or_insert_with(|| format!(".Lfall_{}", id)).clone()
+                }
+            };
+            // The labels directly after the jump.
+            let mut next = Vec::new();
+            for k in b + 1..end {
+                match kinds[k] {
+                    LineKind::Nop => {}
+                    LineKind::Label => next.extend(label_name(&lines[k])),
+                    _ => break,
+                }
+            }
+            let tail = if next.contains(&y.as_str()) {
+                vec![lines[br].clone()]
+            } else if next.contains(&x) {
+                vec![invert_test_branch(&lines[br], &y).expect("inverts")]
+            } else if labels.get(x).is_some_and(|&t| t < b) {
+                vec![lines[br].clone(), format!("    b {}", y)]
+            } else {
+                vec![invert_test_branch(&lines[br], &y).expect("inverts"), format!("    b {}", x)]
+            };
+            let mut copy: Vec<String> = body.iter().map(|&k| lines[k].clone()).collect();
+            copy.extend(tail);
+            replace.insert(b, copy);
+            copies += 1;
+        }
+    }
+    if replace.is_empty() {
+        return (lines, kinds);
+    }
+    let mut out_lines = Vec::with_capacity(n + replace.len() * (MAX_TEST_BLOCK + 2) + fresh.len());
+    let mut out_kinds = Vec::with_capacity(out_lines.capacity());
+    for i in 0..n {
+        if let Some(label) = fresh.remove(&i) {
+            out_lines.push(format!("{}:", label));
+            out_kinds.push(LineKind::Label);
+        }
+        match replace.remove(&i) {
+            Some(copy) => {
+                for line in copy {
+                    out_kinds.push(classify_line(&line));
+                    out_lines.push(line);
+                }
+            }
+            None => {
+                out_kinds.push(kinds[i]);
+                out_lines.push(lines[i].clone());
             }
         }
     }
@@ -7491,7 +7657,9 @@ mod tests {
         // when the operands differ.
         for body in ["    cmp w3, w4\n    b.lt .L1\n.L3:\n    cmp w3, w4\n    b.ne .L2\n    mov x0, #1\n    b .L3\n.L1:\n.L2:\n",
                      "    cmp w3, w4\n    b.lt .L1\n    cmp w3, w5\n    b.ne .L2\n    mov x0, #1\n.L1:\n.L2:\n"] {
-            assert_eq!(f(body).matches("    cmp ").count(), 2, "{body}");
+            // (A jump to the loop's test becomes a third copy of it.)
+            let result = f(body);
+            assert!(result.contains("b.lt .L1\n.L3:\n    cmp w3, w4\n") || result.contains("cmp w3, w5"), "{result}");
         }
     }
 
@@ -7796,6 +7964,23 @@ f:
                             dispatch.replace("    cmp x14, #2\n", "    bl g\n    cmp x14, #2\n"), cases);
         let result = peephole_optimize(input);
         assert_eq!(result.matches("br x17").count(), 1, "{}", result);
+    }
+
+    #[test]
+    fn test_jump_to_test_block_becomes_its_copy() {
+        // A rotated loop's latch: the copy branches back to the body and
+        // falls through to the exit's label.
+        let input = ".type f, %function\nf:\n    cmp x1, #0\n    b.gt .LBB1\n    b .LBB9\n.LBB2:\n    sub x1, x1, #1\n    cmp x1, #0\n    b.le .LBB9\n.LBB1:\n    ldrb w12, [x0]\n    cbz w12, .LBB9\n    add x0, x0, #1\n    b .LBB2\n.LBB9:\n    mov x0, x1\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("    add x0, x0, #1\n    sub x1, x1, #1\n    cmp x1, #0\n    b.gt .LBB1\n.LBB9:"), "{}", result);
+        // A branch back is kept, then a jump to the fall-through.
+        let input = ".type f, %function\nf:\n.LBB1:\n    add x2, x2, #1\n    ldrb w12, [x0, x2]\n    cbz w12, .LBB3\n    add x4, x4, x12\n    b .LBB5\n.LBB3:\n    add x0, x0, #1\n.LBB5:\n    cmp x2, x3\n    b.lo .LBB1\n.LBB6:\n    add x0, x2, x4\n    ret\n.size f, .-f\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("    add x4, x4, x12\n    cmp x2, x3\n    b.lo .LBB1\n    b .Lfall_0\n"), "{}", result);
+        // A tbz in a small function, its fall-through given a label.
+        let input = input.replace("cmp x2, x3\n    b.lo .LBB1", "tbz x2, #3, .LBB1");
+        let result = peephole_optimize(input);
+        assert!(result.contains("    add x4, x4, x12\n    tbz x2, #3, .LBB1\n    b .Lfall_0\n"), "{}", result);
     }
 
     #[test]
@@ -8147,7 +8332,8 @@ f:
         assert!(!result.contains("b .L2") && result.matches("and x0, x1, #0xffff\n    ret").count() == 2, "{}", result);
         // Not a block with a branch in it.
         let asm = asm.replace("    and x0", "    cbz x1, .L1\n    and x0");
-        assert!(peephole_optimize(asm).contains("b .L2"));
+        let result = peephole_optimize(asm);
+        assert_eq!(result.matches("and x0, x1, #0xffff").count(), 1, "{}", result);
     }
 
     fn ret_x0(body: &str) -> String {

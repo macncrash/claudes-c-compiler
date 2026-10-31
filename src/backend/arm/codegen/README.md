@@ -1140,6 +1140,22 @@ checked. sqlite3VdbeExec's dispatch on `pOp->opcode` runs two
 instructions fewer per opcode in each of its copies; speedtest ran 0.98%
 fewer instructions.
 
+Then a `b label` to a short block that only tests and branches (at most 3
+instructions with no calls, branches or directives, then a `b.cc`, `cbz`
+or `cbnz`, or a `tbz`/`tbnz` in a function of at most 4096 instructions)
+becomes a copy of the block, its branch, and a `b` to where the block falls
+through, which is given a `.Lfall_N` label if it has none. The copy is a
+rotated loop's latch (`sub x1, x1, #1; cmp x1, #0; b.le exit` in
+substrFunc), a binary search's `cmp lo, hi; b.gt` (sqlite3BtreeIndexMoveto)
+or sqlite3VdbeExec's `cmp; b.lo` back to its dispatch. Whichever way the
+test goes, one path loses the jump and the other runs as many instructions
+as before: a branch back is copied as it is, taken as predictors assume,
+and any other is inverted to the fall-through with the `b` going to its
+target; a copy directly followed by either label falls through to it. At
+most 512 copies per function, none in one over 200000 instructions.
+Speedtest ran 0.79% fewer instructions, 0.15% of it from blocks that
+already had a label at the fall-through.
+
 **16. Single-Bit Tests** (last, after the copies)
 
 `and D, A, #2^b` then `cbz`/`cbnz D`, D dead after, is `tbz`/`tbnz A, #b`
