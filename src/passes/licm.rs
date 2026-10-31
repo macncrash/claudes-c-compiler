@@ -810,8 +810,12 @@ fn is_load_hoistable(
 /// Share of its loop header's frequency below which a loop computes a
 /// global's address only on rare paths (see rare_globals).
 const RARE_GLOBAL_SHARE: f64 = 0.3;
-/// Most distinct global addresses a loop computes that are all hoisted.
+/// Most distinct global addresses a loop computes that are held to the
+/// stricter SCARCE_GLOBAL_SHARE.
 const FEW_GLOBALS: usize = 3;
+/// The share below which a loop computing at most FEW_GLOBALS globals
+/// computes one's address only on rare paths.
+const SCARCE_GLOBAL_SHARE: f64 = 0.125;
 
 /// The globals whose addresses a loop with calls should go on computing
 /// where it needs them, given block frequencies (empty: none).
@@ -823,10 +827,16 @@ const FEW_GLOBALS: usize = 3;
 /// stored them all on each of its 2.2 million calls. Left in place, each
 /// costs an adrp and add on the path that uses it. A global stays when the
 /// frequencies of the blocks computing its address add up to less than
-/// RARE_GLOBAL_SHARE of the header's, and only in a loop computing more
-/// than FEW_GLOBALS distinct ones: a few fit in registers, and deflate_slow,
-/// using its length and distance code tables only when it emits a match,
-/// ran 1% more instructions with them kept in the loop.
+/// RARE_GLOBAL_SHARE of the header's, or, in a loop computing at most
+/// FEW_GLOBALS distinct ones, less than SCARCE_GLOBAL_SHARE: a few usually
+/// fit in registers, and deflate_slow, using its length and distance code
+/// tables only when it emits a match (an estimated 17% of iterations), ran
+/// 6% more instructions with them kept in the loop. But a loop with no
+/// register to spare spills even one rarely used address on every entry:
+/// sqlite3VdbeRecordCompareWithSkip's field loop with sqlite3SmallTypeSizes
+/// (an estimated 6%) and jsonTranslateTextToBlob's with jsonSpaces (11%)
+/// ran 2-5% fewer instructions with them left in place. (The estimates are
+/// static, so the line between them is a rough one.)
 fn rare_globals(func: &IrFunction, natural_loop: &NaturalLoop, freq: &[f64]) -> FxHashSet<String> {
     let mut share: FxHashMap<&str, f64> = FxHashMap::default();
     if freq.len() != func.blocks.len() {
@@ -839,10 +849,8 @@ fn rare_globals(func: &IrFunction, natural_loop: &NaturalLoop, freq: &[f64]) -> 
             }
         }
     }
-    if share.len() <= FEW_GLOBALS {
-        return FxHashSet::default();
-    }
-    let limit = RARE_GLOBAL_SHARE * freq[natural_loop.header];
+    let share_limit = if share.len() <= FEW_GLOBALS { SCARCE_GLOBAL_SHARE } else { RARE_GLOBAL_SHARE };
+    let limit = share_limit * freq[natural_loop.header];
     share.into_iter().filter(|&(_, f)| f < limit).map(|(name, _)| name.to_string()).collect()
 }
 

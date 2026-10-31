@@ -945,7 +945,12 @@ computing blocks' estimated frequencies (`liveness::compute_block_freq`) add
 up to less than 0.3 of the header's stays where it is used.
 `sqlite3_str_vappendf`'s format loop had stored 23 string literals and
 tables, most used by one conversion each, on every call; SQLite's speedtest
-ran 0.5% fewer instructions once they stayed.
+ran 0.5% fewer instructions once they stayed. A loop computing at most
+three stays with less than 0.125: a few addresses usually fit in registers
+(`deflate_slow`'s length and distance code tables, an estimated 0.17, ran
+6% more instructions left in its loop), but a loop with none to spare
+spilled even one, as `sqlite3VdbeRecordCompareWithSkip` did with
+`sqlite3SmallTypeSizes` (0.06); speedtest ran 0.2% fewer instructions.
 
 ### iv_strength_reduce -- Induction Variable Strength Reduction
 
