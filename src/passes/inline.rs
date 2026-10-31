@@ -296,8 +296,8 @@ fn select_inline_site(
         // Blocks that only return become jumps to the join once inlined, so
         // outside the largest callers only the others count (see
         // MAX_CLEANED_ONLY_RAW_BLOCKS for why those keep the stricter rules).
-        // A call that arrived in a body inlined for its cleaned-up size was
-        // not counted in that size, and stays a call by this rule.
+        // A call that arrived in a body admitted only that way was not
+        // counted in its size, and stays a call by this rule.
         let relaxed = !caller_is_recursive && !caller_at_absolute_cap;
         let cleaned = (!is_tiny && !budget_exhausted && !site.in_cleaned_body)
             .then(|| specialized_size_cached(spec_cache, callee_map, &site.callee_name, &site.const_args))
@@ -315,7 +315,12 @@ fn select_inline_site(
             || cleaned.is_some() {
             let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
             let cost = cleaned.map_or(callee_inst_count, |c| c.insts);
-            let by_cleaned = !(is_tiny || (is_small && (!budget_exhausted || callee_data.is_always_inline)) || is_static_inline_eligible);
+            // Only a body admitted because its return blocks did not count
+            // keeps its calls: one within the block limit lets its calls be
+            // inlined in turn (chess-perft's rook_att, inlined into generate,
+            // brings ray_att, whose lsb and msb follow).
+            let by_cleaned = !(is_tiny || (is_small && (!budget_exhausted || callee_data.is_always_inline)) || is_static_inline_eligible)
+                && cleaned.is_some_and(|c| c.blocks > max_blocks);
             return Some((site.clone(), cost, use_relaxed, by_cleaned));
         }
     }
@@ -2225,6 +2230,51 @@ mod tests {
         } }).collect();
         f.blocks = vec![BasicBlock { label: BlockId(0), instructions, terminator: Terminator::Return(None), source_spans: Vec::new() }];
         f
+    }
+
+    /// A static callee of `insts` additions in `blocks` blocks, too large
+    /// for the raw size rules.
+    fn cleaned_only_callee(insts: usize, blocks: usize) -> CalleeData {
+        let per_block = insts / blocks;
+        let blocks = (0..blocks).map(|b| BasicBlock {
+            label: BlockId(b as u32),
+            instructions: (0..per_block).map(|i| Instruction::BinOp {
+                dest: Value((b * per_block + i) as u32), op: IrBinOp::Add, lhs: Operand::Const(IrConst::I64(i as i64)),
+                rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64,
+            }).collect(),
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }).collect();
+        CalleeData {
+            blocks, param_struct_sizes: vec![], return_type: IrType::Void, num_params: 0, next_value_id: insts as u32,
+            max_block_id: 0, is_always_inline: false, exceeds_normal_limits: false, is_static_inline: false,
+            cleaned_only: true, wide: false, params: vec![],
+        }
+    }
+
+    /// The calls a body inlined for its cleaned-up size brings stay
+    /// candidates, unless only its return blocks not counting admitted it
+    /// (chess-perft ran 31% more instructions when rook_att's calls to
+    /// ray_att stayed calls).
+    #[test]
+    fn calls_in_inlined_bodies_stay_candidates_within_the_block_limit() {
+        let mut callee_map: HashMap<String, CalleeData> = HashMap::new();
+        callee_map.insert("rook".to_string(), cleaned_only_callee(30, 1));
+        callee_map.insert("spread".to_string(), cleaned_only_callee(30, MAX_INLINE_BLOCKS + 3));
+        let mut cache: HashMap<String, Option<CleanedSize>> = HashMap::new();
+        cache.insert("rook".to_string(), Some(CleanedSize { insts: 7, blocks: 1, non_return_blocks: 1 }));
+        cache.insert("spread".to_string(),
+                     Some(CleanedSize { insts: 30, blocks: MAX_INLINE_BLOCKS + 3, non_return_blocks: 2 }));
+        let site = |name: &str| InlineCallSite {
+            block_idx: 0, inst_idx: 0, callee_name: name.to_string(), dest: None, args: vec![], const_args: vec![],
+            in_cleaned_body: false,
+        };
+        for (name, keeps_calls) in [("rook", false), ("spread", true)] {
+            let picked = select_inline_site(&[site(name)], &callee_map, false, false, false, false, false,
+                                            MAX_INLINE_BUDGET_PER_CALLER, MAX_ALWAYS_INLINE_BUDGET_PER_CALLER, &mut cache);
+            let (s, _, _, by_cleaned) = picked.expect("inlined for its cleaned-up size");
+            assert_eq!((s.callee_name.as_str(), by_cleaned), (name, keeps_calls));
+        }
     }
 
     #[test]

@@ -413,10 +413,13 @@ wider raw limit added cold code to opcode handlers and made it run 4% more
 instructions, mostly spills on the dispatch path, and counting only
 non-return blocks everywhere cost speedtest 4% as a whole. A cleaned-up size counts only
 the small callees inlined into the callee, so a call arriving with a body
-inlined this way is not inlined by this rule: `sqlite3DbNNFreeNN`, 21
-instructions, otherwise brought `sqlite3_free` and its statistics into each
-of its 82 callers. Together these cut speedtest's instructions 0.4%, for
-8% more code.
+admitted only because its return blocks did not count is not inlined by
+this rule: `sqlite3DbNNFreeNN`, 21 instructions, otherwise brought
+`sqlite3_free` and its statistics into each of its 82 callers. Calls in a
+body within the block limit stay candidates: chess-perft inlines
+`rook_att` into its move generator, then `ray_att`, then the `lsb` and
+`msb` it calls, and ran 31% more instructions when those stayed calls.
+Together these cut speedtest's instructions 0.5%, for 13% more code.
 
 **Heuristics.** The inliner uses a tiered size-based heuristic:
 
