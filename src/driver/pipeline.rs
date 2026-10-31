@@ -1132,6 +1132,9 @@ impl Driver {
             if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("loop_hoist")) {
                 crate::passes::loop_hoist::hoist_rotated_loops(&mut module);
             }
+            if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("loop_promote")) {
+                crate::passes::loop_promote::promote_loop_locals(&mut module);
+            }
         }
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("loop_layout")) {
             crate::passes::loop_layout::layout_loops(&mut module);

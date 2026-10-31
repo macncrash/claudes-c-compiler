@@ -154,7 +154,7 @@ The optimizer executes in four sequential phases:
          |
          v
  Phi elimination (src/ir/mem2reg), then:
-     loop_rotate, loop_hoist, loop_layout, latch_dup, step_to_load, const_hoist
+     loop_rotate, loop_hoist, loop_promote, loop_layout, latch_dup, step_to_load, const_hoist
 ```
 
 ## Phase Structure
@@ -355,9 +355,11 @@ and every access the compiler makes itself (struct copies, ABI moves, va_arg,
 temporaries, the loads and stores passes create). A class that does not match
 the access's IR type (a scalar read in pieces) also becomes `ANY`.
 
-Three places use the classes: GVN keeps cached loads and forwardable stores of
+Four places use the classes: GVN keeps cached loads and forwardable stores of
 other classes across a store; load_phi walks past a store of another class;
-loop_hoist hoists a load the loop writes only with stores of other classes.
+loop_hoist hoists a load the loop writes only with stores of other classes;
+loop_promote keeps a local's field in a register through a loop whose other
+accesses that may reach it are of other classes.
 
 Classes are dropped before optimization (every access is then `ANY`) with
 `-fno-strict-aliasing`, at `-O0` (strict aliasing is on by default from -O1,
@@ -1318,6 +1320,23 @@ insertion loop stores to the `ush` arrays `s->head` and `s->prev`, and
 `s->window`, `s->hash_mask`, `s->w_mask`, `s->head` and `s->prev` are loaded
 once before it.
 
+loop_promote (loop_promote.rs) then keeps in a register a field of a local
+whose address escapes, which the loop both reads and writes: SQLite's
+balance_nonroot gathers cells with `b.apCell[b.nCell] = ...; b.nCell++`, and
+`&b` is passed to other functions, so `b.nCell` was loaded and stored on
+every iteration. When the loop makes no calls and no memory access other
+than plain loads and stores, and none of those that may reach the field (by
+the alias model of mod_ref: another local, a global or a parameter's object
+cannot; another byte range of the same local cannot) is of an alias class
+that may alias its own, the field is loaded once on the guard's edge into
+the loop, each load of it in the loop becomes a copy of that value and each
+store a copy into it (a variable of several definitions, as lowered phis
+are), and it is stored back on every edge leaving the loop (in a new block
+when the edge's target has other predecessors). Every access to the field
+must have its type and every stored value that type, so that a copy changes
+nothing. Speedtest ran 0.16% fewer instructions; the loop's index is then
+sign-extended each iteration rather than loaded with `ldrsw`.
+
 ### ext_elide -- Extensions Loads Already Made
 
 Runs after phi_cmp, on AArch64, followed by copy propagation and dead code
@@ -1706,7 +1725,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`load_phi`, `unread_locals`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
+`load_phi`, `unread_locals`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_promote`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1756,6 +1775,7 @@ behavior across iterations.
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
 | `loop_layout.rs`         | Loop tails moved before the header (latch falls through) |
+| `loop_promote.rs`        | Locals' fields kept in registers through call-free loops |
 | `loop_rotate.rs`         | Header duplication into latches (bottom-tested loops)  |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
 | `pressure_hoist.rs`      | Instructions hoisted to end several live ranges early  |

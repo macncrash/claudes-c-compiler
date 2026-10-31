@@ -36,6 +36,7 @@ mod step_sink;
 mod load_phi;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_hoist;
+pub(crate) mod loop_promote;
 pub(crate) mod loop_layout;
 mod loop_unroll;
 mod loop_vectorize;
