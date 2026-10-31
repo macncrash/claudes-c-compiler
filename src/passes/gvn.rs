@@ -408,8 +408,11 @@ impl GvnState {
                 Some((ExprKey::Cmp { op: *op, lhs: lhs_vn, rhs: rhs_vn, ty: *ty }, *dest))
             }
             Instruction::Cast { dest, src, from_ty, to_ty } => {
-                // Don't CSE casts to/from 128-bit types (complex codegen)
-                if from_ty.is_128bit() || to_ty.is_128bit() {
+                // Casts between a 128-bit type and a float one are library
+                // calls; integer extensions to and truncations from 128 bits
+                // are numbered (the repeated multiply-highs of a quotient and
+                // remainder by one constant, as div_by_const expands them).
+                if (from_ty.is_128bit() || to_ty.is_128bit()) && !(from_ty.is_integer() && to_ty.is_integer()) {
                     return None;
                 }
                 let src_vn = self.operand_to_vn(src);

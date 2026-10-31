@@ -135,6 +135,21 @@ impl ArmCodegen {
             return;
         }
         if let Some(&(x, m, signed)) = self.mul_highs.get(&dest.0) {
+            // The multiplier first, into x1 unless it has a register, as
+            // loading it may pass through x0.
+            let k = match (m, self.operand_reg(&m)) {
+                (_, Some(r)) => callee_saved_name(r),
+                (Operand::Const(c), None) => {
+                    self.emit_load_imm64("x1", c.to_i64().expect("an integer multiplier"));
+                    "x1"
+                }
+                (Operand::Value(_), None) => {
+                    self.operand_to_x0(&m);
+                    self.state.emit("    mov x1, x0");
+                    self.state.reg_cache.invalidate_acc();
+                    "x1"
+                }
+            };
             let src = match self.operand_reg(&x) {
                 Some(r) => callee_saved_name(r),
                 None => {
@@ -142,9 +157,8 @@ impl ArmCodegen {
                     "x0"
                 }
             };
-            self.emit_load_imm64("x1", m);
             let d = self.dest_reg(dest).map_or("x0", callee_saved_name);
-            self.state.emit_fmt(format_args!("    {} {}, {}, x1", if signed { "smulh" } else { "umulh" }, d, src));
+            self.state.emit_fmt(format_args!("    {} {}, {}, {}", if signed { "smulh" } else { "umulh" }, d, src, k));
             self.state.reg_cache.invalidate_acc();
             if d == "x0" {
                 self.store_x0_to(dest);

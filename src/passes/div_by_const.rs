@@ -55,6 +55,88 @@ use crate::ir::reexports::{
     Value,
 };
 
+/// A 64-bit multiply-high as expand_udiv64 and expand_sdiv64 spell it.
+pub(crate) struct MulHighChain {
+    /// Its block, and the index of its multiply there.
+    pub block: usize,
+    pub mul: usize,
+    /// The 64-bit operand.
+    pub x: Operand,
+    /// The multiplier: an `I64` constant (its 64 bits), or a value
+    /// const_hoist built such a constant in.
+    pub m: Operand,
+    pub signed: bool,
+    /// The extension, product and shift, read only by the next of them.
+    pub parts: [Value; 3],
+    /// The truncation: the high half.
+    pub dest: Value,
+}
+
+/// The multiply-highs of `func`, four instructions in a row of one block:
+///   e = Cast(x, I64 -> I128 | U64 -> U128); p = Mul(e, C);
+///   h = AShr|LShr(p, 64); t = Cast(h, -> I64|U64)
+/// with e, p and h read only by the next, and C in the extension's 64-bit
+/// range (or, on AArch64 after const_hoist, a value copied from such a
+/// constant). t is the high half of x * C: a backend may compute it with one
+/// multiply-high (smulh for a sign extension, umulh for a zero one) and
+/// emit nothing for e, p and h. AArch64 does; const_hoist moves C only
+/// where this matches, so the generic 128-bit multiply never sees it.
+pub(crate) fn mul_high_chains(func: &IrFunction) -> Vec<MulHighChain> {
+    use crate::common::fx_hash::{FxHashMap, FxHashSet};
+    let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut built: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+            if let Instruction::Copy { dest, src: Operand::Const(IrConst::I64(_)) } = inst {
+                built.insert(dest.0);
+            }
+        }
+        block.terminator.for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+    }
+    let once = |v: &Value| uses.get(&v.0) == Some(&1);
+    let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128);
+    let mut chains = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (i, w) in block.instructions.windows(4).enumerate() {
+            let Instruction::Cast { dest: e, src: x @ Operand::Value(_), from_ty, to_ty } = &w[0] else { continue };
+            let signed = match (from_ty, to_ty) {
+                (IrType::I64, IrType::I128) => true,
+                (IrType::U64, IrType::U128) => false,
+                _ => continue,
+            };
+            let Instruction::BinOp { dest: p, op: IrBinOp::Mul, lhs, rhs, ty } = &w[1] else { continue };
+            let m = match (lhs, rhs) {
+                (Operand::Value(v), m) | (m, Operand::Value(v)) if v == e && wide(ty) => m,
+                _ => continue,
+            };
+            let m = match m {
+                Operand::Const(c) => {
+                    let c = match c {
+                        IrConst::I128(c) => *c,
+                        IrConst::I64(c) => *c as i128,
+                        _ => continue,
+                    };
+                    let fits = if signed { i64::try_from(c).is_ok() } else { u64::try_from(c).is_ok() };
+                    if !fits {
+                        continue;
+                    }
+                    Operand::Const(IrConst::I64(c as i64))
+                }
+                Operand::Value(v) if v != e && built.contains(&v.0) => *m,
+                Operand::Value(_) => continue,
+            };
+            let Instruction::BinOp { dest: h, op: IrBinOp::AShr | IrBinOp::LShr, lhs: Operand::Value(pv), rhs: Operand::Const(k), ty } = &w[2] else { continue };
+            let Instruction::Cast { dest: t, src: Operand::Value(hv), from_ty, to_ty: IrType::I64 | IrType::U64 } = &w[3] else { continue };
+            if pv != p || hv != h || !wide(ty) || !wide(from_ty) || k.to_i64() != Some(64) || !once(e) || !once(p) || !once(h) {
+                continue;
+            }
+            chains.push(MulHighChain { block: b, mul: i + 1, x: *x, m, signed, parts: [*e, *p, *h], dest: *t });
+        }
+    }
+    chains
+}
+
 /// Transform division/modulo by constants in a single function.
 pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
     let mut changes = 0;

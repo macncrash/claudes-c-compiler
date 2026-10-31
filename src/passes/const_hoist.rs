@@ -25,6 +25,9 @@ use super::loop_analysis;
 /// Most constants given a register per function.
 const MAX_HOISTED: usize = 4;
 
+/// Most instructions in a function whose multiply-high magics are hoisted.
+const MUL_HIGH_MAX_SIZE: usize = 500;
+
 /// `aarch64` also hoists the constants on the left of subtracts and shifts.
 pub(crate) fn hoist_constants(module: &mut IrModule, aarch64: bool) {
     if crate::common::types::target_is_32bit() {
@@ -101,10 +104,27 @@ fn build_cost(k: i64) -> usize {
     pieces(0).min(pieces(0xffff)).max(1)
 }
 
-/// The hoistable constant operands of an instruction.
-fn for_each_candidate(inst: &mut Instruction, left: bool, mut f: impl FnMut(&mut Operand, i64)) {
+/// The hoistable constant operands of an instruction. `mul_high`: it is the
+/// multiply of a multiply-high (div_by_const::mul_high_chains).
+fn for_each_candidate(inst: &mut Instruction, left: bool, mul_high: bool, mut f: impl FnMut(&mut Operand, i64)) {
     let wide = |ty: &IrType| matches!(ty, IrType::I64 | IrType::U64);
     match inst {
+        // The magic multiplier of a division by a 64-bit constant, which
+        // AArch64 reads from a register into its umulh or smulh: its 64
+        // bits (sqlite3Int64ToText's v/100 and v%100, four instructions on
+        // every digit pair).
+        Instruction::BinOp { lhs, rhs, .. } if left && mul_high => {
+            for o in [lhs, rhs] {
+                let k = match o {
+                    Operand::Const(IrConst::I128(c)) => *c as i64,
+                    Operand::Const(IrConst::I64(c)) => *c,
+                    _ => continue,
+                };
+                if build_cost(k) >= 2 {
+                    f(o, k);
+                }
+            }
+        }
         // AArch64 multiplies and divides take no immediate: zbench's word
         // choice `r % nw`, a multiply by 0x38e38e39 for each word. Only a
         // constant that takes a movk too: with one `mov` saved per use,
@@ -192,6 +212,16 @@ fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
     if in_loop[0] {
         return 0;
     }
+    // A multiply-high's magic only in a function small enough that it keeps
+    // a register: built at entry and spilled, it cost sqlite3_str_vappendf
+    // (1721 instructions, its divisions in loops it seldom runs) eight more
+    // instructions on every call.
+    let size: usize = func.blocks.iter().map(|b| b.instructions.len()).sum();
+    let mul_highs: Vec<(usize, usize)> = if left && size <= MUL_HIGH_MAX_SIZE {
+        super::div_by_const::mul_high_chains(func).iter().map(|c| (c.block, c.mul)).collect()
+    } else {
+        Vec::new()
+    };
     // Loop uses of each candidate constant, weighted by the instructions
     // building it takes, in first-seen order.
     let mut uses: Vec<(i64, usize)> = Vec::new();
@@ -199,8 +229,8 @@ fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
         if !in_loop[b] {
             continue;
         }
-        for inst in &mut block.instructions {
-            for_each_candidate(inst, left, |_, k| match uses.iter_mut().find(|(c, _)| *c == k) {
+        for (i, inst) in block.instructions.iter_mut().enumerate() {
+            for_each_candidate(inst, left, mul_highs.contains(&(b, i)), |_, k| match uses.iter_mut().find(|(c, _)| *c == k) {
                 Some((_, n)) => *n += build_cost(k),
                 None => uses.push((k, build_cost(k))),
             });
@@ -229,8 +259,8 @@ fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
         if !in_loop[b] {
             continue;
         }
-        for inst in &mut block.instructions {
-            for_each_candidate(inst, left, |o, k| {
+        for (i, inst) in block.instructions.iter_mut().enumerate() {
+            for_each_candidate(inst, left, mul_highs.contains(&(b, i)), |o, k| {
                 if let Some(&(_, v)) = regs.iter().find(|(c, _)| *c == k) {
                     *o = Operand::Value(v);
                     changes += 1;

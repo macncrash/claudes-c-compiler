@@ -447,7 +447,10 @@ emit nothing and get no stack slot (`CodegenState::codeless_values`). The
 result is a plain 64-bit value the register allocator may take
 (`RegAllocConfig::gpr_casts`). sqlite3Int64ToText's `v/100` and `v%100`
 went from about 25 instructions, with four stack stores, to five; speedtest
-ran 0.62% fewer instructions.
+ran 0.62% fewer instructions. The chains are found by
+`div_by_const::mul_high_chains`, shared with const_hoist, which may replace
+the constant with a 64-bit value built once at entry (then read from its
+register).
 
 ### Shifts
 

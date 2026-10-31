@@ -192,8 +192,9 @@ pub(super) fn arm_invert_cond_code(cc: &str) -> &'static str {
     }
 }
 
-/// A multiply-high's truncation -> (the 64-bit operand, the multiplier, signed).
-pub(super) type MulHighs = FxHashMap<u32, (Operand, i64, bool)>;
+/// A multiply-high's truncation -> (the 64-bit operand, the multiplier: a
+/// constant, or a 64-bit value const_hoist built it in; signed).
+pub(super) type MulHighs = FxHashMap<u32, (Operand, Operand, bool)>;
 
 /// AArch64 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses AAPCS64 calling convention with stack-based allocation.

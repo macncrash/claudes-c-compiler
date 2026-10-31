@@ -852,7 +852,9 @@ previously computed values.
 - **UnaryOp** -- unary operations.
 - **Cmp** -- comparisons (without commutative canonicalization).
 - **Cast** -- type conversions keyed by source and destination type. Excluded
-  for 128-bit types.
+  between 128-bit and float types (library calls); integer extensions to and
+  truncations from 128 bits are numbered, so the multiply-high that
+  div_by_const writes out for both `x % 100` and `x / 100` is computed once.
 - **GetElementPtr** -- base + offset address computations.
 - **Load** -- redundant load elimination (see below). Excluded for float,
   long double, and 128-bit types.
@@ -1451,7 +1453,14 @@ the constant there takes (three for a costly one, otherwise a movz or movn
 and a movk per further piece). A cheap constant needs two loop uses: read once, it saves one
 `mov` but holds a register through the function, and longest_match lost
 more to the allocation around `MAX_MATCH - len` than it saved. The splitmix64 steps in scalar-bench's hash kernel
-drop sixteen instructions per operation, about 20% faster.
+drop sixteen instructions per operation, about 20% faster. On AArch64 the
+magic multiplier of a division by a 64-bit constant qualifies too, as its
+64 bits, where div_by_const::mul_high_chains finds the multiply-high the
+backend computes with one umulh or smulh reading it from a register (the
+generic 128-bit multiply never sees the 64-bit value), in functions of at
+most 500 instructions: in sqlite3_str_vappendf (1721) the magics went to
+the stack at entry, eight instructions on every call for divisions in loops
+it seldom runs.
 
 ### if_convert -- If-Conversion
 
