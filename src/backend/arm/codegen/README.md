@@ -1236,8 +1236,20 @@ stores, conversions) reload the full-precision value from its tracked source slo
 The peephole optimizer operates on assembly text rather than a structured IR. This is
 a pragmatic choice: it runs after all codegen is complete, so it can catch redundancies
 introduced by any part of the pipeline (including inline asm, intrinsics, and library
-call sequences). The pre-parsed `LineKind` classification ensures the text-based
-approach does not become a performance bottleneck.
+call sequences). The pre-parsed `LineKind` classification keeps most passes to
+one scan of the lines.
+
+The optimizer sees the whole file at once, so anything a pass does per candidate
+must not scan the whole file: SQLite's amalgamation is 360,000 lines, and two
+such searches made the peephole take 43 of the 50 seconds it took to compile
+(branch-over-branch fusion looking up each target label to check b.cond's
+range, broadcast hoisting searching for each loop's label). Those lookups now
+come from a label map and running instruction counts built once per pass
+(`BranchDistances`), or are skipped where nothing could change. Liveness
+(`function_liveness`) is computed about a hundred times per file, and each
+line's parsed uses and definitions are cached between runs by line index,
+reparsed when the line's text or kind has changed. SQLite now compiles in 13
+seconds, to the same assembly.
 
 ### Conservative Scratch Register Partitioning
 

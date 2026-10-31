@@ -408,6 +408,7 @@ fn label_name(line: &str) -> Option<&str> {
 /// Run peephole optimization on AArch64 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
+    LINE_FACTS.with(|facts| facts.borrow_mut().clear());
     let mut lines: Vec<String> = asm.lines().map(String::from).collect();
     let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let n = lines.len();
@@ -1334,6 +1335,11 @@ fn hoist_loop_invariant_dups(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<S
             }
         }
         let Some(e) = e else { continue };
+        // Only a loop with a broadcast in it needs the whole-file search
+        // below (searching for every loop's label took SQLite 1.6 seconds).
+        if !(s + 1..e).any(|d| kinds[d] != LineKind::Nop && dup_parts(&lines[d]).is_some()) {
+            continue;
+        }
         let mentions_label = |line: &str| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.')).any(|t| t == name);
         if (0..n).any(|k| k != s && k != e && kinds[k] != LineKind::Nop && mentions_label(&lines[k])) {
             continue;
@@ -1575,20 +1581,43 @@ fn retarget_move_imm(line: &str, new_dst: u8) -> Option<String> {
 // This is a very common pattern from the codegen: it emits a conditional branch
 // to skip over an unconditional branch.
 
-/// Estimate the distance (in instructions) from position `from` to the label
-/// `target` in the assembly. Returns `None` if the label is not found.
-fn estimate_branch_distance(lines: &[String], kinds: &[LineKind], from: usize, target: &str) -> Option<usize> {
-    // Search both forward and backward for the target label
-    let target_with_colon = format!("{}:", target);
-    for idx in 0..lines.len() {
-        if kinds[idx] == LineKind::Label && lines[idx].trim() == target_with_colon {
-            // Count non-Nop lines between from and idx (each is one 4-byte instruction)
-            let (lo, hi) = if from < idx { (from, idx) } else { (idx, from) };
-            let count = (lo..hi).filter(|&p| kinds[p] != LineKind::Nop && kinds[p] != LineKind::Label).count();
-            return Some(count);
+/// Where each label is in the assembly and how many lines that are neither
+/// Nop nor a label precede each line, for estimating branch distances.
+/// Built once per pass: searching the whole assembly for each branch's label
+/// made fuse_branch_over_branch quadratic, 28 of the 43 seconds SQLite took
+/// to compile.
+struct BranchDistances {
+    label_at: std::collections::HashMap<String, usize>,
+    before: Vec<usize>,
+}
+
+impl BranchDistances {
+    fn new(lines: &[String], kinds: &[LineKind]) -> Self {
+        let mut label_at = std::collections::HashMap::new();
+        let mut before = Vec::with_capacity(lines.len() + 1);
+        let mut count = 0;
+        for (idx, line) in lines.iter().enumerate() {
+            before.push(count);
+            if kinds[idx] == LineKind::Label {
+                if let Some(name) = line.trim().strip_suffix(':') {
+                    label_at.entry(name.to_string()).or_insert(idx);
+                }
+            } else if kinds[idx] != LineKind::Nop {
+                count += 1;
+            }
         }
+        before.push(count);
+        BranchDistances { label_at, before }
     }
-    None
+
+    /// The distance (in instructions) from position `from` to the label
+    /// `target`, or None if the label is not found. Lines removed since
+    /// `new` still count, so the estimate errs long.
+    fn distance(&self, from: usize, target: &str) -> Option<usize> {
+        let idx = *self.label_at.get(target)?;
+        let (lo, hi) = if from < idx { (from, idx) } else { (idx, from) };
+        Some(self.before[hi] - self.before[lo])
+    }
 }
 
 /// Maximum number of instructions a b.cond can reach (±1MB = ±262144 instructions).
@@ -1692,6 +1721,7 @@ fn cond_target(line: &str) -> Option<&str> {
 
 fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
+    let mut distances: Option<BranchDistances> = None;
     let mut i = 0;
     while i + 2 < n {
         if matches!(kinds[i], LineKind::CondBranch | LineKind::CmpBranch) {
@@ -1725,7 +1755,8 @@ fn fuse_branch_over_branch(lines: &mut [String], kinds: &mut [LineKind], n: usiz
                         // If the label isn't found in this snippet (external target),
                         // assume it's in range since the unconditional branch already
                         // reached it, and b.cond has ±1MB range which is generous.
-                        let in_range = estimate_branch_distance(lines, kinds, i, real_target)
+                        let in_range = distances.get_or_insert_with(|| BranchDistances::new(lines, kinds))
+                            .distance(i, real_target)
                             .is_none_or(|d| d < COND_BRANCH_SAFE_DISTANCE);
                         if in_range {
                             if let Some(inverted) = invert_branch(&lines[i], real_target) {
@@ -5839,6 +5870,7 @@ enum Flow {
     Exit,
 }
 
+#[derive(Clone, Copy)]
 struct LineInfo {
     uses: RegSet,
     defs: RegSet,
@@ -6447,6 +6479,51 @@ fn table_entries(lines: &[String], j: usize, end: usize, label_index: &dyn Fn(&s
     (!targets.is_empty()).then_some(targets)
 }
 
+/// The facts function_liveness reads from a line other than a branch (whose
+/// target is a line index): line_info, and x_form_reads for upper halves.
+struct LineFacts {
+    text: String,
+    kind: LineKind,
+    info: LineInfo,
+    x_reads: Option<RegSet>,
+}
+
+thread_local! {
+    /// LineFacts of the lines this peephole run has seen, by line index;
+    /// an entry whose text or kind no longer matches its line is recomputed.
+    /// Passes compute liveness about a hundred times over the whole assembly
+    /// and the lines barely change between them; parsing every line each
+    /// time took 7 of the 14 seconds the peephole spent on SQLite.
+    static LINE_FACTS: std::cell::RefCell<Vec<Option<LineFacts>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The LineInfo of line `k`, with only the registers it reads in x form as
+/// its uses when `upper` (see function_liveness_with).
+fn line_facts(facts: &mut Vec<Option<LineFacts>>, k: usize, line: &str, kind: LineKind, upper: bool,
+              label_index: &dyn Fn(&str) -> Option<usize>) -> LineInfo {
+    let narrow = |mut info: LineInfo, x: Option<RegSet>| {
+        if let (true, Some(x)) = (upper, x) {
+            info.uses &= x;
+        }
+        info
+    };
+    if matches!(kind, LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch) {
+        let info = line_info(line, kind, label_index);
+        return if upper { narrow(info, x_form_reads(line, kind)) } else { info };
+    }
+    if facts.len() <= k {
+        facts.resize_with(k + 1, || None);
+    }
+    match &facts[k] {
+        Some(f) if f.kind == kind && f.text == line => narrow(f.info, f.x_reads),
+        _ => {
+            let (info, x_reads) = (line_info(line, kind, label_index), x_form_reads(line, kind));
+            facts[k] = Some(LineFacts { text: line.to_string(), kind, info, x_reads });
+            narrow(info, x_reads)
+        }
+    }
+}
+
 fn function_liveness(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> Option<(Vec<RegSet>, Vec<Option<u8>>)> {
     function_liveness_with(lines, kinds, start, end, false)
 }
@@ -6465,7 +6542,7 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
         return None;
     }
     // Label name -> line index (local to this function).
-    let mut labels: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut labels: crate::common::fx_hash::FxHashMap<&str, usize> = crate::common::fx_hash::FxHashMap::default();
     for k in body.clone() {
         if kinds[k] == LineKind::Label {
             if let Some(name) = label_name(&lines[k]) {
@@ -6482,14 +6559,11 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
         !0
     };
 
-    let mut infos: Vec<LineInfo> = body.clone().map(|k| line_info(&lines[k], kinds[k], &label_index)).collect();
-    if upper {
-        for (info, k) in infos.iter_mut().zip(body.clone()) {
-            if let Some(x) = x_form_reads(&lines[k], kinds[k]) {
-                info.uses &= x;
-            }
-        }
-    }
+    let infos: Vec<LineInfo> = LINE_FACTS.with(|facts| {
+        let mut facts = facts.borrow_mut();
+        body.clone().map(|k| line_facts(&mut facts, k, &lines[k], kinds[k], upper, &label_index)).collect()
+    });
+    let mut infos = infos;
     for info in infos.iter_mut().filter(|i| matches!(i.flow, Flow::Exit)) {
         info.uses &= ret_mask;
     }
@@ -6512,7 +6586,7 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
     }
     // A jump-table dispatch reads only its register and goes to the table's labels.
     let mut tables: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
-    for k in body.clone() {
+    for k in body.clone().filter(|&k| lines[k].trim_start().starts_with("br")) {
         if let Some(targets) = jump_table_targets(lines, kinds, k, end, &label_index) {
             infos[k - start].uses = regs_in(split_insn(&lines[k]).map_or("", |(_, o)| o));
             tables.insert(k - start, targets);
@@ -8005,6 +8079,37 @@ f:
         assert!(result.contains("b.lt .LBB2"));
         // The unconditional branch to LBB2 should be eliminated
         assert!(!result.contains("    b .LBB2\n"));
+    }
+
+    /// Fused only when the label is within b.cond's range, before or after.
+    #[test]
+    fn test_branch_over_branch_kept_for_far_target() {
+        let fuse = |gap: usize, label_first: bool| {
+            let filler = vec!["    add x1, x1, #1".to_string(); gap];
+            let target = vec![".LBB2:".to_string(), "    ret".to_string()];
+            let branch = ["    b.ge .Lskip_0", "    b .LBB2", ".Lskip_0:", "    ret"].map(String::from).to_vec();
+            let mut lines = if label_first { [target, filler, branch].concat() } else { [branch, filler, target].concat() };
+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            let n = lines.len();
+            fuse_branch_over_branch(&mut lines, &mut kinds, n)
+        };
+        assert!(fuse(1000, false));
+        assert!(fuse(1000, true));
+        assert!(!fuse(COND_BRANCH_SAFE_DISTANCE, false));
+        assert!(!fuse(COND_BRANCH_SAFE_DISTANCE, true));
+    }
+
+    /// Liveness reparses a line whose text changed since it was last seen.
+    #[test]
+    fn test_liveness_follows_changed_lines() {
+        let mut lines = ["    add x9, x9, #1", "    mov x1, x2", "    mov x0, x1", "    ret"].map(String::from).to_vec();
+        let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let (live, _) = function_liveness(&lines, &kinds, 0, 4).unwrap();
+        assert!(live[0] & (1 << 2) != 0 && live[0] & (1 << 3) == 0);
+        lines[1] = "    mov x1, x3".to_string();
+        let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let (live, _) = function_liveness(&lines, &kinds, 0, 4).unwrap();
+        assert!(live[0] & (1 << 3) != 0 && live[0] & (1 << 2) == 0);
     }
 
     #[test]
