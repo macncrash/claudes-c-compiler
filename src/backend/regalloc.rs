@@ -342,7 +342,11 @@ pub fn allocate_registers(
             let from = call_points.partition_point(|&cp| cp < lo);
             for &cp in call_points[from..].iter().take_while(|&&cp| cp <= hi) {
                 let reg_args = liveness.reg_args_call_points.binary_search_by_key(&cp, |&(p, _)| p);
-                let boundary = reg_args.is_ok_and(|i| cp == hi || (cp == iv.start && liveness.reg_args_call_points[i].1 == Some(iv.value_id)));
+                // (A call that defines the value, at any of its definitions
+                // (a lowered phi has several), is where a piece starts: the
+                // value it held is dead there, and a restore after the call
+                // would overwrite the result.)
+                let boundary = reg_args.is_ok_and(|i| cp == hi || liveness.reg_args_call_points[i].1 == Some(iv.value_id));
                 if boundary {
                     continue;
                 }
@@ -1125,7 +1129,7 @@ fn remove_ineligible_operands(func: &IrFunction, eligible: &mut FxHashSet<u32>, 
 /// live into, when the call opens a block; that call does count.)
 fn spans_clobbering_call(liveness: &LivenessResult, iv: &LiveInterval, call_points: &[u32], boundary_ok: &[(u32, Option<u32>)]) -> bool {
     let at_boundary = |cp: u32, piece_end: u32| match boundary_ok.binary_search_by_key(&cp, |&(p, _)| p) {
-        Ok(i) => cp == piece_end || (cp == iv.start && boundary_ok[i].1 == Some(iv.value_id)),
+        Ok(i) => cp == piece_end || boundary_ok[i].1 == Some(iv.value_id),
         Err(_) => false,
     };
     liveness.segments_of(iv).iter().any(|&(lo, hi)| {
@@ -1272,5 +1276,20 @@ mod tests {
         assert_eq!(r.call_saves.get(&call_point).map(|v| v.contains(&reg.unwrap())), Some(true), "{:?}", r.call_saves);
         let r = allocate_registers(&func, &config(false));
         assert!(!r.assignments.contains_key(&1) && r.call_saves.is_empty());
+
+        // A call that defines the value at a later definition (a lowered phi:
+        // `x = g()` at the end of the loop) is where a piece of it starts,
+        // not a call it spans: no restore after it overwrites the result.
+        let BasicBlock { instructions, .. } = &mut func.blocks[2];
+        instructions.push(Instruction::Call { func: "g".to_string(), info: CallInfo {
+            dest: Some(Value(1)), args: vec![], arg_types: vec![], return_type: IrType::I64, is_variadic: false,
+            num_fixed_args: 0, struct_arg_sizes: vec![], struct_arg_aligns: vec![], struct_arg_classes: Vec::new(),
+            struct_arg_riscv_float_classes: Vec::new(), is_sret: false, is_fastcall: false, ret_eightbyte_classes: Vec::new(),
+        } });
+        let r = allocate_registers(&func, &config(true));
+        let g_point = call_point + 1;
+        let reg = r.assignments.get(&1).copied();
+        assert!(reg.is_some(), "{:?}", r.assignments);
+        assert!(!r.call_saves.get(&g_point).is_some_and(|v| v.contains(&reg.unwrap())), "{:?}", r.call_saves);
     }
 }
