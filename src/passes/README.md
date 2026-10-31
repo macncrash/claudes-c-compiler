@@ -831,6 +831,13 @@ overflow is never assumed away: arithmetic whose exact result leaves the type
 gives no range. Folded comparisons become constants, which constant_fold,
 copy_prop and cfg_simplify carry on to the branches they feed.
 
+A signed `x > 0` or `x <= 0` that the ranges leave open, but whose x is never
+negative there (a u8 or u16 field promoted to int, a mask, a value under
+`x >= 0`), becomes `x != 0` or `x == 0`: a `cbnz` or `cbz` on AArch64
+instead of `cmp` and `b.gt`/`b.le`. This saves 20M of SQLite speedtest's
+instructions, most of them in sqlite3BtreeIndexMoveto and moveToRoot
+(`pRoot->nCell > 0`).
+
 Before that, a block that only tests one of its phis against a constant
 loses the predecessors whose edge decides the test: a constant incoming
 value, or one the predecessor's own branch just compared (`x >= 262` taken

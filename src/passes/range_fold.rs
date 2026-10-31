@@ -46,18 +46,43 @@ pub(crate) fn range_fold_function(func: &mut IrFunction) -> usize {
                         continue;
                     }
                     if let Some(result) = ranges.decide(*op, lhs, rhs, *ty, b) {
-                        folds.push((b, i, result));
+                        folds.push((b, i, Fold::Decided(result)));
+                    } else if let Some(op) = ranges.zero_test(*op, lhs, rhs, *ty, b) {
+                        folds.push((b, i, Fold::ZeroTest(op)));
                     }
                 }
             }
         }
         folds
     };
-    for &(b, i, result) in &folds {
-        let Instruction::Cmp { dest, .. } = func.blocks[b].instructions[i] else { unreachable!() };
-        func.blocks[b].instructions[i] = Instruction::Copy { dest, src: Operand::Const(IrConst::I32(result as i32)) };
+    for &(b, i, fold) in &folds {
+        let inst = &mut func.blocks[b].instructions[i];
+        let Instruction::Cmp { dest, op, lhs, rhs, .. } = inst else { unreachable!() };
+        match fold {
+            Fold::Decided(result) => {
+                *inst = Instruction::Copy { dest: *dest, src: Operand::Const(IrConst::I32(result as i32)) };
+            }
+            Fold::ZeroTest(new_op) => {
+                if matches!(lhs, Operand::Const(_)) {
+                    std::mem::swap(lhs, rhs);
+                }
+                *op = new_op;
+            }
+        }
     }
     folds.len() + threaded
+}
+
+/// What range_fold_function does to a comparison.
+#[derive(Clone, Copy)]
+enum Fold {
+    /// Always this result.
+    Decided(bool),
+    /// A signed `x > 0` or `x <= 0` of an x that is never negative, as the
+    /// test for zero (`x != 0` or `x == 0`) it is: `cbnz`/`cbz` on AArch64
+    /// instead of `cmp` and `b.gt`/`b.le` (SQLite's `pRoot->nCell > 0` of
+    /// a u16 field).
+    ZeroTest(IrCmpOp),
 }
 
 /// A block that only tests one of its phis against a constant, entered from
@@ -531,6 +556,23 @@ impl<'a> Ranges<'a> {
         self.dominating_facts(v, b).into_iter()
             .any(|(fop, fit, fk)| fop == IrCmpOp::Ne && fit.w == it.w && it.wrap(fk) == k)
             .then_some(op == IrCmpOp::Ne)
+    }
+
+    /// Eq or Ne for a signed `x > 0` or `x <= 0` (either way round) in block
+    /// `b` whose x is never negative there.
+    fn zero_test(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, b: usize) -> Option<IrCmpOp> {
+        let (x, op) = match (lhs, rhs) {
+            (x @ Operand::Value(_), Operand::Const(k)) if k.is_zero() => (x, op),
+            (Operand::Const(k), x @ Operand::Value(_)) if k.is_zero() => (x, swapped(op)),
+            _ => return None,
+        };
+        let new_op = match op {
+            IrCmpOp::Sgt => IrCmpOp::Ne,
+            IrCmpOp::Sle => IrCmpOp::Eq,
+            _ => return None,
+        };
+        let r = self.operand(x, b, cmp_interp(op, ty)?, MAX_DEPTH)?;
+        (r.lo >= 0).then_some(new_op)
     }
 
     /// `x op y` decided by a dominating branch on a comparison of the same
