@@ -324,6 +324,8 @@ pub fn allocate_registers(
     };
     let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
     let mut call_saves: FxHashMap<u32, Vec<PhysReg>> = FxHashMap::default();
+    // The values in call_saves' registers (never evicted, see below).
+    let mut saved_values: FxHashSet<u32> = FxHashSet::default();
     // Each program point's block weight (block_weight, as use_count).
     let mut point_block: Vec<u32> = Vec::new();
     if config.save_around_calls {
@@ -472,6 +474,7 @@ pub fn allocate_registers(
                         for cp in calls {
                             call_saves.entry(cp).or_default().push(caller[i]);
                         }
+                        saved_values.insert(v);
                     }
                 }
             }
@@ -515,6 +518,9 @@ pub fn allocate_registers(
         }
     }
 
+    evict(&liveness, &eligible, call_points, boundary_ok, &use_count, &handoff, &groups, &saved_values,
+          &folded, callee, caller, &mut callee_busy, &mut caller_busy, &mut assignments);
+
     // CCC_DUMP_REGALLOC=<function|all>: each candidate's interval, weight,
     // and register (or "-" for a stack slot).
     if let Ok(want) = std::env::var("CCC_DUMP_REGALLOC") {
@@ -542,6 +548,117 @@ pub fn allocate_registers(
         used_regs,
         liveness: Some(liveness),
         call_saves,
+    }
+}
+
+/// Eviction, after the priority pass: a candidate left on the stack takes a
+/// register from the values whose pieces overlap its own there, when they
+/// weigh less than it and those that find no other register leave less
+/// weight on the stack than it would. Assigned one at a time, the heaviest
+/// first, short temporaries in a loop's hottest blocks (weighed by a profile)
+/// took every register around a table pointer read throughout the loop,
+/// which was then reloaded at every use (zlib's compress_block).
+///
+/// Copy-group members, values saved around calls, and the bases of folded
+/// GEPs keep their registers: the main pass made choices that depend on them.
+#[allow(clippy::too_many_arguments)]
+fn evict(
+    liveness: &LivenessResult,
+    eligible: &FxHashSet<u32>,
+    call_points: &[u32],
+    boundary_ok: &[(u32, Option<u32>)],
+    use_count: &FxHashMap<u32, u64>,
+    handoff: &dyn Fn(u32, u32, u32) -> bool,
+    groups: &FxHashMap<u32, Vec<u32>>,
+    saved_values: &FxHashSet<u32>,
+    folded: &FxHashMap<u32, u32>,
+    callee: &[PhysReg],
+    caller: &[PhysReg],
+    callee_busy: &mut [Vec<(u32, u32, u32)>],
+    caller_busy: &mut [Vec<(u32, u32, u32)>],
+    assignments: &mut FxHashMap<u32, PhysReg>,
+) {
+    let weight = |v: u32| use_count.get(&v).copied().unwrap_or(0);
+    let bases: FxHashSet<u32> = folded.values().copied().collect();
+    let pinned = |c: u32| c == u32::MAX || groups.contains_key(&c) || saved_values.contains(&c) || bases.contains(&c);
+    let overlaps = |s: u32, e: u32, w: u32, segs: &[(u32, u32)], v: u32| segs.iter().any(|&(lo, hi)| {
+        !(hi < s || lo > e || (e == lo && handoff(w, v, lo)) || (hi == s && handoff(v, w, s)))
+    });
+    let fits = |busy: &[(u32, u32, u32)], segs: &[(u32, u32)], v: u32| {
+        busy.iter().all(|&(s, e, w)| !overlaps(s, e, w, segs, v))
+    };
+    let interval_of: FxHashMap<u32, &LiveInterval> = liveness.intervals.iter().map(|iv| (iv.value_id, iv)).collect();
+    let spans = |iv: &LiveInterval| spans_clobbering_call(liveness, iv, call_points, boundary_ok);
+    let spilled: Vec<&LiveInterval> = build_sorted_candidates(liveness, eligible, assignments, call_points, boundary_ok, use_count, None);
+    // A register slot: (caller-saved, index).
+    for iv in spilled {
+        let v = iv.value_id;
+        let w = weight(v);
+        if w == 0 || assignments.contains_key(&v) || folded.get(&v).is_some_and(|b| assignments.contains_key(b)) {
+            continue;
+        }
+        let segs = liveness.segments_of(iv);
+        let v_spans = spans(iv);
+        // The registers whose overlapping values may all be evicted, cheapest first.
+        let mut options: Vec<(u64, bool, usize, Vec<u32>)> = Vec::new();
+        let slots = (0..callee.len()).map(|i| (false, i)).chain((0..caller.len()).filter(|_| !v_spans).map(|i| (true, i)));
+        for (is_caller, i) in slots {
+            let busy = if is_caller { &caller_busy[i] } else { &callee_busy[i] };
+            let mut out: Vec<u32> = busy.iter().filter(|&&(s, e, c)| overlaps(s, e, c, &segs, v)).map(|&(_, _, c)| c).collect();
+            out.sort_unstable();
+            out.dedup();
+            if out.is_empty() || out.iter().any(|&c| pinned(c)) {
+                continue;
+            }
+            let cost: u64 = out.iter().map(|&c| weight(c)).sum();
+            options.push((cost, is_caller, i, out));
+        }
+        options.sort_by_key(|o| o.0);
+        for (_, is_caller, i, mut out) in options {
+            let pool = if is_caller { &mut *caller_busy } else { &mut *callee_busy };
+            let removed: Vec<(u32, u32, u32)> = pool[i].iter().filter(|e| out.contains(&e.2)).copied().collect();
+            pool[i].retain(|e| !out.contains(&e.2));
+            pool[i].extend(segs.iter().map(|&(lo, hi)| (lo, hi, v)));
+            // Re-place the evicted values, the heaviest first, as the main
+            // pass would: a caller-saved register unless the value spans a
+            // call, then a callee-saved one already saved.
+            out.sort_by_key(|&c| std::cmp::Reverse(weight(c)));
+            let mut placed: Vec<(u32, bool, usize)> = Vec::new();
+            let mut lost = 0u64;
+            for &c in &out {
+                let civ = interval_of[&c];
+                let csegs = liveness.segments_of(civ);
+                let c_spans = spans(civ);
+                let slot = (0..caller.len()).filter(|_| !c_spans).find(|&j| fits(&caller_busy[j], &csegs, c)).map(|j| (true, j))
+                    .or_else(|| (0..callee.len()).find(|&j| !callee_busy[j].is_empty() && fits(&callee_busy[j], &csegs, c)).map(|j| (false, j)));
+                match slot {
+                    Some((k, j)) => {
+                        let busy = if k { &mut caller_busy[j] } else { &mut callee_busy[j] };
+                        busy.extend(csegs.iter().map(|&(lo, hi)| (lo, hi, c)));
+                        placed.push((c, k, j));
+                    }
+                    None => lost += weight(c),
+                }
+            }
+            if lost < w {
+                for &c in &out {
+                    assignments.remove(&c);
+                }
+                for &(c, k, j) in &placed {
+                    assignments.insert(c, if k { caller[j] } else { callee[j] });
+                }
+                assignments.insert(v, if is_caller { caller[i] } else { callee[i] });
+                break;
+            }
+            // Undo.
+            for &(c, k, j) in &placed {
+                let busy = if k { &mut caller_busy[j] } else { &mut callee_busy[j] };
+                busy.retain(|e| e.2 != c);
+            }
+            let pool = if is_caller { &mut *caller_busy } else { &mut *callee_busy };
+            pool[i].retain(|e| e.2 != v);
+            pool[i].extend(removed);
+        }
     }
 }
 
@@ -1224,6 +1341,33 @@ mod tests {
         let w = weighted_use_counts(&f, &lv);
         // v1: read by the copy; v2: defined by it and returned.
         assert_eq!((w[&1], w[&2]), (BLOCK_WEIGHT_UNIT, 2 * BLOCK_WEIGHT_UNIT));
+    }
+
+    /// A spilled value takes a register from a heavier short one that fits
+    /// in another register (`long` [0, 20] needs both registers' holes; the
+    /// temporary at [2, 4] moves to the one busy at [10, 12]), but not when
+    /// the evicted value would go to the stack and weighs more.
+    #[test]
+    fn test_eviction() {
+        let long = LiveInterval { start: 0, end: 20, value_id: 1 };
+        let early = LiveInterval { start: 2, end: 4, value_id: 2 };
+        let run = |late_at: (u32, u32)| {
+            let late = LiveInterval { start: late_at.0, end: late_at.1, value_id: 3 };
+            let lv = liveness(vec![long, early, late], 100, None);
+            let regs = [PhysReg(10), PhysReg(11)];
+            let mut busy = vec![vec![(2, 4, 2)], vec![(late_at.0, late_at.1, 3)]];
+            let mut assignments: FxHashMap<u32, PhysReg> = [(2, regs[0]), (3, regs[1])].into_iter().collect();
+            let eligible: FxHashSet<u32> = [1, 2, 3].into_iter().collect();
+            let use_count: FxHashMap<u32, u64> = [(1, 50), (2, 100), (3, 100)].into_iter().collect();
+            evict(&lv, &eligible, &lv.call_points, &[], &use_count, &|_, _, _| false, &FxHashMap::default(),
+                  &FxHashSet::default(), &FxHashMap::default(), &[], &regs, &mut [], &mut busy, &mut assignments);
+            assignments
+        };
+        let a = run((10, 12));
+        assert_eq!((a.get(&1), a.get(&2), a.get(&3)), (Some(&PhysReg(10)), Some(&PhysReg(11)), Some(&PhysReg(11))));
+        // The other register busy where the temporary is: nothing moves.
+        let a = run((3, 12));
+        assert_eq!((a.get(&1), a.get(&2), a.get(&3)), (None, Some(&PhysReg(10)), Some(&PhysReg(11))));
     }
 
     /// A call at the start or end of an interval only lets the value stay in

@@ -551,6 +551,19 @@ values and were stored and reloaded on every opcode. Counting the copies,
 speedtest runs 45M fewer instructions without a profile (sqlite3VdbeExec 100M
 fewer, sqlite3_str_vappendf 60M more) and 387M fewer (1.9%) with one.
 
+### Eviction
+
+After the priority pass, each value left on the stack, heaviest first, tries
+every register: the values whose pieces overlap its own there are moved to
+any other register they fit in, and the change is kept when those that fit
+nowhere weigh less than it. Copy-group members, values saved around calls
+and the bases of folded GEPs are never moved. Assigned one at a time, the
+short temporaries in a loop's hottest blocks can fill every register's gaps
+around a value read throughout the loop: under a profile zlib's
+compress_block left five table pointers on the stack, reloaded at every use,
+though the temporaries in their way fit in other registers (zlib runs 15M
+fewer instructions with its profile).
+
 A GEP with a constant offset that is only used as a load or store address
 (see GEP Constant Offset Folding) counts its uses toward its base instead,
 and gets no register once its base has one, since codegen then folds it
