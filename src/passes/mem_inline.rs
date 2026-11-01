@@ -11,11 +11,12 @@
 //! 120-byte objects this way in dozens of places. Lengths up to 128 bytes;
 //! memset only on targets where unaligned 8-byte stores are fine (AArch64,
 //! x86-64). Runs once, after the main optimization loop. There, a copy of
-//! 1, 2, 4 or 8 bytes (a call or a Memcpy) becomes one load and one store.
+//! 1, 2, 4 or 8 bytes (a call or a Memcpy) becomes one load and one store,
+//! except a copy of an 8-byte vector temporary (see vector_operands).
 
 use crate::common::types::AliasClass;
 use crate::common::types::{AddressSpace, IrType};
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 /// Largest length copied or cleared in place.
 const MAX_INLINE: i64 = 128;
@@ -23,11 +24,14 @@ const MAX_INLINE: i64 = 128;
 pub(crate) fn inline_function(func: &mut IrFunction, wide_stores: bool) -> usize {
     let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
     let mut fresh = || { next_id += 1; Value(next_id - 1) };
+    let vectors = vector_operands(func);
     let mut inlined = 0;
     for block in &mut func.blocks {
         let mut k = 0;
         while k < block.instructions.len() {
-            let Some(expansion) = expand(&block.instructions[k], wide_stores, &mut fresh) else {
+            let keep = matches!(&block.instructions[k],
+                Instruction::Memcpy { dest, src, .. } if vectors.contains(&dest.0) || vectors.contains(&src.0));
+            let Some(expansion) = expand(&block.instructions[k], wide_stores, &mut fresh).filter(|_| !keep) else {
                 k += 1;
                 continue;
             };
@@ -43,6 +47,25 @@ pub(crate) fn inline_function(func: &mut IrFunction, wide_stores: bool) -> usize
     }
     func.next_value_id = next_id;
     inlined
+}
+
+/// The pointers vector ops write through or read through. An 8-byte vector
+/// temporary (`alloca Ptr size=8`) is one: its copies stay copies, which
+/// the backend makes from its vector register (`str d27`), where a load
+/// and store of it as an integer would move it through a general register
+/// first (`umov x9, v27.d[0]`; vector-bench's blend ran 19% slower).
+fn vector_operands(func: &IrFunction) -> crate::common::fx_hash::FxHashSet<u32> {
+    let mut ptrs = crate::common::fx_hash::FxHashSet::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr, args, .. } = inst {
+            ptrs.extend(dest_ptr.iter().map(|p| p.0));
+            ptrs.extend(args.iter().filter_map(|a| match a {
+                Operand::Value(v) => Some(v.0),
+                Operand::Const(_) => None,
+            }));
+        }
+    }
+    ptrs
 }
 
 /// A copy of 1, 2, 4 or 8 bytes as one load and one store. A Memcpy is a
@@ -188,6 +211,9 @@ pub(crate) fn scalarize_local_copies(func: &mut IrFunction) -> usize {
         }
     }
     moves.retain(|v, _| defs.get(v) == Some(&1));
+    for v in vector_operands(func) {
+        locals.remove(&v);
+    }
     if locals.is_empty() {
         return 0;
     }

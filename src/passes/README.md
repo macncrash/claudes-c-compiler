@@ -1061,6 +1061,14 @@ through and removed when nothing else reads them, so mem2reg then promotes
 the local: zlib's hash insertion had written each word to the stack and read
 it back. A `double` read this way stays a double.
 
+Neither applies to a copy into or out of an 8-byte vector temporary (a
+pointer a vector op writes or reads, `alloca Ptr size=8`): that copy stays
+a Memcpy, which the backend makes from the vector register (`str d28`). As
+an integer load and store it went through a general register (`umov x9,
+v27.d[0]; str x9`), and the temporary kept its own register, so the add
+writing it was not folded into a `usra`: vector-bench's 8-byte blend ran
+11 instructions per vector where clang runs 9, and 19% slower.
+
 ### load_phi -- Loads Joined Across Merges
 
 Runs once after mem_inline. GVN reuses a load or a stored value only along
