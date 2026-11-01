@@ -1103,6 +1103,21 @@ v1 and nothing between the copy and the call uses v22:
   x9, #4; cbnz w6, L` (14M runs), and an overflow test's `adds; cset w12,
   vs; cbnz w12` in its arithmetic opcodes. Speedtest ran 40M fewer
   instructions (0.2%), with or without a profile.
+- Four folds from scalar-bench's LZ compressor (lz_compress ran 113M fewer
+  instructions; scalar-bench 1.6%, zlib 19M, speedtest 13M fewer):
+  - A little-endian byte pair, `ldrb wA, [B, #k]; ldrb wC, [B, #k+1]; orr
+    D, A, C, lsl #8`, is one `ldrh` (the get2byte fold above, without its
+    byte swap).
+  - `mov wA, wA` after a 64-bit write of xA whose low half depends only on
+    its operands' low halves (add, sub, mul, madd, msub, neg, mvn, lsl,
+    register-only logic) makes that write 32-bit: `mul x13, x13, x0; mov
+    w13, w13` is `mul w13, w13, w0`.
+  - `mov T, #2^k - 1; cmp A, T; b.hi|b.ls L` (an unsigned bound too wide
+    for the immediate) is `lsr T, A, #k; cbnz|cbz T, L`: `i - cand <=
+    65535`.
+  - `cmp Z, B; b.hs|b.lo L` right after `mov Z, #0` (a counter before a
+    rotated loop's first test) is `cbz|cbnz B, L`: `0 >= B` unsigned is
+    `B == 0`.
 
 **14. Tail Calls and Leaf Frame Records** (after the local cleanup)
 

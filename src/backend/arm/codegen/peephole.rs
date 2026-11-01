@@ -636,6 +636,8 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
             changed2 |= pass!(sink_compare_past_selects(lines, kinds, n));
             changed2 |= pass!(fuse_cset_into_csel(lines, kinds, n));
             changed2 |= pass!(fuse_cset_into_branch(lines, kinds, n));
+            changed2 |= pass!(fold_low_mask_bound_into_shift(lines, kinds, n));
+            changed2 |= pass!(fold_zero_compare_into_cbz(lines, kinds, n));
             changed2 |= pass!(fuse_cmp_sub_into_subs(lines, kinds, n));
             changed2 |= pass!(forward_copy_propagation(lines, kinds, n));
             changed2 |= pass!(retarget_results(lines, kinds, n));
@@ -3350,8 +3352,48 @@ fn drop_mask_of_narrow_value(lines: &mut [String], kinds: &mut [LineKind], n: us
     changed
 }
 
+/// The 32-bit form of a 64-bit `line` whose result's low half depends only
+/// on the low halves of its operands (add, sub, mul, madd, msub, neg, mvn,
+/// lsl, and register-only and/orr/eor/bic, shifted operands `lsl #k`), or
+/// None.
+fn low_half_form(line: &str) -> Option<String> {
+    let (m, ops) = split_insn(line)?;
+    if !matches!(m, "add" | "sub" | "mul" | "madd" | "msub" | "neg" | "mvn" | "lsl" | "and" | "orr" | "eor" | "bic") {
+        return None;
+    }
+    let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+    let mut out = Vec::with_capacity(p.len());
+    for op in &p {
+        if let Some(r) = gpr_operand(op).filter(|_| op.starts_with('x')) {
+            out.push(wreg_name(r).to_string());
+        } else if *op == "xzr" {
+            out.push("wzr".to_string());
+        } else if let Some(imm) = op.strip_prefix('#') {
+            let v = parse_imm(op)?;
+            let ok = match m {
+                "add" | "sub" => v <= 4095,
+                "lsl" => v < 32,
+                _ => false,
+            };
+            if !ok || imm.is_empty() {
+                return None;
+            }
+            out.push(op.to_string());
+        } else if let Some(k) = op.strip_prefix("lsl #") {
+            k.parse::<u32>().ok().filter(|&k| k < 32)?;
+            out.push(op.to_string());
+        } else {
+            return None;
+        }
+    }
+    Some(format!("    {} {}", m, out.join(", ")))
+}
+
 /// `mov wA, wA` (a zero extension) right after a 32-bit write of wA, which
 /// has already cleared the upper half: `sub w13, w13, w10; mov w13, w13`.
+/// After a 64-bit write of xA whose low half depends only on its operands'
+/// low halves, that write becomes its 32-bit form (lz_hash's `mul x13, x13,
+/// x0; mov w13, w13` is `mul w13, w13, w0`).
 fn drop_redundant_zero_extend(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let mut prev: Option<usize> = None;
@@ -3371,6 +3413,19 @@ fn drop_redundant_zero_extend(lines: &mut [String], kinds: &mut [LineKind], n: u
                         kinds[i] = LineKind::Nop;
                         changed = true;
                         continue;
+                    }
+                    let wrote_x = split_insn(&lines[p]).is_some_and(|(_, o)| {
+                        let d = first_and_rest(o).0;
+                        d.starts_with('x') && gpr_operand(d) == gpr_operand(a)
+                    });
+                    if wrote_x && info.defs.count_ones() == 1 {
+                        if let Some(w) = low_half_form(&lines[p]) {
+                            lines[p] = w;
+                            kinds[p] = classify_line(&lines[p]);
+                            kinds[i] = LineKind::Nop;
+                            changed = true;
+                            continue;
+                        }
                     }
                 }
             }
@@ -4014,9 +4069,13 @@ fn fuse_byte_pair_into_halfword(lines: &mut [String], kinds: &mut [LineKind], n:
             }
         }
         let (Some((ka, ba, offa)), Some((kc, bc, offc))) = (la, lc) else { continue };
-        if ba != bc || offc != offa + 1 || ba == an || ba == cn {
+        // Little-endian, the shifted byte the higher one (lz_hash's
+        // `p[0] | p[1] << 8`): the halfword as it is, no swap.
+        let little = offa == offc + 1 && sx.is_none();
+        if ba != bc || (offc != offa + 1 && !little) || ba == an || ba == cn {
             continue;
         }
+        let offa = if little { offc } else { offa };
         let (first, last) = (ka.min(kc), ka.max(kc));
         // Between the first load and the `orr`: no store, nothing writing B,
         // and A and C left to the loads and the `orr`.
@@ -4064,7 +4123,11 @@ fn fuse_byte_pair_into_halfword(lines: &mut [String], kinds: &mut [LineKind], n:
         lines[last] = format!("    {} {}, {}", load, wreg_name(r), mem);
         kinds[last] = classify_line(&lines[last]);
         kinds[first] = LineKind::Nop;
-        lines[o] = format!("    rev16 {}, {}", wreg_name(dn), wreg_name(r));
+        lines[o] = if little {
+            format!("    mov {}, {}", wreg_name(dn), wreg_name(r))
+        } else {
+            format!("    rev16 {}, {}", wreg_name(dn), wreg_name(r))
+        };
         kinds[o] = classify_line(&lines[o]);
         changed = true;
     }
@@ -5710,6 +5773,129 @@ fn fuse_cset_into_csel(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         lines[j] = format!("    csel {}{}", prefix, new_cc);
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `mov T, #2^k - 1; cmp A, T; b.hi|b.ls L` (an unsigned bound too wide for
+/// a compare's immediate), T dead after the compare and the flags after the
+/// branch: `lsr T, A, #k; cbnz|cbz T, L`, the bound being "no bit from k up"
+/// (lz_compress's `i - cand <= 65535`).
+fn fold_low_mask_bound_into_shift(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    let next = |kinds: &[LineKind], mut j: usize| {
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        j
+    };
+    for i in 0..n {
+        let Some(("mov", ops)) = split_insn(&lines[i]) else { continue };
+        let (t, imm) = first_and_rest(ops);
+        let Some(v) = parse_imm(imm.trim()) else { continue };
+        let k = (v + 1).trailing_zeros();
+        if v < 4096 || v.wrapping_add(1) & v != 0 || k >= 64 {
+            continue;
+        }
+        let Some(tn) = gpr_operand(t) else { continue };
+        let c = next(kinds, i + 1);
+        let b = next(kinds, c + 1);
+        if b >= n {
+            continue;
+        }
+        let Some(("cmp", cops)) = split_insn(&lines[c]) else { continue };
+        let (a, rhs) = first_and_rest(cops);
+        let Some(an) = gpr_operand(a) else { continue };
+        if gpr_operand(rhs.trim()) != Some(tn) || an == tn || a.starts_with('w') != t.starts_with('w')
+            || (t.starts_with('w') && k >= 32) {
+            continue;
+        }
+        let Some((bm, bops)) = split_insn(&lines[b]) else { continue };
+        let op = match bm {
+            "b.hi" => "cbnz",
+            "b.ls" => "cbz",
+            _ => continue,
+        };
+        let l = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+        if l[c] & (1 << tn) != 0 || !flags_dead_after(lines, kinds, b + 1, n) {
+            continue;
+        }
+        live = None;
+        let (shift, branch) = (format!("    lsr {}, {}, #{}", t, a, k), format!("    {} {}, {}", op, t, bops.trim()));
+        lines[i] = shift;
+        lines[b] = branch;
+        kinds[i] = classify_line(&lines[i]);
+        kinds[b] = classify_line(&lines[b]);
+        kinds[c] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `cmp Z, B; b.hs|b.lo L` where Z was just set to zero (`mov Z, #0`, a
+/// loop counter before a rotated loop's first test), the flags dead after
+/// the branch: `0 >= B` unsigned is `B == 0`, so `cbz|cbnz B, L`
+/// (lz_compress's match length `while (l < max ...)`, 27M runs).
+fn fold_zero_compare_into_cbz(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for c in 0..n {
+        let Some(("cmp", ops)) = split_insn(&lines[c]) else { continue };
+        let (z, b) = first_and_rest(ops);
+        let b = b.trim();
+        let (Some(zn), Some(bn)) = (gpr_operand(z), gpr_operand(b)) else { continue };
+        if zn == bn || z.starts_with('w') != b.starts_with('w') {
+            continue;
+        }
+        // Z's last write, a few straight-line lines back, is `mov Z, #0`.
+        let mut k = c;
+        let mut zero = false;
+        let mut seen = 0;
+        while k > 0 && seen < 6 {
+            k -= 1;
+            if kinds[k] == LineKind::Nop {
+                continue;
+            }
+            seen += 1;
+            if matches!(kinds[k], LineKind::Label | LineKind::Call) {
+                break;
+            }
+            let info = line_info(&lines[k], kinds[k], &|_| None);
+            if !matches!(info.flow, Flow::Next) || info.uses == ALL_REGS {
+                break;
+            }
+            if info.defs & (1 << zn) != 0 {
+                zero = split_insn(&lines[k]).is_some_and(|(m, o)| {
+                    let (d, v) = first_and_rest(o);
+                    m == "mov" && gpr_operand(d) == Some(zn) && v.trim() == "#0"
+                });
+                break;
+            }
+        }
+        if !zero {
+            continue;
+        }
+        let mut j = c + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((bm, bops)) = split_insn(&lines[j]) else { continue };
+        let op = match bm {
+            "b.hs" | "b.cs" => "cbz",
+            "b.lo" | "b.cc" => "cbnz",
+            _ => continue,
+        };
+        if !flags_dead_after(lines, kinds, j + 1, n) {
+            continue;
+        }
+        let branch = format!("    {} {}, {}", op, b, bops.trim());
+        lines[j] = branch;
+        kinds[j] = classify_line(&lines[j]);
+        kinds[c] = LineKind::Nop;
         changed = true;
     }
     changed
@@ -7938,6 +8124,21 @@ mod tests {
             let result = peephole_optimize(f(mid, "cbnz"));
             assert!(!result.contains("b.lo"), "{mid}{}", result);
         }
+    }
+
+    /// lz_compress's hash and match loop: a little-endian byte pair is one
+    /// halfword load, a 64-bit multiply truncated to 32 bits is a 32-bit
+    /// multiply, an unsigned bound of 2^16 - 1 is a shift and cbnz, and a
+    /// compare of a just-zeroed counter is a cbz of the bound.
+    #[test]
+    fn test_lz_loop_folds() {
+        let body = "    ldrb w13, [x11]\n    ldrb w14, [x11, #1]\n    orr x13, x13, x14, lsl #8\n    mul x13, x13, x2\n    mov w13, w13\n    lsr x13, x13, #18\n    str x13, [x3]\n    sub x6, x20, x12\n    mov x9, #65535\n    cmp x6, x9\n    b.hi .LBB2\n    mov x10, #0\n    cmp x10, x5\n    b.hs .LBB2\n    str x10, [x4]\n    mov x0, #1\n    ret\n.LBB2:\n    mov x0, #2\n    ret\n";
+        let result = peephole_optimize(format!(".type f, %function\nf:\n{body}.size f, .-f\n"));
+        assert!(result.contains("ldrh w14, [x11]") && !result.contains("ldrb") && !result.contains("rev16"), "{}", result);
+        assert!(result.contains("mul w13, w14, w2"), "{}", result);
+        assert!(!result.contains("mov w13, w13"), "{}", result);
+        assert!(result.contains("lsr x9, x6, #16") && result.contains("cbnz x9, .LBB2") && !result.contains("#65535"), "{}", result);
+        assert!(result.contains("cbz x5, .LBB2") && !result.contains("cmp x10"), "{}", result);
     }
 
     #[test]
