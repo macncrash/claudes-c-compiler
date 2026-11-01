@@ -131,6 +131,8 @@ and a no-op).
 | `omit_frame_pointer` | `bool` | `false` | `-fomit-frame-pointer` (free EBP as GP register) |
 | `no_unwind_tables` | `bool` | `false` | `-fno-asynchronous-unwind-tables` (suppress `.eh_frame`) |
 | `fcommon` | `bool` | `false` | `-fcommon` (COMMON linkage for tentative definitions) |
+| `profile_generate` | `Option<String>` | `None` | `-fprofile-generate[=DIR]` (count block executions, passes::profile) |
+| `profile_use` | `Option<String>` | `None` | `-fprofile-use[=DIR]` (read the counts back) |
 
 **RISC-V specific:**
 
@@ -317,6 +319,14 @@ producing output consumed by the next:
 Between lowering and mem2reg, the driver applies `#pragma weak` and
 `#pragma redefine_extname` directives from the preprocessor, and applies
 `-fcommon` by marking qualifying tentative definitions as COMMON symbols.
+
+At the end of the IR pipeline, after const_hoist, is the profile point
+(passes::profile): with `-fprofile-generate=DIR` the driver adds block
+counters there and writes `DIR/<id>.map` (the instrumented program appends
+its counts to `DIR/<id>.cnt` at exit); with `-fprofile-use=DIR` it reads the
+counts back onto each function whose blocks still match, then runs
+shrink_split (AArch64). `<id>` hashes the source file's full path, so a
+file is profiled and rebuilt from the same path with the same options.
 
 ### Phase Timing
 

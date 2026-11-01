@@ -53,6 +53,7 @@ mod resolve_asm;
 mod ret_dup;
 pub(crate) mod simplify;
 pub(crate) mod shrink_split;
+pub(crate) mod profile;
 
 use crate::ir::analysis::CfgAnalysis;
 use crate::common::fx_hash::FxHashSet;

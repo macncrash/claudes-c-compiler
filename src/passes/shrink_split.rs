@@ -32,6 +32,10 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{BasicBlock, BlockId, Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value};
 use super::inline::{remap_instruction, remap_terminator, Remap};
 
+/// With a profile, the least share of calls (in tenths) that must leave by
+/// the fast region's returns.
+const MIN_FAST_TENTHS: u64 = 3;
+
 /// Most instructions (and terminators) in the fast region.
 const MAX_FAST: usize = 64;
 
@@ -174,6 +178,17 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
         return 0;
     }
     let entry = *entries.iter().next().unwrap();
+    // With a profile, only where the fast returns are taken often enough
+    // (an exit taken on a few calls in a hundred saves its prologue there,
+    // and costs the slow path's copies on all the others).
+    if let Some(profile) = &func.profile {
+        let count = |b: usize| profile.get(&func.blocks[b].label.0).copied().unwrap_or(0);
+        let calls = count(0);
+        let fast: u64 = (0..nb).filter(|&b| !slow[b] && matches!(func.blocks[b].terminator, Terminator::Return(_))).map(count).sum();
+        if calls == 0 || fast.saturating_mul(10) < calls.saturating_mul(MIN_FAST_TENTHS) {
+            return 0;
+        }
+    }
     // A long fast region is mostly checks on the way in (the header parsing
     // of jsonTranslateBlobToText), whose returns are its error paths.
     let fast_size: usize = (0..nb).filter(|&b| !slow[b]).map(|b| func.blocks[b].instructions.len() + 1).sum();

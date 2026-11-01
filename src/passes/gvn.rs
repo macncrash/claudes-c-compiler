@@ -1111,6 +1111,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         };
 
         let mut module = IrModule {
@@ -1188,6 +1189,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         };
 
         let mut module = IrModule {
@@ -1256,6 +1258,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         };
 
         let mut module = IrModule {
@@ -1330,6 +1333,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         };
 
         let mut module = IrModule {
@@ -1404,6 +1408,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         };
 
         let mut module = IrModule {
@@ -1483,6 +1488,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         };
 
         let mut module = IrModule {
@@ -1591,6 +1597,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         };
 
         let mut module = IrModule {
@@ -1649,6 +1656,7 @@ mod tests {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         }
     }
 

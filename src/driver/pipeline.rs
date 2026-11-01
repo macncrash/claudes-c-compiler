@@ -218,6 +218,12 @@ pub struct Driver {
     /// When false (-fno-common, the default), tentative definitions go to BSS with
     /// strong linkage, and duplicate definitions cause link errors.
     pub(super) fcommon: bool,
+    /// -fprofile-generate[=DIR]: count block executions into DIR (see
+    /// passes::profile).
+    pub(super) profile_generate: Option<String>,
+    /// -fprofile-use[=DIR]: read the counts a -fprofile-generate build's
+    /// runs left in DIR.
+    pub(super) profile_use: Option<String>,
     /// Signed overflow wraps (-fwrapv), so optimizations may not assume it
     /// never happens (see passes::iv_widen).
     pub(super) fwrapv: bool,
@@ -306,6 +312,8 @@ impl Driver {
             dump_defines: false,
             color_mode: ColorMode::Auto,
             fcommon: false,
+            profile_generate: None,
+            profile_use: None,
             fwrapv: false,
             strict_aliasing: None,
             fp_contract: true,
@@ -1150,9 +1158,17 @@ impl Driver {
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("const_hoist")) {
             crate::passes::const_hoist::hoist_constants(&mut module, self.target == Target::Aarch64);
         }
-        if self.target == Target::Aarch64
-            && !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("shrink_wrap")) {
-            crate::passes::shrink_split::split_module(&mut module);
+        // The profile point (passes::profile): counters, or counts read back.
+        if let Some(dir) = &self.profile_generate {
+            crate::passes::profile::instrument(&mut module, &crate::passes::profile::unit_id(input_file), dir)?;
+        } else {
+            if let Some(dir) = &self.profile_use {
+                crate::passes::profile::load(&mut module, &crate::passes::profile::unit_id(input_file), dir);
+            }
+            if self.target == Target::Aarch64
+                && !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("shrink_wrap")) {
+                crate::passes::shrink_split::split_module(&mut module);
+            }
         }
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 

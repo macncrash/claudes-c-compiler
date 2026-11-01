@@ -577,6 +577,7 @@ impl Lowerer {
             ret_eightbyte_classes,
             is_gnu_inline_def: is_gnu_inline_no_extern_def,
             split_copies: Vec::new(),
+            profile: None,
         };
         // Collect __attribute__((symver("..."))) directives
         if let Some(ref sv) = func.attrs.symver {

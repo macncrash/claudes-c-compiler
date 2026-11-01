@@ -155,7 +155,7 @@ The optimizer executes in four sequential phases:
          v
  Phi elimination (src/ir/mem2reg), then:
      loop_rotate, loop_hoist, loop_promote, loop_layout, latch_dup, step_to_load, const_hoist,
-     shrink_split (AArch64)
+     profile point (-fprofile-generate counters / -fprofile-use counts), shrink_split (AArch64)
 ```
 
 ## Phase Structure
@@ -1501,6 +1501,24 @@ and when nothing else in the loop defines either. A one-block `while (p < e)
 s = s * 3 + *p++;` loop drops from eight instructions to six. Measured no
 speedup on chess-perft.
 
+### profile -- Block Counts (-fprofile-generate, -fprofile-use)
+
+The profile point is the end of the pipeline, after const_hoist and before
+shrink_split. Compilation is deterministic, so a build with the same source
+and options reaches it with the same blocks. With
+`-fprofile-generate=DIR` each block bumps a 64-bit counter in one array per
+translation unit, the compiler writes `DIR/<id>.map` (each counter's
+function, that function's shape hash, block label), and a destructor appends
+the array to `DIR/<id>.cnt` when the program exits, so runs accumulate.
+With `-fprofile-use=DIR` the runs are summed and each function whose shape
+hash (block labels, instruction kinds, successors) still matches gets its
+blocks' counts (`IrFunction::profile`). shrink_split then splits only where
+at least 3 in 10 calls leave by the fast region's returns, and the register
+allocator weighs each block by its count per call (see the backend README).
+Trained and measured on the same run, SQLite's speedtest runs 1.9% fewer
+instructions; perft and vector-bench run as many, scalar-bench and zbench
+0.2% more.
+
 ### shrink_split -- Values Split Where the Slow Path Starts (AArch64)
 
 Runs last, after const_hoist. A function that calls out only on a slow path
@@ -1834,6 +1852,7 @@ behavior across iterations.
 | `cfg_simplify.rs`        | CFG simplification (branch folding, jump threading)    |
 | `const_hoist.rs`         | Large loop constants built once at function entry      |
 | `shrink_split.rs`        | Values split where the slow path starts (shrink-wrapping) |
+| `profile.rs`             | Block counts: -fprofile-generate and -fprofile-use      |
 | `constant_fold.rs`       | Constant expression evaluation at compile time         |
 | `copy_prop.rs`           | Copy propagation with path compression                 |
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |

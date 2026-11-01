@@ -540,6 +540,17 @@ weighed less than values with many uses spread over the 186 opcode handlers,
 each of which runs for its own opcodes only, and stayed on the stack; SQLite's
 speedtest ran 3.0% fewer instructions once it did not.
 
+With a profile (`-fprofile-use`, `IrFunction::profile`), a block's frequency
+is its count per call instead, capped at a billion runs; blocks made after
+the profile point keep the estimate. A value's weight also counts the
+copies that define it: spilled, each one stores it. Without that, the
+values sqlite3VdbeExec carries around its dispatch loop, defined by a copy
+at every handler's latch and read in a few handlers only, weighed half their
+cost under real counts, lost their callee-saved registers to whole-function
+values and were stored and reloaded on every opcode. Counting the copies,
+speedtest runs 45M fewer instructions without a profile (sqlite3VdbeExec 100M
+fewer, sqlite3_str_vappendf 60M more) and 387M fewer (1.9%) with one.
+
 A GEP with a constant offset that is only used as a load or store address
 (see GEP Constant Offset Folding) counts its uses toward its base instead,
 and gets no register once its base has one, since codegen then folds it

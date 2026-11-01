@@ -58,6 +58,9 @@ pub struct LivenessResult {
     /// the entry's being 1 (compute_block_freq). The register allocator
     /// weights uses by it.
     pub block_freq: Vec<f64>,
+    /// Whether block_freq comes from a profile (real counts per call, which
+    /// an interpreter loop takes far past the static estimates' range).
+    pub profiled: bool,
     /// For values whose liveness has holes, the sorted, disjoint pieces of
     /// their interval in which they are actually live (one per run of blocks
     /// they are live in). A value missing here is live over its whole
@@ -182,7 +185,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     if num_blocks == 0 {
         return LivenessResult {
             intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), scratch_points: Vec::new(),
-            block_freq: Vec::new(), segments: FxHashMap::default(),
+            block_freq: Vec::new(), profiled: false, segments: FxHashMap::default(),
         };
     }
 
@@ -193,7 +196,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     if num_values == 0 {
         return LivenessResult {
             intervals: Vec::new(), call_points: Vec::new(), reg_args_call_points: Vec::new(), scratch_points: Vec::new(),
-            block_freq: Vec::new(), segments: FxHashMap::default(),
+            block_freq: Vec::new(), profiled: false, segments: FxHashMap::default(),
         };
     }
 
@@ -211,8 +214,21 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     // Phase 2: Build successor lists for the CFG.
     let successors = build_successor_lists(func, num_blocks, &ps.block_id_to_idx);
 
-    // Phase 2b: Estimate each block's execution frequency.
-    let block_freq = compute_block_freq(&successors, num_blocks);
+    // Phase 2b: Estimate each block's execution frequency, or take it from
+    // a profile (IrFunction::profile): its count per call. Blocks made
+    // after the profile point keep the estimate.
+    let mut block_freq = compute_block_freq(&successors, num_blocks);
+    let mut profiled = false;
+    if let Some(profile) = &func.profile {
+        if let Some(&calls) = func.blocks.first().and_then(|b| profile.get(&b.label.0)).filter(|&&c| c > 0) {
+            for (b, block) in func.blocks.iter().enumerate() {
+                if let Some(&c) = profile.get(&block.label.0) {
+                    block_freq[b] = c as f64 / calls as f64;
+                }
+            }
+            profiled = true;
+        }
+    }
 
     // Phase 3: Backward dataflow to compute live-in/live-out per block.
     let (live_in, live_out) = run_backward_dataflow(
@@ -249,6 +265,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         reg_args_call_points: ps.reg_args_call_points,
         scratch_points: ps.scratch_points,
         block_freq,
+        profiled,
         segments,
     }
 }

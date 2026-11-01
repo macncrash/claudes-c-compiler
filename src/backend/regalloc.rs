@@ -693,10 +693,13 @@ fn foldable_geps(func: &IrFunction) -> FxHashMap<u32, u32> {
 const BLOCK_WEIGHT_UNIT: u64 = 1000;
 
 /// A block's weight: its estimated frequency (LivenessResult::block_freq) in
-/// BLOCK_WEIGHT_UNITs, capped at 10K runs per call, at least 1.
+/// BLOCK_WEIGHT_UNITs, capped at 10K runs per call (1G from a profile,
+/// where sqlite3VdbeExec's dispatch loop runs millions of times a call and
+/// a lower cap made all its hot blocks weigh the same), at least 1.
 fn block_weight(liveness: &LivenessResult, block_idx: usize) -> u64 {
     let freq = liveness.block_freq.get(block_idx).copied().unwrap_or(1.0);
-    ((freq.min(10_000.0) * BLOCK_WEIGHT_UNIT as f64).round() as u64).max(1)
+    let cap = if liveness.profiled { 1e9 } else { 10_000.0 };
+    ((freq.min(cap) * BLOCK_WEIGHT_UNIT as f64).round() as u64).max(1)
 }
 
 /// Count uses per value, weighted by their blocks' estimated frequencies
@@ -732,6 +735,11 @@ fn weighted_use_counts(func: &IrFunction, liveness: &LivenessResult) -> FxHashMa
         // not Operands (loads, stores, GEPs, memcpy).
         for inst in &block.instructions {
             inst.for_each_used_value(|v| add(&mut use_count, v, weight));
+            // A spilled value is also stored where a copy defines it (a
+            // phi's copies at every latch of an interpreter loop).
+            if let Instruction::Copy { dest, src: Operand::Value(_) } = inst {
+                *use_count.entry(dest.0).or_insert(0) += weight;
+            }
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
@@ -1197,8 +1205,25 @@ mod tests {
             reg_args_call_points: vec![(call, dest)],
             scratch_points: Vec::new(),
             block_freq: Vec::new(),
+            profiled: false,
             segments: FxHashMap::default(),
         }
+    }
+
+    /// A value a copy defines (a phi's latch copy) weighs that copy too: if
+    /// spilled, the copy stores it. Other definitions do not count.
+    #[test]
+    fn test_copies_defining_a_value_weigh_it() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Terminator, Value};
+        let mut f = IrFunction::new("f".to_string(), IrType::I64, vec![], false);
+        f.blocks = vec![BasicBlock { label: BlockId(0), instructions: vec![
+            Instruction::BinOp { dest: Value(1), op: IrBinOp::Add, lhs: Operand::Const(IrConst::I64(1)), rhs: Operand::Const(IrConst::I64(2)), ty: IrType::I64 },
+            Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) },
+        ], terminator: Terminator::Return(Some(Operand::Value(Value(2)))), source_spans: vec![] }];
+        let lv = liveness(Vec::new(), 0, None);
+        let w = weighted_use_counts(&f, &lv);
+        // v1: read by the copy; v2: defined by it and returned.
+        assert_eq!((w[&1], w[&2]), (BLOCK_WEIGHT_UNIT, 2 * BLOCK_WEIGHT_UNIT));
     }
 
     /// A call at the start or end of an interval only lets the value stay in

@@ -228,6 +228,11 @@ pub struct IrFunction {
     /// source's copy group, so the source can stay in a caller-saved register
     /// on the fast path while the copy takes a callee-saved one.
     pub split_copies: Vec<Value>,
+    /// Block execution counts from a profile (-fprofile-use), by block
+    /// label, for the blocks as they were at the profile point (just before
+    /// shrink_split; see passes::profile). The entry block's is the number
+    /// of calls.
+    pub profile: Option<crate::common::fx_hash::FxHashMap<u32, u64>>,
 }
 
 /// A function parameter.
@@ -316,6 +321,7 @@ impl IrFunction {
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
             split_copies: Vec::new(),
+            profile: None,
         }
     }
 

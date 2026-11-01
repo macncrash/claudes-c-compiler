@@ -578,6 +578,10 @@ impl Driver {
                     }
                     // Unknown values silently ignored (matching GCC)
                 }
+                "-fprofile-generate" => self.profile_generate = Some(".".to_string()),
+                arg if arg.starts_with("-fprofile-generate=") => self.profile_generate = Some(arg["-fprofile-generate=".len()..].to_string()),
+                "-fprofile-use" => self.profile_use = Some(".".to_string()),
+                arg if arg.starts_with("-fprofile-use=") => self.profile_use = Some(arg["-fprofile-use=".len()..].to_string()),
                 arg if arg.starts_with("-f") => {}
 
                 // Linker flags
