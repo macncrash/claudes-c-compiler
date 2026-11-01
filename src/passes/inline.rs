@@ -1599,17 +1599,18 @@ fn inline_call_site(
 
     // Clone and remap the callee's blocks
     let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
+    let offsets = Remap { value: &|v| Value(v.0 + value_offset), block: &|b| BlockId(b.0 + block_offset) };
 
     for callee_block in &callee.blocks {
         let mut new_block = BasicBlock {
             label: BlockId(callee_block.label.0 + block_offset),
             instructions: Vec::with_capacity(callee_block.instructions.len()),
             source_spans: callee_block.source_spans.clone(),
-            terminator: remap_terminator(&callee_block.terminator, value_offset, block_offset),
+            terminator: remap_terminator(&callee_block.terminator, &offsets),
         };
 
         for inst in &callee_block.instructions {
-            new_block.instructions.push(remap_instruction(inst, value_offset, block_offset));
+            new_block.instructions.push(remap_instruction(inst, &offsets));
         }
 
         inlined_blocks.push(new_block);
@@ -1845,26 +1846,31 @@ fn inline_call_site(
     true
 }
 
-/// Remap a Value by adding an offset.
-fn remap_value(v: Value, offset: u32) -> Value {
-    Value(v.0 + offset)
+/// How remap_instruction and remap_terminator rename values and blocks:
+/// by an offset (the inliner's copies of a callee) or any other way.
+pub(crate) struct Remap<'a> {
+    pub value: &'a dyn Fn(Value) -> Value,
+    pub block: &'a dyn Fn(BlockId) -> BlockId,
 }
 
-/// Remap a BlockId by adding an offset.
-fn remap_block(b: BlockId, offset: u32) -> BlockId {
-    BlockId(b.0 + offset)
+fn remap_value(v: Value, r: &Remap) -> Value {
+    (r.value)(v)
+}
+
+fn remap_block(b: BlockId, r: &Remap) -> BlockId {
+    (r.block)(b)
 }
 
 /// Remap an Operand (only Value operands need remapping; constants stay the same).
-fn remap_operand(op: &Operand, value_offset: u32) -> Operand {
+fn remap_operand(op: &Operand, r: &Remap) -> Operand {
     match op {
-        Operand::Value(v) => Operand::Value(remap_value(*v, value_offset)),
+        Operand::Value(v) => Operand::Value(remap_value(*v, r)),
         Operand::Const(c) => Operand::Const(*c),
     }
 }
 
 /// Remap all values in a CallInfo (shared between Call and CallIndirect remapping).
-fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
+fn remap_call_info(info: &CallInfo, vo: &Remap) -> CallInfo {
     CallInfo {
         dest: info.dest.map(|v| remap_value(v, vo)),
         args: info.args.iter().map(|a| remap_operand(a, vo)).collect(),
@@ -1883,7 +1889,8 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
 }
 
 /// Remap all values and block references in an instruction.
-fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
+pub(crate) fn remap_instruction(inst: &Instruction, vo: &Remap) -> Instruction {
+    let bo = vo;
     match inst {
         Instruction::Alloca { dest, ty, size, align, volatile } => Instruction::Alloca {
             dest: remap_value(*dest, vo),
@@ -2087,7 +2094,8 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
 }
 
 /// Remap block references in a terminator.
-fn remap_terminator(term: &Terminator, vo: u32, bo: u32) -> Terminator {
+pub(crate) fn remap_terminator(term: &Terminator, vo: &Remap) -> Terminator {
+    let bo = vo;
     match term {
         Terminator::Return(op) => Terminator::Return(op.map(|o| remap_operand(&o, vo))),
         Terminator::Branch(bid) => Terminator::Branch(remap_block(*bid, bo)),

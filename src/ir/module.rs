@@ -223,6 +223,11 @@ pub struct IrFunction {
     /// This prevents infinite recursion when the inline body calls the same symbol
     /// (e.g., glibc's `btowc` inline calling `__btowc_alias` with asm name "btowc").
     pub is_gnu_inline_def: bool,
+    /// Values defined by the copies shrink_split puts on the edge into a
+    /// function's slow path: the register allocator keeps each out of its
+    /// source's copy group, so the source can stay in a caller-saved register
+    /// on the fast path while the copy takes a callee-saved one.
+    pub split_copies: Vec<Value>,
 }
 
 /// A function parameter.
@@ -310,6 +315,7 @@ impl IrFunction {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
+            split_copies: Vec::new(),
         }
     }
 

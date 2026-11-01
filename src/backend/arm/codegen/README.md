@@ -1117,6 +1117,18 @@ return blocks: a shared epilogue, or the `and x0, x10, #0xffff; ret` where
 SQLite's cellSizePtrIdxLeaf's paths meet. Speedtest ran 0.4% fewer
 instructions (0.2% with a limit of 4; 12 was no better than 8).
 
+Then shrink-wrapping: when the blocks the entry reaches without the frame
+(no call, and no mention of sp, fp, lr or a callee-saved register outside
+the epilogues before their returns and tail calls) start the function and
+lead only to one block after them, and one of them leaves the function,
+the prologue moves to that block, under a new `.Lsw_N` label their branches
+to it take, and their returns and tail calls drop their epilogues. They run
+with the CFA at sp and the return address in x30, as the CFI before the
+moved prologue says; everything after it with the frame, as its CFI says.
+The IR pass shrink_split arranges for this (fast blocks first, their values
+in caller-saved registers): sqlite3BtreeNext now returns 0, or tail-calls
+btreeNext, with no frame. Functions with jump tables (`br`) are left alone.
+
 **15. Switch Dispatch Duplication** (after the local cleanup)
 
 A `switch` with a jump table ends in `adr x17, .Ljt; ldr w16, [x17, idx,

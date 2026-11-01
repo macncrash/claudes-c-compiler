@@ -154,7 +154,8 @@ The optimizer executes in four sequential phases:
          |
          v
  Phi elimination (src/ir/mem2reg), then:
-     loop_rotate, loop_hoist, loop_promote, loop_layout, latch_dup, step_to_load, const_hoist
+     loop_rotate, loop_hoist, loop_promote, loop_layout, latch_dup, step_to_load, const_hoist,
+     shrink_split (AArch64)
 ```
 
 ## Phase Structure
@@ -1500,6 +1501,35 @@ and when nothing else in the loop defines either. A one-block `while (p < e)
 s = s * 3 + *p++;` loop drops from eight instructions to six. Measured no
 speedup on chess-perft.
 
+### shrink_split -- Values Split Where the Slow Path Starts (AArch64)
+
+Runs last, after const_hoist. A function that calls out only on a slow path
+still built its frame on every entry, because a value live across the slow
+path's calls (sqlite3BtreeNext's cursor, around its moveToChild loop) took a
+callee-saved register for the whole function, which the fast path then read.
+The slow region is every block a call reaches (a call that is not a tail
+call: the block returns its result through casts and copies, there or in
+an empty block it jumps to, and no local's address escapes, as the
+backend's tail-call conversion requires), with any block that can only go
+on into it; the rest is the fast region. When the slow region has one
+entry, the fast region returns somewhere and has at most 64 instructions
+(a longer one is mostly checks whose returns are error paths), every value
+occurring in both regions gets a new value in the slow region, made by a
+copy on the edge into it (a constant defined once is made again instead,
+so a multiply-high still sees its constant). The fast blocks are laid out
+first, then the copies, then the slow blocks, so a value's live interval in
+the fast region spans no call and takes a caller-saved register. The
+register allocator keeps each copy out of its source's copy group and
+partners (`IrFunction::split_copies`), which would otherwise give both one
+callee-saved register. The AArch64 peephole's shrink_wrap then moves the
+prologue past the fast blocks. Functions with inline asm, dynamic allocas,
+varargs, computed gotos or calls to setjmp and the like are left alone.
+
+SQLite's speedtest runs 39M fewer instructions (0.2%): sqlite3BtreeNext
+39M of them, with 201 functions building their frame only on their slow
+path. A fast exit that is rarely taken costs a move or two on the slow path
+instead (jsonAppendRaw's `N == 0` return, 3M).
+
 ### const_hoist -- Loop Constants Built Once
 
 Runs last, after step_to_load, where no copy propagation folds constants
@@ -1803,6 +1833,7 @@ behavior across iterations.
 | `bound_hoist.rs`         | Invariant loads of loop exit-test bounds moved out     |
 | `cfg_simplify.rs`        | CFG simplification (branch folding, jump threading)    |
 | `const_hoist.rs`         | Large loop constants built once at function entry      |
+| `shrink_split.rs`        | Values split where the slow path starts (shrink-wrapping) |
 | `constant_fold.rs`       | Constant expression evaluation at compile time         |
 | `copy_prop.rs`           | Copy propagation with path compression                 |
 | `dce.rs`                 | Dead code elimination (use-count worklist)              |

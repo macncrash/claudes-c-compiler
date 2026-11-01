@@ -288,7 +288,9 @@ pub fn allocate_registers(
     // candidate first tries its assigned partners' registers, so that the
     // handoff actually happens (`add x20, x20, #1`, no copy).
     let mut partners: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
-    for (dest, ops) in reuse_points.values() {
+    // (Not a split copy and its source: the source is to keep a caller-saved
+    // register on the fast path, see IrFunction::split_copies.)
+    for (dest, ops) in reuse_points.values().filter(|(d, _)| !func.split_copies.contains(&crate::ir::reexports::Value(*d))) {
         for &op in ops {
             partners.entry(*dest).or_default().push(op);
             partners.entry(op).or_default().push(*dest);
@@ -617,7 +619,7 @@ fn copy_groups(
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         let Instruction::Copy { dest, src: Operand::Value(src) } = inst else { continue };
         let (d, s) = (dest.0, src.0);
-        if d == s || !pieces.contains_key(&d) || !pieces.contains_key(&s) {
+        if d == s || !pieces.contains_key(&d) || !pieces.contains_key(&s) || func.split_copies.contains(dest) {
             continue;
         }
         let (rd, rs) = (find(&root, d), find(&root, s));

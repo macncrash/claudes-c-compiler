@@ -478,6 +478,13 @@ pub fn peephole_optimize(asm: String) -> String {
     eliminate_unreferenced_labels(&lines, &mut kinds, n);
     eliminate_unreachable_after_jumps(&lines, &mut kinds, n);
 
+    // The frame built only on the paths that need it.
+    let (lines, kinds) = if skip.contains(&"shrink_wrap") {
+        (lines, kinds)
+    } else {
+        shrink_wrap(lines, kinds)
+    };
+
     // Broadcasts a loop repeats with the same value, before it.
     let (lines, kinds) = if skip.contains(&"hoist_loop_invariant_dups") {
         (lines, kinds)
@@ -4921,6 +4928,284 @@ fn epilogue_after(lines: &[String], kinds: &[LineKind], from: usize, end: usize,
     }
 }
 
+// ── Shrink-wrapping ──────────────────────────────────────────────────────────
+//
+// A function that calls out only on a slow path still builds its frame on
+// every entry: SQLite's sqlite3BtreeNext saves x29, x30 and x20 to return 0
+// or tail-call btreeNext on most calls. When blocks at the start of the
+// function need no frame (no call, and no sp, fp, lr or callee-saved
+// register outside their epilogues), branch only among themselves or to the
+// block after them, and one of them leaves the function, the prologue moves
+// to that block, under a new label their branches to it take, and their
+// returns and tail calls drop their epilogues (the IR pass shrink_split
+// lays functions out and splits values for this):
+//
+//   stp x29, x30, [sp, #-32]!          cbz w0, .L1
+//   mov x29, sp                        mov x0, #0
+//   str x20, [sp, #16]                 ret
+//   cbz w0, .L1                  =>  .Lsw_0:
+//   mov x0, #0                         stp x29, x30, [sp, #-32]!
+//   ldr x20, [sp, #16]                 mov x29, sp
+//   ldp x29, x30, [sp], #32            str x20, [sp, #16]
+//   ret                              .L1:
+// .L1:                                 ...
+//
+// The fast blocks run with the CFA at sp and the return address in x30, as
+// the CFI before the moved prologue says; the blocks after it with the
+// frame, as its CFI says. Functions with jump tables (`br`) are left alone.
+
+/// One straight-line run of a function body: its lines (indices into the
+/// line list), the label it starts with, the labels its branches go to,
+/// whether it falls through to the next block, and the lines of the
+/// epilogue before its `ret` or tail call, if it ends in one.
+struct WrapBlock {
+    lines: Vec<usize>,
+    label: Option<String>,
+    targets: Vec<String>,
+    falls_through: bool,
+    epilogue: Vec<usize>,
+}
+
+/// Whether an instruction line needs the frame: a call, or a mention of sp,
+/// fp, lr or a callee-saved register (x19-x28, v8-v15 in any width).
+fn needs_frame(line: &str, kind: LineKind) -> bool {
+    if kind == LineKind::Call {
+        return true;
+    }
+    line.trim().split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+        if matches!(tok, "sp" | "wsp" | "fp" | "lr") {
+            return true;
+        }
+        let mut chars = tok.chars();
+        let Some(prefix) = chars.next() else { return false };
+        let Ok(n) = chars.as_str().parse::<u8>() else { return false };
+        match prefix {
+            'x' | 'w' => (19..=30).contains(&n),
+            'v' | 'q' | 'd' | 's' | 'h' | 'b' => (8..=15).contains(&n),
+            _ => false,
+        }
+    })
+}
+
+fn shrink_wrap(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<LineKind>) {
+    let n = lines.len();
+    // Line index -> what goes before it (the new label and the prologue);
+    // and the lines that go (the prologue's old place, fast epilogues).
+    let mut insert: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
+    let mut dropped: Vec<usize> = Vec::new();
+    let mut retarget: Vec<(usize, String, String)> = Vec::new();
+    let mut count = 0usize;
+    for (start, end) in function_ranges(&lines, n) {
+        if let Some((at, prologue, drop, retargets)) = shrink_wrap_plan(&lines, &kinds, start, end) {
+            let label = format!(".Lsw_{count}");
+            count += 1;
+            let mut block = vec![format!("{label}:")];
+            block.extend(prologue.iter().map(|&k| lines[k].clone()));
+            insert.insert(at, block);
+            dropped.extend(prologue);
+            dropped.extend(drop);
+            retarget.extend(retargets.into_iter().map(|(k, old)| (k, old, label.clone())));
+        }
+    }
+    if insert.is_empty() {
+        return (lines, kinds);
+    }
+    let (mut lines, mut kinds) = (lines, kinds);
+    for k in dropped {
+        kinds[k] = LineKind::Nop;
+    }
+    for (k, old, new) in retarget {
+        lines[k] = replace_label_operand(&lines[k], &old, &new);
+        kinds[k] = classify_line(&lines[k]);
+    }
+    let mut out_lines = Vec::with_capacity(n + insert.values().map(Vec::len).sum::<usize>());
+    let mut out_kinds = Vec::with_capacity(out_lines.capacity());
+    for (i, (line, kind)) in lines.into_iter().zip(kinds).enumerate() {
+        if let Some(block) = insert.remove(&i) {
+            for l in block {
+                out_kinds.push(classify_line(&l));
+                out_lines.push(l);
+            }
+        }
+        out_lines.push(line);
+        out_kinds.push(kind);
+    }
+    (out_lines, out_kinds)
+}
+
+/// `line` with its branch target `old` (the last operand) replaced by `new`.
+fn replace_label_operand(line: &str, old: &str, new: &str) -> String {
+    match line.rfind(old) {
+        Some(p) if line[p + old.len()..].trim().is_empty() => format!("{}{}", &line[..p], new),
+        _ => line.to_string(),
+    }
+}
+
+/// For one function: where the prologue goes (the line of the first block
+/// that needs the frame), the prologue's lines, the epilogue lines the fast
+/// blocks drop, and the fast blocks' branches into that block (line, label).
+#[allow(clippy::type_complexity)]
+fn shrink_wrap_plan(lines: &[String], kinds: &[LineKind], start: usize, end: usize)
+                    -> Option<(usize, Vec<usize>, Vec<usize>, Vec<(usize, String)>)> {
+    let live: Vec<usize> = (start..end).filter(|&k| kinds[k] != LineKind::Nop).collect();
+    // Header: the function's label and directives, then the prologue.
+    let mut i = 0;
+    while i < live.len() {
+        let k = live[i];
+        let t = lines[k].trim();
+        if (kinds[k] == LineKind::Label && !t.starts_with(".L")) || t == ".cfi_startproc" || t.starts_with(".loc ")
+            || t.starts_with(".globl") || t.starts_with(".p2align") || t.starts_with(".type") {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let first = *live.get(i)?;
+    let size: i64 = lines[first].trim().strip_prefix("stp x29, x30, [sp, #-")?.strip_suffix("]!")?.parse().ok()?;
+    let callee_saved_store = |t: &str| {
+        let Some((m, ops)) = split_insn(t) else { return false };
+        if !matches!(m, "stp" | "str") || !ops.contains("[sp, #") || ops.contains("]!") || !ops.ends_with(']') {
+            return false;
+        }
+        let regs: Vec<&str> = ops.split(", [").next().unwrap_or("").split(", ").collect();
+        regs.iter().all(|r| needs_frame(r, LineKind::Other) && !matches!(*r, "sp" | "x29" | "x30"))
+    };
+    let mut prologue = vec![first];
+    i += 1;
+    while i < live.len() {
+        let k = live[i];
+        let t = lines[k].trim();
+        let ok = t.starts_with(".cfi_def_cfa_offset") || t.starts_with(".cfi_offset") || t.starts_with(".cfi_def_cfa_register")
+            || t == "mov x29, sp" || callee_saved_store(t)
+            || (t.starts_with("sub sp, sp, #") && !t[13..].contains(','));
+        if !ok {
+            break;
+        }
+        prologue.push(k);
+        i += 1;
+    }
+    if !prologue.iter().any(|&k| lines[k].trim() == "mov x29, sp") {
+        return None;
+    }
+    let pop = format!("ldp x29, x30, [sp], #{size}");
+    // The body's blocks.
+    let mut blocks: Vec<WrapBlock> = Vec::new();
+    let mut cur = WrapBlock { lines: Vec::new(), label: None, targets: Vec::new(), falls_through: true, epilogue: Vec::new() };
+    let mut open = false;
+    for &k in &live[i..] {
+        let t = lines[k].trim();
+        if t == ".cfi_endproc" || t.starts_with(".size") {
+            continue;
+        }
+        if kinds[k] == LineKind::Label {
+            if open || !cur.lines.is_empty() {
+                blocks.push(std::mem::replace(&mut cur,
+                    WrapBlock { lines: Vec::new(), label: None, targets: Vec::new(), falls_through: true, epilogue: Vec::new() }));
+            }
+            cur.label = Some(label_name(&lines[k])?.to_string());
+            open = true;
+            continue;
+        }
+        cur.lines.push(k);
+        open = true;
+        let terminates = match kinds[k] {
+            LineKind::CondBranch | LineKind::CmpBranch => {
+                cur.targets.push(last_operand(split_insn(t)?.1).to_string());
+                false
+            }
+            LineKind::Branch => {
+                let (m, target) = split_insn(t)?;
+                if m != "b" {
+                    return None; // br: a jump table or computed goto
+                }
+                if target.starts_with(".L") {
+                    cur.targets.push(target.to_string());
+                } else {
+                    cur.epilogue = epilogue_before(lines, &cur.lines, &pop)?;
+                }
+                true
+            }
+            LineKind::Ret => {
+                cur.epilogue = epilogue_before(lines, &cur.lines, &pop)?;
+                true
+            }
+            _ => false,
+        };
+        if terminates {
+            cur.falls_through = false;
+            blocks.push(std::mem::replace(&mut cur,
+                WrapBlock { lines: Vec::new(), label: None, targets: Vec::new(), falls_through: true, epilogue: Vec::new() }));
+            open = false;
+        }
+    }
+    if open {
+        blocks.push(cur);
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    let by_label: std::collections::HashMap<&str, usize> = blocks.iter().enumerate()
+        .filter_map(|(b, blk)| blk.label.as_deref().map(|l| (l, b))).collect();
+    let needs: Vec<bool> = blocks.iter().map(|blk| {
+        blk.lines.iter().any(|&k| !blk.epilogue.contains(&k)
+            && (lines[k].trim().starts_with(".cfi_") || (!lines[k].trim().starts_with('.') && needs_frame(&lines[k], kinds[k]))))
+    }).collect();
+    // The fast blocks: the longest run of blocks from the entry that need no
+    // frame, branch only among themselves or to the block after them (where
+    // the prologue goes), and of which one leaves the function.
+    let succ = |b: usize| -> Option<Vec<usize>> {
+        let mut s: Vec<usize> = blocks[b].targets.iter().map(|t| by_label.get(t.as_str()).copied()).collect::<Option<_>>()?;
+        if blocks[b].falls_through {
+            s.push(b + 1);
+        }
+        Some(s)
+    };
+    let free = needs.iter().take_while(|&&n| !n).count();
+    let t = (1..=free.min(blocks.len() - 1)).rev().find(|&t| {
+        blocks[..t].iter().any(|blk| !blk.epilogue.is_empty())
+            && (0..t).all(|b| succ(b).is_some_and(|s| s.iter().all(|&x| x <= t)))
+    })?;
+    let label = blocks[t].label.clone();
+    let mut retargets = Vec::new();
+    for blk in &blocks[..t] {
+        for &k in &blk.lines {
+            if matches!(kinds[k], LineKind::CondBranch | LineKind::CmpBranch | LineKind::Branch)
+                && label.as_deref().is_some_and(|l| last_operand(split_insn(&lines[k]).map_or("", |s| s.1)) == l) {
+                retargets.push((k, label.clone().unwrap()));
+            }
+        }
+    }
+    // The prologue goes before the boundary block's label (or first line).
+    let at = match &label {
+        Some(l) => *live.iter().find(|&&k| kinds[k] == LineKind::Label && label_name(&lines[k]) == Some(l.as_str()))?,
+        None => *blocks[t].lines.first()?,
+    };
+    let drop: Vec<usize> = blocks[..t].iter().flat_map(|blk| blk.epilogue.iter().copied()).collect();
+    Some((at, prologue, drop, retargets))
+}
+
+/// The epilogue right before a block's last line (its `ret` or tail call):
+/// callee-saved restores and the frame record's pop, which must be there.
+fn epilogue_before(lines: &[String], block: &[usize], pop: &str) -> Option<Vec<usize>> {
+    let mut epilogue = Vec::new();
+    let mut saw_pop = false;
+    for &k in block[..block.len() - 1].iter().rev() {
+        let t = lines[k].trim();
+        let restore = split_insn(t).is_some_and(|(m, ops)| {
+            matches!(m, "ldp" | "ldr") && ops.contains("[sp, #") && ops.ends_with(']')
+                && ops.split(", [").next().unwrap_or("").split(", ")
+                    .all(|r| needs_frame(r, LineKind::Other) && !matches!(r, "sp" | "x29" | "x30"))
+        });
+        if t == pop && !saw_pop {
+            saw_pop = true;
+        } else if !(saw_pop && restore) {
+            break;
+        }
+        epilogue.push(k);
+    }
+    saw_pop.then_some(epilogue)
+}
+
 // ── Leaf frame omission ──────────────────────────────────────────────────────
 //
 // A function that calls nothing and, after the other passes, never touches
@@ -8168,6 +8453,30 @@ f:
         let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
         let (live, _) = function_liveness(&lines, &kinds, 0, 4).unwrap();
         assert!(live[0] & (1 << 3) != 0 && live[0] & (1 << 2) == 0);
+    }
+
+    /// A function returning early without touching the frame builds it only
+    /// on the path that calls, after the early return.
+    fn wrap_input(fast: &str) -> String {
+        format!(".type f, %function\nf:\n.cfi_startproc\n    stp x29, x30, [sp, #-32]!\n    .cfi_def_cfa_offset 32\n    \
+                 .cfi_offset x29, -32\n    .cfi_offset x30, -24\n    mov x29, sp\n    .cfi_def_cfa_register x29\n    \
+                 str x20, [sp, #16]\n{fast}    cbnz w0, .L1\n    mov x0, #7\n    ldr x20, [sp, #16]\n    \
+                 ldp x29, x30, [sp], #32\n    ret\n.L1:\n    mov x20, x1\n    bl g\n    add x0, x0, x20\n    \
+                 ldr x20, [sp, #16]\n    ldp x29, x30, [sp], #32\n    ret\n.cfi_endproc\n.size f, .-f\n")
+    }
+
+    #[test]
+    fn test_shrink_wrap_moves_prologue_past_early_return() {
+        let result = peephole_optimize(wrap_input(""));
+        let fast = result.find("mov x0, #7\n    ret").expect("fast return without epilogue");
+        let prologue = result.find("stp x29, x30, [sp, #-32]!").unwrap();
+        assert!(fast < prologue && result.find(".cfi_def_cfa_offset 32").unwrap() > prologue, "{result}");
+        assert!(result.contains("cbnz w0, .Lsw_0\n"), "{result}");
+        assert!(result.find(".Lsw_0:").unwrap() < prologue && prologue < result.find(".L1:").unwrap(), "{result}");
+        // A fast path reading a callee-saved register keeps the frame first.
+        let kept = peephole_optimize(wrap_input("    mov x0, x21\n"));
+        assert!(kept.find("stp x29, x30").unwrap() < kept.find("cbnz").unwrap(), "{kept}");
+        assert!(!kept.contains(".Lsw_"), "{kept}");
     }
 
     /// Functions are optimized one at a time, unless a function's label is

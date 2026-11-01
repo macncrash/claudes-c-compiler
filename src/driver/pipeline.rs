@@ -1150,6 +1150,10 @@ impl Driver {
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("const_hoist")) {
             crate::passes::const_hoist::hoist_constants(&mut module, self.target == Target::Aarch64);
         }
+        if self.target == Target::Aarch64
+            && !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("shrink_wrap")) {
+            crate::passes::shrink_split::split_module(&mut module);
+        }
         if time_phases { eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64()); }
 
         if let Ok(name) = std::env::var("CCC_DUMP_IR") {
