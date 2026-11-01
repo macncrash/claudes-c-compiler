@@ -1548,6 +1548,18 @@ SQLite's speedtest runs 39M fewer instructions (0.2%): sqlite3BtreeNext
 path. A fast exit that is rarely taken costs a move or two on the slow path
 instead (jsonAppendRaw's `N == 0` return, 3M).
 
+With a profile, the fast region's size is not limited (the counts say how
+often its returns are taken: every call but those entering the slow region),
+and a short chain of blocks that only returns (blocks of at most four
+copies in all, jumping on to a `ret`) entered from both regions is copied
+for the fast one, which then leaves by its own return: vdbeSorterCompareInt's
+compares and its call to vdbeSorterCompareTail returned through one block,
+which put the whole function in the slow region. Without a profile neither
+happens: an exit shared with a slow path is often an error code returned
+mostly from it (insertCellFast's), and splitting those cost 9M. Profiled,
+speedtest runs 30M fewer instructions (vdbeSorterCompareInt 16M,
+sqlite3VdbeFreeCursorNN 10M).
+
 ### const_hoist -- Loop Constants Built Once
 
 Runs last, after step_to_load, where no copy propagation folds constants

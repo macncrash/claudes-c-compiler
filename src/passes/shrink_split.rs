@@ -36,6 +36,9 @@ use super::inline::{remap_instruction, remap_terminator, Remap};
 /// the fast region's returns.
 const MIN_FAST_TENTHS: u64 = 3;
 
+/// Most instructions in a chain of blocks copied for the fast region.
+const MAX_CLONED_EXIT: usize = 4;
+
 /// Most instructions (and terminators) in the fast region.
 const MAX_FAST: usize = 64;
 
@@ -137,7 +140,7 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
         block.terminator.for_each_used_value(|v| uses_alloca |= allocas.contains(&v));
         frame[b] |= uses_alloca;
     }
-    let succs: Vec<Vec<usize>> = func.blocks.iter().map(|b| match &b.terminator {
+    let mut succs: Vec<Vec<usize>> = func.blocks.iter().map(|b| match &b.terminator {
         Terminator::Branch(t) => vec![index[t]],
         Terminator::CondBranch { true_label, false_label, .. } => vec![index[true_label], index[false_label]],
         Terminator::Switch { cases, default, .. } => cases.iter().map(|(_, t)| index[t]).chain([index[default]]).collect(),
@@ -154,6 +157,57 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
             }
         }
     }
+    // A short chain of blocks that only returns (jumps through blocks of a
+    // few copies to a ret), entered from both regions (where
+    // vdbeSorterCompareInt's fast compares and its call to
+    // vdbeSorterCompareTail meet), is copied for the fast region, which
+    // then does not enter the slow region there. Only with a profile: an
+    // exit shared with a slow path is often taken mostly from it (an error
+    // code returned once a call fails, insertCellFast's).
+    let chain = |b: usize| -> Option<Vec<usize>> {
+        let mut blocks = vec![b];
+        let mut insts = func.blocks[b].instructions.len();
+        let mut cur = b;
+        loop {
+            match &func.blocks[cur].terminator {
+                Terminator::Return(_) => return (insts <= MAX_CLONED_EXIT).then_some(blocks),
+                Terminator::Branch(_) if blocks.len() < 4 => {
+                    cur = succs[cur][0];
+                    insts += func.blocks[cur].instructions.len();
+                    blocks.push(cur);
+                }
+                _ => return None,
+            }
+        }
+    };
+    let exits: Vec<Vec<usize>> = (0..nb).filter(|_| func.profile.is_some()).filter(|&b| slow[b] && !frame[b] && (0..nb).any(|p| !slow[p] && succs[p].contains(&b)))
+        .filter_map(chain).filter(|c| c.iter().all(|&b| !frame[b])).collect();
+    for c in exits {
+        let base = func.blocks.len();
+        let labels: Vec<BlockId> = c.iter().map(|_| {
+            *next_label += 1;
+            BlockId(*next_label - 1)
+        }).collect();
+        for (i, &b) in c.iter().enumerate() {
+            let mut copy = func.blocks[b].clone();
+            copy.label = labels[i];
+            if let Some(&next) = c.get(i + 1) {
+                retarget(&mut copy.terminator, func.blocks[next].label, labels[i + 1]);
+            }
+            func.blocks.push(copy);
+            succs.push(if i + 1 < c.len() { vec![base + i + 1] } else { Vec::new() });
+            slow.push(false);
+        }
+        let from = func.blocks[c[0]].label;
+        let preds: Vec<usize> = (0..base).filter(|&p| !slow[p] && succs[p].contains(&c[0])).collect();
+        for p in preds {
+            retarget(&mut func.blocks[p].terminator, from, labels[0]);
+            for x in succs[p].iter_mut().filter(|x| **x == c[0]) {
+                *x = base;
+            }
+        }
+    }
+    let nb = func.blocks.len();
     // A block that can only go on into the slow region (sqlite3BtreeNext's
     // setup of its moveToChild loop, branching to the loop or past it) is
     // slow too: its fast path never returns, and with it in the slow region
@@ -183,16 +237,19 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
     // and costs the slow path's copies on all the others).
     if let Some(profile) = &func.profile {
         let count = |b: usize| profile.get(&func.blocks[b].label.0).copied().unwrap_or(0);
+        // (The calls that do not enter the slow region by its one entry: the
+        // copied exits have no counts of their own.)
         let calls = count(0);
-        let fast: u64 = (0..nb).filter(|&b| !slow[b] && matches!(func.blocks[b].terminator, Terminator::Return(_))).map(count).sum();
+        let fast = calls.saturating_sub(count(entry));
         if calls == 0 || fast.saturating_mul(10) < calls.saturating_mul(MIN_FAST_TENTHS) {
             return 0;
         }
     }
     // A long fast region is mostly checks on the way in (the header parsing
-    // of jsonTranslateBlobToText), whose returns are its error paths.
+    // of jsonTranslateBlobToText), whose returns are its error paths; a
+    // profile says how often they are taken instead.
     let fast_size: usize = (0..nb).filter(|&b| !slow[b]).map(|b| func.blocks[b].instructions.len() + 1).sum();
-    if fast_size > MAX_FAST {
+    if fast_size > MAX_FAST && func.profile.is_none() {
         return 0;
     }
     // Values occurring in both regions (allocas stay: they name frame slots).
@@ -393,5 +450,43 @@ mod tests {
         // The tail call's block still reads the original.
         let Instruction::Call { info, .. } = &f.blocks[3].instructions[0] else { panic!() };
         assert!(matches!(info.args[0], Operand::Value(Value(1))));
+    }
+
+    /// f(p): r = p == 0 ? 7 : g() + p; return r -- both paths end at one
+    /// return. With a profile whose calls mostly return 7 the fast path gets
+    /// its own copy of that return; without one the function is left alone.
+    #[test]
+    fn shared_return_is_copied_for_the_fast_path_with_a_profile() {
+        let v = |n: u32| Operand::Value(Value(n));
+        let make = || {
+            let mut f = IrFunction::new("f".to_string(), IrType::I64, vec![], false);
+            f.blocks = vec![
+                block(0, vec![Instruction::ParamRef { dest: Value(1), param_idx: 0, ty: IrType::I64 },
+                              Instruction::Cmp { dest: Value(2), op: IrCmpOp::Eq, lhs: v(1), rhs: Operand::Const(IrConst::I64(0)), ty: IrType::I64 }],
+                      Terminator::CondBranch { cond: v(2), true_label: BlockId(1), false_label: BlockId(2) }),
+                block(1, vec![Instruction::Copy { dest: Value(6), src: Operand::Const(IrConst::I64(7)) }], Terminator::Branch(BlockId(3))),
+                block(2, vec![call("g", Some(4), vec![]),
+                              Instruction::BinOp { dest: Value(5), op: crate::ir::reexports::IrBinOp::Add, lhs: v(4), rhs: v(1), ty: IrType::I64 },
+                              Instruction::Copy { dest: Value(6), src: v(5) }],
+                      Terminator::Branch(BlockId(3))),
+                block(3, vec![], Terminator::Return(Some(v(6)))),
+            ];
+            f.next_value_id = 7;
+            f
+        };
+        let mut next_label = 10;
+        let mut f = make();
+        assert_eq!(split_function(&mut f, &mut next_label), 0);
+        let mut f = make();
+        f.profile = Some([(0, 100), (1, 90), (2, 10), (3, 100)].into_iter().collect());
+        assert_eq!(split_function(&mut f, &mut next_label), 1);
+        let labels: Vec<u32> = f.blocks.iter().map(|b| b.label.0).collect();
+        // The fast blocks and the return's copy, the split block, the slow ones.
+        assert_eq!(labels, [0, 1, 10, 11, 2, 3]);
+        assert!(matches!(f.blocks[1].terminator, Terminator::Branch(BlockId(10))));
+        assert!(matches!(f.blocks[2].terminator, Terminator::Return(Some(Operand::Value(Value(6))))));
+        // The slow path returns its own copy of the result.
+        let Terminator::Return(Some(Operand::Value(r))) = f.blocks[5].terminator else { panic!() };
+        assert_ne!(r, Value(6));
     }
 }
