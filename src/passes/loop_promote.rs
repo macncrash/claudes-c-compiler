@@ -20,7 +20,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, AliasClass, IrType};
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{BasicBlock, BlockId, Instruction, IrFunction, IrModule, Operand, Terminator, Value};
+use crate::ir::reexports::{BasicBlock, BlockId, Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value};
 use super::loop_analysis::{find_natural_loops, merge_loops_by_header, NaturalLoop};
 use super::mod_ref::{AliasModel, ModRef};
 
@@ -184,9 +184,15 @@ fn promote_loop(func: &mut IrFunction, cfg: &CfgAnalysis, l: &NaturalLoop, model
         let ty = a.ty;
         let scalar = (ty.is_integer() || matches!(ty, IrType::Ptr | IrType::F32 | IrType::F64)) && ty.size() <= 8;
         let Some(&size) = alloca_size.get(&loc.0) else { continue };
-        if !scalar || loc.1 < 0 || loc.2 as usize > size || in_loop[a.ptr.0 as usize] || defs[a.ptr.0 as usize] != 1 {
+        if !scalar || loc.1 < 0 || loc.2 as usize > size || in_loop[loc.0 as usize] {
             continue;
         }
+        // The address computed in the loop (LICM leaves a constant offset
+        // there, see licm::folded_addresses) is made again before it.
+        let remade = (in_loop[a.ptr.0 as usize] || defs[a.ptr.0 as usize] != 1).then(|| Instruction::GetElementPtr {
+            dest: Value(n as u32 + 1), base: Value(loc.0), offset: Operand::Const(IrConst::I64(loc.1)), ty: IrType::I8,
+        });
+        let ptr = if remade.is_some() { Value(n as u32 + 1) } else { a.ptr };
         let root = model.root(a.ptr.0);
         let mine: Vec<&Access> = accesses.iter().filter(|x| x.bytes == Some(loc)).collect();
         let class = if mine.iter().all(|x| x.alias == a.alias) { a.alias } else { AliasClass::ANY };
@@ -210,7 +216,7 @@ fn promote_loop(func: &mut IrFunction, cfg: &CfgAnalysis, l: &NaturalLoop, model
             continue;
         }
         apply(func, cfg, l, guard, &blocks, &mine.iter().map(|x| (x.block, x.index)).collect::<Vec<_>>(),
-              a.ptr, ty, class, n as u32, next_label);
+              ptr, remade, ty, class, n as u32, next_label);
         return true;
     }
     false
@@ -219,9 +225,10 @@ fn promote_loop(func: &mut IrFunction, cfg: &CfgAnalysis, l: &NaturalLoop, model
 /// Keep the location `ptr` points to in a new value through the loop.
 #[allow(clippy::too_many_arguments)]
 fn apply(func: &mut IrFunction, cfg: &CfgAnalysis, l: &NaturalLoop, guard: usize, blocks: &[usize],
-         accesses: &[(usize, usize)], ptr: Value, ty: IrType, alias: AliasClass, value: u32, next_label: &mut u32) {
+         accesses: &[(usize, usize)], ptr: Value, remade: Option<Instruction>, ty: IrType, alias: AliasClass, value: u32,
+         next_label: &mut u32) {
     let p = Value(value);
-    func.next_value_id = func.next_value_id.max(value + 1);
+    func.next_value_id = func.next_value_id.max(value + 2);
     let load = Instruction::Load { dest: p, ptr, ty, seg_override: AddressSpace::Default, volatile: false, alias };
     let store = || Instruction::Store { val: Operand::Value(p), ptr, ty, seg_override: AddressSpace::Default, volatile: false, alias };
     for &(b, k) in accesses {
@@ -247,11 +254,14 @@ fn apply(func: &mut IrFunction, cfg: &CfgAnalysis, l: &NaturalLoop, guard: usize
     };
     let header_label = func.blocks[l.header].label;
     if matches!(func.blocks[guard].terminator, Terminator::Branch(_)) {
+        if let Some(gep) = remade {
+            push_front_or_back(&mut func.blocks[guard], gep, false);
+        }
         push_front_or_back(&mut func.blocks[guard], load, false);
     } else {
         let label = fresh(next_label);
         retarget(&mut func.blocks[guard].terminator, header_label, label);
-        new_blocks.push((l.header, block(label, vec![load], header_label)));
+        new_blocks.push((l.header, block(label, remade.into_iter().chain([load]).collect(), header_label)));
     }
     let mut stored: FxHashSet<usize> = FxHashSet::default();
     for &b in blocks {

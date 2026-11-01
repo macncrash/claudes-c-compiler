@@ -990,6 +990,19 @@ three stays with less than 0.125: a few addresses usually fit in registers
 spilled even one, as `sqlite3VdbeRecordCompareWithSkip` did with
 `sqlite3SmallTypeSizes` (0.06); speedtest ran 0.2% fewer instructions.
 
+**Folded addresses stay.** A GEP with a constant offset whose only uses are
+as the address of plain loads and stores is not hoisted (unless a hoisted
+load or store goes through it): the backend folds the offset into each
+access (`ldr x0, [x1, #8]`), so computing it ahead saves nothing and costs
+a register through the loop. `sqlite3_str_vappendf` had hoisted a dozen
+addresses into `pAccum` and a local out of its format loop, which most
+calls run once or not at all, and stored each in a stack slot on every
+call. loop_hoist and loop_promote, which need an address from outside the
+loop, move or remake one themselves. Speedtest ran 70M fewer instructions
+(0.35%; sqlite3_str_vappendf 47M, sqlite3BtreeNext 14M), and with its
+profile 223M fewer (1.1%; sqlite3VdbeExec 202M, whose dispatch loop no
+longer carries those addresses in registers).
+
 ### iv_strength_reduce -- Induction Variable Strength Reduction
 
 Transforms expensive per-iteration index computations in loops into cheaper
@@ -1368,7 +1381,9 @@ loop_hoist then moves loads every iteration makes to the guard's edge into
 the loop. GVN has run by then, so a load the guard already makes (with
 nothing since that may write memory) is reused by a copy instead:
 longest_match loaded `s->window` before its loop for the scan pointer and
-again for the hoisted `s->window + cur_match`. With strict aliasing, stores in
+again for the hoisted `s->window + cur_match`. A constant-offset address of
+an invariant base that LICM left in the loop (see licm) counts as invariant
+and moves out only with a load through it. With strict aliasing, stores in
 the loop of another alias class do not hold a load back: deflate's hash
 insertion loop stores to the `ush` arrays `s->head` and `s->prev`, and
 `s->window`, `s->hash_mask`, `s->w_mask`, `s->head` and `s->prev` are loaded
@@ -1389,7 +1404,9 @@ are), and it is stored back on every edge leaving the loop (in a new block
 when the edge's target has other predecessors). Every access to the field
 must have its type and every stored value that type, so that a copy changes
 nothing. Speedtest ran 0.16% fewer instructions; the loop's index is then
-sign-extended each iteration rather than loaded with `ldrsw`.
+sign-extended each iteration rather than loaded with `ldrsw`. The field's
+address, when LICM left it in the loop, is made again before the loop from
+the local and the offset.
 
 ### ext_elide -- Extensions Loads Already Made
 

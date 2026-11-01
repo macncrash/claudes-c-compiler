@@ -71,9 +71,10 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
         .map(|b| cfg.succs.row(b).iter().map(|&s| s as usize).collect())
         .collect();
     let freq = crate::backend::liveness::compute_block_freq(&succs, cfg.num_blocks);
+    let folded = folded_addresses(func);
 
     for natural_loop in &sorted_loops {
-        total_hoisted += hoist_loop_invariants_freq(func, natural_loop, &cfg.preds, &alloca_info, &freq);
+        total_hoisted += hoist_loop_invariants_freq(func, natural_loop, &cfg.preds, &alloca_info, &freq, &folded);
     }
 
     total_hoisted + hoist_constant_locals(func, &sorted_loops)
@@ -864,7 +865,46 @@ fn hoist_loop_invariants(
     preds: &analysis::FlatAdj,
     alloca_info: &AllocaAnalysis,
 ) -> usize {
-    hoist_loop_invariants_freq(func, natural_loop, preds, alloca_info, &[])
+    let folded = folded_addresses(func);
+    hoist_loop_invariants_freq(func, natural_loop, preds, alloca_info, &[], &folded)
+}
+
+/// GEPs with a constant offset whose only uses are as the address of a
+/// load or store: the backend folds the offset into each access
+/// (`ldr x0, [x1, #8]`), so computing one ahead of its loop saves
+/// nothing, and costs a register across the loop (or a stack slot: in
+/// sqlite3_str_vappendf a dozen such addresses into pAccum and a local,
+/// hoisted out of the format loop, were spilled and stored on every call
+/// for a loop that most calls run once or not at all).
+fn folded_addresses(func: &IrFunction) -> FxHashSet<u32> {
+    let mut geps: FxHashSet<u32> = FxHashSet::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::GetElementPtr { dest, offset: Operand::Const(c), .. } = inst {
+            if c.to_i64().is_some_and(|k| (0..4096).contains(&k)) {
+                geps.insert(dest.0);
+            }
+        }
+    }
+    if geps.is_empty() {
+        return geps;
+    }
+    let mut other_use: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Load { ty, .. } if !matches!(ty, IrType::I128 | IrType::U128) => {}
+                Instruction::Store { val, ty, .. } if !matches!(ty, IrType::I128 | IrType::U128) => {
+                    if let Operand::Value(v) = val {
+                        other_use.insert(v.0);
+                    }
+                }
+                _ => inst.for_each_used_value(|v| { other_use.insert(v); }),
+            }
+        }
+        block.terminator.for_each_used_value(|v| { other_use.insert(v); });
+    }
+    geps.retain(|d| !other_use.contains(d));
+    geps
 }
 
 fn hoist_loop_invariants_freq(
@@ -873,6 +913,7 @@ fn hoist_loop_invariants_freq(
     preds: &analysis::FlatAdj,
     alloca_info: &AllocaAnalysis,
     freq: &[f64],
+    folded: &FxHashSet<u32>,
 ) -> usize {
     let header = natural_loop.header;
     let rare_globals = rare_globals(func, natural_loop, freq);
@@ -1069,6 +1110,14 @@ fn hoist_loop_invariants_freq(
             }
         }
     }
+
+    // A folded address stays in the loop unless a hoisted load or store
+    // goes through it.
+    let mut through: FxHashSet<u32> = FxHashSet::default();
+    for (_, _, inst) in &hoistable_insts {
+        inst.for_each_used_value(|v| { through.insert(v); });
+    }
+    hoistable_insts.retain(|(_, _, inst)| inst.dest().is_none_or(|d| !folded.contains(&d.0) || through.contains(&d.0)));
 
     if hoistable_insts.is_empty() {
         return 0;
@@ -1389,6 +1438,29 @@ mod tests {
             Instruction::BinOp { op: IrBinOp::Mul, .. } => {} // correct
             other => panic!("Expected BinOp::Mul, got {:?}", other),
         }
+    }
+
+    /// A constant-offset address used only to store through stays in the
+    /// loop (the backend folds the offset into the store); the multiply is
+    /// still hoisted.
+    #[test]
+    fn test_folded_address_stays_in_loop() {
+        let mut func = make_loop_func();
+        func.blocks[2].instructions.extend([
+            Instruction::GetElementPtr { dest: Value(6), base: Value(1), offset: Operand::Const(IrConst::I64(8)), ty: IrType::Ptr },
+            Instruction::Store { val: Operand::Value(Value(5)), ptr: Value(6), ty: IrType::I32,
+                seg_override: crate::common::types::AddressSpace::Default, volatile: false,
+                alias: crate::common::types::AliasClass::ANY },
+        ]);
+        func.next_value_id = 7;
+        let alloca_info = analyze_allocas(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+        let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+        assert_eq!(hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info), 1);
+        assert!(matches!(func.blocks[0].instructions.last(), Some(Instruction::BinOp { op: IrBinOp::Mul, .. })));
+        assert!(func.blocks[2].instructions.iter().any(|i| matches!(i, Instruction::GetElementPtr { dest: Value(6), .. })));
     }
 
     #[test]

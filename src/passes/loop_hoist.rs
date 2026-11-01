@@ -217,18 +217,22 @@ fn hoist_loop(
 
     let mut hoisted: FxHashSet<u32> = FxHashSet::default();
     let mut moves: Vec<(usize, usize)> = Vec::new();
+    // Constant-offset addresses of invariant bases, which LICM leaves in
+    // the loop (see licm::folded_addresses): invariant, but moved only
+    // with a load through them.
+    let mut addresses: FxHashMap<u32, (usize, usize, usize)> = FxHashMap::default();
     loop {
         let mut found = false;
         for &b in &blocks {
             for (k, inst) in func.blocks[b].instructions.iter().enumerate() {
                 let Some(d) = inst.dest() else { continue };
-                if hoisted.contains(&d.0) || defs[d.0 as usize] != 1 {
+                if hoisted.contains(&d.0) || addresses.contains_key(&d.0) || defs[d.0 as usize] != 1 {
                     continue;
                 }
                 let (mut invariant, mut uses_hoisted) = (true, false);
                 inst.for_each_used_value(|v| {
                     let h = hoisted.contains(&v);
-                    invariant &= !in_loop[v as usize] || h;
+                    invariant &= !in_loop[v as usize] || h || addresses.contains_key(&v);
                     uses_hoisted |= h;
                 });
                 if !invariant {
@@ -245,6 +249,12 @@ fn hoist_loop(
                     }
                     // Only what the hoisted loads make invariant: LICM has
                     // already moved the rest it could.
+                    Instruction::GetElementPtr { offset: Operand::Const(_), .. } if !uses_hoisted => {
+                        let order = addresses.len();
+                        addresses.insert(d.0, (order, b, k));
+                        found = true;
+                        false
+                    }
                     _ => uses_hoisted && is_hoistable(inst),
                 };
                 if ok {
@@ -261,6 +271,23 @@ fn hoist_loop(
     if moves.is_empty() {
         return 0;
     }
+    // The addresses the moved instructions read move first (their bases
+    // are defined outside the loop, or are such addresses themselves).
+    let mut needed: Vec<(usize, usize, usize)> = Vec::new();
+    let mut work: Vec<(usize, usize)> = moves.clone();
+    while let Some((b, k)) = work.pop() {
+        func.blocks[b].instructions[k].for_each_used_value(|v| {
+            if let Some(&at) = addresses.get(&v) {
+                if !needed.contains(&at) {
+                    needed.push(at);
+                    work.push((at.1, at.2));
+                }
+            }
+        });
+    }
+    // In the order found, which puts a base first.
+    needed.sort_unstable();
+    let moves: Vec<(usize, usize)> = needed.into_iter().map(|(_, b, k)| (b, k)).chain(moves).collect();
 
     // Take the instructions out, keeping their discovery order (operands
     // before their users).
