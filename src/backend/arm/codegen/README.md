@@ -1094,6 +1094,15 @@ v1 and nothing between the copy and the call uses v22:
   xzr, x11, lt; cmp x14, #0; csel x14, x15, x13, ne` becomes `cmp w11, #0;
   csel x15, xzr, x11, lt; cmp w13, w14; csel x14, x15, x13, gt`. Speedtest
   ran 0.20% fewer instructions (block counts, no function slower).
+- `cset C, cc`, then straight-line code that neither sets the flags nor
+  writes C (no label, call or branch between), then `cbnz C, L` is `b.cc
+  L` (`cbz` the inverse condition), and the `cset` goes when nothing else
+  reads C. Codegen fuses a compare into its branch only when the two are
+  adjacent, and a phi copy or an address scheduled between left
+  sqlite3VdbeExec's `cmp x0, x9; cset x6, lo; ldr x9, [sp, ...]; add x5,
+  x9, #4; cbnz w6, L` (14M runs), and an overflow test's `adds; cset w12,
+  vs; cbnz w12` in its arithmetic opcodes. Speedtest ran 40M fewer
+  instructions (0.2%), with or without a profile.
 
 **14. Tail Calls and Leaf Frame Records** (after the local cleanup)
 

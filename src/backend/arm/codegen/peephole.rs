@@ -635,6 +635,7 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
             changed2 |= pass!(fold_offset_into_global_addr(lines, kinds, n));
             changed2 |= pass!(sink_compare_past_selects(lines, kinds, n));
             changed2 |= pass!(fuse_cset_into_csel(lines, kinds, n));
+            changed2 |= pass!(fuse_cset_into_branch(lines, kinds, n));
             changed2 |= pass!(fuse_cmp_sub_into_subs(lines, kinds, n));
             changed2 |= pass!(forward_copy_propagation(lines, kinds, n));
             changed2 |= pass!(retarget_results(lines, kinds, n));
@@ -5714,6 +5715,59 @@ fn fuse_cset_into_csel(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
     changed
 }
 
+/// `cset C, cc`, then straight-line code that neither sets the flags nor
+/// writes C, then `cbnz|cbz C, L`: the branch tests the flags instead,
+/// `b.cc L` (the inverse for cbz), and the cset goes when nothing else
+/// reads C. Codegen fuses a compare into its branch only when they are
+/// adjacent; sqlite3VdbeExec's `cmp x0, x9; cset x6, lo; ldr x9, [sp, ...];
+/// add x5, x9, #4; cbnz w6, L` (a phi copy scheduled in between) ran the
+/// cset 14M times.
+fn fuse_cset_into_branch(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        if kinds[i] != LineKind::CmpBranch {
+            continue;
+        }
+        let Some((m @ ("cbz" | "cbnz"), ops)) = split_insn(&lines[i]) else { continue };
+        let (reg, target) = first_and_rest(ops);
+        let Some(c) = gpr_operand(reg) else { continue };
+        let mut k = i;
+        let mut cc = None;
+        while k > 0 {
+            k -= 1;
+            match kinds[k] {
+                LineKind::Nop => continue,
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                | LineKind::Call | LineKind::Ret => break,
+                _ => {}
+            }
+            let access = classify_access(&lines[k], kinds[k]);
+            if access == Access::Transparent {
+                continue;
+            }
+            let Some((mk, o)) = split_insn(&lines[k]) else { break };
+            if mk == "cset" {
+                let (d, rest) = first_and_rest(o);
+                if gpr_operand(d) == Some(c) {
+                    cc = Some(rest.trim().to_string());
+                }
+                break;
+            }
+            let writes_c = line_info(&lines[k], kinds[k], &|_| None).defs & (1 << c) != 0;
+            if access == Access::Barrier || sets_flags(mk) || writes_c {
+                break;
+            }
+        }
+        let Some(cc) = cc else { continue };
+        let new_cc = if m == "cbnz" { Some(cc.as_str()) } else { invert_condition(&cc) };
+        let Some(new_cc) = new_cc else { continue };
+        lines[i] = format!("    b.{} {}", new_cc, target.trim());
+        kinds[i] = classify_line(&lines[i]);
+        changed = true;
+    }
+    changed
+}
+
 // ── 32-bit copies and shifted operands ───────────────────────────────────────
 //
 // `sxtw xA, wB` and `mov wA, wB` leave wA equal to wB. Later 32-bit reads of
@@ -7867,6 +7921,23 @@ mod tests {
         let g = ".type g, %function\ng:\n    ldrsw x9, [x1]\n    ldrsw x0, [x2]\n.LBB1:\n    cmp x20, x0\n    madd x3, x0, x9, x3\n    add w0, w0, #1\n    sxtw x0, w0\n    b.lo .LBB1\n    str x3, [x2]\n    mov x0, #0\n    ret\n.size g, .-g\n";
         let result = peephole_optimize(g.to_string());
         assert!(result.contains("cmp x20, w0, sxtw") && result.contains("smaddl x3, w0, w9, x3") && !result.contains("sxtw x0"), "{}", result);
+    }
+
+    /// `cset` then code that leaves the flags alone, then `cbnz|cbz` of the
+    /// cset's register: a conditional branch on the flags.
+    #[test]
+    fn test_cset_tested_by_branch_becomes_conditional_branch() {
+        let f = |mid: &str, br: &str| format!(".type f, %function\nf:\n    cmp x0, x9\n    cset x6, lo\n{mid}    {br} w6, .LBB2\n    mov x0, #1\n    ret\n.LBB2:\n    mov x0, #2\n    ret\n.size f, .-f\n");
+        let mid = "    ldr x9, [x1, #8]\n    add x5, x9, #4\n    str x5, [x2]\n";
+        let result = peephole_optimize(f(mid, "cbnz"));
+        assert!(result.contains("b.lo .LBB2") && !result.contains("cset") && !result.contains("cbnz"), "{}", result);
+        let result = peephole_optimize(f(mid, "cbz"));
+        assert!(result.contains("b.hs .LBB2") && !result.contains("cset"), "{}", result);
+        // Not across a flag write, nor a write of the register.
+        for mid in ["    cmn x5, #1\n    csinc x7, x3, x4, eq\n    str x7, [x2]\n", "    ldr x6, [x1]\n"] {
+            let result = peephole_optimize(f(mid, "cbnz"));
+            assert!(!result.contains("b.lo"), "{mid}{}", result);
+        }
     }
 
     #[test]
