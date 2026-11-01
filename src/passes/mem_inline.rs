@@ -15,7 +15,7 @@
 //! except a copy of an 8-byte vector temporary (see vector_operands).
 
 use crate::common::types::AliasClass;
-use crate::common::types::{AddressSpace, IrType};
+use crate::common::types::{AddressSpace, IrType, RiscvFloatClass};
 use crate::ir::reexports::{Instruction, IntrinsicOp, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 /// Largest length copied or cleared in place.
@@ -49,20 +49,35 @@ pub(crate) fn inline_function(func: &mut IrFunction, wide_stores: bool) -> usize
     inlined
 }
 
-/// The pointers vector ops write through or read through. An 8-byte vector
-/// temporary (`alloca Ptr size=8`) is one: its copies stay copies, which
-/// the backend makes from its vector register (`str d27`), where a load
-/// and store of it as an integer would move it through a general register
-/// first (`umov x9, v27.d[0]`; vector-bench's blend ran 19% slower).
+/// The pointers vector ops write through or read through, and the result
+/// buffers of calls returning a short vector in a vector register. An
+/// 8-byte vector temporary (`alloca Ptr size=8`) is one: its copies stay
+/// copies, which the backend makes from its vector register (`str d27`,
+/// or `str d0` straight after the call), where a load and store of it as
+/// an integer would move it through a general register first (`umov x9,
+/// v27.d[0]`; vector-bench's blend ran 19% slower), or a call's result
+/// through the stack.
 fn vector_operands(func: &IrFunction) -> crate::common::fx_hash::FxHashSet<u32> {
     let mut ptrs = crate::common::fx_hash::FxHashSet::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-        if let Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr, args, .. } = inst {
-            ptrs.extend(dest_ptr.iter().map(|p| p.0));
-            ptrs.extend(args.iter().filter_map(|a| match a {
-                Operand::Value(v) => Some(v.0),
-                Operand::Const(_) => None,
-            }));
+        match inst {
+            Instruction::Intrinsic { op: IntrinsicOp::VecOp { .. }, dest_ptr, args, .. } => {
+                ptrs.extend(dest_ptr.iter().map(|p| p.0));
+                ptrs.extend(args.iter().filter_map(|a| match a {
+                    Operand::Value(v) => Some(v.0),
+                    Operand::Const(_) => None,
+                }));
+            }
+            // As the backend's vec_ret_buffer: a one-member HFA returned
+            // through a buffer passed first, of a size the backend keeps in
+            // a vector register (a 4-byte one is better copied as an int).
+            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                if let (true, Some(Some(RiscvFloatClass::Hfa { count: 1, elem_size: 8 | 16 })), Some(Operand::Value(v)))
+                    = (info.is_sret, info.struct_arg_riscv_float_classes.first(), info.args.first()) {
+                    ptrs.insert(v.0);
+                }
+            }
+            _ => {}
         }
     }
     ptrs

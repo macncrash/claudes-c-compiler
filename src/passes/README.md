@@ -1067,7 +1067,10 @@ a Memcpy, which the backend makes from the vector register (`str d28`). As
 an integer load and store it went through a general register (`umov x9,
 v27.d[0]; str x9`), and the temporary kept its own register, so the add
 writing it was not folded into a `usra`: vector-bench's 8-byte blend ran
-11 instructions per vector where clang runs 9, and 19% slower.
+11 instructions per vector where clang runs 9, and 19% slower. The result
+buffer of a call returning an 8- or 16-byte vector (or a struct of one
+double) in v0 is one too: its copy is then a `str d0` straight after the
+call, where it had gone through the stack (`str d0; ldr x0; str x0`).
 
 ### load_phi -- Loads Joined Across Merges
 
