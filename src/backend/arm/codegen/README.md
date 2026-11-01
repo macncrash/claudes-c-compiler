@@ -1035,6 +1035,20 @@ v1 and nothing between the copy and the call uses v22:
   vdbeRecordCompareString's memcmp result, tested in two blocks. Static
   `sxtw` in SQLite went from 4468 to 3558; speedtest ran 0.41% fewer
   instructions (block counts, no function slower).
+- An index, addend, compared value or factor read whole (`[xD, xA, lsl
+  #s]`, `add xC, xD, xA`, `cmp xB, xA`, `madd`) from a register that holds
+  its own sign extension on every path into the read (a forward analysis
+  over the function: `sxtw`, `ldrsw`, narrow loads, fields of at most 32
+  bits, and copies, selects and arithmetic shifts of such registers), and
+  that an `sxtw` of it reaches, reads the low half extended instead (`[xD,
+  wA, sxtw #s]`, `add xC, xD, wA, sxtw`, `cmp xB, wA, sxtw`, `smaddl`): the
+  same value, so the `sxtw` goes once nothing reads the upper half. This
+  is the loop case of the straight-line fold above: balance_nonroot's
+  `add w0, w0, #1; sxtw x0, w0` each iteration, its counter indexing an
+  array across the back edge. `fold_index_into_mem` also folds the
+  extended `add xA, xB, wI, sxtw #k` into the access through `[xA]`.
+  Speedtest ran 50M fewer instructions (0.25%; balance_nonroot 36M), zlib
+  11M fewer.
 
 **13. Constants and Zero** (local cleanup)
 

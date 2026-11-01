@@ -659,6 +659,7 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
             changed2 |= pass!(fuse_rev_into_rev16(lines, kinds, n));
             changed2 |= pass!(fuse_signed_load_mask(lines, kinds, n));
             changed2 |= pass!(fold_extend_into_narrow_store(lines, kinds, n));
+            changed2 |= pass!(read_low_halves_of_sign_extended(lines, kinds, n));
             changed2 |= pass!(fold_sxtw_into_users(lines, kinds, n));
             changed2 |= pass!(fold_zero_extension_into_user(lines, kinds, n));
             changed2 |= pass!(eliminate_dead_writes(lines, kinds, n));
@@ -4445,6 +4446,16 @@ fn writes_sign_extended(mnemonic: &str, dest: &str, srcs: &str, sext: &[bool; 29
             let imm = last_operand(srcs).strip_prefix('#').and_then(|v| v.parse::<i64>().ok());
             imm.is_some_and(|v| (1..32).contains(&v))
         }
+        // A signed field of at most 32 bits, and an arithmetic right shift
+        // of a sign-extended register.
+        "sbfx" if x_dest => {
+            let width = last_operand(srcs).strip_prefix('#').and_then(|v| v.parse::<i64>().ok());
+            width.is_some_and(|w| (1..=32).contains(&w))
+        }
+        "asr" if x_dest => {
+            let src = first_and_rest(srcs).0;
+            last_operand(srcs).starts_with('#') && src.starts_with('x') && gpr_operand(src).is_some_and(|s| sext[s as usize])
+        }
         // Selects between two sign-extended registers (or zero).
         "csel" if x_dest => {
             let (a, rest) = first_and_rest(srcs);
@@ -5970,7 +5981,8 @@ fn fold_offset_into_global_addr(lines: &mut [String], kinds: &mut [LineKind], n:
 
 /// `add xA, xB, xI[, lsl #k]` immediately followed by a load/store through
 /// `[xA]` (A dead afterwards, k the access size's log2 or 0) becomes the
-/// register-offset form `[xB, xI, lsl #k]`.
+/// register-offset form `[xB, xI, lsl #k]`; `add xA, xB, wI, sxtw[ #k]`
+/// (uxtw too) becomes `[xB, wI, sxtw[ #k]]`.
 fn fold_index_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
@@ -5980,15 +5992,18 @@ fn fold_index_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         }
         let Some(("add", ops)) = split_insn(&lines[i]) else { continue };
         let p: Vec<&str> = ops.split(',').map(str::trim).collect();
-        let shift = match p.len() {
-            3 => 0,
-            4 => match p[3].strip_prefix("lsl #").and_then(|k| k.parse::<u32>().ok()) {
-                Some(k) => k,
-                None => continue,
+        // The index's extension ("lsl", "sxtw" or "uxtw") and shift.
+        let (ext, shift) = match p.len() {
+            3 => ("lsl", 0),
+            4 => match p[3].split_once(" #").map_or((p[3], Some(0)), |(e, k)| (e, k.parse::<u32>().ok())) {
+                (e @ ("lsl" | "sxtw" | "uxtw"), Some(k)) => (e, k),
+                _ => continue,
             },
             _ => continue,
         };
-        if !p[..3].iter().all(|r| r.starts_with('x') && gpr_operand(r).is_some()) {
+        let index_width = if ext == "lsl" { 'x' } else { 'w' };
+        if !p[..2].iter().all(|r| r.starts_with('x') && gpr_operand(r).is_some())
+            || !p[2].starts_with(index_width) || gpr_operand(p[2]).is_none() {
             continue;
         }
         let a = gpr_operand(p[0]).unwrap_or(255);
@@ -6043,10 +6058,10 @@ fn fold_index_into_mem(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         if !(is_load && value_reg == Some(a)) && live[j] & (1 << a) != 0 {
             continue;
         }
-        let mem = if shift == 0 {
-            format!("[{}, {}]", p[1], p[2])
-        } else {
-            format!("[{}, {}, lsl #{}]", p[1], p[2], shift)
+        let mem = match (ext, shift) {
+            ("lsl", 0) => format!("[{}, {}]", p[1], p[2]),
+            (_, 0) => format!("[{}, {}, {}]", p[1], p[2], ext),
+            _ => format!("[{}, {}, {} #{}]", p[1], p[2], ext, shift),
         };
         lines[j] = format!("    {} {}, {}", m, reg, mem);
         kinds[j] = classify_line(&lines[j]);
@@ -6867,6 +6882,18 @@ fn line_facts(facts: &mut Vec<Option<LineFacts>>, k: usize, line: &str, kind: Li
     }
 }
 
+/// A line's facts and the registers it reads whole (x form), all its uses
+/// when unknown: line_facts without and with `upper`, in one lookup.
+fn line_facts_and_x_reads(facts: &mut Vec<Option<LineFacts>>, k: usize, line: &str, kind: LineKind,
+                          label_index: &dyn Fn(&str) -> Option<usize>) -> (LineInfo, RegSet) {
+    let info = line_facts(facts, k, line, kind, false, label_index);
+    let x_reads = match facts.get(k) {
+        Some(Some(f)) if f.kind == kind && f.text == line => f.x_reads,
+        _ => x_form_reads(line, kind),
+    };
+    (info, x_reads.map_or(info.uses, |x| info.uses & x))
+}
+
 fn function_liveness(lines: &[String], kinds: &[LineKind], start: usize, end: usize) -> Option<(Vec<RegSet>, Vec<Option<u8>>)> {
     function_liveness_with(lines, kinds, start, end, false)
 }
@@ -7036,6 +7063,191 @@ fn eliminate_dead_upper_extends(lines: &mut [String], kinds: &mut [LineKind], n:
         }
     }
     changed
+}
+
+/// Reads of a whole register that holds a sign-extended 32-bit value on every
+/// path (`sxtw xA, wA`, `ldrsw xA`, ... reach it, and nothing else does), and
+/// that an `sxtw` of A reaches, read the low half with the extension instead:
+///   ldr|str R, [xD, xA, lsl #s]   -> [xD, wA, sxtw #s]
+///   add|sub xC, xD, xA            -> add|sub xC, xD, wA, sxtw
+///   cmp|cmn xB, xA                -> cmp|cmn xB, wA, sxtw
+///   madd xC, xA, xM, xN           -> smaddl xC, wA, wM, xN (M sign-extended too)
+///   cbz|cbnz xA, and xC, xA, #k, asr|lsl xC, xA, #k (as fold_sxtw_into_users)
+/// The same values, so eliminate_dead_upper_extends can then drop the sxtw
+/// when nothing reads A's upper half any more. fold_sxtw_into_users does this
+/// in straight-line code; a loop counter (`add w0, w0, #1; sxtw x0, w0`)
+/// indexing an array (`str x12, [x23, x0, lsl #3]`, balance_nonroot) is
+/// read across the back edge.
+fn read_low_halves_of_sign_extended(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for (start, end) in function_ranges(lines, n) {
+        changed |= read_low_halves_in_function(lines, kinds, start, end);
+    }
+    changed
+}
+
+fn read_low_halves_in_function(lines: &mut [String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
+    // Only registers an sxtw writes can lose one.
+    let targets: RegSet = (start..end).fold(0, |m, k| match kinds[k] {
+        LineKind::Sxtw { dst, .. } if dst <= 28 => m | (1 << dst),
+        _ => m,
+    });
+    if targets == 0 {
+        return false;
+    }
+    let mut labels: crate::common::fx_hash::FxHashMap<&str, usize> = crate::common::fx_hash::FxHashMap::default();
+    for k in start..end {
+        if kinds[k] == LineKind::Label {
+            if let Some(name) = label_name(&lines[k]) {
+                labels.insert(name, k);
+            }
+        }
+    }
+    let label_index = |name: &str| labels.get(name).copied();
+    let len = end - start;
+    // Per line: its facts (flow and registers written), and the registers
+    // it reads whole (x form).
+    let (infos, x_reads): (Vec<LineInfo>, Vec<RegSet>) = LINE_FACTS.with(|facts| {
+        let mut facts = facts.borrow_mut();
+        (start..end).map(|k| line_facts_and_x_reads(&mut facts, k, &lines[k], kinds[k], &label_index)).unzip()
+    });
+    // The registers whose extension is tracked: the targets, what is read
+    // with them (the other factor of a multiply), and what they are made from.
+    let tracked = (0..len).fold(targets, |m, i| {
+        if (x_reads[i] | infos[i].defs) & targets != 0 { m | x_reads[i] } else { m }
+    });
+    // Predecessors: the line before, when it falls through (`falls[i]`),
+    // and the jumps to a line (`jumps_to`). A jump whose targets are not
+    // all known leaves the analysis.
+    let mut falls = vec![false; len];
+    let mut jumps_to: crate::common::fx_hash::FxHashMap<usize, Vec<usize>> = crate::common::fx_hash::FxHashMap::default();
+    for (i, info) in infos.iter().enumerate() {
+        let k = start + i;
+        if kinds[k] == LineKind::Branch && lines[k].trim_start().starts_with("br") {
+            match jump_table_targets(lines, kinds, k, end, &label_index) {
+                Some(targets) => targets.iter().for_each(|t| jumps_to.entry(t - start).or_default().push(i)),
+                None => return false,
+            }
+            continue;
+        }
+        match info.flow {
+            Flow::Next => if i + 1 < len { falls[i + 1] = true },
+            Flow::Exit => {}
+            Flow::Jump { target, falls_through } => {
+                match target {
+                    Some(t) => jumps_to.entry(t - start).or_default().push(i),
+                    // A tail call or a jump out of the function.
+                    None if kinds[k] == LineKind::Branch => {}
+                    None => return false,
+                }
+                if falls_through && i + 1 < len {
+                    falls[i + 1] = true;
+                }
+            }
+        }
+    }
+    // Per line: the registers it writes, and the one it leaves sign-extended
+    // when the registers in the mask are sign-extended before it (only
+    // registers in `tracked`), and whether it is an sxtw.
+    struct Effect { defs: RegSet, sext: Option<(u8, RegSet)>, sxtw: bool }
+    let effects: Vec<Effect> = (start..end).zip(&infos).map(|(k, info)| {
+        let defs = if kinds[k] == LineKind::Call { (1 << 19) - 1 } else { info.defs };
+        if defs & tracked == 0 || defs.count_ones() != 1 || kinds[k] == LineKind::Call {
+            return Effect { defs, sext: None, sxtw: false };
+        }
+        let sext = split_insn(&lines[k]).and_then(|(m, ops)| {
+            let (dest, srcs) = first_and_rest(ops);
+            let d = gpr_operand(dest).filter(|d| defs == 1 << d)?;
+            if writes_sign_extended(m, dest, srcs, &[false; 29]) {
+                Some((d, 0))
+            } else {
+                // Sign-extended given its x sources' (a select, a copy, a shift).
+                writes_sign_extended(m, dest, srcs, &[true; 29]).then(|| (d, x_form_reads(&lines[k], kinds[k]).unwrap_or(ALL_REGS)))
+            }
+        });
+        Effect { defs, sext, sxtw: matches!(kinds[k], LineKind::Sxtw { .. }) }
+    }).collect();
+    // After each line: (sign-extended registers, registers an sxtw of
+    // theirs reaches). The first is a must, the second a may analysis.
+    let transfer = |i: usize, (sext, reach): (RegSet, RegSet)| -> (RegSet, RegSet) {
+        let e = &effects[i];
+        let (mut new_sext, mut new_reach) = (sext & !e.defs, reach & !e.defs);
+        if let Some((d, need)) = e.sext {
+            if sext & need == need {
+                new_sext |= 1 << d;
+            }
+            if e.sxtw {
+                new_reach |= 1 << d;
+            }
+        }
+        (new_sext, new_reach)
+    };
+    let input = |out: &[(RegSet, RegSet)], i: usize| -> (RegSet, RegSet) {
+        let jumps = jumps_to.get(&i).map_or(&[][..], |v| &v[..]);
+        if i == 0 || (!falls[i] && jumps.is_empty()) {
+            return (0, 0);
+        }
+        let from_prev = if falls[i] { out[i - 1] } else { (ALL_REGS, 0) };
+        jumps.iter().fold(from_prev, |(s, r), &p| (s & out[p].0, r | out[p].1))
+    };
+    let mut out: Vec<(RegSet, RegSet)> = vec![(ALL_REGS, 0); len];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..len {
+            let new = transfer(i, input(&out, i));
+            if new != out[i] {
+                out[i] = new;
+                changed = true;
+            }
+        }
+    }
+    let mut rewrote = false;
+    for (i, &reads) in x_reads.iter().enumerate() {
+        let k = start + i;
+        if reads & targets == 0 || kinds[k] == LineKind::Nop {
+            continue;
+        }
+        let (sext, reach) = input(&out, i);
+        for a in (0..29u8).filter(|&a| reads & targets & sext & reach & (1 << a) != 0) {
+            if let Some(new) = read_low_half(&lines[k], kinds[k], a, sext) {
+                kinds[k] = classify_line(&new);
+                lines[k] = new;
+                rewrote = true;
+            }
+        }
+    }
+    rewrote
+}
+
+/// `line` reading the sign-extended register A's low half instead of xA
+/// (see read_low_halves_of_sign_extended; `sext` the registers that are
+/// sign-extended before it), or None.
+fn read_low_half(line: &str, kind: LineKind, a: u8, sext: RegSet) -> Option<String> {
+    let (mnemonic, ops) = split_insn(line)?;
+    let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+    let new = match mnemonic {
+        "cmp" | "cmn" => {
+            (p.len() == 2 && p[1] == xreg_name(a) && p[0].starts_with('x') && gpr_operand(p[0]) != Some(a))
+                .then(|| format!("    {} {}, {}, sxtw", mnemonic, p[0], wreg_name(a)))?
+        }
+        // Both factors sign-extended: a widening multiply of the low halves.
+        "madd" | "msub" if p.len() == 4 => {
+            let other = if p[1] == xreg_name(a) { p[2] } else if p[2] == xreg_name(a) { p[1] } else { return None };
+            let o = gpr_operand(other).filter(|&o| other.starts_with('x') && o != a && sext & (1 << o) != 0)?;
+            if !p[0].starts_with('x') || p[3] == xreg_name(a) || p[3] == xreg_name(o) {
+                return None;
+            }
+            let fused = if mnemonic == "madd" { "smaddl" } else { "smsubl" };
+            format!("    {} {}, {}, {}, {}", fused, p[0], wreg_name(a), wreg_name(o), p[3])
+        }
+        _ => {
+            let first_is_dest = matches!(classify_access(line, kind), Access::Write { .. }) && !mnemonic.starts_with("str");
+            rewrite_sxtw_use(mnemonic, ops, first_is_dest, a, a, "")?
+        }
+    };
+    let new_kind = classify_line(&new);
+    x_form_reads(&new, new_kind).is_some_and(|r| r & (1 << a) == 0).then_some(new)
 }
 
 /// Function boundaries: (start, end) line ranges of each function body.
@@ -7630,13 +7842,31 @@ mod tests {
         let f = |tail: &str| format!(".type f, %function\nf:\n    add w12, w7, w12\n    sxtw x12, w12\n    cmp w12, #5\n    b.ne .LBB1\n    str w12, [x0]\n.LBB1:\n{tail}    ret\n.size f, .-f\n");
         let result = peephole_optimize(f("    lsl x3, x4, x12\n    str x3, [x0]\n"));
         assert!(!result.contains("sxtw"), "{}", result);
-        // An x read on one path keeps it: an index, or the value itself.
-        for tail in ["    ldr x1, [x2, x12, lsl #3]\n    str x1, [x0]\n", "    str x12, [x0]\n"] {
-            assert!(peephole_optimize(f(tail)).contains("sxtw x12, w12"), "{tail}");
-        }
+        // An x read on one path keeps it: the value itself.
+        assert!(peephole_optimize(f("    str x12, [x0]\n")).contains("sxtw x12, w12"));
+        // Not an index, which reads the low half extended instead
+        // (read_low_halves_of_sign_extended).
+        let result = peephole_optimize(f("    ldr x1, [x2, x12, lsl #3]\n    str x1, [x0]\n"));
+        assert!(result.contains("[x2, w12, sxtw #3]") && !result.contains("sxtw x12"), "{}", result);
         // As does a call argument.
         let input = ".type f, %function\nf:\n    add w1, w7, w1\n    sxtw x1, w1\n    bl g\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("sxtw x1, w1"));
+    }
+
+    /// A loop counter re-extended on every iteration and read as an index
+    /// across the back edge: the index reads its low half, and the sxtw goes.
+    /// Not when a path brings a value that is not sign-extended.
+    #[test]
+    fn test_loop_index_reads_low_half() {
+        let f = |init: &str| format!(".type f, %function\nf:\n    {init}\n.LBB1:\n    str x12, [x23, x0, lsl #3]\n    add w0, w0, #1\n    sxtw x0, w0\n    cmp x20, x11\n    b.lo .LBB1\n    str w0, [x2]\n    mov x0, #0\n    ret\n.size f, .-f\n");
+        let result = peephole_optimize(f("ldrsw x0, [x1]"));
+        assert!(result.contains("str x12, [x23, w0, sxtw #3]") && !result.contains("sxtw x0"), "{}", result);
+        let result = peephole_optimize(f("ldr x0, [x1]"));
+        assert!(result.contains("[x23, x0, lsl #3]") && result.contains("sxtw x0, w0"), "{}", result);
+        // A compare and a multiply-add of two such values.
+        let g = ".type g, %function\ng:\n    ldrsw x9, [x1]\n    ldrsw x0, [x2]\n.LBB1:\n    cmp x20, x0\n    madd x3, x0, x9, x3\n    add w0, w0, #1\n    sxtw x0, w0\n    b.lo .LBB1\n    str x3, [x2]\n    mov x0, #0\n    ret\n.size g, .-g\n";
+        let result = peephole_optimize(g.to_string());
+        assert!(result.contains("cmp x20, w0, sxtw") && result.contains("smaddl x3, w0, w9, x3") && !result.contains("sxtw x0"), "{}", result);
     }
 
     #[test]
