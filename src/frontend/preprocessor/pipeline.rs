@@ -936,27 +936,40 @@ impl Preprocessor {
         let expanded = expanded.trim();
 
         // Parse the line number (first token)
-        let mut parts = expanded.split_whitespace();
-        if let Some(line_str) = parts.next() {
-            if let Ok(target_line) = line_str.parse::<usize>() {
-                // source_line_num is 1-based (the line where #line appears)
-                // The line AFTER #line should be target_line, so we record:
-                // (target_line, source_line_num_0based_of_directive)
-                // source_line_num is already 1-based from process_directive caller
-                self.line_override = Some((target_line, source_line_num));
+        let (line_str, after) = expanded.split_once(char::is_whitespace).unwrap_or((expanded, ""));
+        if let Ok(target_line) = line_str.parse::<usize>() {
+            // source_line_num is 1-based (the line where #line appears)
+            // The line AFTER #line should be target_line, so we record:
+            // (target_line, source_line_num_0based_of_directive)
+            // source_line_num is already 1-based from process_directive caller
+            self.line_override = Some((target_line, source_line_num));
 
-                // If there's a filename argument, update __FILE__
-                if let Some(filename_str) = parts.next() {
-                    let filename = filename_str.trim_matches('"');
-                    if !filename.is_empty() {
-                        self.macros.set_file(format!("\"{}\"", filename));
-                    }
+            // If there's a filename argument, the whole string literal
+            // (spaces and escapes included) becomes __FILE__.
+            if let Some(literal) = Self::leading_string_literal(after.trim_start()) {
+                if literal.len() > 2 {
+                    self.macros.set_file(literal.to_string());
                 }
             }
         }
     }
 
-
+    /// The string literal `s` starts with, quotes included, or None.
+    fn leading_string_literal(s: &str) -> Option<&str> {
+        let bytes = s.as_bytes();
+        if bytes.first() != Some(&b'"') {
+            return None;
+        }
+        let mut i = 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'"' => return Some(&s[..=i]),
+                _ => i += 1,
+            }
+        }
+        None
+    }
 }
 
 impl Default for Preprocessor {
