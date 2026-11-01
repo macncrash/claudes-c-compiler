@@ -8,14 +8,10 @@
 |---|---|---|---|---|---|---|---|---|---|---|
 | c-testsuite | 220 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 100.0 |
 | cases | 141 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 100.0 |
-| gcc-torture | 1350 | 1 | 0 | 0 | 0 | 0 | 0 | 1 | 138 | 99.9 |
+| gcc-torture | 1351 | 0 | 0 | 0 | 0 | 0 | 0 | 1 | 138 | 99.9 |
 
 ## Failures
 
-### compile_error (1)
-
-- `gcc-torture/pr28982b`: compile timed out
-
 ### wrong_output (1)
 
-- `gcc-torture/return-addr`: line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16dda2ddf 0x16dda2ddf 0x16dda2ddf 0x16dda2ddf'
+- `gcc-torture/return-addr`: line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16efb2ddf 0x16efb2ddf 0x16efb2ddf 0x16efb2ddf'

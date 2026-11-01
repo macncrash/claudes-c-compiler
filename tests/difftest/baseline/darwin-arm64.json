@@ -4051,8 +4051,7 @@
    "status": "pass"
   },
   "gcc-torture/pr28982b": {
-   "status": "compile_error",
-   "detail": "compile timed out"
+   "status": "pass"
   },
   "gcc-torture/pr29006": {
    "status": "pass"
@@ -5443,7 +5442,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16dda2ddf 0x16dda2ddf 0x16dda2ddf 0x16dda2ddf'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16efb2ddf 0x16efb2ddf 0x16efb2ddf 0x16efb2ddf'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
