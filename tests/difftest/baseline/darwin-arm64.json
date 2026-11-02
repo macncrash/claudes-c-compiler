@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-01",
-  "ccc_rev": "258a6914",
+  "ccc_rev": "a4dd1ed0",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -5454,7 +5454,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b562ddf 0x16b562ddf 0x16b562ddf 0x16b562ddf'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b142ddf 0x16b142ddf 0x16b142ddf 0x16b142ddf'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
