@@ -1515,6 +1515,18 @@ rest settled again. scalar-bench's table CRC-32,
 table entry and `c` widened and shifted back into the unsigned `c`, and
 widened `c` again with a `mov w, w` per byte (52.4M instructions).
 
+A signed 32-bit operation's result is held sign-extended too (an `sxtw`
+after it), but the backend drops that `sxtw` where nothing reads the high
+half, as when the only use is a widening folded into an address
+(`[x, w, sxtw #3]`). So int operations count as extended, through phis,
+only for a widening that needs a register of its own: one used more than
+once, or by a phi or copy. Taken everywhere, the interpreter in
+scalar-bench lost its folded `[x15, w11, sxtw #3]` for an `sxtw` after each
+`pc + 1` (67.6M instructions). Taken there, pageFreeArray's `nFree`,
+incremented as free runs are found and widened to index two arrays, lost
+a register move per run; SQLite speedtest ran 16M fewer (13M with a
+retrained profile), in nine functions.
+
 Then an int add, subtract, multiply, logical operation or left shift whose
 uses, through copies and phis, read only its low 31 bits (narrower casts and
 stores, and operations that are themselves such) becomes U32: the backend

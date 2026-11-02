@@ -95,39 +95,40 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
         (Ext::As(s), Ext::As(t)) if s == t => a,
         _ => Ext::No,
     };
-    let mut state: Vec<Ext> = ext.iter().map(|e| e.map_or(Ext::No, Ext::As)).collect();
-    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-        match inst {
-            Instruction::Phi { dest, ty, .. } if narrow(ty) => state[dest.0 as usize] = Ext::As(*ty),
-            Instruction::Phi { dest, ty, .. } if ty.is_integer() => state[dest.0 as usize] = Ext::Top,
-            Instruction::Copy { dest, src: Operand::Value(_) } => state[dest.0 as usize] = Ext::Top,
-            Instruction::Cast { dest, src: Operand::Value(_), from_ty, to_ty }
-                if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
-            {
-                state[dest.0 as usize] = Ext::Top
+    let settle = |ext: &[Option<IrType>]| -> Vec<Option<IrType>> {
+        let mut state: Vec<Ext> = ext.iter().map(|e| e.map_or(Ext::No, Ext::As)).collect();
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                Instruction::Phi { dest, ty, .. } if narrow(ty) => state[dest.0 as usize] = Ext::As(*ty),
+                Instruction::Phi { dest, ty, .. } if ty.is_integer() => state[dest.0 as usize] = Ext::Top,
+                Instruction::Copy { dest, src: Operand::Value(_) } => state[dest.0 as usize] = Ext::Top,
+                Instruction::Cast { dest, src: Operand::Value(_), from_ty, to_ty }
+                    if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
+                {
+                    state[dest.0 as usize] = Ext::Top
+                }
+                Instruction::BinOp { dest, op: IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::LShr, ty: IrType::I64 | IrType::U64, .. }
+                    if ext[dest.0 as usize].is_none() =>
+                {
+                    state[dest.0 as usize] = Ext::Top
+                }
+                _ => {}
             }
-            Instruction::BinOp { dest, op: IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::LShr, ty: IrType::I64 | IrType::U64, .. }
-                if ext[dest.0 as usize].is_none() =>
-            {
-                state[dest.0 as usize] = Ext::Top
-            }
-            _ => {}
         }
-    }
-    let of = |state: &[Ext], v: crate::ir::reexports::Value| state.get(v.0 as usize).copied().unwrap_or(Ext::No);
-    // The size a zero-extended operand is extended from.
-    let zext = |state: &[Ext], o: &Operand| match o {
-        Operand::Value(v) => match of(state, *v) {
-            Ext::Top => Ext::Top,
-            Ext::As(e) if e.is_unsigned() => Ext::As(e),
-            _ => Ext::No,
-        },
-        Operand::Const(c) => match c.to_i64() {
-            Some(0..=0xff) => Ext::As(IrType::U8),
-            Some(0x100..=0xffff) => Ext::As(IrType::U16),
-            Some(0x1_0000..=0xffff_ffff) => Ext::As(IrType::U32),
-            _ => Ext::No,
-        },
+        let of = |state: &[Ext], v: crate::ir::reexports::Value| state.get(v.0 as usize).copied().unwrap_or(Ext::No);
+        // The size a zero-extended operand is extended from.
+        let zext = |state: &[Ext], o: &Operand| match o {
+            Operand::Value(v) => match of(state, *v) {
+                Ext::Top => Ext::Top,
+                Ext::As(e) if e.is_unsigned() => Ext::As(e),
+                _ => Ext::No,
+            },
+            Operand::Const(c) => match c.to_i64() {
+                Some(0..=0xff) => Ext::As(IrType::U8),
+                Some(0x100..=0xffff) => Ext::As(IrType::U16),
+                Some(0x1_0000..=0xffff_ffff) => Ext::As(IrType::U32),
+                _ => Ext::No,
+            },
     };
     let mut changed = true;
     let mut rounds = 0;
@@ -203,11 +204,39 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
     }
     // Unsettled after the cap, an optimistic phi may still be wrong: keep
     // only what the instructions themselves show.
-    if !changed {
-        ext = state.iter().map(|s| match s {
-            Ext::As(t) => Some(*t),
-            _ => None,
-        }).collect();
+    if changed {
+        return ext.to_vec();
+    }
+    state.iter().map(|s| match s {
+        Ext::As(t) => Some(*t),
+        _ => None,
+    }).collect()
+    };
+    // The backend keeps a signed 32-bit operation's result sign-extended
+    // (an `sxtw` after it), but drops that `sxtw` where no use reads the
+    // high half, as when the only one is a widening folded into an address
+    // (`[x, w, sxtw #3]`). So an int operation counts as extended only for a
+    // widening that needs a register of its own, used more than once or by
+    // a phi: pqdownheap's `j`, a shift or an increment merged by a phi,
+    // widened and merged again by loop rotation's phi.
+    let mut seeded = ext.clone();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::BinOp { dest, op, ty: IrType::I32, .. } = inst {
+            if !matches!(op, IrBinOp::UDiv | IrBinOp::URem) {
+                seeded[dest.0 as usize] = Some(IrType::I32);
+            }
+        }
+    }
+    let int_ops = settle(&seeded);
+    ext = settle(&ext);
+    let mut uses = vec![0u32; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            // A phi or copy needs the value in a register as it is.
+            let n = if matches!(inst, Instruction::Phi { .. } | Instruction::Copy { .. }) { 2 } else { 1 };
+            inst.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { *u += n });
+        }
+        block.terminator.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { *u += 1 });
     }
     // (An elided extension's result is held as its source is, for a mask
     // of it further on.)
@@ -215,11 +244,12 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
     for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
         match *inst {
             Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty }
-                if ext.get(v.0 as usize).copied().flatten().is_some_and(|e| covers(e, from_ty))
+                if (ext.get(v.0 as usize).copied().flatten().is_some_and(|e| covers(e, from_ty))
+                    || (from_ty == IrType::I32 && uses[dest.0 as usize] > 1 && int_ops[v.0 as usize] == Some(IrType::I32)))
                     && from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
             {
                 *inst = Instruction::Copy { dest, src: Operand::Value(v) };
-                ext[dest.0 as usize] = ext[v.0 as usize];
+                ext[dest.0 as usize] = ext[v.0 as usize].or(Some(IrType::I32));
                 elided += 1;
             }
             // A narrowing to the type a value is already extended as (the
@@ -459,6 +489,41 @@ mod tests {
         let mut func = crc_loop(Operand::Const(IrConst::I64(-1)));
         elide_extensions(&mut func);
         assert!(widened(&func));
+    }
+
+    /// pqdownheap's `j`: an int phi of `k << 1` and `j + 1`, widened (v4)
+    /// and read `reads` times.
+    fn int_phi_widened(reads: usize) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        let mut body = vec![
+            Instruction::Phi { dest: Value(2), ty: IrType::I32, incoming: vec![(v(1), BlockId(0)), (v(3), BlockId(1))] },
+            Instruction::BinOp { dest: Value(3), op: IrBinOp::Add, lhs: v(2), rhs: Operand::Const(IrConst::I32(1)), ty: IrType::I32 },
+            Instruction::Cast { dest: Value(4), src: v(2), from_ty: IrType::I32, to_ty: IrType::I64 },
+        ];
+        for r in 0..reads {
+            body.push(Instruction::GetElementPtr { dest: Value(10 + r as u32), base: Value(0), offset: v(4), ty: IrType::Ptr });
+        }
+        func.blocks = vec![
+            BasicBlock { label: BlockId(0), instructions: vec![
+                Instruction::BinOp { dest: Value(1), op: IrBinOp::Shl, lhs: v(9), rhs: Operand::Const(IrConst::I32(1)), ty: IrType::I32 },
+            ], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(1), instructions: body, terminator: Terminator::CondBranch { cond: v(8), true_label: BlockId(1), false_label: BlockId(2) }, source_spans: Vec::new() },
+            BasicBlock { label: BlockId(2), instructions: vec![], terminator: Terminator::Return(Some(v(3))), source_spans: Vec::new() },
+        ];
+        func
+    }
+
+    #[test]
+    fn int_operations_widened_into_a_register_of_their_own_are_copied() {
+        let mut func = int_phi_widened(2);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[1].instructions[2], Instruction::Copy { dest: Value(4), .. }));
+        // Read once, the widening folds into the access (`[x, w, sxtw]`)
+        // and the operations' own `sxtw` goes: keep it there.
+        let mut func = int_phi_widened(1);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[1].instructions[2], Instruction::Cast { .. }));
     }
 
     /// `(v1 << v2) | v3` in int, carried around a loop by a phi and stored
