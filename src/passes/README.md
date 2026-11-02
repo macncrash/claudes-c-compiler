@@ -1620,6 +1620,13 @@ step down scalar-bench's tree (tree_kernel 62M fewer instructions, 12% of
 it). Not a select of a value and one constant (lz_compress's `n - i < 130 ?
 n - i : 130` lost 66M to the register it took), nor in larger functions
 (jsonTranslateBlobToText lost 13M).
+So, within the same two registers and size limit, does a constant a loop
+latch compares against that a compare cannot encode (not a 12-bit
+immediate, shifted or not): scalar-bench's `i < HT_KEYS`, 40000, was a
+`mov` every iteration of its hash kernel's loops (18M). A hoisted
+constant's uses in the entry block read its register too, the copies going
+before the first: ht_delete built its multiplier there for the key's hash
+and again at entry for its probe loop (4M).
 
 ### if_convert -- If-Conversion
 

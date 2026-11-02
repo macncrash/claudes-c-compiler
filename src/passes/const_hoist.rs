@@ -249,6 +249,40 @@ fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
     // registers of their own (a pair's movs are the saving, however few
     // other constants' builds weigh).
     let mut selected: Vec<i64> = Vec::new();
+    // A latch's compare against a constant the compare cannot encode (a
+    // loop bound like scalar-bench's HT_KEYS, 40000): one mov an iteration.
+    let mut latch = vec![false; func.blocks.len()];
+    for lp in &loops {
+        for &b in &lp.body {
+            if cfg.succs.row(b).iter().any(|&s| s as usize == lp.header) {
+                latch[b] = true;
+            }
+        }
+    }
+    let encodable = |k: i64| {
+        let a = k.unsigned_abs();
+        a <= 0xfff || (a & 0xfff == 0 && a <= 0xfff000)
+    };
+    let mut bounds: Vec<i64> = Vec::new();
+    for (_, block) in func.blocks.iter().enumerate().filter(|(b, _)| left && latch[*b]) {
+        for inst in &block.instructions {
+            if let Instruction::Cmp { lhs, rhs, ty, .. } = inst {
+                if !ty.is_integer() || !matches!(ty.size(), 4 | 8) {
+                    continue;
+                }
+                for o in [lhs, rhs] {
+                    let k = match o {
+                        Operand::Const(IrConst::I64(k)) => *k,
+                        Operand::Const(IrConst::I32(k)) => *k as i64,
+                        _ => continue,
+                    };
+                    if !encodable(k) && !bounds.contains(&k) {
+                        bounds.push(k);
+                    }
+                }
+            }
+        }
+    }
     for (b, block) in func.blocks.iter_mut().enumerate() {
         if !in_loop[b] {
             continue;
@@ -279,7 +313,7 @@ fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
     // multiply-highs (jsonTranslateBlobToText's selects, among 1800
     // instructions, cost it 13M more than they saved).
     if selected.len() <= MAX_SELECTED && size <= MUL_HIGH_MAX_SIZE {
-        for k in selected {
+        for k in selected.iter().copied().chain(bounds.iter().copied().take(MAX_SELECTED)) {
             if !uses.iter().any(|&(c, _)| c == k) {
                 uses.push((k, 0));
             }
@@ -294,9 +328,13 @@ fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
         (k, Value(next_id - 1))
     }).collect();
     func.next_value_id = next_id;
+    // The loop uses read the registers, and so do the entry block's, which
+    // the copies then precede: ht_delete hashed its key with the constant
+    // built in place at entry and again for its probe loop.
     let mut changes = 0;
+    let mut first_entry_use: Option<usize> = None;
     for (b, block) in func.blocks.iter_mut().enumerate() {
-        if !in_loop[b] {
+        if !in_loop[b] && b != 0 {
             continue;
         }
         for (i, inst) in block.instructions.iter_mut().enumerate() {
@@ -304,17 +342,34 @@ fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
                 if let Some(&(_, v)) = regs.iter().find(|(c, _)| *c == k) {
                     *o = Operand::Value(v);
                     changes += 1;
+                    if b == 0 && first_entry_use.is_none() {
+                        first_entry_use = Some(i);
+                    }
                 }
             });
+            if let (true, Instruction::Cmp { lhs, rhs, .. }) = (latch[b], inst) {
+                for o in [lhs, rhs] {
+                    let k = match o {
+                        Operand::Const(IrConst::I64(k)) => *k,
+                        Operand::Const(IrConst::I32(k)) => *k as i64,
+                        _ => continue,
+                    };
+                    if let Some(&(_, v)) = regs.iter().find(|(c, _)| *c == k).filter(|_| bounds.contains(&k)) {
+                        *o = Operand::Value(v);
+                        changes += 1;
+                    }
+                }
+            }
         }
     }
     let entry = &mut func.blocks[0];
-    let spans = !entry.source_spans.is_empty();
+    let at = first_entry_use.unwrap_or(entry.instructions.len());
+    let spans = entry.source_spans.len() == entry.instructions.len() && !entry.source_spans.is_empty();
     let span = entry.source_spans.last().copied().unwrap_or(crate::common::source::Span::new(0, 0, 0));
-    for &(k, v) in &regs {
-        entry.instructions.push(Instruction::Copy { dest: v, src: Operand::Const(IrConst::I64(k)) });
+    for (n, &(k, v)) in regs.iter().enumerate() {
+        entry.instructions.insert(at + n, Instruction::Copy { dest: v, src: Operand::Const(IrConst::I64(k)) });
         if spans {
-            entry.source_spans.push(span);
+            entry.source_spans.insert(at + n, span);
         }
     }
     changes
@@ -388,6 +443,28 @@ mod tests {
         func.next_value_id = 4;
         assert_eq!(hoist_function(&mut func, true), 1);
         assert!(matches!(func.blocks[1].instructions[1], Instruction::Select { false_val: Operand::Const(_), .. }));
+    }
+
+    /// The entry block's own use of a hoisted constant reads the register
+    /// (the copy goes before it), and a loop latch's compare against a bound
+    /// no compare encodes (40000) gets one too.
+    #[test]
+    fn test_entry_use_and_latch_bound_read_registers() {
+        const K: i64 = 0xbf58476d1ce4e5b9u64 as i64;
+        let mut func = loop_func();
+        func.blocks[0].instructions.push(Instruction::BinOp {
+            dest: Value(5), op: IrBinOp::Mul, lhs: Operand::Value(Value(0)), rhs: Operand::Const(IrConst::I64(K)), ty: IrType::I64,
+        });
+        func.blocks[1].instructions.push(Instruction::Cmp {
+            dest: Value(6), op: crate::ir::reexports::IrCmpOp::Ult, lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(40000)), ty: IrType::I32,
+        });
+        func.next_value_id = 7;
+        assert_eq!(hoist_function(&mut func, true), 3);
+        let entry = &func.blocks[0].instructions;
+        assert!(matches!(entry[0], Instruction::Copy { src: Operand::Const(IrConst::I64(K)), .. }), "{:?}", entry);
+        assert!(matches!(entry.last(), Some(Instruction::BinOp { rhs: Operand::Value(_), .. })), "{:?}", entry);
+        assert!(matches!(func.blocks[1].instructions[1], Instruction::Cmp { rhs: Operand::Value(_), .. }));
     }
 
     #[test]
