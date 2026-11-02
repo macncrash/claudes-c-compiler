@@ -42,6 +42,7 @@ The optimizer executes in four sequential phases:
      resolve_asm
      addr_arg_promote
      global_promote
+     sroa, mem2reg (little-endian targets)
          |
          v
  Phase 0.5: IsConstant Resolution
@@ -213,6 +214,18 @@ code:
    The outermost such loop is used. An inlined generator's `state += ...`
    was otherwise loaded and stored on every iteration, each load waiting on
    the previous store.
+
+11. **sroa** -- a local struct or array (up to 256 bytes) reached only by
+   loads and stores at constant offsets, and by whole copies into or out of
+   it, becomes one local per field, which mem2reg then promotes. Fields are
+   the narrowest ranges accessed; a constant store spanning several (the
+   zeroing an initializer starts with) is split across them, with bytes no
+   field covers as pieces of their own, as are the gaps a whole copy
+   reaches. Partial overlaps, other access sizes, variable offsets and
+   escaping addresses keep the local whole, as does a copy of a local of 8
+   bytes or less, one load and store whole (zlib's 4-byte code). A result
+   struct's counters (`r.misses += ...; return r;`) otherwise lived on the
+   stack, loaded and stored at every iteration. Only on AArch64 and x86-64.
 
 A scalar declared without an initializer in a loop body is lowered with a
 store of 0 at its declaration: it is a new object each iteration, and

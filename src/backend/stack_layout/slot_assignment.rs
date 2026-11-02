@@ -372,7 +372,9 @@ fn classify_value(
     multi_block_values: &mut Vec<MultiBlockValue>,
     block_local_values: &mut Vec<BlockLocalValue>,
 ) {
-    let mut is_i128 = matches!(inst.result_type(), Some(IrType::I128) | Some(IrType::U128));
+    // A copy of a 128-bit constant (a struct result folded whole) too.
+    let mut is_i128 = matches!(inst.result_type(), Some(IrType::I128) | Some(IrType::U128))
+        || matches!(inst, Instruction::Copy { src: Operand::Const(IrConst::I128(_)), .. });
     let is_f128 = matches!(inst.result_type(), Some(IrType::F128))
         || matches!(inst, Instruction::Copy { src: Operand::Const(IrConst::LongDouble(..)), .. });
 

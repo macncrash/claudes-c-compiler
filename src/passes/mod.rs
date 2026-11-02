@@ -30,6 +30,7 @@ pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
 pub(crate) mod lftr;
 mod mem_inline;
+mod sroa;
 pub(crate) mod licm;
 mod ext_elide;
 mod step_sink;
@@ -366,6 +367,15 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     }
 
     run_inline_phase(module, &disabled);
+    // Local structs reached only at constant offsets: one local per field,
+    // promoted (see sroa.rs). Little-endian targets only.
+    if matches!(target, crate::backend::Target::Aarch64 | crate::backend::Target::X86_64) && !disabled.contains("sroa") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            if sroa::split_function(func) > 0 {
+                crate::ir::mem2reg::promote_function_allocas(func);
+            }
+        }
+    }
     constant_fold::resolve_remaining_is_constant(module);
 
     let iterations = 3;
