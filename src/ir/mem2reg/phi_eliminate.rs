@@ -551,6 +551,151 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
     func.blocks = blocks;
 }
 
+/// Restores of phis from their temporaries move into the predecessors, where
+/// a restore of the value its temporary was just saved from goes, with the
+/// save.
+///
+/// The phis of a block that conflict (one's incoming value is another's
+/// destination) are saved into temporaries on every edge and restored at the
+/// start of the block. The passes after phi elimination (loop rotation and
+/// promotion) leave many such saves of the phi itself: sqlite3VdbeExec's
+/// dispatch loop carries values that most of its 232 latches leave alone,
+/// and each of those loaded them into temporaries for the loop's head to
+/// store back.
+///
+/// A block's copies `p = copy t`, each t used there only, that can go first
+/// (nothing before them touches p or writes t) move to the end of every
+/// predecessor when all of them branch to it alone (then
+/// the copies run on the same paths, in the same order, the t's holding the
+/// same values). In each, a `t = copy p` with neither written after it is
+/// then dropped together with the restore.
+pub(crate) fn sink_phi_restores(module: &mut IrModule) {
+    for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+        sink_phi_restores_in_function(func);
+    }
+}
+
+fn sink_phi_restores_in_function(func: &mut IrFunction) {
+    let n = func.blocks.len();
+    if n < 2 {
+        return;
+    }
+    let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+        }
+        block.terminator.for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+    }
+    let index: FxHashMap<BlockId, usize> = func.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect();
+    // Predecessors by a plain branch; None when some other terminator
+    // reaches the block.
+    let mut preds: Vec<Option<Vec<usize>>> = vec![Some(Vec::new()); n];
+    for (i, block) in func.blocks.iter().enumerate() {
+        match &block.terminator {
+            Terminator::Branch(l) => {
+                if let Some(Some(p)) = index.get(l).map(|&t| &mut preds[t]) {
+                    p.push(i);
+                }
+            }
+            t => {
+                let mut targets: Vec<BlockId> = Vec::new();
+                match t {
+                    Terminator::CondBranch { true_label, false_label, .. } => targets.extend([*true_label, *false_label]),
+                    Terminator::Switch { cases, default, .. } => {
+                        targets.push(*default);
+                        targets.extend(cases.iter().map(|(_, l)| *l));
+                    }
+                    Terminator::IndirectBranch { possible_targets, .. } => targets.extend(possible_targets.iter().copied()),
+                    Terminator::Return(_) | Terminator::Unreachable | Terminator::Branch(_) => {}
+                }
+                for l in targets {
+                    if let Some(&t) = index.get(&l) {
+                        preds[t] = None;
+                    }
+                }
+            }
+        }
+    }
+    for (b, ps) in preds.iter().enumerate().skip(1) {
+        let Some(ps) = ps.as_ref().filter(|p| !p.is_empty()) else { continue };
+        // The restores that can go first: no line before them touches p,
+        // or writes t (read only there).
+        let block = &func.blocks[b];
+        let mut touched: FxHashSet<u32> = FxHashSet::default();
+        let mut moved = vec![false; block.instructions.len()];
+        for (i, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Copy { dest: p, src: Operand::Value(t) } = inst {
+                if uses.get(&t.0) == Some(&1) && !touched.contains(&p.0) && !touched.contains(&t.0) {
+                    moved[i] = true;
+                    continue;
+                }
+            }
+            inst.for_each_used_value(|v| { touched.insert(v); });
+            if let Some(d) = inst.dest() {
+                touched.insert(d.0);
+            }
+        }
+        let k = moved.iter().filter(|&&m| m).count();
+        if k == 0 {
+            continue;
+        }
+        let block = &mut func.blocks[b];
+        let restores: Vec<Instruction> = block.instructions.iter().zip(&moved).filter(|(_, &m)| m).map(|(i, _)| i.clone()).collect();
+        let mut i = 0;
+        block.instructions.retain(|_| { i += 1; !moved[i - 1] });
+        if !block.source_spans.is_empty() {
+            let mut i = 0;
+            block.source_spans.retain(|_| { i += 1; !moved[i - 1] });
+        }
+        for &p in ps {
+            let block = &mut func.blocks[p];
+            let start = block.instructions.len();
+            block.instructions.extend(restores.iter().cloned());
+            if !block.source_spans.is_empty() {
+                block.source_spans.extend(std::iter::repeat_n(crate::common::source::Span::dummy(), k));
+            }
+            drop_round_trip_copies(block, start);
+        }
+    }
+}
+
+/// Drop each restore `p = copy t` (at `start` or later) with the save
+/// `t = copy p` it undoes: neither p nor t written in between.
+fn drop_round_trip_copies(block: &mut BasicBlock, start: usize) {
+    let mut gone = vec![false; block.instructions.len()];
+    for r in start..block.instructions.len() {
+        let Instruction::Copy { dest: p, src: Operand::Value(t) } = block.instructions[r] else { continue };
+        for s in (0..r).rev() {
+            if gone[s] {
+                continue;
+            }
+            let inst = &block.instructions[s];
+            let def = inst.dest().map(|d| d.0);
+            if let Instruction::Copy { dest, src: Operand::Value(v) } = inst {
+                if dest.0 == t.0 && v.0 == p.0 {
+                    gone[s] = true;
+                    gone[r] = true;
+                    break;
+                }
+            }
+            // Calls and asm may write values only through their dest.
+            if def == Some(p.0) || def == Some(t.0) {
+                break;
+            }
+        }
+    }
+    if !gone.contains(&true) {
+        return;
+    }
+    let mut i = 0;
+    block.instructions.retain(|_| { i += 1; !gone[i - 1] });
+    if !block.source_spans.is_empty() {
+        let mut i = 0;
+        block.source_spans.retain(|_| { i += 1; !gone[i - 1] });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +761,72 @@ mod tests {
         let result = find_conflicting_phis(&copies);
         assert!(result.contains(&0), "Chain phi reading overwritten dest should be conflicting");
         assert!(result.contains(&1), "Chain phi whose dest is read by conflicting phi should also be marked");
+    }
+
+    /// A dispatch loop's head restoring two phis from temporaries: entered
+    /// from 0, and from latches 2 (leaving v1 alone) and 3 (changing both).
+    /// `cond` makes latch 3 a conditional branch.
+    fn dispatch(cond: bool) -> IrFunction {
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{IrBinOp, IrConst};
+        let v = |n| Operand::Value(Value(n));
+        let c = |n| Operand::Const(IrConst::I64(n));
+        let block = |l: u32, instructions: Vec<Instruction>, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        let latch3 = if cond {
+            Terminator::CondBranch { cond: v(5), true_label: BlockId(1), false_label: BlockId(4) }
+        } else {
+            Terminator::Branch(BlockId(1))
+        };
+        func.blocks = vec![
+            block(0, vec![
+                Instruction::Copy { dest: Value(20), src: c(0) },
+                Instruction::Copy { dest: Value(21), src: c(1) },
+            ], Terminator::Branch(BlockId(1))),
+            block(1, vec![
+                Instruction::BinOp { dest: Value(5), op: IrBinOp::Add, lhs: v(22), rhs: c(1), ty: IrType::I64 },
+                Instruction::Copy { dest: Value(1), src: v(20) },
+                Instruction::Copy { dest: Value(2), src: v(21) },
+            ], Terminator::CondBranch { cond: v(5), true_label: BlockId(2), false_label: BlockId(3) }),
+            block(2, vec![
+                Instruction::Copy { dest: Value(20), src: v(1) },
+                Instruction::Copy { dest: Value(21), src: v(4) },
+            ], Terminator::Branch(BlockId(1))),
+            block(3, vec![
+                Instruction::Copy { dest: Value(20), src: v(2) },
+                Instruction::Copy { dest: Value(21), src: v(1) },
+            ], latch3),
+            block(4, vec![], Terminator::Return(Some(v(1)))),
+        ];
+        func.next_value_id = 23;
+        func
+    }
+
+    #[test]
+    fn phi_restores_move_into_latches_and_round_trips_go() {
+        let mut func = dispatch(false);
+        sink_phi_restores_in_function(&mut func);
+        let copies = |b: usize| -> Vec<(u32, u32)> {
+            func.blocks[b].instructions.iter().filter_map(|i| match i {
+                Instruction::Copy { dest, src: Operand::Value(s) } => Some((dest.0, s.0)),
+                Instruction::Copy { dest, .. } => Some((dest.0, u32::MAX)),
+                _ => None,
+            }).collect()
+        };
+        // The head keeps only its own work.
+        assert_eq!(func.blocks[1].instructions.len(), 1);
+        assert_eq!(copies(0), vec![(20, u32::MAX), (21, u32::MAX), (1, 20), (2, 21)]);
+        // Latch 2 saved v1 only to restore it.
+        assert_eq!(copies(2), vec![(21, 4), (2, 21)]);
+        // Latch 3 swaps them, through the temporaries.
+        assert_eq!(copies(3), vec![(20, 2), (21, 1), (1, 20), (2, 21)]);
+    }
+
+    #[test]
+    fn phi_restores_stay_with_a_conditional_predecessor() {
+        let mut func = dispatch(true);
+        sink_phi_restores_in_function(&mut func);
+        assert_eq!(func.blocks[1].instructions.len(), 3);
+        assert_eq!(func.blocks[2].instructions.len(), 2);
     }
 }

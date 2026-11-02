@@ -314,6 +314,19 @@ retargeted because the target is a runtime value. For these edges, copies are pl
 in the predecessor block. This is safe in practice because C computed gotos (`goto *ptr`)
 typically branch to a single logical target at a time.
 
+### Restores Sunk into Predecessors (`sink_phi_restores`)
+
+Run once the passes after phi elimination are done (loop rotation and promotion, before the
+profile point). The conflicting phis' restores `p = copy t` at the start of a block run on every
+edge into it, so every edge has to save each temporary, even one passing the phi its own value:
+sqlite3VdbeExec's dispatch loop carries values that most of its 232 latches leave alone, and
+each latch loaded them into temporaries for the loop's head to store back.
+
+When every predecessor of a block reaches it by a plain branch, the restores that can go first
+(each `t` read there only, nothing before them touching `p` or writing `t`) move to the end of
+each predecessor, in order. There a save `t = copy p` with neither written after it goes with
+its restore. SQLite's speedtest ran 1.1% fewer instructions (sqlite3VdbeExec 210M).
+
 ---
 
 ## File Inventory
@@ -322,7 +335,7 @@ typically branch to a single logical target at a time.
 |------|---------|
 | `mod.rs` | Module declaration and public re-exports of `promote_allocas`, `promote_allocas_with_params`, and `eliminate_phis`. |
 | `promote.rs` | SSA construction: alloca identification, phi insertion via iterated dominance frontiers, and variable renaming via dominator-tree DFS. |
-| `phi_eliminate.rs` | Phi elimination: conflict detection, two-phase copy emission, critical edge splitting via trampoline blocks, and final IR rewriting. |
+| `phi_eliminate.rs` | Phi elimination: conflict detection, two-phase copy emission, critical edge splitting via trampoline blocks, and final IR rewriting; sinking restores into predecessors. |
 
 The SSA construction pass depends on shared infrastructure in `ir::analysis` for CFG
 construction, dominator computation (Cooper-Harvey-Kennedy), and dominance frontier

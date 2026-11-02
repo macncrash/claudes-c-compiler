@@ -17,7 +17,7 @@ use crate::frontend::lexer::Lexer;
 use crate::frontend::parser::Parser;
 use crate::frontend::sema::SemanticAnalyzer;
 use crate::ir::lowering::Lowerer;
-use crate::ir::mem2reg::{promote_allocas, eliminate_phis};
+use crate::ir::mem2reg::{promote_allocas, eliminate_phis, sink_phi_restores};
 use crate::passes::run_passes;
 
 /// Compilation mode - determines where in the pipeline to stop.
@@ -1160,6 +1160,9 @@ impl Driver {
         }
         if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("const_hoist")) {
             crate::passes::const_hoist::hoist_constants(&mut module, self.target == Target::Aarch64);
+        }
+        if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("sink_phi_restores")) {
+            sink_phi_restores(&mut module);
         }
         // The profile point (passes::profile): counters, or counts read back.
         if let Some(dir) = &self.profile_generate {

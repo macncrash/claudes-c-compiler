@@ -506,9 +506,16 @@ pub fn peephole_optimize(asm: String) -> String {
         duplicate_test_blocks(lines, kinds)
     };
     let n = lines.len();
+    let (mut lines, mut kinds) = (lines, kinds);
+
+    // The copies put the dispatch's own lines after their predecessors'
+    // (sqlite3VdbeExec's handlers reload the values carried around its
+    // loop, which the dispatch block then stores back to the same slots).
+    if !skip.contains(&"forward_held_slots") {
+        forward_held_slots(&mut lines, &mut kinds, n);
+    }
 
     // Last, once no code moves: single-bit tests branch on the bit.
-    let (mut lines, mut kinds) = (lines, kinds);
     if !skip.contains(&"fuse_bit_test_into_tbz") {
         fuse_bit_test_into_tbz(&mut lines, &mut kinds, n);
     }
@@ -1176,6 +1183,7 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
 /// register, or goes when it is the same one: a value left on the stack is
 /// loaded at each use, and sqlite3VdbeExec reloads them a few lines apart
 /// (`ldr x0, [sp, #3040]` twice around an unrelated store of a byte).
+/// A store of a register to the slot it holds goes too.
 /// What is held is forgotten at labels, branches and calls, at any store
 /// other than of a whole x or w register to a slot (a store through a
 /// pointer may write a slot whose address was taken), at anything moving
@@ -1209,6 +1217,15 @@ fn forward_held_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
                 continue;
             }
             LineKind::StoreSp { reg, offset, is_word } => {
+                // Storing back the register the slot still holds (a phi's
+                // copies through a temporary, its source and destination
+                // sharing a slot: sqlite3VdbeExec's values carried around
+                // its dispatch loop, reloaded and stored at every latch).
+                if reg < 31 && held.contains(&(offset, is_word, reg)) {
+                    kinds[i] = LineKind::Nop;
+                    changed = true;
+                    continue;
+                }
                 let end = offset + size(is_word);
                 held.retain(|&(o, w, _)| o + size(w) <= offset || end <= o);
                 if reg < 31 {
@@ -8031,6 +8048,22 @@ mod tests {
         for mid in ["    str x5, [x1]\n", "    bl g\n", "    ldr x0, [x6]\n"] {
             let result = peephole_optimize(body(mid));
             assert_eq!(result.matches("ldr x0, [sp, #40]").count(), 2, "{}: {}", mid, result);
+        }
+    }
+
+    #[test]
+    fn test_held_slot_store_back_dropped() {
+        // A phi's copies through temporaries, sources and destinations
+        // sharing slots (sqlite3VdbeExec's dispatch latch).
+        let body = |mid: &str| format!(
+            ".type f, %function\nf:\n.LBB1:\n    ldr x11, [sp, #1384]\n    ldr x0, [sp, #1376]\n    add x26, x26, #24\n{}    str x0, [sp, #1376]\n    str x11, [sp, #1384]\n    add x23, x23, #1\n    ldrb w10, [x26]\n    cbnz w10, .LBB1\n    ret\n.size f, .-f\n", mid);
+        let result = peephole_optimize(body(""));
+        assert!(!result.contains("str x0, [sp, #1376]") && !result.contains("str x11, [sp, #1384]"), "{}", result);
+        // Not after a store through a pointer (it may write the slot), nor
+        // after the register is written.
+        for mid in ["    str x5, [x1]\n", "    add x0, x0, #1\n"] {
+            let result = peephole_optimize(body(mid));
+            assert!(result.contains("str x0, [sp, #1376]"), "{}: {}", mid, result);
         }
     }
 
