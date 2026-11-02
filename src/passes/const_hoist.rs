@@ -25,6 +25,9 @@ use super::loop_analysis;
 /// Most constants given a register per function.
 const MAX_HOISTED: usize = 4;
 
+/// Most constants of selects of two constants given one besides.
+const MAX_SELECTED: usize = 2;
+
 /// Most instructions in a function whose multiply-high magics are hoisted.
 const MUL_HIGH_MAX_SIZE: usize = 500;
 
@@ -182,6 +185,23 @@ fn for_each_candidate(inst: &mut Instruction, left: bool, mul_high: bool, mut f:
                 }
             }
         }
+        // A select of two constants (a child pointer's offset, `key < n->key
+        // ? 8 : 16`) builds both on every run: a select takes no immediate
+        // but the zero register (and csinc/csinv for 1 and -1). Not one
+        // constant against a value, which costs a register for one mov.
+        Instruction::Select { true_val, false_val, ty, .. } if left && ty.is_integer() => {
+            let k = |o: &Operand| match o {
+                Operand::Const(IrConst::I64(k)) => Some(*k),
+                Operand::Const(IrConst::I32(k)) => Some(*k as i64),
+                _ => None,
+            };
+            if let (Some(a), Some(b)) = (k(true_val), k(false_val)) {
+                if !matches!(a, -1..=1) && !matches!(b, -1..=1) {
+                    f(true_val, a);
+                    f(false_val, b);
+                }
+            }
+        }
         Instruction::Store { val, ty, .. } if wide(ty) => {
             if let Some(k) = candidate(val, false) {
                 f(val, k);
@@ -225,29 +245,49 @@ fn hoist_function(func: &mut IrFunction, left: bool) -> usize {
     // Loop uses of each candidate constant, weighted by the instructions
     // building it takes, in first-seen order.
     let mut uses: Vec<(i64, usize)> = Vec::new();
+    // The constants of selects of two constants, which get MAX_SELECTED
+    // registers of their own (a pair's movs are the saving, however few
+    // other constants' builds weigh).
+    let mut selected: Vec<i64> = Vec::new();
     for (b, block) in func.blocks.iter_mut().enumerate() {
         if !in_loop[b] {
             continue;
         }
         for (i, inst) in block.instructions.iter_mut().enumerate() {
-            for_each_candidate(inst, left, mul_highs.contains(&(b, i)), |_, k| match uses.iter_mut().find(|(c, _)| *c == k) {
-                Some((_, n)) => *n += build_cost(k),
-                None => uses.push((k, build_cost(k))),
+            let select = matches!(inst, Instruction::Select { .. });
+            for_each_candidate(inst, left, mul_highs.contains(&(b, i)), |_, k| {
+                if select {
+                    if !selected.contains(&k) {
+                        selected.push(k);
+                    }
+                    return;
+                }
+                match uses.iter_mut().find(|(c, _)| *c == k) {
+                    Some((_, n)) => *n += build_cost(k),
+                    None => uses.push((k, build_cost(k))),
+                }
             });
         }
-    }
-    if uses.is_empty() {
-        return 0;
     }
     // A cheap constant read once saves one instruction but holds a register
     // through the whole function (`MAX_MATCH - len` in longest_match lost
     // more to the allocation around it); one read in several places pays.
     uses.retain(|&(k, n)| costly(k) || n >= 2);
+    uses.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    uses.truncate(MAX_HOISTED);
+    // Only in a function small enough to keep them in registers, as for
+    // multiply-highs (jsonTranslateBlobToText's selects, among 1800
+    // instructions, cost it 13M more than they saved).
+    if selected.len() <= MAX_SELECTED && size <= MUL_HIGH_MAX_SIZE {
+        for k in selected {
+            if !uses.iter().any(|&(c, _)| c == k) {
+                uses.push((k, 0));
+            }
+        }
+    }
     if uses.is_empty() {
         return 0;
     }
-    uses.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-    uses.truncate(MAX_HOISTED);
     let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
     let regs: Vec<(i64, Value)> = uses.iter().map(|&(k, _)| {
         next_id += 1;
@@ -326,6 +366,28 @@ mod tests {
         // The use outside the loop keeps its immediate.
         assert!(matches!(func.blocks[2].instructions[0], Instruction::BinOp { rhs: Operand::Const(_), .. }));
         assert_eq!(func.next_value_id, 4);
+    }
+
+    /// A select of two constants in a loop (a child pointer's offset) gets
+    /// both in registers, besides the costly constant; a select of a value
+    /// and one constant does not.
+    #[test]
+    fn test_select_of_two_constants_built_once() {
+        let select = |dest: u32, t: Operand| Instruction::Select {
+            dest: Value(dest), cond: Operand::Value(Value(1)), true_val: t,
+            false_val: Operand::Const(IrConst::I64(16)), ty: IrType::I64,
+        };
+        let mut func = loop_func();
+        func.blocks[1].instructions.push(select(3, Operand::Const(IrConst::I64(8))));
+        func.next_value_id = 4;
+        assert_eq!(hoist_function(&mut func, true), 3);
+        assert!(matches!(func.blocks[1].instructions[1], Instruction::Select {
+            true_val: Operand::Value(_), false_val: Operand::Value(_), .. }));
+        let mut func = loop_func();
+        func.blocks[1].instructions.push(select(3, Operand::Value(Value(0))));
+        func.next_value_id = 4;
+        assert_eq!(hoist_function(&mut func, true), 1);
+        assert!(matches!(func.blocks[1].instructions[1], Instruction::Select { false_val: Operand::Const(_), .. }));
     }
 
     #[test]

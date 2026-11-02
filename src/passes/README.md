@@ -1611,6 +1611,16 @@ most 500 instructions: in sqlite3_str_vappendf (1721) the magics went to
 the stack at entry, eight instructions on every call for divisions in loops
 it seldom runs.
 
+On AArch64 the two constants of a select of two constants in a loop also
+qualify, in two registers of their own besides the four, in functions of at
+most 500 instructions: a select takes no immediate (only the zero register,
+and csinc/csinv for 1 and -1), so `n = key < n->key ? n->left : n->right`,
+a select between the offsets 8 and 16, built both with a `mov` at every
+step down scalar-bench's tree (tree_kernel 62M fewer instructions, 12% of
+it). Not a select of a value and one constant (lz_compress's `n - i < 130 ?
+n - i : 130` lost 66M to the register it took), nor in larger functions
+(jsonTranslateBlobToText lost 13M).
+
 ### if_convert -- If-Conversion
 
 Converts simple diamond and triangle branch-and-phi patterns into `Select`
