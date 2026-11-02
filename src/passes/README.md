@@ -435,6 +435,17 @@ body within the block limit stay candidates: chess-perft inlines
 `msb` it calls, and ran 31% more instructions when those stayed calls.
 Together these cut speedtest's instructions 0.5%, for 13% more code.
 
+**Sole calls in loops.** A static function the module calls exactly once,
+its address never taken (in code, a global's initializer, inline assembly,
+an alias or top-level assembly), adds no code inlined: its own body goes.
+Where that call sits in a loop of the caller, the cleaned-up limits are
+100 instructions in 16 blocks instead (clang weighs a local function's
+last call the same way). scalar-bench's `ht_delete`, 48 instructions in
+10 blocks, rebuilt its hash multiplier at each of 2M calls. Only in loops:
+vector-bench's `check_all`, called once from `main` outside its loops,
+grew `main`, whose hot `step2` loop then built its two-lane argument on
+the stack, 82M more instructions.
+
 **Heuristics.** The inliner uses a tiered size-based heuristic:
 
 | Category | Instruction limit | Block limit | Notes |

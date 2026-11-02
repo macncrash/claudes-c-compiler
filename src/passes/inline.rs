@@ -106,6 +106,14 @@ const MAX_SPECIALIZED_INLINE_INSTRUCTIONS: usize = 20;
 /// once its parameters and locals live in registers.
 const MAX_CLEANED_INLINE_INSTRUCTIONS: usize = 40;
 
+/// The cleaned-up size limit instead for a static function with one call
+/// in the module and its address never taken: inlined, its body goes, so
+/// only the call is saved (clang weighs a local function's last call the
+/// same way). scalar-bench's ht_delete, 48 instructions cleaned up, was a
+/// call with its constants built again at every key deleted.
+const MAX_SOLE_CALL_INLINE_INSTRUCTIONS: usize = 100;
+const MAX_SOLE_CALL_INLINE_BLOCKS: usize = 16;
+
 /// Upper bound on the small callees inlined into a specialized copy while
 /// measuring it.
 const MAX_SPECIALIZED_NESTED_INLINES: usize = 8;
@@ -290,6 +298,8 @@ fn select_inline_site(
         // anything larger would multiply its stack frame by the recursion depth.
         let (max_insts, max_blocks) = if caller_is_recursive {
             (MAX_SPECIALIZED_INLINE_INSTRUCTIONS, MAX_SMALL_INLINE_BLOCKS)
+        } else if callee_data.sole_call && site.in_loop {
+            (MAX_SOLE_CALL_INLINE_INSTRUCTIONS, MAX_SOLE_CALL_INLINE_BLOCKS)
         } else {
             (MAX_CLEANED_INLINE_INSTRUCTIONS, MAX_INLINE_BLOCKS)
         };
@@ -1007,6 +1017,9 @@ struct CalleeData {
     /// A cleaned-only callee over the raw block limit for the largest
     /// callers (see MAX_CLEANED_ONLY_RAW_BLOCKS).
     wide: bool,
+    /// A static function called once, its address never taken: inlined,
+    /// its own body goes (see MAX_SOLE_CALL_INLINE_INSTRUCTIONS).
+    sole_call: bool,
     /// The callee's parameters, for building a specialized copy when sizing
     /// call sites that pass constants (see `specialized_size`).
     params: Vec<IrParam>,
@@ -1029,6 +1042,8 @@ struct InlineCallSite {
     const_args: Vec<Option<ConstArg>>,
     /// In a body inlined into the caller for its cleaned-up size.
     in_cleaned_body: bool,
+    /// In a loop of the caller (a block on a cycle), for a sole-call callee.
+    in_loop: bool,
 }
 
 /// A call argument that is constant in the caller: the constant, plus the cast
@@ -1240,6 +1255,38 @@ fn func_has_static_locals_with_label_refs(module: &IrModule, func_name: &str) ->
     false
 }
 
+/// Static functions the module calls exactly once and never refers to
+/// otherwise: no address taken (in code, a global's initializer or inline
+/// assembly), no alias, no mention in top-level assembly.
+fn sole_call_statics(module: &IrModule) -> FxHashSet<&str> {
+    let mut calls: HashMap<&str, usize> = HashMap::new();
+    let mut other: FxHashSet<String> = FxHashSet::default();
+    for inst in module.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instructions) {
+        match inst {
+            Instruction::Call { func, .. } => *calls.entry(func.as_str()).or_insert(0) += 1,
+            Instruction::GlobalAddr { name, .. } => { other.insert(name.clone()); }
+            Instruction::InlineAsm { input_symbols, .. } => {
+                for s in input_symbols.iter().flatten() {
+                    other.insert(s.split('+').next().unwrap_or(s).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    for global in &module.globals {
+        global.init.for_each_ref(&mut |name: &str| { other.insert(name.to_string()); });
+    }
+    for (alias, target, _) in &module.aliases {
+        other.insert(alias.clone());
+        other.insert(target.clone());
+    }
+    module.functions.iter()
+        .filter(|f| f.is_static && !f.is_declaration && calls.get(f.name.as_str()) == Some(&1)
+            && !other.contains(&f.name) && !module.toplevel_asm.iter().any(|a| a.contains(f.name.as_str())))
+        .map(|f| f.name.as_str())
+        .collect()
+}
+
 /// Build a map of function name -> callee data for functions eligible for inlining.
 /// The functions on a cycle of the module's call graph (calling themselves,
 /// directly or through others), by Tarjan's strongly connected components.
@@ -1318,6 +1365,7 @@ fn recursive_functions(module: &IrModule) -> FxHashSet<&str> {
 fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
     let mut map = HashMap::new();
     let recursive = recursive_functions(module);
+    let sole = sole_call_statics(module);
 
     let debug_callee = std::env::var("CCC_INLINE_DEBUG").is_ok();
     for func in &module.functions {
@@ -1502,6 +1550,7 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             is_static_inline: func.is_static && func.is_inline,
             cleaned_only,
             wide: cleaned_only && func.blocks.len() > 2 * MAX_INLINE_BLOCKS,
+            sole_call: sole.contains(func.name.as_str()),
             params: func.params.clone(),
         });
     }
@@ -1544,6 +1593,7 @@ fn find_inline_call_sites(
                             args: info.args.clone(),
                             const_args: Vec::new(),
                             in_cleaned_body: false,
+                            in_loop: false,
                         });
                     }
                 }
@@ -1551,6 +1601,24 @@ fn find_inline_call_sites(
         }
     }
 
+    if sites.iter().any(|s| callee_map[&s.callee_name].sole_call) {
+        let labels = crate::ir::analysis::build_label_map(func);
+        let (_, succs) = crate::ir::analysis::build_cfg(func, &labels);
+        for site in sites.iter_mut().filter(|s| callee_map[&s.callee_name].sole_call) {
+            // Whether the call's block reaches itself.
+            let mut seen = vec![false; func.blocks.len()];
+            let mut stack: Vec<usize> = succs.row(site.block_idx).iter().map(|&b| b as usize).collect();
+            while let Some(b) = stack.pop() {
+                if b == site.block_idx {
+                    site.in_loop = true;
+                    break;
+                }
+                if !std::mem::replace(&mut seen[b], true) {
+                    stack.extend(succs.row(b).iter().map(|&x| x as usize));
+                }
+            }
+        }
+    }
     if !sites.is_empty() {
         let consts = constant_values(func);
         for site in &mut sites {
@@ -2256,7 +2324,7 @@ mod tests {
         CalleeData {
             blocks, param_struct_sizes: vec![], return_type: IrType::Void, num_params: 0, next_value_id: insts as u32,
             max_block_id: 0, is_always_inline: false, exceeds_normal_limits: false, is_static_inline: false,
-            cleaned_only: true, wide: false, params: vec![],
+            cleaned_only: true, wide: false, sole_call: false, params: vec![],
         }
     }
 
@@ -2275,7 +2343,7 @@ mod tests {
                      Some(CleanedSize { insts: 30, blocks: MAX_INLINE_BLOCKS + 3, non_return_blocks: 2 }));
         let site = |name: &str| InlineCallSite {
             block_idx: 0, inst_idx: 0, callee_name: name.to_string(), dest: None, args: vec![], const_args: vec![],
-            in_cleaned_body: false,
+            in_cleaned_body: false, in_loop: false,
         };
         for (name, keeps_calls) in [("rook", false), ("spread", true)] {
             let picked = select_inline_site(&[site(name)], &callee_map, false, false, false, false, false,
@@ -2297,5 +2365,28 @@ mod tests {
         let mut names: Vec<&str> = rec.into_iter().collect();
         names.sort_unstable();
         assert_eq!(names, ["a", "b", "c"]);
+    }
+
+    /// Static functions called once: not one called twice, one whose
+    /// address is taken, one a global points to, or an external one.
+    #[test]
+    fn sole_call_statics_are_called_once_and_never_referenced() {
+        let mut module = IrModule::new();
+        module.functions.push(caller("main", &["once", "twice", "twice", "taken", "pointed", "ext"]));
+        for name in ["once", "twice", "taken", "pointed", "ext"] {
+            let mut f = caller(name, &[]);
+            f.is_static = name != "ext";
+            module.functions.push(f);
+        }
+        module.functions[0].blocks[0].instructions.push(Instruction::GlobalAddr { dest: Value(1), name: "taken".to_string() });
+        module.globals.push(crate::ir::reexports::IrGlobal {
+            name: "table".to_string(), ty: IrType::Ptr, size: 8, align: 8,
+            init: crate::ir::reexports::GlobalInit::GlobalAddr("pointed".to_string()), is_static: true,
+            is_extern: false, is_common: false, section: None, is_weak: false, visibility: None,
+            has_explicit_align: false, is_const: true, is_used: false, is_thread_local: false,
+        });
+        let mut names: Vec<&str> = sole_call_statics(&module).into_iter().collect();
+        names.sort_unstable();
+        assert_eq!(names, ["once"]);
     }
 }
