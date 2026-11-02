@@ -128,6 +128,15 @@ const MAX_SPECIALIZED_NESTED_INLINES: usize = 8;
 /// 4% more instructions, its register allocation spilling on the dispatch
 /// path as cold opcode handlers grew, and counting only non-return blocks
 /// made speedtest as a whole run 4% more.
+/// The cleaned-up limit for a call in a loop of its caller (in place of
+/// MAX_CLEANED_INLINE_INSTRUCTIONS): chess-perft's add_pawn_move, 48
+/// instructions, called per pawn move from generate's loops. (Not for
+/// vector code: vector-bench's select_clamp, inlined into main's timing
+/// loop, ran its lanes through the stack around main's calls, 614M more
+/// instructions. Nor for a callee with calls of its own: zlib's
+/// flush_pending, on a rare path in deflate's loops, cost 4.8M.)
+const MAX_LOOP_CLEANED_INLINE_INSTRUCTIONS: usize = 60;
+
 const MAX_CLEANED_ONLY_RAW_BLOCKS: usize = 4 * MAX_INLINE_BLOCKS;
 
 /// Maximum instructions for a `static` (non-`inline`) function to be eligible
@@ -301,6 +310,8 @@ fn select_inline_site(
             (MAX_SPECIALIZED_INLINE_INSTRUCTIONS, MAX_SMALL_INLINE_BLOCKS)
         } else if callee_data.sole_call && site.in_loop {
             (MAX_SOLE_CALL_INLINE_INSTRUCTIONS, MAX_SOLE_CALL_INLINE_BLOCKS)
+        } else if site.in_loop && !callee_data.vector && !callee_data.calls {
+            (MAX_LOOP_CLEANED_INLINE_INSTRUCTIONS, MAX_INLINE_BLOCKS)
         } else {
             (MAX_CLEANED_INLINE_INSTRUCTIONS, MAX_INLINE_BLOCKS)
         };
@@ -1031,6 +1042,12 @@ struct CalleeData {
     /// On a cycle of the call graph: inlined only into callers on none, by
     /// its cleaned-up size, the calls it brings staying calls.
     in_cycle: bool,
+    /// Uses vector (NEON) operations, whose registers a caller with calls
+    /// saves and restores around each one: no loop bonus.
+    vector: bool,
+    /// Makes calls of its own (or copies memory with one): no loop bonus
+    /// either, as the call it saves is not the only one.
+    calls: bool,
     /// The callee's parameters, for building a specialized copy when sizing
     /// call sites that pass constants (see `specialized_size`).
     params: Vec<IrParam>,
@@ -1055,6 +1072,70 @@ struct InlineCallSite {
     in_cleaned_body: bool,
     /// In a loop of the caller (a block on a cycle), for a sole-call callee.
     in_loop: bool,
+}
+
+/// Whether each block reaches itself: it is in a strongly connected
+/// component of more than one block, or branches to itself (iterative
+/// Tarjan).
+fn blocks_on_cycles(succs: &crate::ir::analysis::FlatAdj, n: usize) -> Vec<bool> {
+    let mut num = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut looped = vec![false; n];
+    let mut next = 0;
+    for root in 0..n {
+        if num[root] != usize::MAX {
+            continue;
+        }
+        let mut work = vec![(root, 0usize)];
+        num[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (v, ref mut k)) = work.last_mut() {
+            let row = succs.row(v);
+            if let Some(&w) = row.get(*k) {
+                *k += 1;
+                let w = w as usize;
+                if w == v {
+                    looped[v] = true;
+                }
+                if num[w] == usize::MAX {
+                    num[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(num[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(u, _)) = work.last() {
+                low[u] = low[u].min(low[v]);
+            }
+            if low[v] == num[v] {
+                let mut members = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if members.len() > 1 {
+                    for w in members {
+                        looped[w] = true;
+                    }
+                }
+            }
+        }
+    }
+    looped
 }
 
 /// A call argument that is constant in the caller: the constant, plus the cast
@@ -1569,6 +1650,10 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             is_static_inline: func.is_static && func.is_inline,
             cleaned_only,
             wide: cleaned_only && func.blocks.len() > 2 * MAX_INLINE_BLOCKS,
+            vector: func.blocks.iter().flat_map(|b| &b.instructions)
+                .any(|i| matches!(i, Instruction::Intrinsic { op: crate::ir::reexports::IntrinsicOp::VecOp { .. }, .. })),
+            calls: func.blocks.iter().flat_map(|b| &b.instructions)
+                .any(|i| matches!(i, Instruction::Call { .. } | Instruction::CallIndirect { .. } | Instruction::Memcpy { .. })),
             sole_call: sole.contains(func.name.as_str()),
             in_cycle,
             params: func.params.clone(),
@@ -1621,22 +1706,12 @@ fn find_inline_call_sites(
         }
     }
 
-    if sites.iter().any(|s| callee_map[&s.callee_name].sole_call) {
+    if !sites.is_empty() {
         let labels = crate::ir::analysis::build_label_map(func);
         let (_, succs) = crate::ir::analysis::build_cfg(func, &labels);
-        for site in sites.iter_mut().filter(|s| callee_map[&s.callee_name].sole_call) {
-            // Whether the call's block reaches itself.
-            let mut seen = vec![false; func.blocks.len()];
-            let mut stack: Vec<usize> = succs.row(site.block_idx).iter().map(|&b| b as usize).collect();
-            while let Some(b) = stack.pop() {
-                if b == site.block_idx {
-                    site.in_loop = true;
-                    break;
-                }
-                if !std::mem::replace(&mut seen[b], true) {
-                    stack.extend(succs.row(b).iter().map(|&x| x as usize));
-                }
-            }
+        let looped = blocks_on_cycles(&succs, func.blocks.len());
+        for site in &mut sites {
+            site.in_loop = looped[site.block_idx];
         }
     }
     if !sites.is_empty() {
@@ -2344,7 +2419,7 @@ mod tests {
         CalleeData {
             blocks, param_struct_sizes: vec![], return_type: IrType::Void, num_params: 0, next_value_id: insts as u32,
             max_block_id: 0, is_always_inline: false, exceeds_normal_limits: false, is_static_inline: false,
-            cleaned_only: true, wide: false, sole_call: false, in_cycle: false, params: vec![],
+            cleaned_only: true, wide: false, sole_call: false, in_cycle: false, vector: false, calls: false, params: vec![],
         }
     }
 
@@ -2398,6 +2473,40 @@ mod tests {
         let map = build_callee_map(&module);
         assert!(map.get("once").is_some_and(|c| c.sole_call));
         assert!(!map.contains_key("twice"));
+    }
+
+    #[test]
+    fn blocks_on_cycles_are_the_loop_blocks() {
+        // 0 -> 1 -> 2 -> 1, 2 -> 3, 3 -> 3, 3 -> 4.
+        let succ: Vec<Vec<usize>> = vec![vec![1], vec![2], vec![1, 3], vec![3, 4], vec![]];
+        let adj = crate::ir::analysis::FlatAdj::from_vecs_usize(&succ);
+        assert_eq!(blocks_on_cycles(&adj, 5), [false, true, true, true, false]);
+    }
+
+    /// A call in a loop takes a callee up to MAX_LOOP_CLEANED_INLINE_INSTRUCTIONS
+    /// cleaned up (chess-perft's add_pawn_move, 48), unless it uses vector
+    /// operations or makes calls of its own.
+    #[test]
+    fn calls_in_loops_take_larger_callees_without_vectors_or_calls() {
+        let site = |in_loop: bool| InlineCallSite {
+            block_idx: 0, inst_idx: 0, callee_name: "pawn".to_string(), dest: None, args: vec![], const_args: vec![],
+            in_cleaned_body: false, in_loop,
+        };
+        let pick = |in_loop: bool, vector: bool, calls: bool| {
+            let mut callee_map: HashMap<String, CalleeData> = HashMap::new();
+            let mut pawn = cleaned_only_callee(64, 4);
+            pawn.vector = vector;
+            pawn.calls = calls;
+            callee_map.insert("pawn".to_string(), pawn);
+            let mut cache: HashMap<String, Option<CleanedSize>> = HashMap::new();
+            cache.insert("pawn".to_string(), Some(CleanedSize { insts: 48, blocks: 5, non_return_blocks: 4 }));
+            select_inline_site(&[site(in_loop)], &callee_map, false, false, false, false, false, false,
+                               MAX_INLINE_BUDGET_PER_CALLER, MAX_ALWAYS_INLINE_BUDGET_PER_CALLER, &mut cache).is_some()
+        };
+        assert!(pick(true, false, false));
+        assert!(!pick(false, false, false));
+        assert!(!pick(true, true, false));
+        assert!(!pick(true, false, true));
     }
 
     /// A function on a call-graph cycle is inlined into a caller on none,

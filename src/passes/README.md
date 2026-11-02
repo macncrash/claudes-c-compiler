@@ -457,6 +457,16 @@ Such a function is a candidate up to twice those limits before cleanup
 in `sqlite3BtreeTableMoveto`'s binary search, was a call 9M times
 (39.6M instructions).
 
+**Calls in loops.** A call in a loop of its caller (its block on a cycle
+of the CFG, found once per round as strongly connected components) takes a
+callee of up to 60 instructions cleaned up, in place of 40: chess-perft's
+`add_pawn_move`, 48 instructions, called per pawn move from `generate`'s
+loops (41.6M instructions). Not a callee using vector operations, whose
+registers a caller with calls saves around each one (vector-bench's
+`select_clamp`, inlined into `main`'s timing loop, cost 614M), nor one
+with calls of its own, where the call saved is not the only one (zlib's
+`flush_pending`, on a rare path in deflate's loops, cost 4.8M).
+
 **Small callees in recursive callers.** A recursive caller takes only
 callees of at most 20 cleaned-up instructions, since anything inlined
 multiplies its frame by the recursion depth, and in at most 3 blocks. As
