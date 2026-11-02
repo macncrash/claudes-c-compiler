@@ -251,6 +251,7 @@ fn select_inline_site(
     caller_at_absolute_cap: bool,
     caller_has_section: bool,
     caller_is_recursive: bool,
+    caller_in_cycle: bool,
     budget_remaining: usize,
     always_inline_budget_remaining: usize,
     spec_cache: &mut HashMap<String, Option<CleanedSize>>,
@@ -317,6 +318,9 @@ fn select_inline_site(
         if callee_data.wide && !relaxed {
             continue;
         }
+        if callee_data.in_cycle && (caller_in_cycle || caller_is_recursive || cleaned.is_none()) {
+            continue;
+        }
         if (caller_is_recursive || callee_data.cleaned_only) && !is_tiny && !callee_data.is_always_inline
             && cleaned.is_none() {
             continue;
@@ -329,8 +333,9 @@ fn select_inline_site(
             // keeps its calls: one within the block limit lets its calls be
             // inlined in turn (chess-perft's rook_att, inlined into generate,
             // brings ray_att, whose lsb and msb follow).
-            let by_cleaned = !(is_tiny || (is_small && (!budget_exhausted || callee_data.is_always_inline)) || is_static_inline_eligible)
-                && cleaned.is_some_and(|c| c.blocks > max_blocks);
+            let by_cleaned = callee_data.in_cycle
+                || (!(is_tiny || (is_small && (!budget_exhausted || callee_data.is_always_inline)) || is_static_inline_eligible)
+                    && cleaned.is_some_and(|c| c.blocks > max_blocks));
             return Some((site.clone(), cost, use_relaxed, by_cleaned));
         }
     }
@@ -342,7 +347,7 @@ fn select_inline_site(
         // For recursive callers, skip non-tiny, non-always_inline callees.
         // (Tiny callees were handled in the first pass, as were cleaned-only
         // ones that qualify.)
-        if (caller_is_recursive || callee_data.cleaned_only) && !callee_data.is_always_inline {
+        if (caller_is_recursive || callee_data.cleaned_only || callee_data.in_cycle) && !callee_data.is_always_inline {
             continue;
         }
         // When the caller has a section attribute (e.g., .init.text),
@@ -401,6 +406,7 @@ pub fn run(module: &mut IrModule) -> usize {
     // Build a snapshot of eligible callees (we can't borrow module mutably while reading callees).
     // We clone the callee function bodies since we need them while mutating callers.
     let callee_map = build_callee_map(module);
+    let in_cycle: FxHashSet<String> = recursive_functions(module).into_iter().map(str::to_string).collect();
     let mut spec_cache: HashMap<String, Option<CleanedSize>> = HashMap::new();
 
     if callee_map.is_empty() {
@@ -451,6 +457,7 @@ pub fn run(module: &mut IrModule) -> usize {
                 })
             })
         };
+        let caller_in_cycle = in_cycle.contains(&module.functions[func_idx].name);
         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
         let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
@@ -492,6 +499,7 @@ pub fn run(module: &mut IrModule) -> usize {
                 caller_at_absolute_cap,
                 caller_has_section,
                 caller_is_recursive,
+                caller_in_cycle,
                 budget_remaining,
                 always_inline_budget_remaining,
                 &mut spec_cache,
@@ -1020,6 +1028,9 @@ struct CalleeData {
     /// A static function called once, its address never taken: inlined,
     /// its own body goes (see MAX_SOLE_CALL_INLINE_INSTRUCTIONS).
     sole_call: bool,
+    /// On a cycle of the call graph: inlined only into callers on none, by
+    /// its cleaned-up size, the calls it brings staying calls.
+    in_cycle: bool,
     /// The callee's parameters, for building a specialized copy when sizing
     /// call sites that pass constants (see `specialized_size`).
     params: Vec<IrParam>,
@@ -1380,12 +1391,11 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // along, which is inlined in turn, up to the round limit: SQLite's
         // 22-instruction sqlite3BitvecDestroy became 5,000 instructions in
         // each of its callers. (always_inline is left to its own limits.)
-        if !func.is_always_inline && recursive.contains(func.name.as_str()) {
-            if debug_callee {
-                eprintln!("[INLINE_DEBUG] {} skipped: recursive", func.name);
-            }
-            continue;
-        }
+        // So such a function is inlined only into callers on no cycle, and
+        // the calls its body brings stay calls (SQLite's sqlite3_value_text,
+        // on a cycle through sqlite3VdbeMemStringify, is a call per row from
+        // its SQL functions).
+        let in_cycle = !func.is_always_inline && recursive.contains(func.name.as_str());
 
         // Determine if this is an always_inline function
         let is_always_inline = func.is_always_inline;
@@ -1560,6 +1570,7 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
             cleaned_only,
             wide: cleaned_only && func.blocks.len() > 2 * MAX_INLINE_BLOCKS,
             sole_call: sole.contains(func.name.as_str()),
+            in_cycle,
             params: func.params.clone(),
         });
     }
@@ -2333,7 +2344,7 @@ mod tests {
         CalleeData {
             blocks, param_struct_sizes: vec![], return_type: IrType::Void, num_params: 0, next_value_id: insts as u32,
             max_block_id: 0, is_always_inline: false, exceeds_normal_limits: false, is_static_inline: false,
-            cleaned_only: true, wide: false, sole_call: false, params: vec![],
+            cleaned_only: true, wide: false, sole_call: false, in_cycle: false, params: vec![],
         }
     }
 
@@ -2355,7 +2366,7 @@ mod tests {
             in_cleaned_body: false, in_loop: false,
         };
         for (name, keeps_calls) in [("rook", false), ("spread", true)] {
-            let picked = select_inline_site(&[site(name)], &callee_map, false, false, false, false, false,
+            let picked = select_inline_site(&[site(name)], &callee_map, false, false, false, false, false, false,
                                             MAX_INLINE_BUDGET_PER_CALLER, MAX_ALWAYS_INLINE_BUDGET_PER_CALLER, &mut cache);
             let (s, _, _, by_cleaned) = picked.expect("inlined for its cleaned-up size");
             assert_eq!((s.callee_name.as_str(), by_cleaned), (name, keeps_calls));
@@ -2389,6 +2400,30 @@ mod tests {
         assert!(!map.contains_key("twice"));
     }
 
+    /// A function on a call-graph cycle is inlined into a caller on none,
+    /// the calls it brings staying calls (so a recursive one does not
+    /// unfold), and not into a caller on a cycle.
+    #[test]
+    fn functions_on_cycles_inline_only_into_callers_on_none() {
+        let mut callee_map: HashMap<String, CalleeData> = HashMap::new();
+        let mut text = cleaned_only_callee(20, 2);
+        text.in_cycle = true;
+        callee_map.insert("value_text".to_string(), text);
+        let mut cache: HashMap<String, Option<CleanedSize>> = HashMap::new();
+        cache.insert("value_text".to_string(), Some(CleanedSize { insts: 12, blocks: 2, non_return_blocks: 2 }));
+        let site = InlineCallSite {
+            block_idx: 0, inst_idx: 0, callee_name: "value_text".to_string(), dest: None, args: vec![], const_args: vec![],
+            in_cleaned_body: false, in_loop: false,
+        };
+        let pick = |caller_in_cycle: bool, cache: &mut HashMap<String, Option<CleanedSize>>| {
+            select_inline_site(std::slice::from_ref(&site), &callee_map, false, false, false, false, false, caller_in_cycle,
+                               MAX_INLINE_BUDGET_PER_CALLER, MAX_ALWAYS_INLINE_BUDGET_PER_CALLER, cache)
+        };
+        let (_, _, _, keeps_calls) = pick(false, &mut cache).expect("inlined off the cycle");
+        assert!(keeps_calls);
+        assert!(pick(true, &mut cache).is_none());
+    }
+
     /// In a recursive caller a small callee's blocks that only return do not
     /// count either (jsonAppendChar, 15 instructions in 4 blocks, one a
     /// return, called per character by the recursive
@@ -2407,7 +2442,7 @@ mod tests {
             in_cleaned_body: false, in_loop: false,
         };
         let pick = |name: &str, cache: &mut HashMap<String, Option<CleanedSize>>| {
-            select_inline_site(&[site(name)], &callee_map, false, false, false, false, true,
+            select_inline_site(&[site(name)], &callee_map, false, false, false, false, true, false,
                                MAX_INLINE_BUDGET_PER_CALLER, MAX_ALWAYS_INLINE_BUDGET_PER_CALLER, cache)
         };
         assert!(pick("append", &mut cache).is_some());

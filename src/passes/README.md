@@ -398,12 +398,18 @@ functions.
 **Eligibility.** Not all functions can be inlined. Variadic functions, functions
 containing `VaStart`/`VaEnd`/`VaArg`, `DynAlloca`, `StackSave`/`StackRestore`,
 `IndirectBranch`, or static locals with label references are excluded.
-`__attribute__((noinline))` functions and recursive calls are also excluded, as
-are (unless `always_inline`) functions on a cycle of the call graph, found as
-strongly connected components: an inlined recursive function brings its own
-call along, which was inlined again up to the round limit (SQLite's
-22-instruction `sqlite3BitvecDestroy` became 5,000 instructions in each of its
-callers, and the whole file took twice as long to compile).
+`__attribute__((noinline))` functions and recursive calls are also excluded.
+A function on a cycle of the call graph (a strongly connected component) is
+inlined, unless `always_inline`, only by its cleaned-up size, only into a
+caller on no cycle, and the calls its body brings stay calls: an inlined
+recursive function brings its own call along, which was inlined again up
+to the round limit (SQLite's 22-instruction `sqlite3BitvecDestroy` became
+5,000 instructions in each of its callers, and the whole file took twice as
+long to compile), so these were excluded outright. SQLite's call graph has
+large cycles, though, and with them `sqlite3PcacheFetchFinish`, a call per
+page fetched from `getPageNormal`, and the string and allocation helpers
+of its SQL functions: inlined off the cycles, speedtest ran 79.7M fewer
+instructions, for 3.4% more code.
 
 **Linkage.** A function with external linkage is a candidate too, judged by
 its cleaned-up size (after mem2reg and folding, as for larger static
