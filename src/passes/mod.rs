@@ -763,7 +763,9 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     // backend folds them into loads and stores.
     if !disabled.contains("gep_reassoc") {
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
-            if gep_reassoc::reassociate_function(func, target == crate::backend::Target::Aarch64) > 0 {
+            if gep_reassoc::reassociate_function(func, target == crate::backend::Target::Aarch64)
+                + gep_reassoc::hoist_invariant_subtrahends(func) > 0
+            {
                 copy_prop::propagate_copies(func);
                 dce::eliminate_dead_code(func);
             }

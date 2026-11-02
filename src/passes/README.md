@@ -1207,6 +1207,14 @@ and start must be small constants or sign-extended 32-bit values, so the
 scaled bound cannot overflow; pointer tests are signed, or unsigned when
 constant bounds show the loop runs.
 
+Two tests need no such bounds, holding exactly in wrapping arithmetic. A
+counter from 0 stepping by 1, run while `k <u n`, first fails the test at
+`k == n`, so the test is `k != n` all along. And `k != n` is `o != o0 +
+(n - k0)` for any other variable `o` stepping alike, integer or pointer,
+unsigned included. scalar-bench's LZ decoder copies a match with
+`for (k = 0; k < len; k++, o++) out[o] = out[o - dist]`, and stepped `k`
+as well as `o` for every byte (13.8M instructions).
+
 ### loop_vectorize -- In-Place Loop Vectorization
 
 Runs once after lftr, for AArch64. A single-block loop counted down to zero
@@ -1282,6 +1290,13 @@ of the same base in its block whose offset is within one: the CRC's rows 5
 to 7, at 5120 to 7168 bytes, were a movz and an add each every iteration,
 and are each the row before plus 1024. (Row 4, at 4096, is one
 `add x22, x12, #1, lsl #12`.)
+
+Then, in a loop, an access `gep(p, x - d)` from a base and a subtrahend both
+defined outside it, the subtraction read only there and `d` nowhere else in
+the loop, becomes `gep(p - d, x)`, with `p - d` computed in the preheader. It
+takes the register `d` held, and the subtraction leaves the loop. In
+lz_decompress's `out[o - dist]` that was one `sub` per byte copied (13.7M
+instructions).
 
 ### load_group -- Next Words' Loads Next to Each Other
 

@@ -26,6 +26,10 @@
 //! moves through memory, which does not wrap, wherever it is).
 //! Runs late, after iv_widen, on 64-bit targets, and not with -fwrapv (the
 //! counter itself must not wrap).
+//!
+//! Without those bounds, an inequality moves to a variable stepping alike
+//! (`i != n` is `o != o0 + (n - i0)`, wrapping or not), and so does an
+//! unsigned `i <u n` of a counter from 0 by 1, which first fails at `n`.
 
 use crate::common::fx_hash::FxHashSet;
 use crate::common::types::IrType;
@@ -66,6 +70,8 @@ struct Affine {
     step: i64,
     /// GEP (pointer) or Add I64 (integer) step.
     pointer: bool,
+    /// A U64 phi (unsigned arithmetic: only the exact rewrite applies).
+    unsigned: bool,
 }
 
 fn def_of(func: &IrFunction, v: Value) -> Option<(usize, usize)> {
@@ -78,7 +84,7 @@ fn affine_phis(func: &IrFunction, header: usize, pre: BlockId, latch: BlockId) -
     let mut out = Vec::new();
     for inst in &func.blocks[header].instructions {
         let Instruction::Phi { dest, ty, incoming } = inst else { continue };
-        if incoming.len() != 2 || !matches!(ty, IrType::I64 | IrType::Ptr) {
+        if incoming.len() != 2 || !matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
             continue;
         }
         let Some(init) = incoming.iter().find(|(_, l)| *l == pre).map(|(op, _)| *op) else { continue };
@@ -86,7 +92,7 @@ fn affine_phis(func: &IrFunction, header: usize, pre: BlockId, latch: BlockId) -
         let Some((b, k)) = def_of(func, next) else { continue };
         let is_phi = |op: &Operand| matches!(op, Operand::Value(v) if v == dest);
         let step = match &func.blocks[b].instructions[k] {
-            Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, ty: IrType::I64, .. } if *ty == IrType::I64 => {
+            Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, ty: IrType::I64, .. } if *ty != IrType::Ptr => {
                 if is_phi(lhs) { rhs.as_i64() } else if is_phi(rhs) { lhs.as_i64() } else { None }
                     .map(|s| (s, false))
             }
@@ -95,7 +101,7 @@ fn affine_phis(func: &IrFunction, header: usize, pre: BlockId, latch: BlockId) -
             _ => None,
         };
         if let Some((step, pointer)) = step.filter(|s| s.0 != 0) {
-            out.push(Affine { phi: *dest, init, next, step, pointer });
+            out.push(Affine { phi: *dest, init, next, step, pointer, unsigned: *ty == IrType::U64 });
         }
     }
     out
@@ -129,17 +135,29 @@ fn replace_test(func: &mut IrFunction, body: &FxHashSet<usize>, header: usize, p
     let ivs = affine_phis(func, header, pre_label, latch_label);
     // The exit test: the header's branch on a signed compare of an integer
     // variable with a loop-invariant bound.
-    let Terminator::CondBranch { cond: Operand::Value(cond), .. } = func.blocks[header].terminator else { return false };
+    let Terminator::CondBranch { cond: Operand::Value(cond), true_label, .. } = func.blocks[header].terminator else { return false };
     let Some(cmp_at) = func.blocks[header].instructions.iter().position(|i| i.dest() == Some(cond)) else { return false };
     let Instruction::Cmp { op, lhs: Operand::Value(iv), rhs: bound, .. } = func.blocks[header].instructions[cmp_at].clone()
         else { return false };
-    if !matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge | IrCmpOp::Eq | IrCmpOp::Ne) {
+    if !matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge | IrCmpOp::Eq | IrCmpOp::Ne | IrCmpOp::Ult) {
         return false;
     }
     let Some(counter) = ivs.iter().find(|a| a.phi == iv && !a.pointer) else { return false };
     let defined_in_loop = |func: &IrFunction, v: Value| def_of(func, v).is_some_and(|(b, _)| body.contains(&b));
-    if matches!(bound, Operand::Value(v) if defined_in_loop(func, v))
-        || !bounded(func, &bound) || !bounded(func, &counter.init) || counter.step.abs() > 64 {
+    if matches!(bound, Operand::Value(v) if defined_in_loop(func, v)) {
+        return false;
+    }
+    // A counter from 0 stepping by 1, run while below the bound, first
+    // fails the test at the bound itself: `i <u n` is `i != n` all along.
+    // An inequality of two variables stepping alike (any start, any bound)
+    // is one of the other's, wrapping or not: `i != n` is
+    // `o != o0 + (n - i0)` (lz_decompress's `for (k = 0; k < len; k++, o++)`).
+    let stays = func.blocks.iter().position(|b| b.label == true_label).is_some_and(|b| body.contains(&b));
+    let exact = op == IrCmpOp::Ne
+        || (op == IrCmpOp::Ult && stays && counter.init.as_i64() == Some(0) && counter.step == 1);
+    let ranged = !counter.unsigned && op != IrCmpOp::Ult
+        && bounded(func, &bound) && bounded(func, &counter.init) && counter.step.abs() <= 64;
+    if !exact && !ranged {
         return false;
     }
 
@@ -180,7 +198,24 @@ fn replace_test(func: &mut IrFunction, body: &FxHashSet<usize>, header: usize, p
     let mut new_op = op;
     let mut pointer_folds: Vec<(Value, Operand)> = Vec::new();
     let mut new_phi: Option<(Value, Operand, Value, i64)> = None;
-    if let Some(k) = shift_by {
+    let alike = (shift_by.is_none() && exact).then(|| ivs.iter().find(|a| a.phi != counter.phi && a.step == counter.step
+        && match a.init {
+            Operand::Value(v) => !defined_in_loop(func, v),
+            Operand::Const(_) => !a.pointer,
+        })).flatten();
+    if let Some(q) = alike {
+        let diff = sub(bound, counter.init, &mut pre_insts, &mut fresh);
+        let end = fresh();
+        pre_insts.push(match q.init {
+            Operand::Value(base) if q.pointer => Instruction::GetElementPtr { dest: end, base, offset: diff, ty: IrType::I8 },
+            init => Instruction::BinOp { dest: end, op: IrBinOp::Add, lhs: init, rhs: diff, ty: IrType::I64 },
+        });
+        new_op = IrCmpOp::Ne;
+        new_lhs = Operand::Value(q.phi);
+        new_rhs = Operand::Value(end);
+    } else if !ranged {
+        return false;
+    } else if let Some(k) = shift_by {
         // The shifted counter becomes the variable: off = i << k throughout.
         let m = 1i64 << k;
         let step = counter.step * m;
@@ -375,4 +410,56 @@ fn insert_at(func: &mut IrFunction, b: usize, k: usize, inst: Instruction) {
         block.source_spans.insert(k, span);
     }
     block.instructions.insert(k, inst);
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::common::types::{AddressSpace, AliasClass};
+    use crate::ir::reexports::BasicBlock;
+
+    /// lz_decompress's copy, `for (k = k0; k < len; k++, o++) out[o] = out[o - dist]`:
+    /// out v0, len v1, dist v2 and o0 v3 from outside, the counter k (v11)
+    /// and the index o (v10) unsigned. `exit_on_true` swaps the branch.
+    pub(crate) fn copy_loop(k0: i64, exit_on_true: bool) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let (stay, leave) = if exit_on_true { (BlockId(3), BlockId(2)) } else { (BlockId(2), BlockId(3)) };
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![
+            BasicBlock { label: BlockId(0), instructions: vec![], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(1), instructions: vec![
+                Instruction::Phi { dest: Value(10), ty: IrType::U64, incoming: vec![(v(3), BlockId(0)), (v(16), BlockId(2))] },
+                Instruction::Phi { dest: Value(11), ty: IrType::U64, incoming: vec![(Operand::Const(IrConst::I64(k0)), BlockId(0)), (v(15), BlockId(2))] },
+                Instruction::Cmp { dest: Value(12), op: IrCmpOp::Ult, lhs: v(11), rhs: v(1), ty: IrType::U64 },
+            ], terminator: Terminator::CondBranch { cond: v(12), true_label: stay, false_label: leave }, source_spans: Vec::new() },
+            BasicBlock { label: BlockId(2), instructions: vec![
+                Instruction::BinOp { dest: Value(13), op: IrBinOp::Sub, lhs: v(10), rhs: v(2), ty: IrType::I64 },
+                Instruction::GetElementPtr { dest: Value(14), base: Value(0), offset: v(13), ty: IrType::Ptr },
+                Instruction::Load { dest: Value(17), ptr: Value(14), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::GetElementPtr { dest: Value(18), base: Value(0), offset: v(10), ty: IrType::Ptr },
+                Instruction::Store { val: v(17), ptr: Value(18), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::BinOp { dest: Value(15), op: IrBinOp::Add, lhs: v(11), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(16), op: IrBinOp::Add, lhs: v(10), rhs: Operand::Const(IrConst::I64(1)), ty: IrType::I64 },
+            ], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(3), instructions: vec![], terminator: Terminator::Return(Some(v(10))), source_spans: Vec::new() },
+        ];
+        func.next_value_id = 19;
+        func
+    }
+
+    #[test]
+    fn unsigned_count_from_zero_becomes_an_inequality_of_the_index() {
+        let mut func = copy_loop(0, false);
+        assert_eq!(lftr_function(&mut func), 1);
+        // end = o0 + len before the loop; the loop runs while o != end.
+        let Instruction::BinOp { dest: end, op: IrBinOp::Add, lhs: Operand::Value(Value(3)), rhs: Operand::Value(Value(1)), .. } =
+            func.blocks[0].instructions[0] else { panic!("{:?}", func.blocks[0].instructions) };
+        assert!(func.blocks[1].instructions.iter().any(|i| matches!(i,
+            Instruction::Cmp { dest: Value(12), op: IrCmpOp::Ne, lhs: Operand::Value(Value(10)), rhs: Operand::Value(e), .. } if *e == end)),
+            "{:?}", func.blocks[1].instructions);
+        // From 1, `k < len` may fail above len (len 0); run while it fails,
+        // past it.
+        assert_eq!(lftr_function(&mut copy_loop(1, false)), 0);
+        assert_eq!(lftr_function(&mut copy_loop(0, true)), 0);
+    }
 }

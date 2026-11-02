@@ -1,4 +1,6 @@
 //! Move constant GEP offsets past variable ones, into the memory accesses.
+//! (And, in a loop, an invariant subtrahend of an index into the base:
+//! see hoist_invariant_subtrahends.)
 //!
 //!   %f = gep %p, 120                          %t = gep %p, %i
 //!   %a = gep %f, %i                       =>  %a = gep %t, 120
@@ -322,6 +324,93 @@ fn merge_dominated_geps(func: &mut IrFunction) {
     }
 }
 
+/// A loop's access at a variable offset less a loop-invariant one, from a
+/// loop-invariant base, gets that base less it from the preheader:
+///
+///   loop:                                    pre:  %b2 = sub %b, %d
+///     %o2 = sub %o, %d                  =>
+///     %a = gep %b, %o2                       loop: %a = gep %b2, %o
+///
+/// lz_decompress's `out[o - dist]`, a subtraction per byte copied. Only when
+/// the subtrahend has no other use in the loop, so the new base takes the
+/// register it held there; the innermost loop holding the access.
+pub(crate) fn hoist_invariant_subtrahends(func: &mut IrFunction) -> usize {
+    use super::loop_analysis;
+    if func.blocks.len() < 2 {
+        return 0;
+    }
+    let cfg = CfgAnalysis::build(func);
+    let mut loops = loop_analysis::merge_loops_by_header(
+        loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom));
+    loops.sort_by_key(|lp| lp.body.len());
+    let mut innermost: Vec<Option<usize>> = vec![None; func.blocks.len()];
+    for (l, lp) in loops.iter().enumerate() {
+        for &b in &lp.body {
+            innermost[b].get_or_insert(l);
+        }
+    }
+    let max_id = func.max_value_id() as usize;
+    let mut def_block: Vec<Option<usize>> = vec![None; max_id + 1];
+    let mut uses: Vec<Vec<usize>> = vec![Vec::new(); max_id + 1];
+    for (b, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                def_block[d.0 as usize] = Some(b);
+            }
+            inst.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { u.push(b) });
+        }
+        block.terminator.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { u.push(b) });
+    }
+    // (loop, base, subtrahend) -> the new base.
+    let mut made: FxHashMap<(usize, u32, u32), Value> = FxHashMap::default();
+    let mut next_id = func.next_value_id.max(max_id as u32 + 1);
+    let mut rewrites: Vec<(usize, usize, Value, Operand)> = Vec::new();
+    let mut pre_insts: Vec<(usize, Instruction)> = Vec::new();
+    for (b, &l) in innermost.iter().enumerate() {
+        let Some(l) = l else { continue };
+        let body = &loops[l].body;
+        let Some(pre) = loop_analysis::find_preheader(loops[l].header, body, &cfg.preds) else { continue };
+        let outside = |v: Value| def_block.get(v.0 as usize).copied().flatten().is_none_or(|d| !body.contains(&d));
+        for (k, inst) in func.blocks[b].instructions.iter().enumerate() {
+            let Instruction::GetElementPtr { base, offset: Operand::Value(off), .. } = *inst else { continue };
+            if !outside(base) || uses[off.0 as usize].len() != 1 {
+                continue;
+            }
+            let Some(db) = def_block[off.0 as usize].filter(|d| body.contains(d)) else { continue };
+            let Some(Instruction::BinOp { op: IrBinOp::Sub, lhs, rhs: Operand::Value(d), ty: IrType::I64 | IrType::U64, .. }) =
+                func.blocks[db].instructions.iter().find(|i| i.dest() == Some(off)).cloned() else { continue };
+            if !outside(d) || uses[d.0 as usize].iter().filter(|u| body.contains(u)).count() != 1 {
+                continue;
+            }
+            let nb = *made.entry((l, base.0, d.0)).or_insert_with(|| {
+                let nb = Value(next_id);
+                next_id += 1;
+                pre_insts.push((pre, Instruction::BinOp {
+                    dest: nb, op: IrBinOp::Sub, lhs: Operand::Value(base), rhs: Operand::Value(d), ty: IrType::I64,
+                }));
+                nb
+            });
+            rewrites.push((b, k, nb, lhs));
+        }
+    }
+    for &(b, k, nb, lhs) in &rewrites {
+        if let Instruction::GetElementPtr { base, offset, .. } = &mut func.blocks[b].instructions[k] {
+            *base = nb;
+            *offset = lhs;
+        }
+    }
+    for (pre, inst) in pre_insts {
+        let block = &mut func.blocks[pre];
+        if block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty() {
+            let span = *block.source_spans.last().unwrap();
+            block.source_spans.push(span);
+        }
+        block.instructions.push(inst);
+    }
+    func.next_value_id = next_id;
+    rewrites.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +451,24 @@ mod tests {
         // An address that is itself stored keeps its index.
         let mut func = indexed(true);
         assert_eq!(split_index_constants(&mut func), 0);
+    }
+
+    #[test]
+    fn invariant_subtrahend_of_an_index_moves_into_the_base() {
+        let mut func = crate::passes::lftr::tests::copy_loop(0, false);
+        assert_eq!(hoist_invariant_subtrahends(&mut func), 1);
+        // out - dist before the loop, indexed by o.
+        let Instruction::BinOp { dest: nb, op: IrBinOp::Sub, lhs: Operand::Value(Value(0)), rhs: Operand::Value(Value(2)), .. } =
+            func.blocks[0].instructions[0] else { panic!("{:?}", func.blocks[0].instructions) };
+        assert!(matches!(func.blocks[2].instructions[1],
+            Instruction::GetElementPtr { dest: Value(14), base, offset: Operand::Value(Value(10)), .. } if base == nb));
+        // Not when dist is read in the loop too: both would be live there.
+        let mut func = crate::passes::lftr::tests::copy_loop(0, false);
+        func.blocks[2].instructions.push(Instruction::Store {
+            val: Operand::Value(Value(2)), ptr: Value(18), ty: IrType::I64,
+            seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY,
+        });
+        assert_eq!(hoist_invariant_subtrahends(&mut func), 0);
     }
 
     #[test]
