@@ -15,8 +15,9 @@
 //! A value is taken as extended when it is an 8-, 16- or 32-bit load
 //! (`ldrsw` for int), a U32 operation (a 32-bit instruction clears the high
 //! half), a narrowing cast (deflate's `(Pos)strstart`, then widened as an
-//! index), a copy of one, or a phi all of whose incoming values are (or
-//! constants in its type's range). Runs late, after the passes that may
+//! index), a copy of one, a phi all of whose incoming values are (or
+//! constants in its type's range), or a 64-bit logical operation of
+//! zero-extended values (crc32's `table[...] ^ (c >> 8)`). Runs late, after the passes that may
 //! replace a load with another value of its type (GVN forwards stored
 //! values, whose high bits an 8- or 16-bit operation may leave unspecified).
 //! compress_block's `bi_valid`, loaded as int and widened for
@@ -77,67 +78,137 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
     let covers = |e: IrType, from: IrType| {
         e == from || (e.is_unsigned() && (e.size() < from.size() || (from.is_unsigned() && e.size() <= from.size())))
     };
-    // Copies and phis, to a fixpoint (optimistically: a phi is assumed
-    // extended until an incoming value shows otherwise).
-    let mut changed = true;
-    let mut assumed: Vec<Option<IrType>> = ext.clone();
+    // Through copies, phis, widenings and 64-bit logical operations, to a
+    // fixpoint. Each value moves only down: from not yet known (`Top`), to
+    // extended one way, to not at all. A phi of the narrow type is assumed
+    // extended as it until an incoming value shows otherwise, a wider one
+    // as its incoming values once one of them is known (words_kernel's
+    // `i < n ? text[i] : ' '`, a char load or a space, merged as a long).
+    #[derive(Clone, Copy, PartialEq)]
+    enum Ext {
+        Top,
+        As(IrType),
+        No,
+    }
+    let meet = |a: Ext, b: Ext| match (a, b) {
+        (Ext::Top, x) | (x, Ext::Top) => x,
+        (Ext::As(s), Ext::As(t)) if s == t => a,
+        _ => Ext::No,
+    };
+    let mut state: Vec<Ext> = ext.iter().map(|e| e.map_or(Ext::No, Ext::As)).collect();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-        if let Instruction::Phi { dest, ty, .. } = inst {
-            if narrow(ty) {
-                assumed[dest.0 as usize] = Some(*ty);
+        match inst {
+            Instruction::Phi { dest, ty, .. } if narrow(ty) => state[dest.0 as usize] = Ext::As(*ty),
+            Instruction::Phi { dest, ty, .. } if ty.is_integer() => state[dest.0 as usize] = Ext::Top,
+            Instruction::Copy { dest, src: Operand::Value(_) } => state[dest.0 as usize] = Ext::Top,
+            Instruction::Cast { dest, src: Operand::Value(_), from_ty, to_ty }
+                if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
+            {
+                state[dest.0 as usize] = Ext::Top
             }
+            Instruction::BinOp { dest, op: IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::LShr, ty: IrType::I64 | IrType::U64, .. }
+                if ext[dest.0 as usize].is_none() =>
+            {
+                state[dest.0 as usize] = Ext::Top
+            }
+            _ => {}
         }
     }
-    // A wider integer phi whose incoming values are all extended one narrow
-    // way holds that extension too (words_kernel's `i < n ? text[i] : ' '`,
-    // a char load or a space, merged as a long): pessimistically, only once
-    // every incoming value is known.
+    let of = |state: &[Ext], v: crate::ir::reexports::Value| state.get(v.0 as usize).copied().unwrap_or(Ext::No);
+    // The size a zero-extended operand is extended from.
+    let zext = |state: &[Ext], o: &Operand| match o {
+        Operand::Value(v) => match of(state, *v) {
+            Ext::Top => Ext::Top,
+            Ext::As(e) if e.is_unsigned() => Ext::As(e),
+            _ => Ext::No,
+        },
+        Operand::Const(c) => match c.to_i64() {
+            Some(0..=0xff) => Ext::As(IrType::U8),
+            Some(0x100..=0xffff) => Ext::As(IrType::U16),
+            Some(0x1_0000..=0xffff_ffff) => Ext::As(IrType::U32),
+            _ => Ext::No,
+        },
+    };
+    let mut changed = true;
     let mut rounds = 0;
     while changed && rounds < 64 {
         changed = false;
         rounds += 1;
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
-            let (dest, ty, ok) = match inst {
+            let (dest, now) = match inst {
                 Instruction::Phi { dest, ty, incoming } if !narrow(ty) && ty.is_integer() => {
-                    let t = incoming.iter().find_map(|(op, _)| match op {
-                        Operand::Value(v) => assumed.get(v.0 as usize).copied().flatten(),
-                        Operand::Const(_) => None,
-                    });
-                    match t {
-                        Some(t) => (dest, t, incoming.iter().all(|(op, _)| match op {
-                            Operand::Value(v) => assumed.get(v.0 as usize) == Some(&Some(t)),
-                            Operand::Const(c) => fits(c, t),
-                        })),
-                        None => (dest, IrType::Void, false),
+                    let mut t = Ext::Top;
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            t = meet(t, of(&state, *v));
+                        }
                     }
+                    if let Ext::As(e) = t {
+                        if !incoming.iter().all(|(op, _)| !matches!(op, Operand::Const(c) if !fits(c, e))) {
+                            t = Ext::No;
+                        }
+                    }
+                    (dest, t)
                 }
-                Instruction::Phi { dest, ty, incoming } => (dest, *ty, narrow(ty) && incoming.iter().all(|(op, _)| match op {
-                    Operand::Value(v) => assumed.get(v.0 as usize) == Some(&Some(*ty)),
-                    Operand::Const(c) => fits(c, *ty),
-                })),
-                Instruction::Copy { dest, src: Operand::Value(v) } => match assumed.get(v.0 as usize).copied().flatten() {
-                    Some(t) => (dest, t, true),
-                    None => (dest, IrType::Void, false),
-                },
+                Instruction::Phi { dest, ty, incoming } => {
+                    let ok = narrow(ty) && incoming.iter().all(|(op, _)| match op {
+                        Operand::Value(v) => matches!(of(&state, *v), Ext::Top) || of(&state, *v) == Ext::As(*ty),
+                        Operand::Const(c) => fits(c, *ty),
+                    });
+                    (dest, if ok { Ext::As(*ty) } else { Ext::No })
+                }
+                Instruction::Copy { dest, src: Operand::Value(v) } => (dest, of(&state, *v)),
                 // A widening the loop below makes a copy (the char load
                 // widened before the merge).
                 Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty }
                     if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
-                    match assumed.get(v.0 as usize).copied().flatten().filter(|&e| covers(e, *from_ty)) {
-                        Some(t) => (dest, t, true),
-                        None => (dest, IrType::Void, false),
-                    },
+                {
+                    (dest, match of(&state, *v) {
+                        Ext::As(e) if !covers(e, *from_ty) => Ext::No,
+                        s => s,
+                    })
+                }
+                // A 64-bit logical operation of zero-extended values, or one
+                // shifted right by a constant, is zero-extended from the
+                // wider of them (crc32's `crc_table[...] ^ (c >> 8)`, merged
+                // back into the unsigned `c` and widened for the shift again).
+                Instruction::BinOp { dest, op, lhs, rhs, ty: IrType::I64 | IrType::U64 }
+                    if matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::LShr) && ext[dest.0 as usize].is_none() =>
+                {
+                    let (a, b) = (zext(&state, lhs), zext(&state, rhs));
+                    (dest, match (op, a, b) {
+                        (IrBinOp::LShr, a, _) if matches!(rhs, Operand::Const(_)) => a,
+                        (IrBinOp::LShr, ..) | (_, Ext::No, _) | (_, _, Ext::No) => Ext::No,
+                        (_, Ext::Top, _) | (_, _, Ext::Top) => Ext::Top,
+                        (_, Ext::As(a), Ext::As(b)) => Ext::As(if a.size() >= b.size() { a } else { b }),
+                    })
+                }
                 _ => continue,
             };
-            let now = if ok { Some(ty) } else { None };
-            let wide_phi = matches!(inst, Instruction::Phi { ty, .. } if !narrow(ty));
-            if assumed[dest.0 as usize] != now && (now.is_none() || wide_phi || matches!(inst, Instruction::Copy { .. } | Instruction::Cast { .. })) {
-                assumed[dest.0 as usize] = now;
+            let old = state[dest.0 as usize];
+            let new = meet(old, now);
+            if new != old {
+                state[dest.0 as usize] = new;
                 changed = true;
             }
         }
+        // Values left unknown (a cycle of them with nothing known coming
+        // in) are taken as not extended, and the rest settled again.
+        if !changed && state.contains(&Ext::Top) {
+            for s in state.iter_mut().filter(|s| **s == Ext::Top) {
+                *s = Ext::No;
+            }
+            changed = true;
+        }
     }
-    ext = assumed;
+    // Unsettled after the cap, an optimistic phi may still be wrong: keep
+    // only what the instructions themselves show.
+    if !changed {
+        ext = state.iter().map(|s| match s {
+            Ext::As(t) => Some(*t),
+            _ => None,
+        }).collect();
+    }
     // (An elided extension's result is held as its source is, for a mask
     // of it further on.)
     let mut elided = 0;
@@ -351,6 +422,43 @@ mod tests {
         let mut func = char_merge(200);
         elide_extensions(&mut func);
         assert!(matches!(func.blocks[2].instructions[1], Instruction::Cast { .. }));
+    }
+
+    /// crc32's `c = table[...] ^ (c >> 8)`: an unsigned phi widened, shifted
+    /// right and xored in 64 bits with `other`, then merged back into it.
+    fn crc_loop(other: Operand) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let load = |dest| Instruction::Load { dest: Value(dest), ptr: Value(0), ty: IrType::U32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![
+            BasicBlock { label: BlockId(0), instructions: vec![], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(1), instructions: vec![
+                Instruction::Phi { dest: Value(2), ty: IrType::U32, incoming: vec![(Operand::Const(IrConst::I64(0xffff_ffff)), BlockId(0)), (v(6), BlockId(1))] },
+                Instruction::Cast { dest: Value(3), src: v(2), from_ty: IrType::U32, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(4), op: IrBinOp::LShr, lhs: v(3), rhs: Operand::Const(IrConst::I64(8)), ty: IrType::I64 },
+                load(5),
+                Instruction::Cast { dest: Value(7), src: v(5), from_ty: IrType::U32, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(8), op: IrBinOp::Xor, lhs: v(7), rhs: other, ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(6), op: IrBinOp::Xor, lhs: v(8), rhs: v(4), ty: IrType::I64 },
+            ], terminator: Terminator::CondBranch { cond: v(9), true_label: BlockId(1), false_label: BlockId(2) }, source_spans: Vec::new() },
+            BasicBlock { label: BlockId(2), instructions: vec![], terminator: Terminator::Return(Some(v(2))), source_spans: Vec::new() },
+        ];
+        func
+    }
+
+    #[test]
+    fn unsigned_merged_from_logical_ops_of_zero_extended_values_not_widened() {
+        let widened = |func: &IrFunction| matches!(func.blocks[1].instructions[1], Instruction::Cast { .. });
+        let mut func = crc_loop(Operand::Const(IrConst::I64(0x1234)));
+        elide_extensions(&mut func);
+        assert!(!widened(&func));
+        // A parameter's high bits, or a negative constant's, are not known zero.
+        let mut func = crc_loop(Operand::Value(Value(9)));
+        elide_extensions(&mut func);
+        assert!(widened(&func));
+        let mut func = crc_loop(Operand::Const(IrConst::I64(-1)));
+        elide_extensions(&mut func);
+        assert!(widened(&func));
     }
 
     /// `(v1 << v2) | v3` in int, carried around a loop by a phi and stored

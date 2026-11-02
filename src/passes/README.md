@@ -1489,6 +1489,17 @@ it back to char with an `sxtb` per character of what `ldrsb` loaded
 (31.7M instructions); SQLite speedtest ran 13M fewer, most in
 jsonTranslateBlobToText and balance_nonroot.
 
+A 64-bit and, or or xor of zero-extended values (or constants below
+2^32), or one shifted right by a constant, is zero-extended from the wider
+of them. Each value only moves down, from not yet known, to extended one
+way, to not at all, so a phi of its own narrow type is assumed extended
+until an incoming value shows otherwise, even one defined further on in
+its loop; values a cycle leaves unknown are taken as not extended and the
+rest settled again. scalar-bench's table CRC-32,
+`c = crc_table[(c ^ p[i]) & 0xff] ^ (c >> 8)`, merges a 64-bit xor of the
+table entry and `c` widened and shifted back into the unsigned `c`, and
+widened `c` again with a `mov w, w` per byte (52.4M instructions).
+
 Then an int add, subtract, multiply, logical operation or left shift whose
 uses, through copies and phis, read only its low 31 bits (narrower casts and
 stores, and operations that are themselves such) becomes U32: the backend
