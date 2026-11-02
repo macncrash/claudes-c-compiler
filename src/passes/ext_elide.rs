@@ -291,8 +291,14 @@ fn unread_truncations(func: &mut IrFunction) -> usize {
     for (b, block) in func.blocks.iter().enumerate() {
         for (i, inst) in block.instructions.iter().enumerate() {
             let Instruction::Cast { dest, from_ty, to_ty, .. } = inst else { continue };
-            if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() < from_ty.size() && from_ty.size() <= 8
-                && low_bits_only(func, &uses, dest.0, to_ty.size() * 8, &mut Vec::new())
+            // A narrowing read only in the bits it keeps, or a widening read
+            // only in the bits it extends (jsonBlobAppendNode's
+            // `a[0] = eType | (szPayload << 4)`, the u8 parameter masked with
+            // `and #0xff` for a byte store).
+            let kept = to_ty.size().min(from_ty.size());
+            if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() != from_ty.size() && from_ty.size() <= 8 && to_ty.size() <= 8
+                && (to_ty.size() < from_ty.size() || !uses[dest.0 as usize].is_empty())
+                && low_bits_only(func, &uses, dest.0, kept * 8, &mut Vec::new())
             {
                 dropped.push((b, i));
             }
@@ -524,6 +530,30 @@ mod tests {
         let mut func = int_phi_widened(1);
         elide_extensions(&mut func);
         assert!(matches!(func.blocks[1].instructions[2], Instruction::Cast { .. }));
+    }
+
+    /// jsonBlobAppendNode's `a[0] = eType | (sz << 4)`: a u8 (v1) widened,
+    /// or'ed with a 64-bit value and stored as `store_ty`.
+    fn byte_or_stored(store_ty: IrType) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![BasicBlock { label: BlockId(0), instructions: vec![
+            Instruction::Cast { dest: Value(3), src: v(1), from_ty: IrType::U8, to_ty: IrType::I64 },
+            Instruction::BinOp { dest: Value(4), op: IrBinOp::Or, lhs: v(3), rhs: v(2), ty: IrType::I64 },
+            Instruction::Store { val: v(4), ptr: Value(0), ty: store_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+        ], terminator: Terminator::Return(None), source_spans: Vec::new() }];
+        func
+    }
+
+    #[test]
+    fn widening_read_only_in_its_source_bits_dropped() {
+        let mut func = byte_or_stored(IrType::U8);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[0].instructions[0], Instruction::Copy { dest: Value(3), .. }));
+        // A 16-bit store reads the zeros the extension put above the byte.
+        let mut func = byte_or_stored(IrType::U16);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[0].instructions[0], Instruction::Cast { .. }));
     }
 
     /// `(v1 << v2) | v3` in int, carried around a loop by a phi and stored

@@ -1543,6 +1543,12 @@ in). deflate_fast's `(ush)(strstart - match_start)`, stored as 16 bits and
 decremented in 16 bits for d_code's widening, was masked with
 `and #0xffff` for neither.
 
+A widening read only in the bits it extends becomes a copy the same way:
+jsonBlobAppendNode's `a[0] = eType | (szPayload << 4)` widens its u8
+parameter for the 64-bit or, and stores a byte, and masked the parameter
+with `and #0xff` first. SQLite speedtest ran 19.4M fewer instructions
+(pageFindSlot, cellSizePtrIdxLeaf and jsonBlobAppendNode about 5M each).
+
 ### addr_sink -- Addresses Down to Their Access
 
 Runs after step_sink, on AArch64. `p[i] = expr` computes the address before
