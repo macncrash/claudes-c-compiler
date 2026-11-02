@@ -540,6 +540,17 @@ weighed less than values with many uses spread over the 186 opcode handlers,
 each of which runs for its own opcodes only, and stayed on the stack; SQLite's
 speedtest ran 3.0% fewer instructions once it did not.
 
+A loop is a natural loop: the blocks that reach a back edge's source without
+passing its header. A cycle entered in more than one place (a `goto` into a
+loop's body, irreducible) has none, as the walk back from its source reaches
+the entry. Its loop is then the blocks on the cycle (reachable from its
+header without leaving the loops around it, and leading back to the source),
+taken only where it nests with every other loop. Taken whole, such a walk put
+the entry inside a loop where it got no mass, and every block outside the
+function's later loops weighed nothing: in SQLite's balance_nonroot, the
+loop over the cells of the sibling pages reloaded `b.apCell` from the stack
+for every cell.
+
 With a profile (`-fprofile-use`, `IrFunction::profile`), a block's frequency
 is its count per call instead, capped at a billion runs; blocks made after
 the profile point keep the estimate. A value's weight also counts the

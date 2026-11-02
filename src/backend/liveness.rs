@@ -1596,35 +1596,134 @@ fn find_loops(successors: &[Vec<usize>], num_blocks: usize) -> Vec<(usize, Vec<u
     // in it counted once. (Counted per back edge, sqlite3VdbeExec's
     // dispatch loop, which each opcode's handler jumps back to, nested its
     // blocks hundreds deep, some more than others.)
+    //
+    // A retreating edge whose target does not dominate its source (a cycle
+    // entered in more than one place, irreducible) has no natural loop: the
+    // walk back from its source reaches the entry. Its body is then the
+    // blocks on the cycle (below). (The whole walk took in the entry, which
+    // then got no mass: every block of SQLite's balance_nonroot outside its later loops
+    // weighed nothing to the register allocator, and its hottest loop, over
+    // the cells of the sibling pages, reloaded b.apCell from the stack every
+    // cell.)
     back_edges.sort_unstable_by_key(|&(_, header)| header);
     let mut in_body = vec![false; num_blocks];
     let mut members: Vec<usize> = Vec::new();
+    let mut walked: Vec<usize> = Vec::new();
+    let mut worklist: Vec<usize> = Vec::new();
+    let mut irreducible: Vec<(usize, usize)> = Vec::new();
     for group in back_edges.chunk_by(|a, b| a.1 == b.1) {
         let header = group[0].1;
         in_body[header] = true;
         members.push(header);
-        let mut worklist: Vec<usize> = Vec::new();
         for &(tail, _) in group {
-            if !in_body[tail] {
-                in_body[tail] = true;
-                members.push(tail);
-                worklist.push(tail);
+            if in_body[tail] {
+                continue;
             }
-        }
-        // Backwards from the tails, stopping at the header.
-        while let Some(b) = worklist.pop() {
-            for &pred in &predecessors[b] {
-                if pred < num_blocks && !in_body[pred] {
-                    in_body[pred] = true;
-                    members.push(pred);
-                    worklist.push(pred);
+            // Backwards from the tail, stopping at the header and at blocks
+            // already in the body (whose own walks stayed inside).
+            in_body[tail] = true;
+            walked.push(tail);
+            worklist.push(tail);
+            let mut reached_entry = tail == 0;
+            while let Some(b) = worklist.pop() {
+                for &pred in &predecessors[b] {
+                    if pred < num_blocks && !in_body[pred] {
+                        reached_entry |= pred == 0;
+                        in_body[pred] = true;
+                        walked.push(pred);
+                        worklist.push(pred);
+                    }
                 }
+            }
+            if reached_entry {
+                for &b in &walked {
+                    in_body[b] = false;
+                }
+                walked.clear();
+                irreducible.push((tail, header));
+            } else {
+                members.append(&mut walked);
             }
         }
         for &b in &members {
             in_body[b] = false;
         }
-        loops.push((header, std::mem::take(&mut members)));
+        if members.len() > 1 || group.iter().any(|&(tail, _)| tail == header) {
+            loops.push((header, std::mem::take(&mut members)));
+        } else {
+            members.clear();
+        }
+    }
+    if irreducible.is_empty() {
+        return loops;
+    }
+
+    // The irreducible cycles' blocks: reachable from the header (without
+    // passing through it) and leading back to the source. Each is taken
+    // (joined to its header's loop, if any) only where it nests with every
+    // other loop, as compute_block_freq needs; a cycle through
+    // sqlite3VdbeExec's dispatch loop, entered by a goto into an opcode's
+    // handler, cut across it and scaled the wrong blocks.
+    let mut from_header = vec![false; num_blocks];
+    let mut seen: Vec<usize> = Vec::new();
+    for group in irreducible.chunk_by(|a, b| a.1 == b.1) {
+        let header = group[0].1;
+        let at = loops.iter().position(|(h, _)| *h == header);
+        let mut body: Vec<usize> = at.map_or_else(|| vec![header], |i| loops[i].1.clone());
+        for &b in &body {
+            in_body[b] = true;
+        }
+        // Not through the headers of loops around it: from inside a loop,
+        // its own back edges reach every block of it.
+        let around: Vec<usize> = loops.iter()
+            .filter(|(h, body)| *h != header && body.contains(&header))
+            .map(|(h, _)| *h)
+            .collect();
+        worklist.push(header);
+        while let Some(b) = worklist.pop() {
+            for &s in &successors[b] {
+                if s < num_blocks && s != header && !from_header[s] && !around.contains(&s) {
+                    from_header[s] = true;
+                    seen.push(s);
+                    worklist.push(s);
+                }
+            }
+        }
+        for &(tail, _) in group {
+            if in_body[tail] {
+                continue;
+            }
+            in_body[tail] = true;
+            body.push(tail);
+            worklist.push(tail);
+            while let Some(b) = worklist.pop() {
+                for &pred in &predecessors[b] {
+                    if pred < num_blocks && !in_body[pred] && from_header[pred] {
+                        in_body[pred] = true;
+                        body.push(pred);
+                        worklist.push(pred);
+                    }
+                }
+            }
+        }
+        for &s in &seen {
+            from_header[s] = false;
+        }
+        seen.clear();
+        let nests = loops.iter().enumerate().filter(|&(i, _)| Some(i) != at).all(|(_, (_, other))| {
+            // (One around the header is not inside the cycle.)
+            let shared = other.iter().filter(|&&b| in_body[b]).count();
+            shared == 0 || (shared == other.len() && !other.contains(&header)) || shared == body.len()
+        });
+        for &b in &body {
+            in_body[b] = false;
+        }
+        if nests {
+            match at {
+                Some(i) => loops[i].1 = body,
+                None => loops.push((header, body)),
+            }
+        }
     }
 
     loops
@@ -1896,6 +1995,33 @@ mod tests {
                         vec![8, 9], vec![10], vec![10], vec![]];
         let freq = compute_block_freq(&succ, 11);
         let want = [1.0, 10.0, 2.5, 2.5, 2.5, 1.0, 7.5, 1.0, 0.5, 0.5, 1.0];
+        for (b, (&got, &w)) in freq.iter().zip(&want).enumerate() {
+            assert!((got - w).abs() < 1e-9, "block {b}: {got} != {w}");
+        }
+    }
+
+    /// A cycle entered in two places is a loop of its own blocks; the entry
+    /// stays outside it, with all of the mass.
+    #[test]
+    fn test_block_freq_cycle_entered_twice() {
+        // 0 -> 1, 2 (each half); 1 -> 2; 2 -> 1 / 3 (exit).
+        let succ = vec![vec![1, 2], vec![2], vec![1, 3], vec![]];
+        let freq = compute_block_freq(&succ, 4);
+        let want = [1.0, 10.0, 10.0, 1.0];
+        for (b, (&got, &w)) in freq.iter().zip(&want).enumerate() {
+            assert!((got - w).abs() < 1e-9, "block {b}: {got} != {w}");
+        }
+    }
+
+    /// A cycle entered in two places inside a dispatch loop is a loop
+    /// nested in it, not one around it by way of the dispatch loop's latch.
+    #[test]
+    fn test_block_freq_cycle_entered_twice_inside_a_loop() {
+        // 0 -> 1 (dispatch) -> 2, 3; 2 -> 7 and 3 -> 5 (entering the cycle
+        // 7 -> 5 -> 7 twice); 7 -> 4 (latch) -> 1 / 6 (exit).
+        let succ = vec![vec![1], vec![2, 3], vec![7], vec![5], vec![1, 6], vec![7], vec![], vec![5, 4]];
+        let freq = compute_block_freq(&succ, 8);
+        let want = [1.0, 10.0, 5.0, 5.0, 10.0, 50.0, 1.0, 100.0];
         for (b, (&got, &w)) in freq.iter().zip(&want).enumerate() {
             assert!((got - w).abs() < 1e-9, "block {b}: {got} != {w}");
         }
