@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-02",
-  "ccc_rev": "597b9036",
+  "ccc_rev": "ae30b39c",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -830,6 +830,9 @@
    "status": "pass"
   },
   "cases/int_midpoints_and_shifts": {
+   "status": "pass"
+  },
+  "cases/int_ops_widened_twice": {
    "status": "pass"
   },
   "cases/int_results_and_pointer_walks": {
@@ -5472,7 +5475,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b16addf 0x16b16addf 0x16b16addf 0x16b16addf'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16bd06ddf 0x16bd06ddf 0x16bd06ddf 0x16bd06ddf'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
