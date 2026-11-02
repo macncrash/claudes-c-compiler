@@ -71,6 +71,12 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
         let bits = ty.size() * 8;
         if ty.is_unsigned() { k >= 0 && k < 1 << bits } else { k >= -(1 << (bits - 1)) && k < 1 << (bits - 1) }
     };
+    // Whether a register holding a value extended as `e` holds it extended
+    // as `from` too: the same, or zero-extended from fewer bits than an
+    // unsigned `from` has, or than a signed one's sign bit.
+    let covers = |e: IrType, from: IrType| {
+        e == from || (e.is_unsigned() && (e.size() < from.size() || (from.is_unsigned() && e.size() <= from.size())))
+    };
     // Copies and phis, to a fixpoint (optimistically: a phi is assumed
     // extended until an incoming value shows otherwise).
     let mut changed = true;
@@ -82,10 +88,29 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
             }
         }
     }
-    while changed {
+    // A wider integer phi whose incoming values are all extended one narrow
+    // way holds that extension too (words_kernel's `i < n ? text[i] : ' '`,
+    // a char load or a space, merged as a long): pessimistically, only once
+    // every incoming value is known.
+    let mut rounds = 0;
+    while changed && rounds < 64 {
         changed = false;
+        rounds += 1;
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
             let (dest, ty, ok) = match inst {
+                Instruction::Phi { dest, ty, incoming } if !narrow(ty) && ty.is_integer() => {
+                    let t = incoming.iter().find_map(|(op, _)| match op {
+                        Operand::Value(v) => assumed.get(v.0 as usize).copied().flatten(),
+                        Operand::Const(_) => None,
+                    });
+                    match t {
+                        Some(t) => (dest, t, incoming.iter().all(|(op, _)| match op {
+                            Operand::Value(v) => assumed.get(v.0 as usize) == Some(&Some(t)),
+                            Operand::Const(c) => fits(c, t),
+                        })),
+                        None => (dest, IrType::Void, false),
+                    }
+                }
                 Instruction::Phi { dest, ty, incoming } => (dest, *ty, narrow(ty) && incoming.iter().all(|(op, _)| match op {
                     Operand::Value(v) => assumed.get(v.0 as usize) == Some(&Some(*ty)),
                     Operand::Const(c) => fits(c, *ty),
@@ -94,22 +119,25 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
                     Some(t) => (dest, t, true),
                     None => (dest, IrType::Void, false),
                 },
+                // A widening the loop below makes a copy (the char load
+                // widened before the merge).
+                Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty }
+                    if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
+                    match assumed.get(v.0 as usize).copied().flatten().filter(|&e| covers(e, *from_ty)) {
+                        Some(t) => (dest, t, true),
+                        None => (dest, IrType::Void, false),
+                    },
                 _ => continue,
             };
             let now = if ok { Some(ty) } else { None };
-            if assumed[dest.0 as usize] != now && (now.is_none() || matches!(inst, Instruction::Copy { .. })) {
+            let wide_phi = matches!(inst, Instruction::Phi { ty, .. } if !narrow(ty));
+            if assumed[dest.0 as usize] != now && (now.is_none() || wide_phi || matches!(inst, Instruction::Copy { .. } | Instruction::Cast { .. })) {
                 assumed[dest.0 as usize] = now;
                 changed = true;
             }
         }
     }
     ext = assumed;
-    // Whether a register holding a value extended as `e` holds it extended
-    // as `from` too: the same, or zero-extended from fewer bits than an
-    // unsigned `from` has, or than a signed one's sign bit.
-    let covers = |e: IrType, from: IrType| {
-        e == from || (e.is_unsigned() && (e.size() < from.size() || (from.is_unsigned() && e.size() <= from.size())))
-    };
     // (An elided extension's result is held as its source is, for a mask
     // of it further on.)
     let mut elided = 0;
@@ -118,6 +146,17 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
             Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty }
                 if ext.get(v.0 as usize).copied().flatten().is_some_and(|e| covers(e, from_ty))
                     && from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
+            {
+                *inst = Instruction::Copy { dest, src: Operand::Value(v) };
+                ext[dest.0 as usize] = ext[v.0 as usize];
+                elided += 1;
+            }
+            // A narrowing to the type a value is already extended as (the
+            // char merged as a long, cast back to char: `sxtb` of what
+            // `ldrsb` loaded).
+            Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty }
+                if narrow(&to_ty) && from_ty.is_integer() && from_ty.size() > to_ty.size()
+                    && ext.get(v.0 as usize).copied().flatten().is_some_and(|e| covers(e, to_ty)) =>
             {
                 *inst = Instruction::Copy { dest, src: Operand::Value(v) };
                 ext[dest.0 as usize] = ext[v.0 as usize];
@@ -281,6 +320,37 @@ mod tests {
         // Nor may a parameter's.
         let mut func = byte_phi(Operand::Value(Value(9)));
         assert_eq!(elide_extensions(&mut func), 0);
+    }
+
+    /// `c = i < n ? text[i] : k` as a long phi of a signed char load (widened)
+    /// and a constant, then narrowed back to char: the widening and the
+    /// narrowing are both copies when k fits in a char, neither when not.
+    fn char_merge(k: i64) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![
+            BasicBlock { label: BlockId(0), instructions: vec![
+                Instruction::Load { dest: Value(1), ptr: Value(0), ty: IrType::I8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::Cast { dest: Value(2), src: v(1), from_ty: IrType::I8, to_ty: IrType::I64 },
+            ], terminator: Terminator::CondBranch { cond: v(9), true_label: BlockId(1), false_label: BlockId(2) }, source_spans: Vec::new() },
+            BasicBlock { label: BlockId(1), instructions: vec![], terminator: Terminator::Branch(BlockId(2)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(2), instructions: vec![
+                Instruction::Phi { dest: Value(3), ty: IrType::I64, incoming: vec![(v(2), BlockId(0)), (Operand::Const(IrConst::I64(k)), BlockId(1))] },
+                Instruction::Cast { dest: Value(4), src: v(3), from_ty: IrType::I64, to_ty: IrType::I8 },
+            ], terminator: Terminator::Return(Some(v(4))), source_spans: Vec::new() },
+        ];
+        func
+    }
+
+    #[test]
+    fn char_merged_as_long_and_narrowed_back_is_copied() {
+        let mut func = char_merge(32);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[0].instructions[1], Instruction::Copy { .. }));
+        assert!(matches!(func.blocks[2].instructions[1], Instruction::Copy { dest: Value(4), src: Operand::Value(Value(3)) }));
+        let mut func = char_merge(200);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[2].instructions[1], Instruction::Cast { .. }));
     }
 
     /// `(v1 << v2) | v3` in int, carried around a loop by a phi and stored

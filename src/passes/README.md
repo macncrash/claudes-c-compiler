@@ -1480,6 +1480,15 @@ source type has (or than a signed one's sign bit) serves it too, and a mask
 by 0xff, 0xffff or 0xffffffff of a value zero-extended within it becomes a
 copy (division by a constant masks its 32-bit dividend that way).
 
+A phi wider than the values it merges counts as extended their way when
+all of them are (the widening of an extended value counting as it, and
+constants in range), and a narrowing cast of a value extended as its
+target type becomes a copy. scalar-bench's word splitter merges
+`i < n ? text[i] : ' '` as a long, a char load or a space, and narrowed
+it back to char with an `sxtb` per character of what `ldrsb` loaded
+(31.7M instructions); SQLite speedtest ran 13M fewer, most in
+jsonTranslateBlobToText and balance_nonroot.
+
 Then an int add, subtract, multiply, logical operation or left shift whose
 uses, through copies and phis, read only its low 31 bits (narrower casts and
 stores, and operations that are themselves such) becomes U32: the backend
