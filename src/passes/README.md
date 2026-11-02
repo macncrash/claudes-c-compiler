@@ -445,6 +445,19 @@ last call the same way). scalar-bench's `ht_delete`, 48 instructions in
 vector-bench's `check_all`, called once from `main` outside its loops,
 grew `main`, whose hot `step2` loop then built its two-lane argument on
 the stack, 82M more instructions.
+Such a function is a candidate up to twice those limits before cleanup
+(rather than the cleaned-only 120 instructions in 24 blocks): SQLite's
+`sqlite3VarintValue`, 135 instructions raw and 70 cleaned up, called once
+in `sqlite3BtreeTableMoveto`'s binary search, was a call 9M times
+(39.6M instructions).
+
+**Small callees in recursive callers.** A recursive caller takes only
+callees of at most 20 cleaned-up instructions, since anything inlined
+multiplies its frame by the recursion depth, and in at most 3 blocks. As
+elsewhere, blocks that only return do not count against that: SQLite's
+`jsonAppendChar` (15 instructions in 4 blocks, one a return) was a call
+per character in the recursive `jsonTranslateBlobToText`, and
+`jsonLabelCompare` one per step of `jsonLookupStep` (28.9M instructions).
 
 **Heuristics.** The inliner uses a tiered size-based heuristic:
 

@@ -312,7 +312,7 @@ fn select_inline_site(
         let cleaned = (!is_tiny && !budget_exhausted && !site.in_cleaned_body)
             .then(|| specialized_size_cached(spec_cache, callee_map, &site.callee_name, &site.const_args))
             .flatten()
-            .filter(|c| c.insts <= max_insts && (c.blocks <= max_blocks || (relaxed && c.non_return_blocks <= max_blocks))
+            .filter(|c| c.insts <= max_insts && (c.blocks <= max_blocks || ((relaxed || caller_is_recursive) && c.non_return_blocks <= max_blocks))
                 && (c.insts <= MAX_SPECIALIZED_INLINE_INSTRUCTIONS || c.insts <= budget_remaining));
         if callee_data.wide && !relaxed {
             continue;
@@ -1440,9 +1440,18 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         // of times.
         let linkable = func.is_static
             || (!func.is_weak && !func.is_naked && func.section.is_none());
+        // A static function's only call may take a larger one (see
+        // MAX_SOLE_CALL_INLINE_INSTRUCTIONS), judged by its cleaned size too:
+        // sqlite3VarintValue, 135 instructions before cleanup, in
+        // sqlite3BtreeTableMoveto's binary search.
+        let (raw_insts, raw_blocks) = if sole.contains(func.name.as_str()) {
+            (2 * MAX_SOLE_CALL_INLINE_INSTRUCTIONS, 2 * MAX_SOLE_CALL_INLINE_BLOCKS)
+        } else {
+            (2 * MAX_INLINE_INSTRUCTIONS, MAX_CLEANED_ONLY_RAW_BLOCKS)
+        };
         let cleaned_only = linkable && !func.is_inline && !is_always_inline
             && !is_trivially_empty && !is_small_static && !is_medium_static
-            && inst_count_for_static <= 2 * MAX_INLINE_INSTRUCTIONS && func.blocks.len() <= MAX_CLEANED_ONLY_RAW_BLOCKS;
+            && inst_count_for_static <= raw_insts && func.blocks.len() <= raw_blocks;
         if !is_always_inline && !is_trivially_empty && !is_small_static && !is_medium_static && !cleaned_only
             && (!func.is_static || !func.is_inline) {
                 if debug_callee {
@@ -2351,6 +2360,58 @@ mod tests {
             let (s, _, _, by_cleaned) = picked.expect("inlined for its cleaned-up size");
             assert_eq!((s.callee_name.as_str(), by_cleaned), (name, keeps_calls));
         }
+    }
+
+    /// A static function called once is a candidate up to twice the
+    /// sole-call limits before cleanup (sqlite3VarintValue, 135
+    /// instructions, 70 once cleaned up); called twice, it is held to the
+    /// cleaned-only limits.
+    #[test]
+    fn sole_calls_are_candidates_by_their_own_raw_limits() {
+        let body = |name: &str| {
+            let mut f = IrFunction::new(name.to_string(), IrType::Void, vec![], false);
+            f.is_static = true;
+            f.blocks = cleaned_only_callee(140, 20).blocks;
+            f.blocks.iter_mut().enumerate().for_each(|(b, blk)| {
+                blk.label = BlockId(b as u32);
+                if b + 1 < 20 {
+                    blk.terminator = Terminator::Branch(BlockId(b as u32 + 1));
+                }
+            });
+            f
+        };
+        let mut module = IrModule::new();
+        module.functions.push(caller("main", &["once", "twice", "twice"]));
+        module.functions.push(body("once"));
+        module.functions.push(body("twice"));
+        let map = build_callee_map(&module);
+        assert!(map.get("once").is_some_and(|c| c.sole_call));
+        assert!(!map.contains_key("twice"));
+    }
+
+    /// In a recursive caller a small callee's blocks that only return do not
+    /// count either (jsonAppendChar, 15 instructions in 4 blocks, one a
+    /// return, called per character by the recursive
+    /// jsonTranslateBlobToText); its instructions still do.
+    #[test]
+    fn recursive_callers_take_small_callees_by_their_non_return_blocks() {
+        let mut callee_map: HashMap<String, CalleeData> = HashMap::new();
+        callee_map.insert("append".to_string(), cleaned_only_callee(16, 4));
+        callee_map.insert("bigger".to_string(), cleaned_only_callee(24, 4));
+        let mut cache: HashMap<String, Option<CleanedSize>> = HashMap::new();
+        cache.insert("append".to_string(), Some(CleanedSize { insts: 15, blocks: 4, non_return_blocks: 3 }));
+        cache.insert("bigger".to_string(),
+                     Some(CleanedSize { insts: MAX_SPECIALIZED_INLINE_INSTRUCTIONS + 4, blocks: 4, non_return_blocks: 3 }));
+        let site = |name: &str| InlineCallSite {
+            block_idx: 0, inst_idx: 0, callee_name: name.to_string(), dest: None, args: vec![], const_args: vec![],
+            in_cleaned_body: false, in_loop: false,
+        };
+        let pick = |name: &str, cache: &mut HashMap<String, Option<CleanedSize>>| {
+            select_inline_site(&[site(name)], &callee_map, false, false, false, false, true,
+                               MAX_INLINE_BUDGET_PER_CALLER, MAX_ALWAYS_INLINE_BUDGET_PER_CALLER, cache)
+        };
+        assert!(pick("append", &mut cache).is_some());
+        assert!(pick("bigger", &mut cache).is_none());
     }
 
     #[test]
