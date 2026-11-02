@@ -155,7 +155,7 @@ The optimizer executes in four sequential phases:
          |
          v
  Phi elimination (src/ir/mem2reg), then:
-     loop_rotate, loop_hoist, loop_promote, loop_layout, latch_dup, step_to_load, const_hoist,
+     loop_rotate, loop_hoist, loop_promote, index_base, loop_layout, latch_dup, step_to_load, const_hoist,
      profile point (-fprofile-generate counters / -fprofile-use counts), shrink_split (AArch64)
 ```
 
@@ -1432,6 +1432,20 @@ sign-extended each iteration rather than loaded with `ldrsw`. The field's
 address, when LICM left it in the loop, is made again before the loop from
 the local and the offset.
 
+index_base (index_base.rs) then gives a local array indexed in a loop its
+address in a value. The backend builds a local's address where an
+instruction needs it, folding a constant offset into the access, but an
+index does not fold: `w[len] = c` built `sp + 64` at every letter of
+scalar-bench's word splitter, and its interpreter's `r[in->a]` at every
+instruction. A copy of the local's address goes at the end of each
+predecessor outside the loop, and the loop's indexed GEPs read it, which
+may then take a register. The loop is the largest holding the GEP of at
+most 64 blocks, else the innermost: in sqlite3_str_vappendf, whose format
+loop is the whole function, the value spanned every call and spilled
+(3.9M more instructions), while the word splitter's character loop lets
+one value serve both the letters' stores and the word's hash. scalar-bench
+ran 129M fewer instructions (2.2%), SQLite speedtest 6.5M fewer.
+
 ### ext_elide -- Extensions Loads Already Made
 
 Runs after phi_cmp, on AArch64, followed by copy propagation and dead code
@@ -1896,7 +1910,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`load_phi`, `unread_locals`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_promote`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
+`load_phi`, `unread_locals`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_promote`, `index_base`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -1949,6 +1963,7 @@ behavior across iterations.
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
 | `loop_layout.rs`         | Loop tails moved before the header (latch falls through) |
 | `loop_promote.rs`        | Locals' fields kept in registers through call-free loops |
+| `index_base.rs`          | Indexed local arrays' addresses in values before loops |
 | `loop_rotate.rs`         | Header duplication into latches (bottom-tested loops)  |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
 | `pressure_hoist.rs`      | Instructions hoisted to end several live ranges early  |

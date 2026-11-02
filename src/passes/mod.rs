@@ -31,6 +31,7 @@ pub(crate) mod iv_widen;
 pub(crate) mod lftr;
 mod mem_inline;
 mod sroa;
+pub(crate) mod index_base;
 pub(crate) mod licm;
 mod ext_elide;
 mod step_sink;
