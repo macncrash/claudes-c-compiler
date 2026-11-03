@@ -656,6 +656,7 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
             changed2 |= pass!(drop_redundant_zero_extend(lines, kinds, n));
             changed2 |= pass!(drop_byte_mask_before_compare(lines, kinds, n));
             changed2 |= pass!(fold_mask_into_compare(lines, kinds, n));
+            changed2 |= pass!(fold_low_mask_bound_into_tst(lines, kinds, n));
             changed2 |= pass!(fold_bit_test_into_extract(lines, kinds, n));
             changed2 |= pass!(drop_mask_of_narrow_value(lines, kinds, n));
             changed2 |= pass!(drop_sxtw_of_nonnegative(lines, kinds, n));
@@ -3132,6 +3133,73 @@ fn drop_byte_mask_before_compare(lines: &mut [String], kinds: &mut [LineKind], n
             continue;
         }
         lines[c] = format!("    cmp {}, #{}", xreg_name(t), m);
+        kinds[c] = classify_line(&lines[c]);
+        lines[j] = format!("    b.{} {}", ucc, target);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `and D, S, #(2^n - 1)` compared below a power of two `2^k` (k < n), D
+/// dead after, the one conditional branch reading the flags (on neither
+/// path read again): D is below 2^k when its bits k..n-1 are clear, `tst S,
+/// #mask` with lt/lo as eq and ge/hs as ne. btreeParseCellPtr's
+/// `if( pInfo->nSize<4 )` of a u16: `and x11, x11, #0xffff; cmp w11, #4;
+/// b.ge L` is `tst w11, #0xfffc; b.ne L`. A 32-bit `and` or compare tests
+/// the low halves.
+fn fold_low_mask_bound_into_tst(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let live = live_out_all(lines, kinds, n);
+    let next = |kinds: &[LineKind], mut k: usize| {
+        k += 1;
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
+    for i in 0..n {
+        let and_line = lines[i].clone();
+        let Some(("and", aops)) = split_insn(&and_line) else { continue };
+        let p: Vec<&str> = aops.split(',').map(str::trim).collect();
+        let [dd, ss, mask] = p[..] else { continue };
+        let Some(m) = parse_imm(mask) else { continue };
+        let (Some(d), Some(s)) = (gpr_operand(dd), gpr_operand(ss)) else { continue };
+        // A low mask of n >= 2 bits, short of the sign bit of either width.
+        if m < 3 || m & (m + 1) != 0 || m >= 1 << 31 || d > 28 || s > 28 || dd.starts_with('w') != ss.starts_with('w') {
+            continue;
+        }
+        let c = next(kinds, i);
+        if c >= n {
+            continue;
+        }
+        let cmp_line = lines[c].clone();
+        let Some(("cmp", cops)) = split_insn(&cmp_line) else { continue };
+        let (cr, imm) = first_and_rest(cops);
+        let Some(bound) = parse_imm(imm.trim()) else { continue };
+        if gpr_operand(cr) != Some(d) || bound < 2 || !bound.is_power_of_two() || bound > m || live[c] & (1 << d) != 0 {
+            continue;
+        }
+        let j = next(kinds, c);
+        if j >= n || kinds[j] != LineKind::CondBranch {
+            continue;
+        }
+        let branch = lines[j].clone();
+        let Some((bcc, target)) = split_insn(&branch) else { continue };
+        let ucc = match bcc {
+            "b.lt" | "b.lo" => "eq",
+            "b.ge" | "b.hs" => "ne",
+            _ => continue,
+        };
+        let target = target.trim();
+        let Some(tl) = (0..n).find(|&l| kinds[l] == LineKind::Label && label_name(&lines[l]) == Some(target)) else { continue };
+        if flags_read_from(lines, kinds, j + 1, n) || flags_read_from(lines, kinds, tl, n) {
+            continue;
+        }
+        let wide = dd.starts_with('x') && cr.starts_with('x');
+        let sreg = if wide { xreg_name(s) } else { wreg_name(s) };
+        lines[c] = format!("    tst {}, #{:#x}", sreg, m & !(bound - 1));
         kinds[c] = classify_line(&lines[c]);
         lines[j] = format!("    b.{} {}", ucc, target);
         kinds[j] = classify_line(&lines[j]);
@@ -9462,6 +9530,22 @@ f:
 
     fn ret_x0(body: &str) -> String {
         format!(".globl f\n.type f, %function\nf:\n{RET_X0_MARKER}\n{body}    ret\n.size f, .-f\n")
+    }
+
+    #[test]
+    fn test_low_mask_below_power_of_two_is_a_test() {
+        let f = |cmp: &str, b: &str, after: &str| ret_x0(&format!(
+            "    add x11, x12, x10\n    strh w11, [x2, #22]\n    and x11, x11, #0xffff\n    {cmp}\n    {b} .LBB1\n    mov x0, #4\n    strh w0, [x2, #22]\n.LBB1:\n{after}    mov x0, #1\n"));
+        let result = peephole_optimize(f("cmp w11, #4", "b.ge", ""));
+        assert!(result.contains("tst w11, #0xfffc") && result.contains("b.ne .LBB1") && !result.contains("and x11"), "{}", result);
+        let result = peephole_optimize(f("cmp w11, #16", "b.lo", ""));
+        assert!(result.contains("tst w11, #0xfff0") && result.contains("b.eq .LBB1"), "{}", result);
+        // Not for a bound that is no power of two, nor a condition other than
+        // below/at least, nor with the masked value read again.
+        for body in [f("cmp w11, #5", "b.ge", ""), f("cmp w11, #4", "b.gt", ""),
+                     f("cmp w11, #4", "b.ge", "    str x11, [x3]\n")] {
+            assert!(peephole_optimize(body.clone()).contains("and x11, x11, #0xffff"), "{}", peephole_optimize(body));
+        }
     }
 
     #[test]
