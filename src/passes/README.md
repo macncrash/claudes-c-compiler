@@ -1433,6 +1433,17 @@ of its own each character. ext_elide runs first, with copy propagation
 after it, so the counter's elided extension for the index is the counter
 itself.
 
+Or in any block, when the step reaches a phi of the counter through others
+(a merge of paths before the latch), under the same test of the counter
+dead after that block. An access at a constant offset from the counter
+(`[in, #1]`, the GEP folded into it) reads the counter where the access is,
+so the step goes below it. inflate_fast's `*out++ = (unsigned char)here->val`
+for a literal joins the other codes' paths before the latch, and its refill
+`hold += *in++ << bits` twice read `[in, #1]` after stepping `in` by 2: both
+pointers were moved back into their registers each iteration. zlib ran
+2.4% fewer instructions (inflate_fast 2780M to 2442M, below clang's 2519M),
+scalar-bench 1.0%.
+
 ### loop_rotate -- Loop Rotation
 
 Runs after phi elimination, just before codegen. A latch that branches back

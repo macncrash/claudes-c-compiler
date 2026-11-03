@@ -12,7 +12,10 @@
 //!
 //! Applies to a phi's incoming value that is an add or subtract of the phi
 //! and a constant in the phi's block, when every other use of the phi is an
-//! instruction of that block (not a phi or the terminator). The step goes
+//! instruction of that block (not a phi or the terminator); or to such a
+//! step in any block that some phi takes (one merging paths before the
+//! latch), when the phi is dead after that block. An access at a constant
+//! offset from the phi (`[in, #1]`) reads it where the access is. The step goes
 //! as late as possible: just before its first read in the block, or at the
 //! end (before a compare the branch tests), which must be after the phi's
 //! last use. (Right after that use, an
@@ -42,6 +45,33 @@ pub(crate) fn sink_steps(func: &mut IrFunction) -> usize {
             }
         }
     }
+    // Steps of phis feeding some phi from anywhere: through a merge
+    // (inflate_fast's `*out++ = here->val` for a literal, joining the
+    // other codes' paths before the loop's latch), by phi -> steps.
+    let mut is_phi = vec![false; max_id + 1];
+    let mut feeds_phi = vec![false; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                is_phi[dest.0 as usize] = true;
+                for (op, _) in incoming {
+                    if let Operand::Value(v) = op {
+                        feeds_phi[v.0 as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut steps_of: crate::common::fx_hash::FxHashMap<u32, Vec<(Value, usize)>> = Default::default();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Instruction::BinOp { dest, op: IrBinOp::Add | IrBinOp::Sub, lhs: Operand::Value(l), rhs: Operand::Const(_), .. } = inst {
+                if is_phi[l.0 as usize] && feeds_phi[dest.0 as usize] {
+                    steps_of.entry(l.0).or_default().push((*dest, b));
+                }
+            }
+        }
+    }
     let mut moved = 0;
     for h in 0..func.blocks.len() {
         // (phi, step, block stepping) in this block.
@@ -53,6 +83,11 @@ pub(crate) fn sink_steps(func: &mut IrFunction) -> usize {
                 let sb = def_block[s.0 as usize];
                 if sb == h || (sb != usize::MAX && func.blocks[sb].label == *from) {
                     pairs.push((*dest, *s, sb));
+                }
+            }
+            for &(s, sb) in steps_of.get(&dest.0).into_iter().flatten() {
+                if !pairs.iter().any(|&(_, t, _)| t == s) {
+                    pairs.push((*dest, s, sb));
                 }
             }
         }
@@ -73,6 +108,17 @@ pub(crate) fn sink_steps(func: &mut IrFunction) -> usize {
                     Some((ub, ui)) if ub == b && !matches!(insts[ui], Instruction::Phi { .. }) => {
                         if ui != at {
                             last = last.max(Some(ui));
+                        }
+                        // A constant offset from the phi is folded into the
+                        // accesses using it (`[in, #1]`), which read the
+                        // phi there: inflate_fast's `hold += *in++ << bits`
+                        // twice, stepping in before the second load.
+                        if let Instruction::GetElementPtr { dest, offset: Operand::Const(_), .. } = insts[ui] {
+                            for g in uses[dest.0 as usize].iter().flatten() {
+                                if g.0 == b {
+                                    last = last.max(Some(g.1));
+                                }
+                            }
                         }
                     }
                     _ if b != h => {}
@@ -429,6 +475,44 @@ mod tests {
             BasicBlock { label: BlockId(4), instructions: vec![], terminator: Terminator::Return(Some(v(10))), source_spans: Vec::new() },
         ];
         func
+    }
+
+    /// inflate_fast's refill, `hold += *in++; hold += *in++` when bits are
+    /// short: the pointer's step (v11) reaches the loop's phi (v10) through
+    /// the merge after the refill (v20), and its second load reads
+    /// `[in, #1]` after the step.
+    fn refill() -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let load = |dest, ptr| Instruction::Load { dest: Value(dest), ptr: Value(ptr), ty: IrType::U8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(0, vec![], Terminator::Branch(BlockId(1))),
+            block(1, vec![
+                Instruction::Phi { dest: Value(10), ty: IrType::Ptr, incoming: vec![(v(0), BlockId(0)), (v(20), BlockId(3))] },
+            ], Terminator::CondBranch { cond: v(1), true_label: BlockId(2), false_label: BlockId(3) }),
+            block(2, vec![
+                Instruction::GetElementPtr { dest: Value(12), base: Value(10), offset: Operand::Const(IrConst::I64(1)), ty: IrType::Ptr },
+                load(13, 10),
+                Instruction::BinOp { dest: Value(11), op: IrBinOp::Add, lhs: v(10), rhs: Operand::Const(IrConst::I64(2)), ty: IrType::I64 },
+                load(14, 12),
+            ], Terminator::Branch(BlockId(3))),
+            block(3, vec![
+                Instruction::Phi { dest: Value(20), ty: IrType::Ptr, incoming: vec![(v(11), BlockId(2)), (v(10), BlockId(1))] },
+            ], Terminator::CondBranch { cond: v(2), true_label: BlockId(1), false_label: BlockId(4) }),
+            block(4, vec![], Terminator::Return(None)),
+        ];
+        func
+    }
+
+    #[test]
+    fn step_through_a_merge_moves_after_an_access_at_an_offset_of_the_counter() {
+        let mut func = refill();
+        assert_eq!(sink_steps(&mut func), 1);
+        assert!(matches!(func.blocks[2].instructions[..], [
+            Instruction::GetElementPtr { .. }, Instruction::Load { .. }, Instruction::Load { .. },
+            Instruction::BinOp { dest: Value(11), .. },
+        ]), "{:?}", func.blocks[2].instructions);
     }
 
     #[test]
