@@ -387,6 +387,14 @@ fn low_bits_only(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32
             Instruction::Cast { from_ty, to_ty, .. } => fits(to_ty) || (fits(from_ty) && to_ty.is_integer() && to_ty.size() > from_ty.size()),
             Instruction::Store { val: Operand::Value(x), ptr, ty, .. } => x.0 == v && ptr.0 != v && fits(ty),
             Instruction::Copy { dest, .. } | Instruction::Phi { dest, .. } => low_bits_only(func, uses, dest.0, bits, seen),
+            // A compare of 32 or 64 bits within `bits` (narrower ones
+            // compare whole w registers, the bits above included).
+            Instruction::Cmp { ty, .. } => fits(ty) && ty.size() >= 4,
+            // A value chosen (not the condition, tested whole): the
+            // select's low bits are the chosen operand's (allocateBtreePage's
+            // closest distance, `sqlite3AbsInt32(..)` kept as the minimum).
+            Instruction::Select { dest, cond, .. } => !matches!(cond, Operand::Value(c) if c.0 == v)
+                && low_bits_only(func, uses, dest.0, bits, seen),
             // The low bits of these depend only on the operands' low bits,
             // whatever the width they are computed in.
             Instruction::BinOp { dest, op, lhs, rhs, ty } if ty.is_integer() && ty.size() <= 8 => {
@@ -662,6 +670,35 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
         func.blocks = vec![BasicBlock { label: BlockId(0), instructions: insts, terminator: Terminator::Return(Some(v(8))), source_spans: Vec::new() }];
         func
+    }
+
+    /// `d = (int)x; m = d < m0 ? d : m0; *p = m`, with `cmp_ty` the
+    /// compare's type; `d` is the select's condition too when `as_cond`.
+    fn min_of_truncated(cmp_ty: IrType, as_cond: bool) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let insts = vec![
+            Instruction::Cast { dest: Value(3), src: v(1), from_ty: IrType::I64, to_ty: IrType::I32 },
+            Instruction::Cmp { dest: Value(4), op: crate::ir::reexports::IrCmpOp::Slt, lhs: v(3), rhs: v(2), ty: cmp_ty },
+            Instruction::Select { dest: Value(5), cond: v(if as_cond { 3 } else { 4 }), true_val: v(3), false_val: v(2), ty: IrType::I32 },
+            Instruction::Store { val: v(5), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+        ];
+        let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![BasicBlock { label: BlockId(0), instructions: insts, terminator: Terminator::Return(None), source_spans: Vec::new() }];
+        func
+    }
+
+    #[test]
+    fn truncation_compared_and_selected_in_its_bits_dropped() {
+        let mut func = min_of_truncated(IrType::I32, false);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[0].instructions[0], Instruction::Copy { dest: Value(3), .. }));
+        // A byte compare reads the whole w register; a select's condition
+        // is tested whole.
+        for (ty, as_cond) in [(IrType::I8, false), (IrType::I32, true)] {
+            let mut func = min_of_truncated(ty, as_cond);
+            elide_extensions(&mut func);
+            assert!(matches!(func.blocks[0].instructions[0], Instruction::Cast { .. }), "{ty:?} {as_cond}");
+        }
     }
 
     #[test]

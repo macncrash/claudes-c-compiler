@@ -642,6 +642,11 @@ fn sink_phi_restores_in_function(func: &mut IrFunction) {
         }
         let block = &mut func.blocks[b];
         let restores: Vec<Instruction> = block.instructions.iter().zip(&moved).filter(|(_, &m)| m).map(|(i, _)| i.clone()).collect();
+        // Spans out of step with the instructions (an earlier pass's) say
+        // nothing about which line is which: dropped.
+        if block.source_spans.len() != moved.len() {
+            block.source_spans.clear();
+        }
         let mut i = 0;
         block.instructions.retain(|_| { i += 1; !moved[i - 1] });
         if !block.source_spans.is_empty() {
@@ -820,6 +825,16 @@ mod tests {
         assert_eq!(copies(2), vec![(21, 4), (2, 21)]);
         // Latch 3 swaps them, through the temporaries.
         assert_eq!(copies(3), vec![(20, 2), (21, 1), (1, 20), (2, 21)]);
+    }
+
+    #[test]
+    fn phi_restores_move_from_a_head_whose_spans_are_out_of_step() {
+        // An earlier pass left the head one span more than instructions.
+        let mut func = dispatch(false);
+        func.blocks[1].source_spans = vec![crate::common::source::Span::dummy(); 4];
+        sink_phi_restores_in_function(&mut func);
+        assert_eq!(func.blocks[1].instructions.len(), 1);
+        assert!(func.blocks[1].source_spans.is_empty());
     }
 
     #[test]
