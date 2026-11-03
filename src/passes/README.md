@@ -1716,6 +1716,17 @@ mostly from it (insertCellFast's), and splitting those cost 9M. Profiled,
 speedtest runs 30M fewer instructions (vdbeSorterCompareInt 16M,
 sqlite3VdbeFreeCursorNN 10M).
 
+With a profile, the slow region may also have up to four entries: each edge
+into one gets a split block of its own, copying the values live into that
+entry (the renaming in the slow region is the same for all), and the fast
+blocks are followed by all the split blocks. The share of calls that leave
+by the fast returns counts every entry. applyAffinity's checks on the
+affinity and the flags each lead to their own conversion call, and now
+return without a frame (4M of the profiled speedtest's 10M). Without a
+profile a fast region of early checks (moveToRoot's) is split as readily
+as one that mostly returns, and the copies on its several entries cost
+7M there, so one entry is still required.
+
 ### const_hoist -- Loop Constants Built Once
 
 Runs last, after step_to_load, where no copy propagation folds constants

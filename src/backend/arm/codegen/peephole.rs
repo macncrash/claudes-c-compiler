@@ -5060,9 +5060,18 @@ fn epilogue_after(lines: &[String], kinds: &[LineKind], from: usize, end: usize,
 //   ret                              .L1:
 // .L1:                                 ...
 //
+// The fast blocks may also branch to later blocks that nothing falls into
+// (shrink_split's blocks on the edges into the slow region's other
+// entries): each gets a copy of the prologue under a label of its own,
+// which the fast blocks' branches there take. Nothing after the fast blocks
+// may go back into them, or it would run into a prologue again
+// (sqlite3_free_filename's scan for four zero bytes).
+//
 // The fast blocks run with the CFA at sp and the return address in x30, as
 // the CFI before the moved prologue says; the blocks after it with the
-// frame, as its CFI says. Functions with jump tables (`br`) are left alone.
+// frame, as its CFI says. With several copies, the state before the first
+// is remembered (`.cfi_remember_state`) and restored before each other.
+// Functions with jump tables (`br`) are left alone.
 
 /// One straight-line run of a function body: its lines (indices into the
 /// line list), the label it starts with, the labels its branches go to,
@@ -5106,15 +5115,28 @@ fn shrink_wrap(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<Li
     let mut retarget: Vec<(usize, String, String)> = Vec::new();
     let mut count = 0usize;
     for (start, end) in function_ranges(&lines, n) {
-        if let Some((at, prologue, drop, retargets)) = shrink_wrap_plan(&lines, &kinds, start, end) {
-            let label = format!(".Lsw_{count}");
-            count += 1;
-            let mut block = vec![format!("{label}:")];
-            block.extend(prologue.iter().map(|&k| lines[k].clone()));
-            insert.insert(at, block);
+        if let Some((sites, prologue, drop)) = shrink_wrap_plan(&lines, &kinds, start, end) {
+            let several = sites.len() > 1;
+            let last = sites.len() - 1;
+            for (i, (at, retargets)) in sites.into_iter().enumerate() {
+                let label = format!(".Lsw_{count}");
+                count += 1;
+                let mut block = vec![format!("{label}:")];
+                // Each site starts without the frame: the unwind state
+                // before the first prologue, remembered there and restored
+                // at the others.
+                if i > 0 {
+                    block.push("    .cfi_restore_state".to_string());
+                }
+                if several && i < last {
+                    block.push("    .cfi_remember_state".to_string());
+                }
+                block.extend(prologue.iter().map(|&k| lines[k].clone()));
+                insert.insert(at, block);
+                retarget.extend(retargets.into_iter().map(|(k, old)| (k, old, label.clone())));
+            }
             dropped.extend(prologue);
             dropped.extend(drop);
-            retarget.extend(retargets.into_iter().map(|(k, old)| (k, old, label.clone())));
         }
     }
     if insert.is_empty() {
@@ -5151,12 +5173,15 @@ fn replace_label_operand(line: &str, old: &str, new: &str) -> String {
     }
 }
 
-/// For one function: where the prologue goes (the line of the first block
-/// that needs the frame), the prologue's lines, the epilogue lines the fast
-/// blocks drop, and the fast blocks' branches into that block (line, label).
+/// For one function: where the prologue goes, with the fast blocks'
+/// branches there (line, label) -- the first block that needs the frame,
+/// and blocks after it the fast blocks branch to that are not fallen into
+/// (shrink_split's blocks on the edges into the slow region's other
+/// entries) --, the prologue's lines, and the epilogue lines the fast
+/// blocks drop.
 #[allow(clippy::type_complexity)]
 fn shrink_wrap_plan(lines: &[String], kinds: &[LineKind], start: usize, end: usize)
-                    -> Option<(usize, Vec<usize>, Vec<usize>, Vec<(usize, String)>)> {
+                    -> Option<(Vec<(usize, Vec<(usize, String)>)>, Vec<usize>, Vec<usize>)> {
     let live: Vec<usize> = (start..end).filter(|&k| kinds[k] != LineKind::Nop).collect();
     // Header: the function's label and directives, then the prologue.
     let mut i = 0;
@@ -5270,29 +5295,49 @@ fn shrink_wrap_plan(lines: &[String], kinds: &[LineKind], start: usize, end: usi
         }
         Some(s)
     };
+    // A later block the fast blocks may enter too, with its own copy of the
+    // prologue: one not fallen into, with a label.
+    let other_entry = |x: usize| x < blocks.len() && !blocks[x - 1].falls_through && blocks[x].label.is_some();
     let free = needs.iter().take_while(|&&n| !n).count();
     let t = (1..=free.min(blocks.len() - 1)).rev().find(|&t| {
+        let mut sites: Vec<usize> = (0..t).filter_map(succ).flatten().filter(|&x| x > t).collect();
+        sites.sort_unstable();
+        sites.dedup();
         blocks[..t].iter().any(|blk| !blk.epilogue.is_empty())
-            && (0..t).all(|b| succ(b).is_some_and(|s| s.iter().all(|&x| x <= t)))
+            && (0..t).all(|b| succ(b).is_some_and(|s| s.iter().all(|&x| x <= t || other_entry(x))))
+            && sites.len() < MAX_WRAP_SITES
+            // Nothing after them enters the fast blocks, whose returns lose
+            // their epilogues.
+            && (t..blocks.len()).all(|b| succ(b).is_some_and(|s| s.iter().all(|&x| x >= t)))
     })?;
-    let label = blocks[t].label.clone();
-    let mut retargets = Vec::new();
-    for blk in &blocks[..t] {
-        for &k in &blk.lines {
-            if matches!(kinds[k], LineKind::CondBranch | LineKind::CmpBranch | LineKind::Branch)
-                && label.as_deref().is_some_and(|l| last_operand(split_insn(&lines[k]).map_or("", |s| s.1)) == l) {
-                retargets.push((k, label.clone().unwrap()));
+    let mut entries: Vec<usize> = (0..t).filter_map(succ).flatten().filter(|&x| x > t).collect();
+    entries.sort_unstable();
+    entries.dedup();
+    let mut sites = Vec::new();
+    for x in std::iter::once(t).chain(entries) {
+        let label = blocks[x].label.clone();
+        let mut retargets = Vec::new();
+        for blk in &blocks[..t] {
+            for &k in &blk.lines {
+                if matches!(kinds[k], LineKind::CondBranch | LineKind::CmpBranch | LineKind::Branch)
+                    && label.as_deref().is_some_and(|l| last_operand(split_insn(&lines[k]).map_or("", |s| s.1)) == l) {
+                    retargets.push((k, label.clone().unwrap()));
+                }
             }
         }
+        // The prologue goes before the block's label (or first line).
+        let at = match &label {
+            Some(l) => *live.iter().find(|&&k| kinds[k] == LineKind::Label && label_name(&lines[k]) == Some(l.as_str()))?,
+            None => *blocks[x].lines.first()?,
+        };
+        sites.push((at, retargets));
     }
-    // The prologue goes before the boundary block's label (or first line).
-    let at = match &label {
-        Some(l) => *live.iter().find(|&&k| kinds[k] == LineKind::Label && label_name(&lines[k]) == Some(l.as_str()))?,
-        None => *blocks[t].lines.first()?,
-    };
     let drop: Vec<usize> = blocks[..t].iter().flat_map(|blk| blk.epilogue.iter().copied()).collect();
-    Some((at, prologue, drop, retargets))
+    Some((sites, prologue, drop))
 }
+
+/// Most places a moved prologue is copied to.
+const MAX_WRAP_SITES: usize = 4;
 
 /// The epilogue right before a block's last line (its `ret` or tail call):
 /// callee-saved restores and the frame record's pop, which must be there.
@@ -7220,12 +7265,17 @@ fn function_liveness_with(lines: &[String], kinds: &[LineKind], start: usize, en
             }
         }
     }
-    // A call reads only the argument registers its marker names.
+    // A call reads only the argument registers its marker names, and an
+    // indirect call its target (which may be one of x0-x7 too).
     for k in body.clone() {
         if kinds[k] == LineKind::Call {
             if let Some(m) = call_uses(lines, kinds, k, start) {
+                let target = match split_insn(&lines[k]) {
+                    Some(("blr", ops)) => regs_in(ops),
+                    _ => 0,
+                };
                 let info = &mut infos[k - start];
-                info.uses = (info.uses & !ARG_REGS) | (m & ARG_REGS);
+                info.uses = (info.uses & !ARG_REGS) | (m & ARG_REGS) | target;
             }
         }
     }
@@ -9041,6 +9091,28 @@ f:
         assert!(!kept.contains(".Lsw_"), "{kept}");
     }
 
+    #[test]
+    fn test_shrink_wrap_copies_prologue_to_each_slow_entry() {
+        let head = ".type f, %function\nf:\n.cfi_startproc\n    stp x29, x30, [sp, #-32]!\n    .cfi_def_cfa_offset 32\n    \
+                    .cfi_offset x29, -32\n    .cfi_offset x30, -24\n    mov x29, sp\n    .cfi_def_cfa_register x29\n    \
+                    str x20, [sp, #16]\n";
+        let slow = |l: &str, f: &str, back: &str| format!("{l}:\n    mov x20, x1\n    bl {f}\n{back}    add x0, x0, x20\n    \
+                    ldr x20, [sp, #16]\n    ldp x29, x30, [sp], #32\n    ret\n");
+        let body = |back: &str| format!("{head}.L0:\n    cbz w0, .L2\n    cbnz w2, .L1\n    mov x0, #7\n    ldr x20, [sp, #16]\n    \
+                    ldp x29, x30, [sp], #32\n    ret\n{}{}.cfi_endproc\n.size f, .-f\n", slow(".L1", "g", ""), slow(".L2", "h", back));
+        let result = peephole_optimize(body(""));
+        assert!(result.contains("cbz w0, .Lsw_1\n") && result.contains("cbnz w2, .Lsw_0\n"), "{result}");
+        assert_eq!(result.matches("stp x29, x30, [sp, #-32]!").count(), 2, "{result}");
+        let (s0, s1) = (result.find(".Lsw_0:").unwrap(), result.find(".Lsw_1:").unwrap());
+        assert!(result.find("mov x0, #7\n    ret").unwrap() < s0 && s0 < result.find(".L1:").unwrap(), "{result}");
+        assert!(result.find(".L1:").unwrap() < s1 && s1 < result.find(".L2:").unwrap(), "{result}");
+        assert!(result[s0..s1].contains(".cfi_remember_state") && result[s1..].contains(".cfi_restore_state"), "{result}");
+        // Not when a later block goes back into the frameless blocks: they
+        // would run into the prologue again.
+        let kept = peephole_optimize(body("    cbz w0, .L0\n"));
+        assert!(!kept.contains(".Lsw_"), "{kept}");
+    }
+
     /// Functions are optimized one at a time, unless a function's label is
     /// used outside it: a computed goto's label table keeps its blocks.
     #[test]
@@ -9390,6 +9462,15 @@ f:
 
     fn ret_x0(body: &str) -> String {
         format!(".globl f\n.type f, %function\nf:\n{RET_X0_MARKER}\n{body}    ret\n.size f, .-f\n")
+    }
+
+    #[test]
+    fn test_indirect_call_through_argument_register_reads_it() {
+        // The function pointer waits in x4, which the call's argument marker
+        // (x0-x2) does not name: the copy into it stays.
+        let body = "    stp x29, x30, [sp, #-16]!\n    mov x29, sp\n    mov x4, x3\n    mov x0, #1\n    .ccc_call_uses 0x7\n    blr x4\n    ldp x29, x30, [sp], #16\n";
+        let result = peephole_optimize(ret_x0(body));
+        assert!(result.contains("mov x4, x3") || result.contains("blr x3") || result.contains("br x3"), "{}", result);
     }
 
     #[test]

@@ -21,12 +21,17 @@
 //! block when the fast blocks need no frame (no stack, no callee-saved
 //! register) and drops their epilogues.
 //!
+//! With a profile the slow region may have a few entries, each edge into
+//! one getting a split block of its own (applyAffinity's conversions each
+//! called from its own check); the backend copies the prologue to each.
+//!
 //! Runs last, after phi elimination (values may have several definitions:
 //! every occurrence in the slow region is renamed) and const_hoist (whose
 //! hoisted constants the slow region gets copies of too). Functions are left
-//! alone when the slow region has several entries, when the fast region
-//! never returns, or when anything there needs the stack (an alloca's
-//! address, 128-bit arithmetic, intrinsics that call out, inline asm).
+//! alone when the slow region has several entries (without a profile) or
+//! more than four, when the fast region never returns, or when anything
+//! there needs the stack (an alloca's address, 128-bit arithmetic,
+//! intrinsics that call out, inline asm).
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{BasicBlock, BlockId, Instruction, IrConst, IrFunction, IrModule, Operand, Terminator, Value};
@@ -41,6 +46,10 @@ const MAX_CLONED_EXIT: usize = 4;
 
 /// Most instructions (and terminators) in the fast region.
 const MAX_FAST: usize = 64;
+
+/// Most entries into the slow region, with a profile (each gets a split
+/// block, and the backend a copy of the prologue).
+const MAX_ENTRIES: usize = 4;
 
 /// Callees that return twice: their caller's frame must exist from the start.
 const RETURNS_TWICE: &[&str] = &["setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp", "savectx", "vfork", "getcontext"];
@@ -227,20 +236,26 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
     if !(0..nb).any(|b| !slow[b] && matches!(func.blocks[b].terminator, Terminator::Return(_))) {
         return 0;
     }
-    let entries: FxHashSet<usize> = (0..nb).filter(|&b| !slow[b]).flat_map(|b| succs[b].iter().copied()).filter(|&s| slow[s]).collect();
-    if entries.len() != 1 {
+    let mut entries: Vec<usize> = (0..nb).filter(|&b| !slow[b]).flat_map(|b| succs[b].iter().copied()).filter(|&s| slow[s]).collect();
+    entries.sort_unstable();
+    entries.dedup();
+    // Several entries only with a profile: without one, a fast region of
+    // early checks whose returns are rare error paths (moveToRoot's) is
+    // split as readily as one that returns on most calls, and every entry's
+    // copies then cost the calls that go on.
+    let max_entries = if func.profile.is_some() { MAX_ENTRIES } else { 1 };
+    if entries.is_empty() || entries.len() > max_entries {
         return 0;
     }
-    let entry = *entries.iter().next().unwrap();
     // With a profile, only where the fast returns are taken often enough
     // (an exit taken on a few calls in a hundred saves its prologue there,
     // and costs the slow path's copies on all the others).
     if let Some(profile) = &func.profile {
         let count = |b: usize| profile.get(&func.blocks[b].label.0).copied().unwrap_or(0);
-        // (The calls that do not enter the slow region by its one entry: the
+        // (The calls that do not enter the slow region by its entries: the
         // copied exits have no counts of their own.)
         let calls = count(0);
-        let fast = calls.saturating_sub(count(entry));
+        let fast = calls.saturating_sub(entries.iter().map(|&e| count(e)).sum());
         if calls == 0 || fast.saturating_mul(10) < calls.saturating_mul(MIN_FAST_TENTHS) {
             return 0;
         }
@@ -272,7 +287,7 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
     if shared.is_empty() {
         return 0;
     }
-    let live_in = live_into(func, &succs, entry, &shared);
+    let live_ins: Vec<FxHashSet<u32>> = entries.iter().map(|&e| live_into(func, &succs, e, &shared)).collect();
     let mut next = func.next_value_id.max(func.max_value_id() + 1);
     let rename: FxHashMap<u32, Value> = shared.iter().map(|&v| {
         next += 1;
@@ -285,10 +300,7 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
         block.instructions = block.instructions.iter().map(|i| remap_instruction(i, &remap)).collect();
         block.terminator = remap_terminator(&block.terminator, &remap);
     }
-    // The split block on the edges into the slow region.
-    let target = func.blocks[entry].label;
-    let label = BlockId(*next_label);
-    *next_label += 1;
+    // A split block on the edges into each entry of the slow region.
     // A constant (const_hoist's, defined once) is made again rather than
     // copied, so what reads it still sees the constant (the multiply-high
     // of sqlite3Int64ToText's division by 100).
@@ -303,20 +315,31 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
             };
         }
     }
-    let copies: Vec<Instruction> = shared.iter().filter(|v| live_in.contains(v)).map(|v| match defs.get(v) {
-        Some(&(1, Some(c))) => Instruction::Copy { dest: rename[v], src: Operand::Const(c) },
-        _ => Instruction::Copy { dest: rename[v], src: Operand::Value(Value(*v)) },
-    }).collect();
-    func.split_copies.extend(copies.iter().filter(|c| matches!(c, Instruction::Copy { src: Operand::Value(_), .. }))
-        .filter_map(|c| c.dest()));
-    for b in (0..nb).filter(|&b| !slow[b]) {
-        retarget(&mut func.blocks[b].terminator, target, label);
+    let mut splits = Vec::new();
+    for (&entry, live_in) in entries.iter().zip(&live_ins) {
+        let target = func.blocks[entry].label;
+        let label = BlockId(*next_label);
+        *next_label += 1;
+        let copies: Vec<Instruction> = shared.iter().filter(|v| live_in.contains(v)).map(|v| match defs.get(v) {
+            Some(&(1, Some(c))) => Instruction::Copy { dest: rename[v], src: Operand::Const(c) },
+            _ => Instruction::Copy { dest: rename[v], src: Operand::Value(Value(*v)) },
+        }).collect();
+        for c in &copies {
+            if let Instruction::Copy { dest, src: Operand::Value(_) } = c {
+                if !func.split_copies.contains(dest) {
+                    func.split_copies.push(*dest);
+                }
+            }
+        }
+        for b in (0..nb).filter(|&b| !slow[b]) {
+            retarget(&mut func.blocks[b].terminator, target, label);
+        }
+        splits.push(BasicBlock { label, instructions: copies, terminator: Terminator::Branch(target), source_spans: Vec::new() });
     }
-    let split = BasicBlock { label, instructions: copies, terminator: Terminator::Branch(target), source_spans: Vec::new() };
-    // Fast blocks first, then the split block, then the slow ones.
+    // Fast blocks first, then the split blocks, then the slow ones.
     let blocks = std::mem::take(&mut func.blocks);
     let (fast, rest): (Vec<_>, Vec<_>) = blocks.into_iter().zip(slow).partition(|(_, s)| !s);
-    func.blocks = fast.into_iter().map(|(b, _)| b).chain([split]).chain(rest.into_iter().map(|(b, _)| b)).collect();
+    func.blocks = fast.into_iter().map(|(b, _)| b).chain(splits).chain(rest.into_iter().map(|(b, _)| b)).collect();
     1
 }
 
@@ -450,6 +473,56 @@ mod tests {
         // The tail call's block still reads the original.
         let Instruction::Call { info, .. } = &f.blocks[3].instructions[0] else { panic!() };
         assert!(matches!(info.args[0], Operand::Value(Value(1))));
+    }
+
+    /// f(p): if (p == 0) return 7; if (p == 1) return g() + p; if (p == 2)
+    /// return h() * p; return 8 -- two calls, each entered from the fast blocks: with a profile, a
+    /// split block on each edge, both copying p; without one, left alone.
+    #[test]
+    fn each_entry_into_the_slow_region_gets_a_split_block_with_a_profile() {
+        let v = |n: u32| Operand::Value(Value(n));
+        let make = || {
+            let mut f = IrFunction::new("f".to_string(), IrType::I64, vec![], false);
+            let cmp = |dest: u32, k: i64| Instruction::Cmp { dest: Value(dest), op: IrCmpOp::Eq, lhs: v(1), rhs: Operand::Const(IrConst::I64(k)), ty: IrType::I64 };
+            let binop = |dest: u32, op, lhs: u32| Instruction::BinOp { dest: Value(dest), op, lhs: v(lhs), rhs: v(1), ty: IrType::I64 };
+            f.blocks = vec![
+                block(0, vec![Instruction::ParamRef { dest: Value(1), param_idx: 0, ty: IrType::I64 }, cmp(2, 0)],
+                      Terminator::CondBranch { cond: v(2), true_label: BlockId(1), false_label: BlockId(2) }),
+                block(1, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(7))))),
+                block(2, vec![cmp(3, 1)], Terminator::CondBranch { cond: v(3), true_label: BlockId(3), false_label: BlockId(5) }),
+                block(5, vec![cmp(8, 2)], Terminator::CondBranch { cond: v(8), true_label: BlockId(4), false_label: BlockId(6) }),
+                block(6, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(8))))),
+                block(3, vec![call("g", Some(4), vec![]), binop(5, crate::ir::reexports::IrBinOp::Add, 4)], Terminator::Return(Some(v(5)))),
+                block(4, vec![call("h", Some(6), vec![]), binop(7, crate::ir::reexports::IrBinOp::Mul, 6)], Terminator::Return(Some(v(7)))),
+            ];
+            f.next_value_id = 9;
+            f
+        };
+        let mut next_label = 10;
+        let mut f = make();
+        assert_eq!(split_function(&mut f, &mut next_label), 0);
+        let mut f = make();
+        f.profile = Some([(0, 100), (1, 60), (2, 40), (5, 30), (6, 20), (3, 10), (4, 10)].into_iter().collect());
+        assert_eq!(split_function(&mut f, &mut next_label), 1);
+        let labels: Vec<u32> = f.blocks.iter().map(|b| b.label.0).collect();
+        // The fast blocks, a split block per entry, then the slow blocks.
+        assert_eq!(labels, [0, 1, 2, 5, 6, 10, 11, 3, 4]);
+        assert!(matches!(f.blocks[2].terminator, Terminator::CondBranch { true_label: BlockId(10), .. }));
+        assert!(matches!(f.blocks[3].terminator, Terminator::CondBranch { true_label: BlockId(11), .. }));
+        let copy = |b: &BasicBlock| match b.instructions[..] {
+            [Instruction::Copy { dest, src: Operand::Value(Value(1)) }] => dest,
+            _ => panic!("{:?}", b.instructions),
+        };
+        let (c3, c4) = (copy(&f.blocks[5]), copy(&f.blocks[6]));
+        assert_eq!(c3, c4);
+        assert!(matches!(f.blocks[5].terminator, Terminator::Branch(BlockId(3))));
+        assert!(matches!(f.blocks[6].terminator, Terminator::Branch(BlockId(4))));
+        // Both slow blocks read the copy.
+        for b in &f.blocks[7..] {
+            let Instruction::BinOp { rhs: Operand::Value(r), .. } = b.instructions[1] else { panic!() };
+            assert_eq!(r, c3);
+        }
+        assert_eq!(f.split_copies, [c3]);
     }
 
     /// f(p): r = p == 0 ? 7 : g() + p; return r -- both paths end at one
