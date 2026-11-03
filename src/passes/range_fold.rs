@@ -648,6 +648,33 @@ impl<'a> Ranges<'a> {
         Some(r)
     }
 
+    /// `x`'s range (in its own interpretation) where block `p` branches to
+    /// block `to`: at the end of `p`, narrowed by `p`'s branch condition on
+    /// that edge. A phi's incoming value is only taken along its edge:
+    /// substrFunc's `for( ; p1>0; p1--)`, rotated, enters the loop's phi on
+    /// `p1 > 0` from the guard and `p1 - 1 > 0` from the latch, so the phi
+    /// is positive, its decrement never negative, and the latch's test a
+    /// test for zero.
+    fn on_edge(&mut self, x: Value, p: usize, to: usize, d: u32) -> Option<R> {
+        let own = self.interp(x, MAX_DEPTH)?;
+        let mut r = self.value(x, p, d)?;
+        if let Terminator::CondBranch { cond: Operand::Value(c), true_label, false_label } = &self.func.blocks[p].terminator {
+            let (t, f) = (self.labels.get(true_label).copied(), self.labels.get(false_label).copied());
+            if t != f && (t == Some(to) || f == Some(to)) {
+                let mut facts = Vec::new();
+                self.facts_of(*c, t == Some(to), x, 4, &mut facts);
+                for (op, it, k) in facts.into_iter().filter(|f| f.1.w == own.w) {
+                    r = if op == IrCmpOp::Ne {
+                        r.without(own.wrap(k))?
+                    } else {
+                        r.meet(constrain(it.full(), op, k)?.reread(it, own)?)?
+                    };
+                }
+            }
+        }
+        Some(r)
+    }
+
     /// Facts `v op k` (with `v`'s low bits and `k` read in the interpretation)
     /// from the edges into the blocks dominating `b` that have one predecessor.
     fn dominating_facts(&self, v: Value, b: usize) -> Vec<(IrCmpOp, Interp, i128)> {
@@ -748,7 +775,13 @@ impl<'a> Ranges<'a> {
                 let mut out: Option<R> = None;
                 for (op, label) in incoming {
                     let p = *self.labels.get(label)?;
-                    let x = self.operand(op, p, own, d)?;
+                    let x = match op {
+                        Operand::Value(x) => {
+                            let to = self.defs.get(&v.0)?.0;
+                            self.on_edge(*x, p, to, d)?.view(self.interp(*x, MAX_DEPTH)?, own)?
+                        }
+                        _ => self.operand(op, p, own, d)?,
+                    };
                     out = Some(out.map_or(x, |o| o.join(x)));
                 }
                 out
@@ -898,6 +931,55 @@ mod tests {
             let mut func = lookahead(reader);
             assert_eq!(thread_decided_tests(&mut func), 0, "p read in b{}", reader);
         }
+    }
+
+    /// bi_reverse's count in gen_codes: b0: len = (int)*(u16 *)q; skip the
+    /// loop when `len == 0` (if `guarded`); b1: p = phi [len, b0], [n, b1];
+    /// n = p - 1; `n > 0` loops back.
+    fn countdown(guarded: bool) -> IrFunction {
+        use crate::common::types::{AddressSpace, AliasClass};
+        let v = |n| Operand::Value(Value(n));
+        let k = |n| Operand::Const(IrConst::I32(n));
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let entry = if guarded {
+            Terminator::CondBranch { cond: v(2), true_label: BlockId(3), false_label: BlockId(1) }
+        } else {
+            Terminator::Branch(BlockId(1))
+        };
+        let mut func = IrFunction::new("t".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![
+            block(0, vec![
+                Instruction::Load { dest: Value(0), ptr: Value(9), ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::Cast { dest: Value(1), src: v(0), from_ty: IrType::U16, to_ty: IrType::I32 },
+                Instruction::Cmp { dest: Value(2), op: IrCmpOp::Eq, lhs: v(1), rhs: k(0), ty: IrType::I32 },
+            ], entry),
+            block(1, vec![
+                Instruction::Phi { dest: Value(3), ty: IrType::I32, incoming: vec![(v(1), BlockId(0)), (v(4), BlockId(1))] },
+                Instruction::BinOp { dest: Value(4), op: IrBinOp::Sub, lhs: v(3), rhs: k(1), ty: IrType::I32 },
+                Instruction::Cmp { dest: Value(5), op: IrCmpOp::Sgt, lhs: v(4), rhs: k(0), ty: IrType::I32 },
+            ], Terminator::CondBranch { cond: v(5), true_label: BlockId(1), false_label: BlockId(2) }),
+            block(2, vec![], Terminator::Return(None)),
+            block(3, vec![], Terminator::Return(None)),
+        ];
+        func.next_value_id = 10;
+        func
+    }
+
+    #[test]
+    fn phi_value_narrowed_by_the_branch_on_its_edge() {
+        // len != 0 on b0's edge and n > 0 on b1's: p >= 1, n >= 0, and the
+        // loop's test is a test for zero.
+        let op = |func: &IrFunction| match func.blocks[1].instructions[2] {
+            Instruction::Cmp { op, .. } => op,
+            _ => panic!(),
+        };
+        let mut func = countdown(true);
+        range_fold_function(&mut func);
+        assert_eq!(op(&func), IrCmpOp::Ne);
+        // Without the guard len may be 0, and n then -1.
+        let mut func = countdown(false);
+        range_fold_function(&mut func);
+        assert_eq!(op(&func), IrCmpOp::Sgt);
     }
 
     #[test]
