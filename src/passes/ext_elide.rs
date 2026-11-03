@@ -112,6 +112,9 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
                 {
                     state[dest.0 as usize] = Ext::Top
                 }
+                Instruction::BinOp { dest, op: IrBinOp::AShr, rhs: Operand::Const(_), ty: IrType::I64 | IrType::U64, .. } => {
+                    state[dest.0 as usize] = Ext::Top
+                }
                 _ => {}
             }
         }
@@ -160,13 +163,25 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
                 }
                 Instruction::Copy { dest, src: Operand::Value(v) } => (dest, of(&state, *v)),
                 // A widening the loop below makes a copy (the char load
-                // widened before the merge).
+                // widened before the merge) holds its source as it is; one
+                // it keeps extends it by its source type.
                 Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty }
                     if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
                 {
                     (dest, match of(&state, *v) {
-                        Ext::As(e) if !covers(e, *from_ty) => Ext::No,
-                        s => s,
+                        Ext::As(e) if covers(e, *from_ty) => Ext::As(e),
+                        Ext::Top => Ext::Top,
+                        _ => Ext::As(*from_ty),
+                    })
+                }
+                // A shift right keeps the value within the range of the type
+                // it was extended from, the sign with it (a binary search's
+                // `(lwr + upr) >> 1`, widened to shift, merged back into an
+                // int and widened again as an index).
+                Instruction::BinOp { dest, op: IrBinOp::AShr, lhs, rhs: Operand::Const(_), ty: IrType::I64 | IrType::U64 } => {
+                    (dest, match lhs {
+                        Operand::Value(l) => of(&state, *l),
+                        Operand::Const(_) => Ext::No,
                     })
                 }
                 // A 64-bit logical operation of zero-extended values, or one
@@ -518,6 +533,41 @@ mod tests {
             BasicBlock { label: BlockId(2), instructions: vec![], terminator: Terminator::Return(Some(v(3))), source_spans: Vec::new() },
         ];
         func
+    }
+
+    /// A binary search's `mid = (lwr + upr) >> 1`: the int sum widened and
+    /// shifted in 64 bits by `op`, merged into the int `mid`, widened again
+    /// as an index (v3).
+    fn halved_midpoint(op: IrBinOp) -> IrFunction {
+        let v = |n| Operand::Value(Value(n));
+        let one = || Operand::Const(IrConst::I64(1));
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![
+            BasicBlock { label: BlockId(0), instructions: vec![
+                Instruction::Cast { dest: Value(8), src: v(9), from_ty: IrType::I32, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(5), op, lhs: v(8), rhs: one(), ty: IrType::I64 },
+            ], terminator: Terminator::Branch(BlockId(1)), source_spans: Vec::new() },
+            BasicBlock { label: BlockId(1), instructions: vec![
+                Instruction::Phi { dest: Value(2), ty: IrType::I32, incoming: vec![(v(5), BlockId(0)), (v(6), BlockId(1))] },
+                Instruction::Cast { dest: Value(3), src: v(2), from_ty: IrType::I32, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(4), op: IrBinOp::Add, lhs: v(3), rhs: v(10), ty: IrType::I64 },
+                Instruction::Cast { dest: Value(7), src: v(4), from_ty: IrType::I32, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(6), op, lhs: v(7), rhs: one(), ty: IrType::I64 },
+            ], terminator: Terminator::CondBranch { cond: v(3), true_label: BlockId(1), false_label: BlockId(2) }, source_spans: Vec::new() },
+            BasicBlock { label: BlockId(2), instructions: vec![], terminator: Terminator::Return(Some(v(3))), source_spans: Vec::new() },
+        ];
+        func
+    }
+
+    #[test]
+    fn int_shifted_right_after_widening_merged_and_widened_again_is_copied() {
+        let mut func = halved_midpoint(IrBinOp::AShr);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[1].instructions[1], Instruction::Copy { dest: Value(3), .. }));
+        // A logical shift of a negative int leaves it out of an int's range.
+        let mut func = halved_midpoint(IrBinOp::LShr);
+        elide_extensions(&mut func);
+        assert!(matches!(func.blocks[1].instructions[1], Instruction::Cast { dest: Value(3), .. }));
     }
 
     #[test]

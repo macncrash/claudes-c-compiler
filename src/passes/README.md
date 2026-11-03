@@ -1567,6 +1567,14 @@ incremented as free runs are found and widened to index two arrays, lost
 a register move per run; SQLite speedtest ran 16M fewer (13M with a
 retrained profile), in nine functions.
 
+A widening that stays extends its result by its source type, whatever its
+source held, and a 64-bit arithmetic shift right by a constant keeps a
+value extended as it was. sqlite3BtreeIndexMoveto's binary search computes
+`idx = (lwr + upr) >> 1` by widening the int sum and shifting it in 64 bits
+(an `sbfx`), merges it into the int `idx`, and widened `idx` again as an
+index into the cell offsets with an `sxtw` per probe; SQLite speedtest ran
+57M fewer instructions.
+
 Then an int add, subtract, multiply, logical operation or left shift whose
 uses, through copies and phis, read only its low 31 bits (narrower casts and
 stores, and operations that are themselves such) becomes U32: the backend
