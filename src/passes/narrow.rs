@@ -60,6 +60,60 @@ struct BinOpDef {
 
 /// Narrow operations in a single function.
 pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
+    let retyped = retype_reinterpreted_loads(func);
+    narrow_wide_ops(func) + retyped
+}
+
+/// A load whose only use reinterprets it as the other signedness of its
+/// width (`(signed char)p[1]` of a `u8 *p`), a reinterpretation only
+/// widened, loads that type instead, so the extension is the load's own
+/// (`ldrsb`, not `ldrb` and `sxtb`). Other uses (a byte swap) may want
+/// the loaded type.
+fn retype_reinterpreted_loads(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize;
+    let mut uses: Vec<u32> = vec![0; max_id + 1];
+    // Uses that widen the value from its own type.
+    let mut widened: Vec<u32> = vec![0; max_id + 1];
+    // Load dest -> (block, index).
+    let mut load_at: Vec<Option<(usize, usize)>> = vec![None; max_id + 1];
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (i, inst) in block.instructions.iter().enumerate() {
+            inst.for_each_used_value(|v| uses[v as usize] += 1);
+            if let Instruction::Cast { src: Operand::Value(v), from_ty, to_ty, .. } = inst {
+                if to_ty.is_integer() && from_ty.size() < to_ty.size() {
+                    widened[v.0 as usize] += 1;
+                }
+            }
+            if let Instruction::Load { dest, ty, volatile: false, .. } = inst {
+                if ty.is_integer() && ty.size() < 8 {
+                    load_at[dest.0 as usize] = Some((b, i));
+                }
+            }
+        }
+        block.terminator.for_each_used_value(|v| uses[v as usize] += 1);
+    }
+    let mut changes = 0;
+    for b in 0..func.blocks.len() {
+        for i in 0..func.blocks[b].instructions.len() {
+            let Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty } = func.blocks[b].instructions[i] else { continue };
+            if !(to_ty.is_integer() && to_ty.size() == from_ty.size() && to_ty != from_ty && uses[v.0 as usize] == 1
+                && uses[dest.0 as usize] > 0 && widened[dest.0 as usize] == uses[dest.0 as usize]) {
+                continue;
+            }
+            let Some((lb, li)) = load_at[v.0 as usize] else { continue };
+            let Instruction::Load { ty, .. } = &mut func.blocks[lb].instructions[li] else { continue };
+            if *ty != from_ty {
+                continue;
+            }
+            *ty = to_ty;
+            func.blocks[b].instructions[i] = Instruction::Copy { dest, src: Operand::Value(v) };
+            changes += 1;
+        }
+    }
+    changes
+}
+
+fn narrow_wide_ops(func: &mut IrFunction) -> usize {
     // Early exit: the pass can only do work if the function contains I64/U64
     // BinOps or Cmps (which are the targets of narrowing). Skip the expensive
     // multi-pass analysis if none exist.

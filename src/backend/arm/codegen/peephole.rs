@@ -4026,7 +4026,8 @@ fn upper16_zero_before(lines: &[String], kinds: &[LineKind], i: usize, r: u8) ->
 
 /// get2byte's two byte loads, merged high byte first:
 ///   ldrb wA, [B, #k]; ldrb wC, [B, #k+1]; orr D, C, A, lsl #8
-/// with A and C read by the `orr` only, and dead after it: one halfword
+/// with A and C read by the `orr` only, and dead after it (A perhaps a
+/// signed byte, `ldrsb xA` or `ldrb` and `sxtb`): one halfword
 /// load and a byte swap, `ldrh wC, [B, #k]; rev16 wD, wC` (freeSpace and
 /// pageFindSlot walking a page's free-block list). The halfword load goes
 /// where the later byte load was, so nothing between the two may store,
@@ -4034,17 +4035,18 @@ fn upper16_zero_before(lines: &[String], kinds: &[LineKind], i: usize, r: u8) ->
 fn fuse_byte_pair_into_halfword(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
-    // `ldrb wR, [B]` or `[B, #k]`: (R, B, k).
-    let byte_load = |line: &str| -> Option<(u8, u8, i64)> {
-        let ("ldrb", ops) = split_insn(line)? else { return None };
+    // `ldrb wR, [B]` or `[B, #k]`, or `ldrsb xR`: (R, B, k, signed).
+    let byte_load = |line: &str| -> Option<(u8, u8, i64, bool)> {
+        let (m @ ("ldrb" | "ldrsb"), ops) = split_insn(line)? else { return None };
+        let signed = m == "ldrsb";
         let (r, mem) = first_and_rest(ops);
         let mem = mem.trim().strip_prefix('[')?.strip_suffix(']')?;
         let (b, k) = match mem.split_once(',') {
             Some((b, k)) => (b.trim(), parse_imm(k.trim())?),
             None => (mem.trim(), 0),
         };
-        (r.starts_with('w') && b.starts_with('x')).then_some(())?;
-        Some((gpr_operand(r)?, gpr_operand(b)?, i64::try_from(k).ok()?))
+        (r.starts_with(if signed { 'x' } else { 'w' }) && b.starts_with('x')).then_some(())?;
+        Some((gpr_operand(r)?, gpr_operand(b)?, i64::try_from(k).ok()?, signed))
     };
     for o in 0..n {
         let orr = lines[o].clone();
@@ -4059,6 +4061,7 @@ fn fuse_byte_pair_into_halfword(lines: &mut [String], kinds: &mut [LineKind], n:
         // high byte (OP_Column's 2-byte integer) its `sxtb A, wA`.
         let mut sx: Option<usize> = None;
         let (mut la, mut lc) = (None, None);
+        let mut signed_a = false;
         let mut k = o;
         let mut seen = 0;
         while k > 0 && seen < 6 && (la.is_none() || lc.is_none()) {
@@ -4071,8 +4074,11 @@ fn fuse_byte_pair_into_halfword(lines: &mut [String], kinds: &mut [LineKind], n:
                 break;
             }
             match byte_load(&lines[k]) {
-                Some((r, b, off)) if r == an && la.is_none() => la = Some((k, b, off)),
-                Some((r, b, off)) if r == cn && lc.is_none() => lc = Some((k, b, off)),
+                Some((r, b, off, sg)) if r == an && la.is_none() && !(sg && sx.is_some()) => {
+                    la = Some((k, b, off));
+                    signed_a = sg;
+                }
+                Some((r, b, off, false)) if r == cn && lc.is_none() => lc = Some((k, b, off)),
                 _ => {
                     if la.is_none() && sx.is_none() {
                         if let Some(("sxtb", so)) = split_insn(&lines[k]) {
@@ -4088,7 +4094,7 @@ fn fuse_byte_pair_into_halfword(lines: &mut [String], kinds: &mut [LineKind], n:
         let (Some((ka, ba, offa)), Some((kc, bc, offc))) = (la, lc) else { continue };
         // Little-endian, the shifted byte the higher one (lz_hash's
         // `p[0] | p[1] << 8`): the halfword as it is, no swap.
-        let little = offa == offc + 1 && sx.is_none();
+        let little = offa == offc + 1 && sx.is_none() && !signed_a;
         if ba != bc || (offc != offa + 1 && !little) || ba == an || ba == cn {
             continue;
         }
@@ -4117,6 +4123,18 @@ fn fuse_byte_pair_into_halfword(lines: &mut [String], kinds: &mut [LineKind], n:
             continue;
         }
         let load = "ldrh";
+        if signed_a {
+            // The signed high byte's own load: the halfword at the first
+            // load, swapped at the second, sign-extended by the `orr`.
+            lines[first] = format!("    {} {}, {}", load, wreg_name(cn), mem);
+            kinds[first] = classify_line(&lines[first]);
+            lines[last] = format!("    rev16 {}, {}", wreg_name(cn), wreg_name(cn));
+            kinds[last] = classify_line(&lines[last]);
+            lines[o] = format!("    sxth {}, {}", d, wreg_name(cn));
+            kinds[o] = classify_line(&lines[o]);
+            changed = true;
+            continue;
+        }
         if let Some(ks) = sx {
             // Signed: the halfword at the first load (nothing between
             // stores or moves B), swapped at the next of the sign extension
@@ -8303,6 +8321,15 @@ mod tests {
         // A signed high byte: sign-extended halfword.
         let result = run("    ldrb w12, [x1]\n    sxtb x12, w12\n    ldrb w13, [x1, #1]\n    orr x12, x13, x12, lsl #8\n    str x12, [x11]\n");
         assert!(result.contains("ldrh w13, [x1]") && result.contains("rev16 w13, w13") && result.contains("sxth x12, w13"), "{}", result);
+        // Loaded signed (OP_Column's 2-byte integer read through a signed
+        // char), either load first.
+        let result = run("    ldrsb x11, [x27]\n    ldrb w12, [x27, #1]\n    orr x11, x12, x11, lsl #8\n    str x11, [x10]\n");
+        assert!(result.contains("ldrh w12, [x27]") && result.contains("rev16 w12, w12") && result.contains("sxth x11, w12") && !result.contains("ldrsb"), "{}", result);
+        let result = run("    ldrb w12, [x27, #1]\n    ldrsb x11, [x27]\n    orr x11, x12, x11, lsl #8\n    str x11, [x10]\n");
+        assert!(result.contains("ldrh w12, [x27]") && result.contains("sxth x11, w12"), "{}", result);
+        // A signed low byte is not a halfword's.
+        let body = "    ldrb w11, [x27]\n    ldrsb x12, [x27, #1]\n    orr x11, x12, x11, lsl #8\n    str x11, [x10]\n";
+        assert!(run(body).contains("ldrsb x12"), "{}", run(body));
         // Not across a store, nor when a byte is read again.
         let keep = [
             "    ldrb w11, [x10, #2]\n    str x3, [x4]\n    ldrb w20, [x10, #3]\n    orr x20, x20, x11, lsl #8\n    str x20, [x1]\n",
