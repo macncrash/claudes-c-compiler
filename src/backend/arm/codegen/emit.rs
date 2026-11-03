@@ -836,7 +836,7 @@ impl ArmCodegen {
                 }
 
                 // lhs in register, rhs needs loading into x0
-                self.operand_to_x0(rhs);
+                self.cmp_operand_to_x0(rhs, use_32bit);
                 if use_32bit {
                     self.state.emit_fmt(format_args!("    cmp {}, w0", lhs_reg));
                 } else {
@@ -885,12 +885,42 @@ impl ArmCodegen {
         // Fallback: load both into x0/x1
         self.operand_to_x0(lhs);
         self.state.emit("    mov x1, x0");
-        self.operand_to_x0(rhs);
+        self.cmp_operand_to_x0(rhs, use_32bit);
         if use_32bit {
             self.state.emit("    cmp w1, w0");
         } else {
             self.state.emit("    cmp x1, x0");
         }
+    }
+
+    /// Load a compare's operand into x0. For a 32-bit compare a constant's
+    /// high half is never read, so it is loaded zero-extended when that
+    /// takes fewer instructions than sign-extended: INT_MIN is one `movz`,
+    /// not `movn` and `movk` (sqlite3AbsInt32's `x == (int)0x80000000`).
+    fn cmp_operand_to_x0(&mut self, op: &Operand, use_32bit: bool) {
+        if let (true, Operand::Const(c)) = (use_32bit, op) {
+            if let Some(v) = c.to_i64() {
+                let (sext, zext) = (v as i32 as i64, v as u32 as i64);
+                if Self::imm64_insns(zext) < Self::imm64_insns(sext) {
+                    self.state.reg_cache.invalidate_acc();
+                    self.emit_load_imm64("x0", zext);
+                    return;
+                }
+            }
+        }
+        self.operand_to_x0(op);
+    }
+
+    /// The instructions emit_load_imm64 takes for `val`.
+    fn imm64_insns(val: i64) -> usize {
+        let bits = val as u64;
+        if bits == 0 || bits == u64::MAX {
+            return 1;
+        }
+        let hw = (0..4).map(|i| (bits >> (16 * i)) as u16);
+        let zeros = hw.clone().filter(|&h| h == 0).count();
+        let ones = hw.clone().filter(|&h| h == 0xffff).count();
+        if ones > zeros { 4 - ones } else { 4 - zeros }
     }
 
     // --- AArch64 large-offset helpers ---
