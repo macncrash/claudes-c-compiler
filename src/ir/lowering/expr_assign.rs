@@ -50,8 +50,14 @@ impl Lowerer {
         // This matches GCC's evaluation order: the address where we store is
         // computed using the state before any RHS side effects (e.g., i++ in
         // `a[i] = i++` uses the pre-increment value of i for the index).
+        // Except when the RHS makes a call and the address has no side
+        // effects: then the address is computed after the call, as clang
+        // does, so its loads are not live across the call (and reloaded
+        // after it), and a later read of the stored element sees the same
+        // address.
         let lhs_ty = self.get_expr_type(lhs);
-        let lv = self.lower_lvalue(lhs);
+        let rhs_first = expr_has_call(rhs) && address_is_pure(lhs);
+        let mut lv = if rhs_first { None } else { self.lower_lvalue(lhs) };
 
         // When assigning a complex RHS to a non-complex LHS, extract the real part first
         let rhs_ct = self.expr_ctype(rhs);
@@ -79,6 +85,9 @@ impl Lowerer {
             self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty)
         };
 
+        if rhs_first {
+            lv = self.lower_lvalue(lhs);
+        }
         if let Some(lv) = lv {
             self.store_lvalue_typed(&lv, rhs_val, lhs_ty);
             return rhs_val;
@@ -1152,5 +1161,36 @@ impl Lowerer {
         }
 
         Operand::Value(result_alloca)
+    }
+}
+
+/// Whether evaluating `e` calls a function.
+fn expr_has_call(e: &Expr) -> bool {
+    match e {
+        Expr::FunctionCall(..) => true,
+        Expr::BinaryOp(_, a, b, _) | Expr::Assign(a, b, _) | Expr::CompoundAssign(_, a, b, _)
+        | Expr::Comma(a, b, _) | Expr::ArraySubscript(a, b, _) | Expr::GnuConditional(a, b, _) => {
+            expr_has_call(a) || expr_has_call(b)
+        }
+        Expr::Conditional(a, b, c, _) => expr_has_call(a) || expr_has_call(b) || expr_has_call(c),
+        Expr::UnaryOp(_, a, _) | Expr::PostfixOp(_, a, _) | Expr::MemberAccess(a, _, _)
+        | Expr::PointerMemberAccess(a, _, _) | Expr::Cast(_, a, _) | Expr::Deref(a, _)
+        | Expr::AddressOf(a, _) => expr_has_call(a),
+        _ => false,
+    }
+}
+
+/// Whether the lvalue `e` is computed from variables, constants and loads
+/// alone: no calls, no assignments, no increments.
+fn address_is_pure(e: &Expr) -> bool {
+    match e {
+        Expr::Identifier(..) | Expr::IntLiteral(..) | Expr::UIntLiteral(..) | Expr::LongLiteral(..)
+        | Expr::ULongLiteral(..) | Expr::LongLongLiteral(..) | Expr::ULongLongLiteral(..)
+        | Expr::CharLiteral(..) => true,
+        Expr::MemberAccess(a, _, _) | Expr::PointerMemberAccess(a, _, _) | Expr::Cast(_, a, _)
+        | Expr::Deref(a, _) | Expr::AddressOf(a, _) => address_is_pure(a),
+        Expr::UnaryOp(op, a, _) => !matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) && address_is_pure(a),
+        Expr::ArraySubscript(a, b, _) | Expr::BinaryOp(_, a, b, _) => address_is_pure(a) && address_is_pure(b),
+        _ => false,
     }
 }
