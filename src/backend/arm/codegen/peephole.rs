@@ -7042,6 +7042,15 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
             return LineInfo { uses: 1 << b, defs: 1 << d, flow: Flow::Next, deletable_dest: Some(d) };
         }
     }
+    // A global's address from the GOT: nothing but the base is read, and any
+    // symbol name is not a register. Left to the fallback below this read
+    // every register, and so kept them all live on every path to it.
+    if mnemonic == "ldr" && srcs.contains(":got_lo12:") {
+        let base = srcs.trim().strip_prefix('[').map(|m| first_and_rest(m).0);
+        if let (Some(d), Some(b)) = (gpr_operand(dest), base.and_then(gpr_operand)) {
+            return LineInfo { uses: 1 << b, defs: 1 << d, flow: Flow::Next, deletable_dest: Some(d) };
+        }
+    }
     // `movk xD, #imm, lsl #s` replaces 16 bits of D: it reads and writes D
     // only (a barrier for the rewriting passes, but not for liveness).
     if mnemonic == "movk" && !srcs.contains(':') && regs_in(srcs) == 0 {
@@ -9051,6 +9060,24 @@ mod tests {
         assert!(peephole_optimize(f("mov x9, #36864", "and x10, x0, x9", "cbz x11, .LBB1", 0)).contains("cbz x11"));
         assert!(kept(&peephole_optimize(f("mov x9, #36864", "and x10, x0, x9", "cbz x10, .LBB1", 8000))));
         assert!(kept(&peephole_optimize(f("mov x9, #36864", "and x10, x0, x9", "cbnz x10, .LBB1", 8000))));
+    }
+
+    #[test]
+    fn test_got_load_reads_only_its_base() {
+        // Liveness across the load: x10 is written again after it, so the
+        // first write is dead, and the mask test on x10 may fold.
+        let body = |got: &str, tail: &str| ret_x0(&format!("    mov x10, #5\n    adrp x7, :got:g\n    {got}\n    mov x10, #6\n    str x10, [x1]\n    str x7, [x2]\n{tail}"));
+        let result = peephole_optimize(body("ldr x7, [x7, :got_lo12:g]", ""));
+        assert!(!result.contains("mov x10, #5") && result.contains("mov x10, #6"), "{}", result);
+        // A symbol named like a register is not read.
+        let result = peephole_optimize(body("ldr x7, [x7, :got_lo12:x10]", ""));
+        assert!(!result.contains("mov x10, #5"), "{}", result);
+        // The base is read.
+        let result = peephole_optimize(ret_x0("    mov x9, #7\n    ldr x4, [x9, :got_lo12:g]\n    mov x9, #8\n    str x9, [x1]\n    str x4, [x2]\n"));
+        assert!(result.contains("mov x9, #7"), "{}", result);
+        // The destination is written: an earlier value of it is dead.
+        let result = peephole_optimize(ret_x0("    mov x4, #7\n    adrp x5, :got:g\n    ldr x4, [x5, :got_lo12:g]\n    str x4, [x2]\n"));
+        assert!(!result.contains("mov x4, #7"), "{}", result);
     }
 
     #[test]
