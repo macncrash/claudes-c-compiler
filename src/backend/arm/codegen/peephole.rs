@@ -657,6 +657,7 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
             changed2 |= pass!(drop_byte_mask_before_compare(lines, kinds, n));
             changed2 |= pass!(fold_mask_into_compare(lines, kinds, n));
             changed2 |= pass!(fold_low_mask_bound_into_tst(lines, kinds, n));
+            changed2 |= pass!(fold_min_compare_into_overflow(lines, kinds, n));
             changed2 |= pass!(fold_bit_test_into_extract(lines, kinds, n));
             changed2 |= pass!(drop_mask_of_narrow_value(lines, kinds, n));
             changed2 |= pass!(drop_sxtw_of_nonnegative(lines, kinds, n));
@@ -3269,6 +3270,71 @@ fn fold_low_mask_bound_into_tst(lines: &mut [String], kinds: &mut [LineKind], n:
         lines[c] = format!("    tst {}, #{:#x}", sreg, m & !(bound - 1));
         kinds[c] = classify_line(&lines[c]);
         lines[j] = format!("    b.{} {}", ucc, target);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `movz T, #32768, lsl #16` (INT_MIN) compared with a 32-bit R for
+/// equality, T dead after, the one conditional branch reading the flags:
+/// R - 1 overflows exactly when R is INT_MIN, so `cmp R, #1` with eq as vs
+/// and ne as vc. The same for `lsl #48` and a 64-bit R. sqlite3AbsInt32's
+/// `if( x==(int)0x80000000 )` in allocateBtreePage's search loop.
+fn fold_min_compare_into_overflow(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    let next = |kinds: &[LineKind], mut k: usize| {
+        k += 1;
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
+    for i in 0..n {
+        let Some(("movz", mops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = mops.split(',').map(str::trim).collect();
+        let [tt, "#32768", shift] = p[..] else { continue };
+        let wide = match shift {
+            "lsl #16" => false,
+            "lsl #48" => true,
+            _ => continue,
+        };
+        let Some(t) = gpr_operand(tt) else { continue };
+        let c = next(kinds, i);
+        if c >= n {
+            continue;
+        }
+        let Some(("cmp", cops)) = split_insn(&lines[c]) else { continue };
+        let (rr, other) = first_and_rest(cops);
+        let other = other.trim();
+        let (Some(r), Some(o)) = (gpr_operand(rr), gpr_operand(other)) else { continue };
+        if o != t || r == t || rr.starts_with('x') != wide || other.starts_with('x') != wide {
+            continue;
+        }
+        let j = next(kinds, c);
+        if j >= n || kinds[j] != LineKind::CondBranch {
+            continue;
+        }
+        let Some((bcc, target)) = split_insn(&lines[j]) else { continue };
+        let vcc = match bcc {
+            "b.eq" => "vs",
+            "b.ne" => "vc",
+            _ => continue,
+        };
+        let target = target.trim().to_string();
+        let Some(tl) = (0..n).find(|&l| kinds[l] == LineKind::Label && label_name(&lines[l]) == Some(target.as_str())) else { continue };
+        if flags_read_from(lines, kinds, j + 1, n) || flags_read_from(lines, kinds, tl, n) {
+            continue;
+        }
+        let live = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+        if live[c] & (1 << t) != 0 {
+            continue;
+        }
+        lines[c] = format!("    cmp {}, #1", rr);
+        kinds[c] = classify_line(&lines[c]);
+        lines[j] = format!("    b.{} {}", vcc, target);
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
         changed = true;
@@ -8629,6 +8695,21 @@ mod tests {
         assert!(peephole_optimize(f("cmp w3, #0", "b.lt .LBB1", "    csel x5, x1, x2, eq\n    str x5, [x1]\n", "")).contains("cmp w3, #0"));
         assert!(peephole_optimize(f("cmp w3, #0", "b.le .LBB1", "", "")).contains("cmp w3, #0"));
         assert!(peephole_optimize(f("cmp w3, #1", "b.lt .LBB1", "", "")).contains("cmp w3, #1"));
+    }
+
+    #[test]
+    fn test_minimum_compared_for_equality_is_an_overflow_test() {
+        let f = |mov: &str, cmp: &str, br: &str, at: &str| ret_x0(&format!("    {mov}\n    {cmp}\n    {br}\n    neg x12, x12\n    mov x0, x12\n    ret\n.LBB1:\n{at}    mov x0, #3\n"));
+        let result = peephole_optimize(f("movz x9, #32768, lsl #16", "cmp w12, w9", "b.eq .LBB1", ""));
+        assert!(result.contains("cmp w12, #1") && result.contains("b.vs .LBB1") && !result.contains("movz"), "{}", result);
+        let result = peephole_optimize(f("movz x9, #32768, lsl #48", "cmp x12, x9", "b.ne .LBB1", ""));
+        assert!(result.contains("cmp x12, #1") && result.contains("b.vc .LBB1"), "{}", result);
+        // Not when the widths disagree, the target reads the flags, the
+        // constant is read again, or the condition is not equality.
+        assert!(peephole_optimize(f("movz x9, #32768, lsl #16", "cmp x12, x9", "b.eq .LBB1", "")).contains("cmp x12, x9"));
+        assert!(peephole_optimize(f("movz x9, #32768, lsl #16", "cmp w12, w9", "b.eq .LBB1", "    cset x5, lt\n    str x5, [x1]\n")).contains("cmp w12, w9"));
+        assert!(peephole_optimize(f("movz x9, #32768, lsl #16", "cmp w12, w9", "b.eq .LBB1", "    str x9, [x1]\n")).contains("cmp w12, w9"));
+        assert!(peephole_optimize(f("movz x9, #32768, lsl #16", "cmp w12, w9", "b.lt .LBB1", "")).contains("cmp w12, w9"));
     }
 
     #[test]

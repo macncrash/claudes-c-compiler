@@ -116,6 +116,34 @@ impl ArmCodegen {
             };
             let lhs_reg = self.operand_reg(lhs).map(callee_saved_name);
             let rhs_reg = self.operand_reg(rhs).map(callee_saved_name);
+            // A constant no logical immediate holds, but two do: two
+            // instructions rather than building it (a varint's
+            // `x ^= 0x204000` in btreeParseCellPtr).
+            if rhs_imm.is_none() && rhs_reg.is_none() && matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) {
+                if let Some((k1, k2)) = Self::const_as_two_logical_imms(op, rhs, use_32bit) {
+                    let a = match lhs_reg {
+                        Some(r) => r,
+                        None => {
+                            self.operand_to_x0(lhs);
+                            "x0"
+                        }
+                    };
+                    let d = self.dest_reg(dest).map_or("x0", callee_saved_name);
+                    let mnemonic = arm_alu_mnemonic(op);
+                    let w = |r: &str| if use_32bit && r.starts_with('x') { r.replacen('x', "w", 1) } else { r.to_string() };
+                    self.state.emit_fmt(format_args!("    {} {}, {}, #{}", mnemonic, w(d), w(a), k1));
+                    self.state.emit_fmt(format_args!("    {} {}, {}, #{}", mnemonic, w(d), w(d), k2));
+                    if use_32bit && !is_unsigned {
+                        self.state.emit_fmt(format_args!("    sxtw {}, {}", d, w(d)));
+                    }
+                    if d == "x0" {
+                        self.store_x0_to(dest);
+                    } else {
+                        self.state.reg_cache.invalidate_acc();
+                    }
+                    return;
+                }
+            }
             let rhs_needs_load = rhs_imm.is_none() && rhs_reg.is_none();
             let a = match lhs_reg {
                 Some(r) => r,

@@ -495,6 +495,42 @@ impl ArmCodegen {
         ok.then_some(if use_32bit { v as i32 as i64 } else { v })
     }
 
+    /// Two logical immediates that together apply constant `op` with `bin`
+    /// (And, Or or Xor), when no single one holds it: for Or and Xor, its
+    /// lowest run of ones and the rest; for And, the complements of those
+    /// two parts of its complement (`a & ~(c1 | c2)` is
+    /// `(a & ~c1) & ~c2`). Returned as the signed values to print.
+    pub(super) fn const_as_two_logical_imms(bin: IrBinOp, op: &Operand, use_32bit: bool) -> Option<(i64, i64)> {
+        let Operand::Const(c) = op else { return None };
+        let width_mask = if use_32bit { u32::MAX as u64 } else { u64::MAX };
+        let v = c.to_i64()? as u64 & width_mask;
+        let ok = |x: u64| if use_32bit {
+            super::asm_emitter::is_valid_aarch64_logical_immediate_32(x as u32)
+        } else {
+            super::asm_emitter::is_valid_aarch64_logical_immediate(x)
+        };
+        // One mov builds it (movz or movn of one halfword): no fewer
+        // instructions, and the built constant may be shared.
+        let one_mov = |x: u64| (0..if use_32bit { 2 } else { 4 }).any(|s| x & !(0xffff << (16 * s)) == 0);
+        if ok(v) || one_mov(v) || one_mov(!v & width_mask) {
+            return None;
+        }
+        let bits = if bin == IrBinOp::And { !v & width_mask } else { v };
+        if bits == 0 {
+            return None;
+        }
+        // The lowest run of ones: from the lowest set bit up to the next clear one.
+        let low = bits & bits.wrapping_neg();
+        let run = (bits.wrapping_add(low) ^ bits) & bits;
+        let (p1, p2) = (run, bits & !run);
+        let (k1, k2) = if bin == IrBinOp::And { (!p1 & width_mask, !p2 & width_mask) } else { (p1, p2) };
+        if p2 == 0 || !ok(k1) || !ok(k2) {
+            return None;
+        }
+        let print = |x: u64| if use_32bit { x as u32 as i32 as i64 } else { x as i64 };
+        Some((print(k1), print(k2)))
+    }
+
     /// If `op` is a constant shift amount valid for a `width`-bit shift, return it.
     pub(super) fn const_as_shift_imm(op: &Operand, width: i64) -> Option<i64> {
         match op {
@@ -2482,3 +2518,23 @@ impl Default for ArmCodegen {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_split_into_two_logical_immediates() {
+        let k = |v: i64| Operand::Const(IrConst::I64(v));
+        // x ^= 0x204000: bits 14 and 21, one run each.
+        assert_eq!(ArmCodegen::const_as_two_logical_imms(IrBinOp::Xor, &k(0x204000), false), Some((0x4000, 0x200000)));
+        assert_eq!(ArmCodegen::const_as_two_logical_imms(IrBinOp::Or, &k(0x7000f), true), Some((0xf, 0x70000)));
+        // And clears the complement in two steps: ~0x204000 is ~0x4000 & ~0x200000.
+        assert_eq!(ArmCodegen::const_as_two_logical_imms(IrBinOp::And, &k(!0x204000), false), Some((!0x4000, !0x200000)));
+        assert_eq!(ArmCodegen::const_as_two_logical_imms(IrBinOp::And, &k(!0x204000), true), Some((!0x4000, !0x200000)));
+        // One immediate already holds it, one mov builds it, or two cannot.
+        assert_eq!(ArmCodegen::const_as_two_logical_imms(IrBinOp::And, &k(0xff3f), true), None);
+        assert_eq!(ArmCodegen::const_as_two_logical_imms(IrBinOp::Xor, &k(0xff00), false), None);
+        assert_eq!(ArmCodegen::const_as_two_logical_imms(IrBinOp::Xor, &k(0x1234), false), None);
+    }
+}
