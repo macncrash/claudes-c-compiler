@@ -4011,21 +4011,38 @@ fn reuse_constants(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bo
 }
 
 /// `mul T, A, B` then `add D, C, T` (either order) or `sub D, C, T`, with T
-/// dead afterwards: `madd D, A, B, C` / `msub D, A, B, C`.
+/// dead afterwards: `madd D, A, B, C` / `msub D, A, B, C`. A load that leaves
+/// T, A and B alone may stand between them, the product then being taken at
+/// the add: a GEP whose base lives on the stack reloads it there
+/// (`pOp = &aOp[pOp->p2 - 1]` in sqlite3VdbeExec).
 fn fuse_mul_into_madd(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
+    let next = |kinds: &[LineKind], mut k: usize| {
+        k += 1;
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
     for i in 0..n {
         let Some(("mul", ops)) = split_insn(&lines[i]) else { continue };
         let m: Vec<&str> = ops.split(',').map(str::trim).collect();
         let [t, a, b] = m[..] else { continue };
         let Some(tr) = gpr_operand(t) else { continue };
-        let mut j = i + 1;
-        while j < n && kinds[j] == LineKind::Nop {
-            j += 1;
-        }
+        let mut j = next(kinds, i);
         if j >= n {
             continue;
+        }
+        if let Some(("ldr", lops)) = split_insn(&lines[j]) {
+            let (rt, mem) = first_and_rest(lops);
+            let keeps = |f: &str| gpr_operand(f) != gpr_operand(rt);
+            if gpr_operand(rt).is_some() && mem.trim_end().ends_with(']') && !mentions_reg(lops, tr) && keeps(a) && keeps(b) {
+                j = next(kinds, j);
+                if j >= n {
+                    continue;
+                }
+            }
         }
         let Some((op @ ("add" | "sub"), aops)) = split_insn(&lines[j]) else { continue };
         let s: Vec<&str> = aops.split(',').map(str::trim).collect();
@@ -4688,7 +4705,7 @@ fn fold_extend_into_narrow_store(lines: &mut [String], kinds: &mut [LineKind], n
 ///   add|sub xC, xD, xA [, lsl #s]      -> add|sub xC, xD, wB, sxtw [#s]
 ///   ldr|str R, [xD, xA [, lsl #s]]     -> [xD, wB, sxtw [#s]]
 ///   madd|msub xC, xA, xM, xN           -> smaddl|smsubl xC, wB, wM, xN
-///     (xM set by the line before from a 32-bit constant)
+///     (xM last named by a move of a 32-bit constant, after the sxtw)
 ///   cbz|cbnz xA, L                     -> cbz|cbnz wB, L
 ///   and xC, xA, #k (k < 2^32)          -> and wC, wB, #k
 ///   a 32-bit read of wA                -> wB
@@ -4716,7 +4733,7 @@ fn fold_sxtw_into_users(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
             let Some((mnemonic, ops)) = split_insn(&lines[k]) else { break };
             // A compare-and-branch that is A's last read on both paths.
             if kinds[k] == LineKind::CmpBranch && live[k] & (1 << a) == 0 {
-                if let Some(new) = rewrite_sxtw_use(mnemonic, ops, false, a, b, &lines[prev]) {
+                if let Some(new) = rewrite_sxtw_use(mnemonic, ops, false, a, b, &|r| last_mention(lines, kinds, i + 1, k, r)) {
                     rewrites.push((k, new));
                     ok = true;
                 }
@@ -4734,7 +4751,7 @@ fn fold_sxtw_into_users(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
                 _ => (None, ops),
             };
             if mentions_reg(srcs, a) {
-                match rewrite_sxtw_use(mnemonic, ops, dest.is_some(), a, b, &lines[prev]) {
+                match rewrite_sxtw_use(mnemonic, ops, dest.is_some(), a, b, &|r| last_mention(lines, kinds, i + 1, k, r)) {
                     Some(new) => rewrites.push((k, new)),
                     None => break,
                 }
@@ -4761,9 +4778,15 @@ fn fold_sxtw_into_users(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
     changed
 }
 
+/// The last line of from..to naming register r, if any.
+fn last_mention<'l>(lines: &'l [String], kinds: &[LineKind], from: usize, to: usize, r: u8) -> Option<&'l str> {
+    (from..to).rev().find(|&k| kinds[k] != LineKind::Nop && mentions_reg(&lines[k], r)).map(|k| lines[k].as_str())
+}
+
 /// One read of xA rewritten to read wB sign-extended (see
-/// fold_sxtw_into_users), or None.
-fn rewrite_sxtw_use(mnemonic: &str, ops: &str, first_is_dest: bool, a: u8, b: u8, prev_line: &str) -> Option<String> {
+/// fold_sxtw_into_users), or None. `setter` gives the last line naming a
+/// register since the sxtw.
+fn rewrite_sxtw_use<'l>(mnemonic: &str, ops: &str, first_is_dest: bool, a: u8, b: u8, setter: &dyn Fn(u8) -> Option<&'l str>) -> Option<String> {
     let (xa, wa, wb) = (xreg_name(a), wreg_name(a), wreg_name(b));
     let p: Vec<&str> = ops.split(',').map(str::trim).collect();
     let shift_amount = |s: &str| s.strip_prefix("lsl #").and_then(|k| k.parse::<u8>().ok()).filter(|&k| k <= 4);
@@ -4810,14 +4833,14 @@ fn rewrite_sxtw_use(mnemonic: &str, ops: &str, first_is_dest: bool, a: u8, b: u8
                 return None;
             }
             // The other factor must be a sign-extended 32-bit constant.
-            let (pm, pops) = split_insn(prev_line)?;
+            let o = gpr_operand(other)?;
+            let (pm, pops) = split_insn(setter(o)?)?;
             let (pd, pv) = first_and_rest(pops);
             let k = parse_imm(pv.trim()).map(|v| v as i64)
                 .or_else(|| pv.trim().strip_prefix("#-").and_then(|v| v.parse::<i64>().ok()).map(|v| -v))?;
             if pm != "mov" || pd != other || !(i32::MIN as i64..=i32::MAX as i64).contains(&k) {
                 return None;
             }
-            let o = gpr_operand(other)?;
             let fused = if mnemonic == "madd" { "smaddl" } else { "smsubl" };
             Some(format!("    {} {}, {}, {}, {}", fused, c, wb, wreg_name(o), acc))
         }
@@ -7924,7 +7947,7 @@ fn read_low_half(line: &str, kind: LineKind, a: u8, sext: RegSet) -> Option<Stri
         }
         _ => {
             let first_is_dest = matches!(classify_access(line, kind), Access::Write { .. }) && !mnemonic.starts_with("str");
-            rewrite_sxtw_use(mnemonic, ops, first_is_dest, a, a, "")?
+            rewrite_sxtw_use(mnemonic, ops, first_is_dest, a, a, &|_| None)?
         }
     };
     let new_kind = classify_line(&new);
@@ -9027,6 +9050,30 @@ mod tests {
         // Not when the product is used again.
         let input = ".type f, %function\nf:\n    mul x3, x1, x2\n    add x0, x4, x3\n    add x0, x0, x3\n    ret\n.size f, .-f\n";
         assert!(peephole_optimize(input.to_string()).contains("mul x3, x1, x2"));
+    }
+
+    #[test]
+    fn test_mul_add_fuses_around_a_load() {
+        let body = |load: &str| format!(".type f, %function\nf:\n    mul x0, x1, x9\n    {}\n    add x20, x2, x0\n    mov x0, #0\n    str x20, [x3]\n    ret\n.size f, .-f\n", load);
+        // The addend reloaded between them.
+        let result = peephole_optimize(body("ldr x2, [sp, #16]"));
+        assert!(result.contains("madd x20, x1, x9, x2") && !result.contains("mul x0"), "{}", result);
+        // Not when the load replaces a factor, reads the product, or
+        // replaces it, or writes back to a factor.
+        for load in ["ldr x1, [sp, #16]", "ldr x9, [sp, #16]", "ldr x4, [x0]", "ldr x0, [sp, #16]", "ldr x4, [x1], #8", "ldr x4, [x9, #8]!"] {
+            let result = peephole_optimize(body(load));
+            assert!(!result.contains("madd"), "{}: {}", load, result);
+        }
+    }
+
+    #[test]
+    fn test_sxtw_into_madd_past_a_load() {
+        let body = |mid: &str| format!(".type f, %function\nf:\n    sub w0, w0, #1\n    sxtw x0, w0\n    mov x9, #24\n    {}\n    madd x20, x0, x9, x1\n    mov x0, #0\n    str x20, [x3]\n    ret\n.size f, .-f\n", mid);
+        let result = peephole_optimize(body("ldr x1, [sp, #16]"));
+        assert!(result.contains("smaddl x20, w0, w9, x1") && !result.contains("sxtw"), "{}", result);
+        // The factor is no longer the constant at the madd.
+        let result = peephole_optimize(body("ldr x9, [sp, #16]"));
+        assert!(result.contains("sxtw x0, w0") && !result.contains("smaddl"), "{}", result);
     }
 
     #[test]
