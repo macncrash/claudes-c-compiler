@@ -2789,6 +2789,71 @@ fn fuse_bit_test_into_tbz(lines: &mut [String], kinds: &mut [LineKind], n: usize
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
     }
+    // `mov T, #k; and D, A, T; cbz|cbnz D, L`, k two bits of the low half
+    // that no logical immediate encodes, D and T dead afterwards: a test of
+    // each bit, one instruction fewer. `pMem->flags & (MEM_Agg|MEM_Dyn)` in
+    // sqlite3VdbeExec. cbnz is two tbnz to L. cbz jumps over the second test
+    // when the first bit is set, the third line becoming that label.
+    let live = live_out_all(lines, kinds, n);
+    let next = |kinds: &[LineKind], mut k: usize| {
+        k += 1;
+        while k < n && kinds[k] == LineKind::Nop {
+            k += 1;
+        }
+        k
+    };
+    let mut fresh = 0usize;
+    for i in 0..n {
+        let Some(("mov", ops)) = split_insn(&lines[i]) else { continue };
+        let (t, imm) = first_and_rest(ops);
+        let (Some(tr), Some(v)) = (gpr_operand(t), parse_imm(imm.trim())) else { continue };
+        if v.count_ones() != 2 || v >> 32 != 0 {
+            continue;
+        }
+        let j = next(kinds, i);
+        if j >= n {
+            continue;
+        }
+        let Some(("and", aops)) = split_insn(&lines[j]) else { continue };
+        let p: Vec<&str> = aops.split(',').map(str::trim).collect();
+        let [d, x, y] = p[..] else { continue };
+        let (Some(dr), Some(xr), Some(yr)) = (gpr_operand(d), gpr_operand(x), gpr_operand(y)) else { continue };
+        let ar = match (xr == tr, yr == tr) {
+            (true, false) => yr,
+            (false, true) => xr,
+            _ => continue,
+        };
+        let k = next(kinds, j);
+        if k >= n || ar > 28 {
+            continue;
+        }
+        let Some((m @ ("cbz" | "cbnz"), bops)) = split_insn(&lines[k]) else { continue };
+        let (reg, target) = first_and_rest(bops);
+        let target = target.trim().to_string();
+        if gpr_operand(reg) != Some(dr) || live[k] & (1 << dr | 1 << tr) != 0 {
+            continue;
+        }
+        let Some(&l) = labels.get(&target) else { continue };
+        if at[l.max(k)] - at[l.min(k)] > TBZ_SAFE_BYTES {
+            continue;
+        }
+        let (low, high) = (v.trailing_zeros(), 63 - v.leading_zeros());
+        let a = wreg_name(ar);
+        if m == "cbnz" {
+            lines[i] = format!("    tbnz {}, #{}, {}", a, low, target);
+            lines[j] = format!("    tbnz {}, #{}, {}", a, high, target);
+            kinds[k] = LineKind::Nop;
+        } else {
+            let over = format!(".Lbit_{fresh}");
+            fresh += 1;
+            lines[i] = format!("    tbnz {}, #{}, {}", a, low, over);
+            lines[j] = format!("    tbz {}, #{}, {}", a, high, target);
+            lines[k] = format!("{over}:");
+            kinds[k] = classify_line(&lines[k]);
+        }
+        kinds[i] = classify_line(&lines[i]);
+        kinds[j] = classify_line(&lines[j]);
+    }
 }
 
 /// `and D, A, B` then `cmp D, #0` (D dead afterwards): `tst A, B`. cmp #0
@@ -8959,6 +9024,33 @@ mod tests {
         let far = peephole_optimize(f("and x9, x0, #4", "cbz x9, .LBB1", 8000));
         assert!(far.contains("cbz w9") && !far.contains("tbz"));
         assert!(peephole_optimize(f("and x9, x0, #4", "cbz x9, .LBB1", 7900)).contains("tbz w0, #2"));
+    }
+
+    #[test]
+    fn test_two_bit_test_branches_on_each_bit() {
+        let f = |mov: &str, and: &str, br: &str, gap: usize| ret_x0(&format!("    {mov}\n    {and}\n    {br}\n{}    mov x0, #2\n.LBB1:\n", "    str x3, [x2], #8\n".repeat(gap)));
+        let result = peephole_optimize(f("mov x9, #36864", "and x10, x0, x9", "cbz w10, .LBB1", 0));
+        assert!(result.contains("    tbnz w0, #12, .Lbit_0\n    tbz w0, #15, .LBB1\n.Lbit_0:\n"), "{}", result);
+        assert!(!result.contains("and x10") && !result.contains("#36864"), "{}", result);
+        let result = peephole_optimize(f("mov x9, #36", "and x9, x9, x0", "cbnz x9, .LBB1", 0));
+        assert!(result.contains("    tbnz w0, #2, .LBB1\n    tbnz w0, #5, .LBB1\n") && !result.contains("Lbit"), "{}", result);
+        // Each gets a label of its own.
+        let two = "    mov x9, #36\n    and x10, x0, x9\n    cbz x10, .LBB1\n    mov x9, #36\n    and x10, x1, x9\n    cbz x10, .LBB1\n    mov x0, #2\n.LBB1:\n";
+        let result = peephole_optimize(ret_x0(two));
+        assert!(result.contains(".Lbit_0:") && result.contains(".Lbit_1:"), "{}", result);
+        // Not with the masked value or the mask read later, three bits, a
+        // bit of the upper half, a test of another register, or a target
+        // that may be beyond +/-32KB.
+        let kept = |r: &str| r.contains("and x10") && !r.contains("tbz");
+        let r = peephole_optimize(ret_x0("    mov x9, #36864\n    and x10, x0, x9\n    cbz x10, .LBB1\n    mov x0, #2\n.LBB1:\n    str x10, [x2]\n"));
+        assert!(kept(&r), "{}", r);
+        let r = peephole_optimize(ret_x0("    mov x9, #36864\n    and x10, x0, x9\n    cbz x10, .LBB1\n    mov x0, #2\n.LBB1:\n    str x9, [x2]\n"));
+        assert!(kept(&r), "{}", r);
+        assert!(kept(&peephole_optimize(f("mov x9, #37", "and x10, x0, x9", "cbz x10, .LBB1", 0))));
+        assert!(kept(&peephole_optimize(f("mov x9, #0x100000004", "and x10, x0, x9", "cbz x10, .LBB1", 0))));
+        assert!(peephole_optimize(f("mov x9, #36864", "and x10, x0, x9", "cbz x11, .LBB1", 0)).contains("cbz x11"));
+        assert!(kept(&peephole_optimize(f("mov x9, #36864", "and x10, x0, x9", "cbz x10, .LBB1", 8000))));
+        assert!(kept(&peephole_optimize(f("mov x9, #36864", "and x10, x0, x9", "cbnz x10, .LBB1", 8000))));
     }
 
     #[test]
