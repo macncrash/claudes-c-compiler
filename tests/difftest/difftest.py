@@ -8,6 +8,7 @@ Usage:
     tests/difftest/difftest.py --suite cases -k va # filter by suite / substring
     tests/difftest/difftest.py --save-baseline     # record baseline/<platform>.json
     tests/difftest/difftest.py --compare           # diff against the saved baseline
+    tests/difftest/difftest.py --profile --compare # the same, each test built from its own profile
 
 Suites:
     cases        tests/difftest/cases/*.c (hand-written). A companion file
@@ -221,28 +222,47 @@ def run_test(test, args, ref_cache, ref_cc_version):
             return {"status": REF_FAIL, "detail": detail}
 
         # ccc side.
-        t0 = time.time()
-        ccc_bin = os.path.join(workdir, "ccc")
-        ok, stage, err = build(args.ccc, args.ccc_flags, test, ccc_bin, workdir, args.ref_cc)
-        compile_s = time.time() - t0
-        if not ok:
-            status = {"asm": ASM_ERROR, "link": LINK_ERROR, "helper": REF_FAIL}.get(stage, COMPILE_ERROR)
-            return {"status": status, "detail": first_line(err), "compile_s": compile_s}
-        r = execute(ccc_bin, os.path.dirname(test.path))
-        if r["status"] == "timeout":
-            return {"status": TIMEOUT, "detail": "ccc binary timed out", "compile_s": compile_s}
-        if r["code"] < 0:
-            return {"status": CRASH, "detail": describe(r), "compile_s": compile_s}
-        out = r["stdout"].decode("latin-1")
-        if out != ref["stdout"]:
-            return {"status": WRONG_OUTPUT, "compile_s": compile_s,
-                    "detail": first_diff(ref["stdout"], out)}
-        if r["code"] != ref["code"]:
-            return {"status": WRONG_EXIT, "compile_s": compile_s,
-                    "detail": f"expected exit {ref['code']}, got {r['code']}"}
-        return {"status": PASS, "compile_s": compile_s}
+        flags = args.ccc_flags
+        if args.profile:
+            prof = os.path.join(workdir, "prof")
+            os.mkdir(prof)
+            r = build_and_judge(test, args, ref, args.ccc_flags + [f"-fprofile-generate={prof}"],
+                                os.path.join(workdir, "train"), workdir)
+            if r["status"] not in (PASS, TIMEOUT):
+                if r["status"] != REF_FAIL:
+                    r["detail"] = f"training: {r.get('detail', '')}"
+                return r
+            if any(f.endswith(".cnt") for f in os.listdir(prof)):
+                flags = args.ccc_flags + [f"-fprofile-use={prof}"]
+        r = build_and_judge(test, args, ref, flags, os.path.join(workdir, "ccc"), workdir)
+        if flags is not args.ccc_flags:
+            r["trained"] = True
+        return r
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def build_and_judge(test, args, ref, flags, binary, workdir):
+    """Build a test with ccc, run it, and compare it with the reference's run."""
+    t0 = time.time()
+    ok, stage, err = build(args.ccc, flags, test, binary, workdir, args.ref_cc)
+    compile_s = time.time() - t0
+    if not ok:
+        status = {"asm": ASM_ERROR, "link": LINK_ERROR, "helper": REF_FAIL}.get(stage, COMPILE_ERROR)
+        return {"status": status, "detail": first_line(err), "compile_s": compile_s}
+    r = execute(binary, os.path.dirname(test.path))
+    if r["status"] == "timeout":
+        return {"status": TIMEOUT, "detail": "ccc binary timed out", "compile_s": compile_s}
+    if r["code"] < 0:
+        return {"status": CRASH, "detail": describe(r), "compile_s": compile_s}
+    out = r["stdout"].decode("latin-1")
+    if out != ref["stdout"]:
+        return {"status": WRONG_OUTPUT, "compile_s": compile_s,
+                "detail": first_diff(ref["stdout"], out)}
+    if r["code"] != ref["code"]:
+        return {"status": WRONG_EXIT, "compile_s": compile_s,
+                "detail": f"expected exit {ref['code']}, got {r['code']}"}
+    return {"status": PASS, "compile_s": compile_s}
 
 
 def strip_repo(text):
@@ -382,7 +402,11 @@ def main():
     ap.add_argument("--save-baseline", action="store_true", help="write baseline/<platform>.{json,md}")
     ap.add_argument("--compare", action="store_true", help="diff against baseline/<platform>.json")
     ap.add_argument("--json", help="also write full results to this path")
+    ap.add_argument("--profile", action="store_true",
+                    help="train each test with -fprofile-generate, then build it with -fprofile-use")
     args = ap.parse_args()
+    if args.profile and args.save_baseline:
+        raise SystemExit("--profile compares against the plain baseline; it cannot save one")
     args.ccc_flags = args.ccc_flags.split()
     args.ref_flags = arch_flags() + args.ref_flags.split()
 
@@ -429,6 +453,9 @@ def main():
 
     print_summary(results, args.verbose)
     print(f"\n{len(tests)} tests in {elapsed:.1f}s")
+    trained = sum(1 for r in results.values() if r.get("trained"))
+    if args.profile:
+        print(f"{trained} tests built from a profile")
 
     ccc_rev = subprocess.run(["git", "-C", REPO, "describe", "--always", "--dirty"],
                              capture_output=True, text=True).stdout.strip()
@@ -458,7 +485,8 @@ def main():
             f.write("\n")
         write_markdown(os.path.join(BASELINE_DIR, f"{args.platform}.md"), meta, results)
         print(f"baseline written to {os.path.relpath(baseline_json, REPO)}")
-    return 1 if regressions else 0
+    # A profile run that used no counts tested nothing it set out to.
+    return 1 if regressions or (args.profile and not trained) else 0
 
 
 if __name__ == "__main__":

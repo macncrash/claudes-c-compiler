@@ -24,6 +24,7 @@ Useful options:
 | `--save-baseline` | write `baseline/<platform>.json` and `.md` |
 | `--ccc-flags`, `--ref-flags` | compiler flags (defaults `-O2 -w` / `-O0 -w`) |
 | `--json PATH` | write full results for ad-hoc analysis |
+| `--profile` | train each test and build it from its own profile (see below) |
 
 ## Suites
 
@@ -53,6 +54,17 @@ on it. The pass rate excludes `ref_fail`.
 `baseline/<platform>.md` is the human-readable record and
 `baseline/<platform>.json` is what `--compare` reads. Re-record after
 intentional changes with `--save-baseline`, and commit both files.
+
+## Profiles
+
+A plain run never passes `-fprofile-use`, so it says nothing about the code
+that only runs with one, such as block placement. `--profile --compare` builds
+each test with `-fprofile-generate`, runs that and judges it like any other
+binary, then rebuilds with `-fprofile-use` and judges the result. A failure in
+the instrumented binary has `training:` before its reason. A training run that
+times out or leaves no counts still gets its plain build, and the summary says
+how many tests really used counts. Run this after changing anything gated on a
+profile. It compares against the usual baseline and cannot save one.
 
 ## macOS notes
 
