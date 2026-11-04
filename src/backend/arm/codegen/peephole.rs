@@ -2719,6 +2719,73 @@ fn fuse_bit_test_into_tbz(lines: &mut [String], kinds: &mut [LineKind], n: usize
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
     }
+    // `cmp R, #128` then `b.lo`/`b.lt` (`b.hs`/`b.ge`), R a byte loaded
+    // (or masked) earlier in the block, the flags read on neither path: a
+    // test of its top bit, `tbz R, #7` (`tbnz`). A varint's continuation
+    // bit in btreeParseCellPtr (`if( *pIter>=0x80 )`). The same for #32768
+    // and a halfword, bit 15.
+    for i in 0..n {
+        let Some(("cmp", ops)) = split_insn(&lines[i]) else { continue };
+        let (r, imm) = first_and_rest(ops);
+        let Some(rn) = gpr_operand(r) else { continue };
+        let bit = match imm.trim() {
+            "#128" => 7,
+            "#32768" => 15,
+            _ => continue,
+        };
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some((m, target)) = split_insn(&lines[j]) else { continue };
+        let op = match m {
+            "b.lo" | "b.lt" => "tbz",
+            "b.hs" | "b.ge" => "tbnz",
+            _ => continue,
+        };
+        // R's definition, earlier in this block, keeps only the low bits.
+        let mut narrow = false;
+        for k in (0..i).rev() {
+            match kinds[k] {
+                LineKind::Nop => continue,
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                | LineKind::Call | LineKind::Ret => break,
+                _ => {}
+            }
+            if line_info(&lines[k], kinds[k], &|_| None).defs & (1 << rn) == 0 {
+                continue;
+            }
+            narrow = match split_insn(&lines[k]) {
+                Some((lm @ ("ldrb" | "ldrh"), lops)) => {
+                    let d = first_and_rest(lops).0;
+                    d.starts_with('w') && gpr_operand(d) == Some(rn) && (lm == "ldrb") == (bit == 7)
+                }
+                Some(("and", aops)) => {
+                    let p: Vec<&str> = aops.split(',').map(str::trim).collect();
+                    let mask = if bit == 7 { 0xff } else { 0xffff };
+                    p.len() == 3 && gpr_operand(p[0]) == Some(rn) && parse_imm(p[2]) == Some(mask)
+                }
+                _ => false,
+            };
+            break;
+        }
+        if !narrow {
+            continue;
+        }
+        let target = target.trim();
+        let Some(&t) = labels.get(target) else { continue };
+        if flags_read_from(lines, kinds, j + 1, n) || flags_read_from(lines, kinds, t, n)
+            || at[t.max(j)] - at[t.min(j)] > TBZ_SAFE_BYTES
+        {
+            continue;
+        }
+        lines[j] = format!("    {} {}, #{}, {}", op, wreg_name(rn), bit, target);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+    }
 }
 
 /// `and D, A, B` then `cmp D, #0` (D dead afterwards): `tst A, B`. cmp #0
@@ -8562,6 +8629,27 @@ mod tests {
         assert!(peephole_optimize(f("cmp w3, #0", "b.lt .LBB1", "    csel x5, x1, x2, eq\n    str x5, [x1]\n", "")).contains("cmp w3, #0"));
         assert!(peephole_optimize(f("cmp w3, #0", "b.le .LBB1", "", "")).contains("cmp w3, #0"));
         assert!(peephole_optimize(f("cmp w3, #1", "b.lt .LBB1", "", "")).contains("cmp w3, #1"));
+    }
+
+    #[test]
+    fn test_byte_compared_with_its_top_bit_branches_on_it() {
+        let f = |def: &str, cmp: &str, br: &str| ret_x0(&format!("    {def}\n    add x5, x1, #1\n    {cmp}\n    {br}\n    mov x0, #2\n    ret\n.LBB1:\n    mov x0, #3\n"));
+        let result = peephole_optimize(f("ldrb w3, [x1]", "cmp w3, #128", "b.lo .LBB1"));
+        assert!(result.contains("tbz w3, #7, .LBB1") && !result.contains("cmp"), "{}", result);
+        let result = peephole_optimize(f("ldrh w3, [x1, #2]", "cmp w3, #32768", "b.ge .LBB1"));
+        assert!(result.contains("tbnz w3, #15, .LBB1"), "{}", result);
+        // (A masked byte: here the mask and the compare become one tst.)
+        let result = peephole_optimize(f("and x3, x4, #0xff", "cmp w3, #128", "b.hs .LBB1"));
+        assert!(!result.contains("cmp"), "{}", result);
+        // Not for a word, a signed byte, a halfword against #128, nor a
+        // compare that is not of the top bit.
+        assert!(peephole_optimize(f("ldr w3, [x1]", "cmp w3, #128", "b.lo .LBB1")).contains("cmp w3, #128"));
+        assert!(peephole_optimize(f("ldrsb w3, [x1]", "cmp w3, #128", "b.lt .LBB1")).contains("cmp w3, #128"));
+        assert!(peephole_optimize(f("ldrh w3, [x1]", "cmp w3, #128", "b.lo .LBB1")).contains("cmp w3, #128"));
+        assert!(peephole_optimize(f("ldrb w3, [x1]", "cmp w3, #128", "b.hi .LBB1")).contains("cmp w3, #128"));
+        // Nor past a label, where other paths may bring any value.
+        let joined = ret_x0("    ldrb w3, [x1]\n.LBB2:\n    cmp w3, #128\n    b.lo .LBB1\n    add w3, w3, #1\n    b .LBB2\n.LBB1:\n    mov x0, #3\n");
+        assert!(peephole_optimize(joined).contains("cmp w3, #128"));
     }
 
     #[test]
