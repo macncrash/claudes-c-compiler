@@ -520,6 +520,7 @@ pub fn allocate_registers(
 
     evict(&liveness, &eligible, call_points, boundary_ok, &use_count, &handoff, &groups, &saved_values,
           &folded, callee, caller, &mut callee_busy, &mut caller_busy, &mut assignments);
+    drop_cold_callee_saved(&use_count, &folded, callee, &mut callee_busy, &mut assignments);
 
     // CCC_DUMP_REGALLOC=<function|all>: each candidate's interval, weight,
     // and register (or "-" for a stack slot).
@@ -659,6 +660,52 @@ fn evict(
             pool[i].retain(|e| e.2 != v);
             pool[i].extend(removed);
         }
+    }
+}
+
+/// Give up callee-saved registers whose values are used too rarely to pay for
+/// saving them on every call. getPageNormal saved x26, 6M times, for values on
+/// a path run 40K times. A value left on the stack costs about twice its
+/// weight (its uses, and as many stores). AArch64 saves registers in pairs, so
+/// one goes only when the count is odd, otherwise two together. All the values
+/// of a register go, so a copy group in it stays together. The bases of folded
+/// GEPs stay, as in evict.
+fn drop_cold_callee_saved(
+    use_count: &FxHashMap<u32, u64>,
+    folded: &FxHashMap<u32, u32>,
+    callee: &[PhysReg],
+    callee_busy: &mut [Vec<(u32, u32, u32)>],
+    assignments: &mut FxHashMap<u32, PhysReg>,
+) {
+    let bases: FxHashSet<u32> = folded.values().copied().collect();
+    let pinned = |c: u32| c == u32::MAX || bases.contains(&c);
+    let values = |busy: &[(u32, u32, u32)]| {
+        let mut vs: Vec<u32> = busy.iter().map(|e| e.2).collect();
+        vs.sort_unstable();
+        vs.dedup();
+        vs
+    };
+    let mut used = callee_busy.iter().filter(|b| !b.is_empty()).count();
+    let mut cold: Vec<(u64, usize)> = (0..callee.len())
+        .filter(|&i| !callee_busy[i].is_empty() && !callee_busy[i].iter().any(|e| pinned(e.2)))
+        .map(|i| (values(&callee_busy[i]).iter().map(|v| use_count.get(v).copied().unwrap_or(0)).sum(), i))
+        .collect();
+    cold.sort_unstable();
+    let mut next = 0;
+    loop {
+        let k = if used % 2 == 1 { 1 } else { 2 };
+        let Some(take) = cold.get(next..next + k) else { break };
+        if take.iter().map(|c| c.0).sum::<u64>() >= BLOCK_WEIGHT_UNIT {
+            break;
+        }
+        for &(_, i) in take {
+            for v in values(&callee_busy[i]) {
+                assignments.remove(&v);
+            }
+            callee_busy[i].clear();
+        }
+        used -= k;
+        next += k;
     }
 }
 
@@ -1314,6 +1361,45 @@ fn build_sorted_candidates<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cold_callee_saved_registers_are_dropped() {
+        let callee = [PhysReg(20), PhysReg(21), PhysReg(22)];
+        // Weights of the values in r20, r21, r22 (one each, 0: empty); what
+        // stays assigned afterwards.
+        let run = |w: [u64; 3], folded: &[(u32, u32)]| {
+            let mut busy: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); 3];
+            let mut use_count = FxHashMap::default();
+            let mut assignments = FxHashMap::default();
+            for (i, &weight) in w.iter().enumerate() {
+                if weight != 0 {
+                    let v = i as u32 + 1;
+                    // Two pieces: a value is counted once.
+                    busy[i] = vec![(0, 4, v), (8, 12, v)];
+                    use_count.insert(v, weight);
+                    assignments.insert(v, callee[i]);
+                }
+            }
+            let folded: FxHashMap<u32, u32> = folded.iter().copied().collect();
+            drop_cold_callee_saved(&use_count, &folded, &callee, &mut busy, &mut assignments);
+            let mut left: Vec<u32> = assignments.keys().copied().collect();
+            left.sort_unstable();
+            assert!(busy.iter().enumerate().all(|(i, b)| b.is_empty() != left.contains(&(i as u32 + 1))));
+            left
+        };
+        // An odd count: the coldest goes alone, if it is under one run per call.
+        assert_eq!(run([5000, 5000, 12], &[]), [1, 2]);
+        assert_eq!(run([5000, 5000, 999], &[]), [1, 2]);
+        assert_eq!(run([5000, 5000, 1000], &[]), [1, 2, 3]);
+        // An even count: two go together or neither does, as a pair is saved
+        // by one instruction.
+        assert_eq!(run([400, 500, 0], &[]), [] as [u32; 0]);
+        assert_eq!(run([400, 700, 0], &[]), [1, 2]);
+        // After one goes the count is even, and the next two may go as well.
+        assert_eq!(run([300, 300, 5], &[]), [] as [u32; 0]);
+        // The base of a folded GEP stays.
+        assert_eq!(run([5000, 5000, 12], &[(9, 3)]), [1, 2, 3]);
+    }
 
     fn liveness(intervals: Vec<LiveInterval>, call: u32, dest: Option<u32>) -> LivenessResult {
         LivenessResult {
