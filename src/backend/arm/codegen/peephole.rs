@@ -659,6 +659,7 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
             changed2 |= pass!(fold_low_mask_bound_into_tst(lines, kinds, n));
             changed2 |= pass!(fold_min_compare_into_overflow(lines, kinds, n));
             changed2 |= pass!(fold_shift_into_uses(lines, kinds, n));
+            changed2 |= pass!(fold_sign_clamp_into_bic(lines, kinds, n));
             changed2 |= pass!(fold_bit_test_into_extract(lines, kinds, n));
             changed2 |= pass!(drop_mask_of_narrow_value(lines, kinds, n));
             changed2 |= pass!(drop_sxtw_of_nonnegative(lines, kinds, n));
@@ -3271,6 +3272,51 @@ fn fold_low_mask_bound_into_tst(lines: &mut [String], kinds: &mut [LineKind], n:
         lines[c] = format!("    tst {}, #{:#x}", sreg, m & !(bound - 1));
         kinds[c] = classify_line(&lines[c]);
         lines[j] = format!("    b.{} {}", ucc, target);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// `cmp R, #0` then `csel D, xzr, xR, lt` (D = max(R, 0)), the flags read
+/// no further: `bic D, R, R, asr #31` (#63 for a 64-bit R), which clears
+/// R where its sign is set; a 32-bit R gives D zero-extended, the same
+/// number since it is never negative. And for a 64-bit R, `csel D, xR,
+/// xzr, lt` (min(R, 0)) as `and D, R, R, asr #63`. sqlite3VdbeExec's
+/// `if( n<0 ) n = 0`.
+fn fold_sign_clamp_into_bic(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    for i in 0..n {
+        let Some(("cmp", ops)) = split_insn(&lines[i]) else { continue };
+        let (rr, imm) = first_and_rest(ops);
+        let Some(r) = gpr_operand(rr) else { continue };
+        if imm.trim() != "#0" {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some(("csel", cops)) = split_insn(&lines[j]) else { continue };
+        let p: Vec<&str> = cops.split(',').map(str::trim).collect();
+        let [d, a, b, "lt"] = p[..] else { continue };
+        let Some(dn) = gpr_operand(d) else { continue };
+        let op = match (a, b) {
+            ("xzr", x) if gpr_operand(x) == Some(r) && x.starts_with('x') => "bic",
+            (x, "xzr") if gpr_operand(x) == Some(r) && x.starts_with('x') => "and",
+            _ => continue,
+        };
+        // (A 32-bit min would leave a negative D zero-extended, not the
+        // sign-extended value csel copied: 64-bit only.)
+        if !d.starts_with('x') || (op == "and" && rr.starts_with('w')) || flags_read_from(lines, kinds, j + 1, n) {
+            continue;
+        }
+        let (dd, src, bit) = if rr.starts_with('w') { (wreg_name(dn), wreg_name(r), 31) } else { (xreg_name(dn), xreg_name(r), 63) };
+        lines[j] = format!("    {} {}, {}, {}, asr #{}", op, dd, src, src, bit);
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
         changed = true;
@@ -8779,11 +8825,11 @@ mod tests {
     #[test]
     fn test_compare_sinks_past_other_select_to_its_reader() {
         let f = |between: &str| ret_x0(&format!("    cmp w13, w14\n    cset x14, gt\n{between}    cmp x14, #0\n    csel x14, x15, x13, ne\n    str x14, [x1]\n    str x15, [x2]\n"));
-        let result = peephole_optimize(f("    cmp w11, #0\n    csel x15, xzr, x11, lt\n"));
+        let result = peephole_optimize(f("    cmp w11, #0\n    csel x15, x12, x11, lt\n"));
         assert!(!result.contains("cset") && result.contains("csel x14, x15, x13, gt"), "{}", result);
         assert!(result.find("csel x15").unwrap() < result.find("cmp w13, w14").unwrap(), "{}", result);
         // Not past code writing the compare's registers, or reading its flags.
-        assert!(peephole_optimize(f("    cmp w11, #0\n    csel x13, xzr, x11, lt\n")).contains("cset x14, gt"));
+        assert!(peephole_optimize(f("    cmp w11, #0\n    csel x13, x12, x11, lt\n")).contains("cset x14, gt"));
         assert!(peephole_optimize(f("    csel x15, xzr, x11, lt\n    cmp w11, #0\n")).contains("cset x14, gt"));
     }
 
@@ -8799,6 +8845,23 @@ mod tests {
         assert!(peephole_optimize(f("cmp w3, #0", "b.lt .LBB1", "    csel x5, x1, x2, eq\n    str x5, [x1]\n", "")).contains("cmp w3, #0"));
         assert!(peephole_optimize(f("cmp w3, #0", "b.le .LBB1", "", "")).contains("cmp w3, #0"));
         assert!(peephole_optimize(f("cmp w3, #1", "b.lt .LBB1", "", "")).contains("cmp w3, #1"));
+    }
+
+    #[test]
+    fn test_clamp_at_zero_is_a_bit_clear_by_the_sign() {
+        let f = |cmp: &str, csel: &str, after: &str| ret_x0(&format!("    {cmp}\n    {csel}\n{after}    str x15, [x1]\n"));
+        let result = peephole_optimize(f("cmp w12, #0", "csel x15, xzr, x12, lt", ""));
+        assert!(result.contains("bic w15, w12, w12, asr #31") && !result.contains("cmp"), "{}", result);
+        let result = peephole_optimize(f("cmp x12, #0", "csel x15, xzr, x12, lt", ""));
+        assert!(result.contains("bic x15, x12, x12, asr #63"), "{}", result);
+        let result = peephole_optimize(f("cmp x12, #0", "csel x15, x12, xzr, lt", ""));
+        assert!(result.contains("and x15, x12, x12, asr #63"), "{}", result);
+        // Not a 32-bit min (its negative result sign-extended by the csel),
+        // other conditions or operands, or flags read later.
+        assert!(peephole_optimize(f("cmp w12, #0", "csel x15, x12, xzr, lt", "")).contains("csel"));
+        assert!(peephole_optimize(f("cmp w12, #0", "csel x15, xzr, x12, le", "")).contains("csel"));
+        assert!(peephole_optimize(f("cmp w12, #0", "csel x15, xzr, x13, lt", "")).contains("csel"));
+        assert!(peephole_optimize(f("cmp w12, #0", "csel x15, xzr, x12, lt", "    cset x16, eq\n    str x16, [x2]\n")).contains("csel"));
     }
 
     #[test]
