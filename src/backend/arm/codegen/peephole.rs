@@ -1099,6 +1099,11 @@ fn small_loop_alignment(lines: &[String], kinds: &[LineKind], n: usize) -> Vec<O
 // Also handles: str wN, [sp, #off]  →  ldrsw xN, [sp, #off]
 // And a store stored over before any read of the slot: it goes.
 
+/// Most lines to look through for a later store to the same slot. Without a
+/// limit a 256K struct passed by value, 65,536 stores to different slots in
+/// one straight line, took this pass 7 seconds.
+const MAX_STORE_OVER_SCAN: usize = 256;
+
 fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     let mut i = 0;
@@ -1145,7 +1150,11 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
             // the first store goes. Only straight-line code, and nothing
             // else naming sp, may come between.
             let mut k = i + 1;
-            while k < n {
+            let mut scanned = 0;
+            while k < n && scanned < MAX_STORE_OVER_SCAN {
+                if kinds[k] != LineKind::Nop {
+                    scanned += 1;
+                }
                 match kinds[k] {
                     LineKind::Nop => {}
                     LineKind::StoreSp { offset, is_word, .. } if offset == store_off && is_word == store_word => {
@@ -8570,6 +8579,23 @@ mod tests {
             let result = peephole_optimize(body(mid));
             assert_eq!(result.matches("ldr x0, [sp, #40]").count(), 2, "{}: {}", mid, result);
         }
+    }
+
+    #[test]
+    fn test_store_over_is_only_looked_for_nearby() {
+        // Later passes drop the store anyway, so this runs the pass alone.
+        // Each line after the first store counts against the limit.
+        let first_store_goes = |between: usize| {
+            let mut lines = vec!["    str x1, [sp, #16]".to_string()];
+            lines.extend(std::iter::repeat_n("    add x2, x2, #1".to_string(), between));
+            lines.push("    str x3, [sp, #16]".to_string());
+            let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+            let n = lines.len();
+            eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
+            kinds[0] == LineKind::Nop
+        };
+        assert!(first_store_goes(MAX_STORE_OVER_SCAN - 1));
+        assert!(!first_store_goes(MAX_STORE_OVER_SCAN));
     }
 
     #[test]
