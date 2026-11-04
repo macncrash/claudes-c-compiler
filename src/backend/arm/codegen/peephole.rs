@@ -658,6 +658,7 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
             changed2 |= pass!(fold_mask_into_compare(lines, kinds, n));
             changed2 |= pass!(fold_low_mask_bound_into_tst(lines, kinds, n));
             changed2 |= pass!(fold_min_compare_into_overflow(lines, kinds, n));
+            changed2 |= pass!(fold_shift_into_uses(lines, kinds, n));
             changed2 |= pass!(fold_bit_test_into_extract(lines, kinds, n));
             changed2 |= pass!(drop_mask_of_narrow_value(lines, kinds, n));
             changed2 |= pass!(drop_sxtw_of_nonnegative(lines, kinds, n));
@@ -3272,6 +3273,109 @@ fn fold_low_mask_bound_into_tst(lines: &mut [String], kinds: &mut [LineKind], n:
         lines[j] = format!("    b.{} {}", ucc, target);
         kinds[j] = classify_line(&lines[j]);
         kinds[i] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+/// Bytes a plain `ldr`/`str` family line moves: `ldrh` 2, `ldr wN` 4,
+/// `str qN` 16.
+fn access_bytes(mnemonic: &str, reg: &str) -> Option<u32> {
+    match mnemonic {
+        "ldrb" | "strb" | "ldrsb" => Some(1),
+        "ldrh" | "strh" | "ldrsh" => Some(2),
+        "ldrsw" => Some(4),
+        "ldr" | "str" => match reg.as_bytes().first()? {
+            b'b' => Some(1),
+            b'h' => Some(2),
+            b'w' | b's' => Some(4),
+            b'x' | b'd' => Some(8),
+            b'q' => Some(16),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `lsl xA, xB, #s` whose every use, until A is dead in the same
+/// straight-line code, is the index of a register-offset access of 2^s
+/// bytes (`[xC, xA]`) or the second operand of an `add`: each takes xB
+/// shifted itself (`[xC, xB, lsl #s]`, `add xD, xE, xB, lsl #s`), and the
+/// lsl goes. sqlite3VdbeExec's OP_Column, `aOffset[i]` and `&aType[i]` from
+/// one `i * 4`.
+fn fold_shift_into_uses(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    for i in 0..n {
+        let Some(("lsl", ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [aa, bb, ss] = p[..] else { continue };
+        let (Some(a), Some(b)) = (gpr_operand(aa), gpr_operand(bb)) else { continue };
+        let Some(s) = ss.strip_prefix('#').and_then(|v| v.parse::<u32>().ok()) else { continue };
+        if !aa.starts_with('x') || !bb.starts_with('x') || !(1..=4).contains(&s) || a == b {
+            continue;
+        }
+        let lv = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+        let mut rewrites: Vec<(usize, String)> = Vec::new();
+        let mut ok = false;
+        for k in i + 1..n {
+            match kinds[k] {
+                LineKind::Nop => continue,
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+                | LineKind::Call | LineKind::Ret => break,
+                _ => {}
+            }
+            let info = line_info(&lines[k], kinds[k], &|_| None);
+            if info.uses & (1 << a) != 0 {
+                let Some((m, kops)) = split_insn(&lines[k]) else { break };
+                let (first, rest) = first_and_rest(kops);
+                let rest = rest.trim();
+                let new = if let (Some(size), Some(inner)) = (access_bytes(m, first), rest.strip_prefix('[').and_then(|r| r.strip_suffix(']'))) {
+                    // A register-offset access indexed by A alone.
+                    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+                    match parts[..] {
+                        // (A store's data may not be A; a load's dest may.)
+                        [base, idx] if gpr_operand(idx) == Some(a) && idx.starts_with('x') && gpr_operand(base) != Some(a)
+                            && size == 1 << s && (m.starts_with("ld") || gpr_operand(first) != Some(a)) =>
+                            format!("    {} {}, [{}, {}, lsl #{}]", m, first, base, bb, s),
+                        _ => break,
+                    }
+                } else if m == "add" {
+                    let q: Vec<&str> = kops.split(',').map(str::trim).collect();
+                    match q[..] {
+                        [d, e, x] if gpr_operand(x) == Some(a) && gpr_operand(e) != Some(a) && x.starts_with('x') && d.starts_with('x') && e.starts_with('x') =>
+                            format!("    add {}, {}, {}, lsl #{}", d, e, bb, s),
+                        [d, x, e] if gpr_operand(x) == Some(a) && gpr_operand(e) != Some(a) && x.starts_with('x') && d.starts_with('x') && e.starts_with('x') =>
+                            format!("    add {}, {}, {}, lsl #{}", d, e, bb, s),
+                        _ => break,
+                    }
+                } else {
+                    break;
+                };
+                rewrites.push((k, new));
+                // The last use: A dead after it, or written by it.
+                if lv[k] & (1 << a) == 0 || info.defs & (1 << a) != 0 {
+                    ok = true;
+                    break;
+                }
+            } else if info.defs & (1 << a) != 0 {
+                break;
+            }
+            // B must hold its value through the last use.
+            if info.defs & (1 << b) != 0 {
+                break;
+            }
+        }
+        if !ok || rewrites.is_empty() {
+            continue;
+        }
+        for (k, new) in rewrites {
+            lines[k] = new;
+            kinds[k] = classify_line(&lines[k]);
+        }
+        kinds[i] = LineKind::Nop;
+        // B now lives on to the last use: liveness again for the next.
+        live = None;
         changed = true;
     }
     changed
@@ -8695,6 +8799,22 @@ mod tests {
         assert!(peephole_optimize(f("cmp w3, #0", "b.lt .LBB1", "    csel x5, x1, x2, eq\n    str x5, [x1]\n", "")).contains("cmp w3, #0"));
         assert!(peephole_optimize(f("cmp w3, #0", "b.le .LBB1", "", "")).contains("cmp w3, #0"));
         assert!(peephole_optimize(f("cmp w3, #1", "b.lt .LBB1", "", "")).contains("cmp w3, #1"));
+    }
+
+    #[test]
+    fn test_scaled_index_folded_into_its_uses() {
+        let f = |body: &str| ret_x0(&format!("    lsl x10, x13, #2\n{body}    add x0, x14, x15\n"));
+        let result = peephole_optimize(f("    ldr w14, [x28, x10]\n    add x15, x15, x10\n"));
+        assert!(result.contains("ldr w14, [x28, x13, lsl #2]") && result.contains("add x15, x15, x13, lsl #2") && !result.contains("lsl x10"), "{}", result);
+        // A load into the index itself ends it.
+        let result = peephole_optimize(f("    ldrsw x10, [x28, x10]\n    add x15, x10, #1\n    ldr w14, [x2]\n"));
+        assert!(result.contains("ldrsw x10, [x28, x13, lsl #2]") && !result.contains("lsl x10"), "{}", result);
+        // Not for an access of another size, past a write to the source,
+        // with another use of the index, or with the index stored.
+        assert!(peephole_optimize(f("    ldr x14, [x28, x10]\n    mov x15, #0\n")).contains("lsl x10"));
+        assert!(peephole_optimize(f("    ldr w14, [x28, x10]\n    mov x13, #1\n    add x15, x13, x10\n")).contains("lsl x10"));
+        assert!(peephole_optimize(f("    ldr w14, [x28, x10]\n    sub x15, x2, x10\n")).contains("lsl x10"));
+        assert!(peephole_optimize(f("    str x10, [x28, x10]\n    mov x15, #0\n    mov x14, #0\n")).contains("lsl x10"));
     }
 
     #[test]
