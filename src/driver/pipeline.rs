@@ -1170,6 +1170,9 @@ impl Driver {
         } else {
             if let Some(dir) = &self.profile_use {
                 crate::passes::profile::load(&mut module, &crate::passes::profile::unit_id(input_file), dir);
+                if !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("block_place")) {
+                    crate::passes::block_place::place_blocks(&mut module);
+                }
             }
             if self.target == Target::Aarch64
                 && !std::env::var("CCC_DISABLE_PASSES").is_ok_and(|d| d.contains("all") || d.contains("shrink_wrap")) {

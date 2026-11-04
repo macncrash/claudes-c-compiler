@@ -10,6 +10,7 @@
 //! optimizer and catch issues early.
 
 mod addr_arg_promote;
+pub(crate) mod block_place;
 mod bound_hoist;
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
