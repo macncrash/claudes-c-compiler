@@ -2987,6 +2987,11 @@ fn narrow_load_for_copy(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
             let mut same = addr & ((1 << a) | (1 << b)) == 0;
             let mut k = j + 1;
             let ok = loop {
+                // Nothing reads A after the copy (`mov w11, w10; b L`, the
+                // walk stopping at the branch otherwise).
+                if k == j + 1 && live[j] & (1 << a) == 0 {
+                    break true;
+                }
                 if k >= n {
                     break false;
                 }
@@ -8957,6 +8962,12 @@ mod tests {
         // update reads wB and still writes A.
         let result = run("    ldr x0, [sp, #2728]\n    mov w14, w0\n    add w0, w0, #1\n    str x14, [x3]\n    str x0, [x3, #8]\n    mov x0, #0\n");
         assert!(result.contains("ldr w14, [sp, #2728]") && result.contains("add w0, w14, #1"), "{}", result);
+        // A dead at once, with a branch next (OP_Column's `p2`, the walk
+        // for later reads ending at the branch); not when the target reads it.
+        let jump = |read: &str| peephole_optimize(ret_x0(&format!("    ldrsw x10, [x26, #8]\n    mov w11, w10\n    b .LBB1\n    mov x4, #1\n.LBB1:\n    {read}\n    str x11, [x3]\n    str x10, [x3, #8]\n")));
+        let result = jump("ldr w10, [x27, #24]");
+        assert!(result.contains("ldr w11, [x26, #8]") && !result.contains("mov w11"), "{}", result);
+        assert!(jump("add x10, x10, #1").contains("mov w11, w10"));
         // Not when that update reads A whole.
         let result = run("    ldr x0, [sp, #2728]\n    mov w14, w0\n    add x0, x0, #1\n    str x14, [x3]\n    str x0, [x3, #8]\n    mov x0, #0\n");
         assert!(result.contains("mov w14, w0"), "{}", result);
