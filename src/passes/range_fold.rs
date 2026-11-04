@@ -73,6 +73,32 @@ pub(crate) fn range_fold_function(func: &mut IrFunction) -> usize {
     folds.len() + threaded
 }
 
+/// Whether each `(operand, block)` is never negative there, read at `ty`
+/// signed (div_by_const's signed divisions of values a dominating test
+/// bounds below, vdbeRecordCompareString's `(serial_type-12)/2` under
+/// `serial_type>=12`).
+pub(crate) fn never_negative(func: &IrFunction, at: &[(Operand, usize, IrType)]) -> Vec<bool> {
+    if at.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Ranges::new(func);
+    at.iter().map(|(op, b, ty)| {
+        let Some(it) = Interp::of(*ty).map(|it| it.with_sign(true)) else { return false };
+        if ranges.cfg.idom[*b] == usize::MAX {
+            return false;
+        }
+        if let Some(r) = ranges.operand(op, *b, it, MAX_DEPTH) {
+            return r.lo >= 0;
+        }
+        // A narrower signed value in a wider division, which reads it
+        // sign-extended (the convention div_by_const's `_in_i64`
+        // expansions rest on): never negative at its own width.
+        let Operand::Value(v) = op else { return false };
+        matches!(ranges.interp(*v, MAX_DEPTH), Some(own) if own.signed && own.w < it.w)
+            && ranges.value(*v, *b, MAX_DEPTH).is_some_and(|r| r.lo >= 0)
+    }).collect()
+}
+
 /// What range_fold_function does to a comparison.
 #[derive(Clone, Copy)]
 enum Fold {
@@ -616,9 +642,19 @@ impl<'a> Ranges<'a> {
             }
             Operand::Value(v) => {
                 let own = self.interp(*v, MAX_DEPTH)?;
-                self.value(*v, b, depth)?.view(own, it)
+                let r = self.value(*v, b, depth)?;
+                r.view(own, it).or_else(|| (self.widens_exactly(*v, own, it) && it.holds(r)).then_some(r))
             }
         }
+    }
+
+    /// Whether `v`, read at the wider `it`, is the number it is at its own
+    /// `own`: a loaded value, which the load extends to the whole register
+    /// by its type's signedness (`ldrsb x`, `ldrh w`), read signed or from
+    /// an unsigned type.
+    fn widens_exactly(&self, v: Value, own: Interp, it: Interp) -> bool {
+        it.w > own.w && (it.signed || !own.signed)
+            && matches!(self.def(v), Some(Instruction::Load { ty, .. }) if ty.is_integer() && ty.size() < 8)
     }
 
     /// A value's range in block `b`, in its own interpretation.
@@ -637,13 +673,25 @@ impl<'a> Ranges<'a> {
 
     /// Narrow `r` by the branch conditions on `v` that dominate block `b`.
     fn conditions(&self, v: Value, b: usize, own: Interp, mut r: R) -> Option<R> {
-        // Facts read at another width say nothing about `v`.
-        for (op, it, k) in self.dominating_facts(v, b).into_iter().filter(|f| f.1.w == own.w) {
-            r = if op == IrCmpOp::Ne {
-                r.without(own.wrap(k))?
-            } else {
-                r.meet(constrain(it.full(), op, k)?.reread(it, own)?)?
-            };
+        // Facts read at another width say nothing about `v`, except at a
+        // width a load made it exactly (vdbeRecordCompareString's
+        // `serial_type<12` of a loaded signed char).
+        for (op, it, k) in self.dominating_facts(v, b) {
+            if it.w == own.w {
+                r = if op == IrCmpOp::Ne {
+                    r.without(own.wrap(k))?
+                } else {
+                    r.meet(constrain(it.full(), op, k)?.reread(it, own)?)?
+                };
+            } else if self.widens_exactly(v, own, it) {
+                // The fact's numbers are v's own (those outside own's
+                // range never occur).
+                r = if op == IrCmpOp::Ne {
+                    if own.holds(R::point(k)) { r.without(k)? } else { r }
+                } else {
+                    r.meet(constrain(it.full(), op, k)?)?
+                };
+            }
         }
         Some(r)
     }
@@ -707,14 +755,25 @@ impl<'a> Ranges<'a> {
                                                                                   && const_interp(k).is_some());
         let (a, b) = match inst {
             Instruction::Cmp { op, lhs, rhs, ty, .. } => {
-                let (op, other) = match (lhs, rhs) {
-                    (Operand::Value(l), o) if self.same_bits(*l, v) => (*op, o),
-                    (o, Operand::Value(r)) if self.same_bits(*r, v) => (swapped(*op), o),
+                let (op, other, x) = match (lhs, rhs) {
+                    (Operand::Value(l), o) if self.same_bits(*l, v) || self.widened_from(*l, v) => (*op, o, *l),
+                    (o, Operand::Value(r)) if self.same_bits(*r, v) || self.widened_from(*r, v) => (swapped(*op), o, *r),
                     _ => return,
                 };
                 let (Operand::Const(k), Some(it)) = (other, cmp_interp(op, *ty)) else { return };
                 let Some((k, _)) = const_interp(k) else { return };
-                out.push((if truth { op } else { negated(op) }, it, it.wrap(k)));
+                let op = if truth { op } else { negated(op) };
+                if x != v && !self.same_bits(x, v) {
+                    // A widening that keeps v's number, compared at the
+                    // width it reaches: a fact on v's own number when the
+                    // compare's reading keeps it too and k is one of v's.
+                    let (Some(own), Some(xt), k) = (self.interp(v, MAX_DEPTH), self.interp(x, MAX_DEPTH), it.wrap(k)) else { return };
+                    if xt.w == it.w && (it.signed || !own.signed) && own.holds(R::point(k)) {
+                        out.push((op, own, k));
+                    }
+                    return;
+                }
+                out.push((op, it, it.wrap(k)));
                 return;
             }
             // a && b, a || b.
@@ -731,6 +790,17 @@ impl<'a> Ranges<'a> {
                     self.facts_of(*x, truth, v, depth - 1, out);
                 }
             }
+        }
+    }
+
+    /// Whether `x` is `v` extended to a wider type by `v`'s own signedness
+    /// (a cast from `v`'s type), which keeps its number.
+    fn widened_from(&self, x: Value, v: Value) -> bool {
+        match self.def(x) {
+            Some(Instruction::Cast { src: Operand::Value(s), from_ty, to_ty, .. }) if *s == v =>
+                matches!((Interp::of(*from_ty), Interp::of(*to_ty), self.interp(v, MAX_DEPTH)),
+                         (Some(f), Some(t), Some(o)) if f == o && t.w > f.w),
+            _ => false,
         }
     }
 
@@ -980,6 +1050,53 @@ mod tests {
         let mut func = countdown(false);
         range_fold_function(&mut func);
         assert_eq!(op(&func), IrCmpOp::Sgt);
+    }
+
+    /// b0: x = load i8; c = (int)x <`signed` 12 (or `unsigned`); condbr c, b1, b2;
+    /// b2: y = (long)x - 12; t = y < 0 -- and `guarded` false leaves out b0's test.
+    fn serial_type(signed: bool, guarded: bool) -> IrFunction {
+        use crate::common::types::{AddressSpace, AliasClass};
+        let v = |n| Operand::Value(Value(n));
+        let block = |l, instructions, terminator| BasicBlock { label: BlockId(l), instructions, terminator, source_spans: Vec::new() };
+        let op = if signed { IrCmpOp::Slt } else { IrCmpOp::Ult };
+        let entry = if guarded {
+            Terminator::CondBranch { cond: v(2), true_label: BlockId(1), false_label: BlockId(2) }
+        } else {
+            Terminator::Branch(BlockId(2))
+        };
+        let mut func = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(0, vec![
+                Instruction::Load { dest: Value(0), ptr: Value(9), ty: IrType::I8, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::Cast { dest: Value(1), src: v(0), from_ty: IrType::I8, to_ty: IrType::I32 },
+                Instruction::Cmp { dest: Value(2), op, lhs: v(1), rhs: Operand::Const(IrConst::I32(12)), ty: IrType::I32 },
+            ], entry),
+            block(1, vec![], Terminator::Return(Some(Operand::Const(IrConst::I32(-1))))),
+            block(2, vec![
+                Instruction::Cast { dest: Value(3), src: v(0), from_ty: IrType::I8, to_ty: IrType::I64 },
+                Instruction::BinOp { dest: Value(4), op: IrBinOp::Sub, lhs: v(3), rhs: Operand::Const(IrConst::I64(12)), ty: IrType::I64 },
+                Instruction::Cmp { dest: Value(5), op: IrCmpOp::Slt, lhs: v(4), rhs: Operand::Const(IrConst::I64(0)), ty: IrType::I64 },
+            ], Terminator::Return(Some(v(5)))),
+        ];
+        func.next_value_id = 10;
+        func
+    }
+
+    #[test]
+    fn fact_on_a_widened_value_holds_for_the_value() {
+        // (int)x >= 12 on b2's edge: x >= 12, so x - 12 is never negative.
+        let mut func = serial_type(true, true);
+        range_fold_function(&mut func);
+        assert!(matches!(func.blocks[2].instructions[2], Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. }));
+        assert_eq!(never_negative(&serial_type(true, true), &[(Operand::Value(Value(4)), 2, IrType::I64)]), vec![true]);
+        // An unsigned reading of the widened signed char says nothing of
+        // its number (-1 is 0xffffffff), and without the test x may be -128.
+        for (signed, guarded) in [(false, true), (true, false)] {
+            let mut func = serial_type(signed, guarded);
+            range_fold_function(&mut func);
+            assert!(matches!(func.blocks[2].instructions[2], Instruction::Cmp { .. }), "{signed} {guarded}");
+            assert_eq!(never_negative(&serial_type(signed, guarded), &[(Operand::Value(Value(4)), 2, IrType::I64)]), vec![false]);
+        }
     }
 
     #[test]

@@ -139,7 +139,7 @@ pub(crate) fn mul_high_chains(func: &IrFunction) -> Vec<MulHighChain> {
 
 /// Transform division/modulo by constants in a single function.
 pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
-    let mut changes = 0;
+    let mut changes = unsigned_when_never_negative(func);
     let mut next_id = func.next_value_id;
     if next_id == 0 {
         next_id = func.max_value_id() + 1;
@@ -539,6 +539,41 @@ const MAX_SMALL_RANGE: i64 = 1 << 16;
 ///   signed:   t = (x * m) >> s; q = t + (t >>> 63)
 /// equal to x / d for every x in the range, checked exhaustively; the
 /// smallest such shift. The usual 32-bit magic needs two moves.
+/// A signed division or remainder by a power of two of a value never
+/// negative there (by range_fold's ranges, dominating tests included) is
+/// the unsigned one, which needs no rounding toward zero: a shift, or a
+/// mask. (Other divisors have cheaper signed expansions for small ranges
+/// than unsigned 64-bit magic.) vdbeRecordCompareString's `nStr = (serial_type-12) / 2`
+/// under `serial_type>=12` took `sxtw`, `add x, x, x, lsr #63` and `asr`.
+fn unsigned_when_never_negative(func: &mut IrFunction) -> usize {
+    let mut at = Vec::new();
+    let mut sites = Vec::new();
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (i, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::BinOp { op: IrBinOp::SDiv | IrBinOp::SRem, lhs, rhs: Operand::Const(c), ty: ty @ (IrType::I32 | IrType::I64), .. } = inst {
+                // (Powers of two only: other divisors have cheaper signed
+                // expansions for small ranges than unsigned 64-bit magic.)
+                if c.to_i64().is_some_and(|d| d > 1 && (d as u64).is_power_of_two()) {
+                    at.push((*lhs, b, *ty));
+                    sites.push((b, i));
+                }
+            }
+        }
+    }
+    let ok = super::range_fold::never_negative(func, &at);
+    let mut n = 0;
+    for (&(b, i), _) in sites.iter().zip(&ok).filter(|(_, &ok)| ok) {
+        if let Instruction::BinOp { op, ty, .. } = &mut func.blocks[b].instructions[i] {
+            *op = if *op == IrBinOp::SDiv { IrBinOp::UDiv } else { IrBinOp::URem };
+            if *ty == IrType::I32 {
+                *ty = IrType::U32;
+            }
+            n += 1;
+        }
+    }
+    n
+}
+
 fn small_magic(d: i64, lo: i64, hi: i64, signed: bool) -> Option<(i64, u32)> {
     if d < 2 || (d as u64).is_power_of_two() || hi - lo > MAX_SMALL_RANGE || (!signed && lo < 0) {
         return None;
