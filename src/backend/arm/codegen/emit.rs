@@ -34,6 +34,9 @@ pub(super) const ARM_CALLEE_SAVED: [PhysReg; 10] = [
     PhysReg(25), PhysReg(26), PhysReg(27), PhysReg(28), PhysReg(19),
 ];
 
+/// Most doublewords of a struct parameter copied in straight-line code.
+const MAX_UNROLLED_DWORDS: usize = 32;
+
 /// Caller-saved registers available for register allocation: x10-x15.
 ///
 /// These are a subset of the AAPCS64 "corruptible" registers (x9-x15).
@@ -1169,6 +1172,20 @@ impl ArmCodegen {
         }
     }
 
+    /// Copy n_dwords doublewords from [src] to [x16], last first, through
+    /// data. A struct passed by value otherwise takes a load and a store per
+    /// doubleword, 200,000 lines for a 256K one. Besides data this writes only
+    /// x16 and x17, which no parameter is in, and the flags.
+    fn emit_dword_copy_loop(&mut self, src: &str, data: &str, n_dwords: usize) {
+        let label = format!(".Ldword_copy_{}", self.state.next_label_id());
+        self.load_large_imm("x17", (n_dwords as i64 - 1) * 8);
+        self.state.emit_fmt(format_args!("{}:", label));
+        self.state.emit_fmt(format_args!("    ldr {}, [{}, x17]", data, src));
+        self.state.emit_fmt(format_args!("    str {}, [x16, x17]", data));
+        self.state.emit("    subs x17, x17, #8");
+        self.state.emit_fmt(format_args!("    b.pl {}", label));
+    }
+
     /// Emit load from an arbitrary base register with offset, handling large offsets via x17.
     /// For offsets that exceed the ARM64 unsigned immediate range, materializes the
     /// effective address into x17 and loads from [x17].
@@ -1931,6 +1948,11 @@ impl ArmCodegen {
                     let actual_idx = if reg_idx >= sret_shift { reg_idx - sret_shift } else { reg_idx };
                     let src_reg = ARM_ARG_REGS[actual_idx];
                     let n_dwords = size.div_ceil(8);
+                    if n_dwords > MAX_UNROLLED_DWORDS {
+                        self.emit_add_sp_offset("x16", slot.0);
+                        self.emit_dword_copy_loop(src_reg, "x9", n_dwords);
+                        continue;
+                    }
                     for qi in 0..n_dwords {
                         let src_off = (qi * 8) as i64;
                         self.emit_load_from_reg("x9", src_reg, src_off, "ldr");
@@ -2107,6 +2129,11 @@ impl ArmCodegen {
                 ParamClass::LargeStructByRefStack { offset, size } => {
                     let caller_offset = frame_size + offset;
                     self.emit_load_from_sp("x9", caller_offset, "ldr");
+                    if size.div_ceil(8) > MAX_UNROLLED_DWORDS {
+                        self.emit_add_sp_offset("x16", slot.0);
+                        self.emit_dword_copy_loop("x9", "x10", size.div_ceil(8));
+                        continue;
+                    }
                     for qi in 0..size.div_ceil(8) {
                         let off = (qi * 8) as i64;
                         self.emit_load_from_reg("x10", "x9", off, "ldr");
