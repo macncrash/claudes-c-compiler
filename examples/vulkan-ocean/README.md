@@ -34,8 +34,18 @@ make bench           # builds ./ocean-clang too, runs both with no window or GPU
 `--bench N` simulates N frames and prints timing plus a checksum of the vertex
 data. The two builds should print the same heights and checksum.
 
-At the time of writing, the ccc build takes about 1.4 ms per frame with all
-threads and 10 ms on one thread; clang -O2 takes 0.64 ms and 4.3 ms. Before ccc's
-AArch64 backend kept floats in FP registers (d8-d15, v16-v31), those were
-9.3 ms and 79.6 ms. The remaining gap is mostly integer address arithmetic
-and clang's vectorization.
+At the time of writing, on one thread of an M3 Max, the ccc build takes about
+7.9 ms per frame and clang -O2 4.4 ms. The first macOS build of ccc took 80 ms.
+The remaining gap is mostly integer address arithmetic and clang's
+vectorization.
+
+## Before and after
+
+```sh
+make before-after        # three windows, each on one thread, title bars showing the time
+make bench-before-after  # the same three with no window or GPU
+```
+
+Both build the commit that added macOS support (`FIRST_COMMIT`) from git
+history into `build/first`, and compile `ocean.c` with it, with today's ccc and
+with clang. The three print the same heights and checksum.
