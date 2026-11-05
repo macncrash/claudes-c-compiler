@@ -157,7 +157,8 @@ pub(crate) fn load(module: &mut IrModule, id: &str, dir: &str) {
     let Ok(raw) = std::fs::read(format!("{dir}/{id}.cnt")) else { return };
     let mut lines = map.lines();
     let Some(n) = lines.next().and_then(|h| h.strip_prefix("ccc-profile 1 ")).and_then(|n| n.parse::<usize>().ok()) else { return };
-    if n == 0 || raw.len() % (8 * n) != 0 {
+    // n comes from a file: it has to fit what was read before anything is sized by it.
+    if !n.checked_mul(8).is_some_and(|run| run != 0 && run <= raw.len() && raw.len() % run == 0) {
         return;
     }
     let mut counts = vec![0u64; n];
@@ -220,6 +221,22 @@ mod tests {
         m.functions[0].blocks[1].terminator = Terminator::Return(None);
         load(&mut m, "t", &dir);
         assert!(m.functions[0].profile.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_counter_total_that_does_not_fit_the_counts_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("ccc-prof-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+        // No counts, one that would allocate 8PB, one that wraps 8 * n to 0.
+        for (n, counts) in [(3u64, 0), (1_000_000_000_000_000, 0), (1 << 61, 24), (0, 24), (6, 24)] {
+            std::fs::write(format!("{dir}/t.map"), format!("ccc-profile 1 {n}\n")).unwrap();
+            std::fs::write(format!("{dir}/t.cnt"), vec![1u8; counts]).unwrap();
+            let mut m = module();
+            load(&mut m, "t", &dir);
+            assert!(m.functions[0].profile.is_none());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
