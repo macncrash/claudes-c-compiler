@@ -1417,9 +1417,13 @@ impl SemanticAnalyzer {
                 if *op == BinOp::Sub {
                     self.check_pointer_subtraction_compat(lhs, rhs, *span);
                 }
+                self.check_integer_operands(op, lhs, rhs, *span);
             }
-            Expr::UnaryOp(_, operand, _) => {
+            Expr::UnaryOp(op, operand, span) => {
                 self.analyze_expr(operand);
+                if *op == crate::frontend::parser::ast::UnaryOp::BitNot && self.is_floating_expr(operand) {
+                    self.diagnostics.borrow_mut().error("invalid operand to unary ~", *span);
+                }
             }
             Expr::PostfixOp(_, operand, _) => {
                 self.analyze_expr(operand);
@@ -1441,9 +1445,10 @@ impl SemanticAnalyzer {
                     self.check_pointer_float_conversion(&rhs_ty, &lhs_ty, *span);
                 }
             }
-            Expr::CompoundAssign(_, lhs, rhs, _) => {
+            Expr::CompoundAssign(op, lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
+                self.check_integer_operands(op, lhs, rhs, *span);
             }
             Expr::Conditional(cond, then_expr, else_expr, _) => {
                 self.analyze_expr(cond);
@@ -1666,6 +1671,33 @@ impl SemanticAnalyzer {
     /// Check that pointer subtraction operands have compatible pointee types.
     /// C11 6.5.6p3: both operands must point to compatible types.
     /// Emits an error if both operands are pointers to different struct/union types.
+    fn is_floating_expr(&self, expr: &Expr) -> bool {
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        checker.infer_expr_ctype(expr).is_some_and(|ct| ct.is_floating())
+    }
+
+    /// The operators that take only integers (C11 6.5.5p2, 6.5.7p2, 6.5.10-12).
+    /// A float that got past here reached the backend, which has no such instruction.
+    fn check_integer_operands(&self, op: &BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        let symbol = match op {
+            BinOp::Mod => "%",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            _ => return,
+        };
+        if self.is_floating_expr(lhs) || self.is_floating_expr(rhs) {
+            self.diagnostics.borrow_mut().error(format!("invalid operands to binary {symbol}"), span);
+        }
+    }
+
     fn check_pointer_subtraction_compat(&self, lhs: &Expr, rhs: &Expr, span: Span) {
         let checker = super::type_checker::ExprTypeChecker {
             symbols: &self.symbol_table,
@@ -1954,7 +1986,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         struct_aligned: Option<usize>,
     ) -> CType {
         let prefix = if is_union { "union" } else { "struct" };
-        let struct_fields = fields.as_ref().map(|f| self.convert_struct_fields(f)).unwrap_or_default();
+        let mut struct_fields = fields.as_ref().map(|f| self.convert_struct_fields(f)).unwrap_or_default();
         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
         let key = if let Some(tag) = name {
             format!("{}.{}", prefix, tag)
@@ -1962,6 +1994,20 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             let id = self.result.type_context.next_anon_struct_id();
             format!("__anon_struct_{}", id)
         };
+        // A struct is incomplete until its closing brace, so it cannot hold
+        // itself. Left in, flattening its members would never end.
+        struct_fields.retain(|field| {
+            let mut ty = &field.ty;
+            while let CType::Array(inner, _) = ty {
+                ty = inner;
+            }
+            let holds_itself = matches!(ty, CType::Struct(k) | CType::Union(k) if k.as_ref() == key);
+            if holds_itself {
+                let message = format!("field has incomplete type '{} {}'", prefix, name.as_deref().unwrap_or(""));
+                self.diagnostics.borrow_mut().error(message, Span::dummy());
+            }
+            !holds_itself
+        });
         // Track whether this struct/union has been defined (has a body in the
         // AST, e.g. `struct X { ... }` or `struct X {}`), as opposed to just
         // forward-declared (`struct X;`). This distinction is needed for the

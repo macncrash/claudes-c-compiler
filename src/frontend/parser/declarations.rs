@@ -10,6 +10,10 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AccessQuals, AddressSpace};
+
+/// Most elements a range designator covers. It is expanded here, one item per
+/// element, so [0 ... 0x7fffffffffff] would otherwise take all the memory there is.
+const MAX_RANGE_DESIGNATOR: i64 = 1 << 24;
 use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::{ModeKind, ParsedDeclAttrs, Parser};
@@ -818,6 +822,10 @@ impl Parser {
 
     /// Parse an initializer: either a braced initializer list or a single expression.
     pub(super) fn parse_initializer(&mut self) -> Initializer {
+        self.nested(Initializer::List(Vec::new()), Self::parse_initializer_here)
+    }
+
+    fn parse_initializer_here(&mut self) -> Initializer {
         if matches!(self.peek(), TokenKind::LBrace) {
             let open = self.peek_span();
             self.advance();
@@ -877,7 +885,11 @@ impl Parser {
             } else {
                 Some(&self.enum_constants)
             };
-            let items = Self::expand_range_designators(items, enums);
+            let mut too_big = false;
+            let items = Self::expand_range_designators(items, enums, &mut too_big);
+            if too_big {
+                self.emit_error("range designator is too large", open);
+            }
             Initializer::List(items)
         } else {
             Initializer::Expr(self.parse_assignment_expr())
@@ -890,6 +902,7 @@ impl Parser {
     fn expand_range_designators(
         items: Vec<InitializerItem>,
         enum_consts: Option<&FxHashMap<String, i64>>,
+        too_big: &mut bool,
     ) -> Vec<InitializerItem> {
         let mut result = Vec::with_capacity(items.len());
         for item in items {
@@ -899,6 +912,10 @@ impl Parser {
                     let lo = Self::eval_const_int_expr_with_enums(lo_expr, enum_consts, None);
                     let hi = Self::eval_const_int_expr_with_enums(hi_expr, enum_consts, None);
                     if let (Some(lo_val), Some(hi_val)) = (lo, hi) {
+                        if hi_val.checked_sub(lo_val).is_none_or(|n| n >= MAX_RANGE_DESIGNATOR) {
+                            *too_big = true;
+                            continue;
+                        }
                         for idx in lo_val..=hi_val {
                             let mut new_desigs = item.designators.clone();
                             new_desigs[range_pos] = Designator::Index(

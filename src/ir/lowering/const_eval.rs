@@ -118,8 +118,10 @@ impl Lowerer {
         //     sizeof_type uses the correctly-sized global, so we must recompute.
         //     This check covers sizeof itself and any parent expression containing it,
         //     such as `sizeof(x) / sizeof(x[0]) + 1`.
-        if !matches!(expr, Expr::Identifier(_, _)) && !Self::expr_contains_sizeof(expr) {
-            if let Some(val) = self.lookup_sema_const(expr) {
+        // The scan comes after the lookup: this runs at every level of a long
+        // expression, so scanning first made a sum of n terms take n^3 steps.
+        if !matches!(expr, Expr::Identifier(_, _)) {
+            if let Some(val) = self.lookup_sema_const(expr).filter(|_| !Self::expr_contains_sizeof(expr)) {
                 return Some(val);
             }
         }

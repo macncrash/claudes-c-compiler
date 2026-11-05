@@ -492,6 +492,17 @@ impl Lowerer {
             self.terminate(Terminator::Return(ret_op));
         }
 
+        // Every goto and &&label made a block for its label; only a definition
+        // places that block in the function.
+        let state = self.func();
+        let placed: crate::common::fx_hash::FxHashSet<_> = state.blocks.iter().map(|b| b.label).collect();
+        let mut undefined: Vec<&str> = state.user_labels.iter().filter(|(_, block)| !placed.contains(*block))
+            .map(|(key, _)| key.rsplit("::").next().unwrap_or(key)).collect();
+        undefined.sort_unstable();
+        for label in undefined {
+            self.diagnostics.borrow_mut().error(format!("use of undeclared label '{label}'"), func.span);
+        }
+
         // Merge deferred entry-block allocas into blocks[0], right after
         // the existing parameter allocas. mem2reg skips the first N allocas
         // (where N = param count) so deferred local allocas must come after them.

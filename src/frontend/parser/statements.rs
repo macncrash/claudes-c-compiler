@@ -91,6 +91,10 @@ impl Parser {
     }
 
     pub(super) fn parse_stmt(&mut self) -> Stmt {
+        self.nested(Stmt::Expr(None), Self::parse_stmt_here)
+    }
+
+    fn parse_stmt_here(&mut self) -> Stmt {
         // C23 / GNU extension: declarations are allowed in statement position.
         // This handles declarations after labels (e.g., `label: int x = 5;`),
         // after case/default, and other contexts where parse_stmt() is called.

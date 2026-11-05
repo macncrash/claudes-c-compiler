@@ -12,6 +12,7 @@
 //   -> parse_cast_expr -> parse_unary_expr -> parse_postfix_expr
 //   -> parse_primary_expr
 
+use crate::common::source::Span;
 use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::Parser;
@@ -103,6 +104,10 @@ impl Parser {
     }
 
     fn parse_conditional_expr(&mut self) -> Expr {
+        self.nested(Expr::IntLiteral(0, Span::dummy()), Self::parse_conditional_here)
+    }
+
+    fn parse_conditional_here(&mut self) -> Expr {
         let cond = self.parse_binary_expr(PrecedenceLevel::LogicalOr);
         if self.consume_if(&TokenKind::Question) {
             let span = cond.span();
@@ -180,6 +185,10 @@ impl Parser {
     /// Parse a cast expression: (type-name)expr, compound literal (type-name){...},
     /// or fall through to unary expression.
     pub(super) fn parse_cast_expr(&mut self) -> Expr {
+        self.nested(Expr::IntLiteral(0, Span::dummy()), Self::parse_cast_here)
+    }
+
+    fn parse_cast_here(&mut self) -> Expr {
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
             let save_typedef = self.attrs.parsing_typedef();
@@ -231,6 +240,10 @@ impl Parser {
     }
 
     fn parse_unary_expr(&mut self) -> Expr {
+        self.nested(Expr::IntLiteral(0, Span::dummy()), Self::parse_unary_here)
+    }
+
+    fn parse_unary_here(&mut self) -> Expr {
         match self.peek() {
             TokenKind::AmpAmp => {
                 // GCC extension: &&label (address of label, for computed goto)

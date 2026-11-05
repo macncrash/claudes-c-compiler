@@ -1413,6 +1413,8 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
                 }
 
                 params.push(param);
+            } else if bytes[i] != b',' {
+                return None;
             }
 
             while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {

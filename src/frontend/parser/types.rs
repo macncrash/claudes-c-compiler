@@ -453,6 +453,10 @@ impl Parser {
 
     /// Parse a struct or union definition/reference.
     fn parse_struct_or_union(&mut self, is_struct: bool) -> TypeSpecifier {
+        self.nested(TypeSpecifier::Int, |p| p.parse_struct_or_union_here(is_struct))
+    }
+
+    fn parse_struct_or_union_here(&mut self, is_struct: bool) -> TypeSpecifier {
         let (mut is_packed, mut struct_aligned, _, _) = self.parse_gcc_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();

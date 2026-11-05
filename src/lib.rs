@@ -10,7 +10,9 @@ pub mod driver;
 /// Shared entry point for all compiler binaries. Spawns the real work on a
 /// thread with a large stack so deeply recursive C files don't overflow.
 pub fn compiler_main() {
-    const STACK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+    // Address space only, until a program nests that deep; the parser's limit
+    // on nesting (parse.rs) is what keeps it enough.
+    const STACK_SIZE: usize = 1024 * 1024 * 1024; // 1 GB
     let builder = std::thread::Builder::new().stack_size(STACK_SIZE);
     let handler = builder.spawn(|| {
         let args: Vec<String> = std::env::args().collect();

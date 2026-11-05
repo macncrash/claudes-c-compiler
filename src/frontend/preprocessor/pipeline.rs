@@ -838,7 +838,7 @@ impl Preprocessor {
                 // current file's directory in the include search list
                 return self.handle_include_next(rest, line_num, col);
             }
-            "define" => self.handle_define(rest),
+            "define" => self.handle_define(rest, line_num, col),
             "undef" => self.handle_undef(rest),
             "ifdef" => self.handle_ifdef(rest, false),
             "ifndef" => self.handle_ifdef(rest, true),
@@ -885,9 +885,16 @@ impl Preprocessor {
         None
     }
 
-    fn handle_define(&mut self, rest: &str) {
+    fn handle_define(&mut self, rest: &str, line: usize, col: usize) {
         if let Some(def) = parse_define(rest) {
             self.macros.define(def);
+        } else {
+            self.errors.push(PreprocessorDiagnostic {
+                file: self.current_file(),
+                line,
+                col,
+                message: format!("invalid macro definition: {}", rest.trim()),
+            });
         }
     }
 

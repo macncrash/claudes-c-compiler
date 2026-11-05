@@ -270,6 +270,15 @@ impl std::fmt::Debug for ParsedDeclAttrs {
     }
 }
 
+/// Levels of recursive descent allowed, so that source nested without end gets
+/// a diagnostic and not a stack overflow. A parenthesis takes three, a block
+/// two; clang stops at 256 brackets, and GCC when its stack runs out.
+const MAX_NESTING: usize = 6000;
+
+/// Errors reported before giving up on a file (clang stops at 20).
+const MAX_ERRORS: usize = 100;
+
+
 /// Recursive descent parser for C.
 pub struct Parser {
     pub(super) tokens: Vec<Token>,
@@ -296,6 +305,8 @@ pub struct Parser {
     pub(super) pragma_default_visibility: Option<String>,
     /// Count of parse errors encountered (invalid tokens at top level, etc.)
     pub error_count: usize,
+    /// Levels of `nested` being parsed.
+    nesting: usize,
     /// Structured diagnostic engine for error/warning reporting with source snippets.
     pub(super) diagnostics: DiagnosticEngine,
     /// Map of enum constant names to their integer values.
@@ -328,6 +339,7 @@ impl Parser {
             pragma_visibility_stack: Vec::new(),
             pragma_default_visibility: None,
             error_count: 0,
+            nesting: 0,
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
             unevaluable_enum_constants: FxHashSet::default(),
@@ -352,6 +364,34 @@ impl Parser {
     pub(super) fn emit_error(&mut self, message: impl Into<String>, span: Span) {
         self.error_count += 1;
         self.diagnostics.error(message, span);
+        self.stop_after_too_many_errors();
+    }
+
+    /// Errors quote their line, and one macro can put a whole file on a line:
+    /// 18,000 errors on a line of 80,000 tokens took over two minutes.
+    fn stop_after_too_many_errors(&mut self) {
+        if self.error_count == MAX_ERRORS {
+            let span = self.peek_span();
+            self.diagnostics.error("too many errors, stopping", span);
+            self.pos = self.tokens.len();
+        }
+    }
+
+    /// Run one level of the recursive descent. Past MAX_NESTING it is an
+    /// error, and parsing stops there with `give_up` for the level.
+    pub(super) fn nested<T>(&mut self, give_up: T, parse: impl FnOnce(&mut Self) -> T) -> T {
+        if self.nesting >= MAX_NESTING {
+            if !self.at_eof() {
+                let span = self.peek_span();
+                self.emit_error("nesting is too deep", span);
+                self.pos = self.tokens.len();
+            }
+            return give_up;
+        }
+        self.nesting += 1;
+        let result = parse(self);
+        self.nesting -= 1;
+        result
     }
 
     /// Standard C typedef names commonly provided by system headers.
@@ -492,6 +532,7 @@ impl Parser {
             .with_fix_hint(format!("insert {}", expected));
             self.error_count += 1;
             self.diagnostics.emit(&diag);
+            self.stop_after_too_many_errors();
             span
         }
     }
@@ -528,6 +569,7 @@ impl Parser {
             );
             self.error_count += 1;
             self.diagnostics.emit(&diag);
+            self.stop_after_too_many_errors();
             span
         }
     }
@@ -549,6 +591,7 @@ impl Parser {
             .with_fix_hint(format!("insert {}", expected));
             self.error_count += 1;
             self.diagnostics.emit(&diag);
+            self.stop_after_too_many_errors();
             span
         }
     }
