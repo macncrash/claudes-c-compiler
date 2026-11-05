@@ -47,6 +47,9 @@ use super::definitions::*;
 use super::func_state::FunctionBuildState;
 use crate::frontend::sema::type_context::TypeContext;
 
+/// Most bytes of a local cleared with stores; memset does the rest.
+const MAX_ZEROED_BY_STORES: usize = 256;
+
 /// Lowers AST to IR (alloca-based, not yet SSA).
 pub struct Lowerer {
     /// Target architecture, used for ABI-specific lowering decisions
@@ -1468,6 +1471,10 @@ impl Lowerer {
 
     /// Zero-initialize a region of memory within an alloca at the given byte offset.
     pub(super) fn zero_init_region(&mut self, alloca: Value, base_offset: usize, region_size: usize) {
+        if region_size > MAX_ZEROED_BY_STORES {
+            self.zero_init_with_memset(alloca, base_offset, region_size);
+            return;
+        }
         let mut offset = base_offset;
         let end = base_offset + region_size;
         while offset + 8 <= end {
@@ -1494,6 +1501,41 @@ impl Lowerer {
              seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
             offset += 1;
         }
+    }
+
+    /// Clear a region too big for a store per 8 bytes, 32,768 for a 256K struct.
+    fn zero_init_with_memset(&mut self, alloca: Value, base_offset: usize, region_size: usize) {
+        let dest = if base_offset == 0 {
+            alloca
+        } else {
+            let addr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr {
+                dest: addr,
+                base: alloca,
+                offset: Operand::Const(IrConst::ptr_int(base_offset as i64)),
+                ty: IrType::I8,
+            });
+            addr
+        };
+        let result = self.fresh_value();
+        self.emit(Instruction::Call {
+            func: "memset".to_string(),
+            info: CallInfo {
+                dest: Some(result),
+                args: vec![Operand::Value(dest), Operand::Const(IrConst::I32(0)), Operand::Const(IrConst::ptr_int(region_size as i64))],
+                arg_types: vec![IrType::Ptr, IrType::I32, crate::common::types::target_int_ir_type()],
+                return_type: IrType::Ptr,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None; 3],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: Vec::new(),
+                struct_arg_riscv_float_classes: Vec::new(),
+                is_sret: false,
+                is_fastcall: false,
+                ret_eightbyte_classes: Vec::new(),
+            },
+        });
     }
 
     /// Zero-initialize an entire alloca.
