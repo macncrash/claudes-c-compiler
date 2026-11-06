@@ -536,40 +536,6 @@ impl Lowerer {
             }
         }
 
-        // Pre-pass: update typedefs that have __attribute__((vector_size(N))) or
-        // __attribute__((ext_vector_type(N))).
-        // Sema doesn't handle vector_size, so the typedef map has the unwrapped base type.
-        // We need to apply vector_size wrapping before registering function metadata,
-        // so that function return types using vector typedefs are correctly resolved.
-        let mut has_vector_typedefs = false;
-        for decl in &tu.decls {
-            if let ExternalDecl::Declaration(decl) = decl {
-                if decl.is_typedef() {
-                    for declarator in &decl.declarators {
-                        if !declarator.name.is_empty() {
-                            let base_ctype = self.build_full_ctype(&decl.type_spec, &declarator.derived);
-                            let elem_size = base_ctype.size();
-                            if let Some(vs) = decl.resolve_vector_size(elem_size) {
-                                has_vector_typedefs = true;
-                                let vec_ctype = CType::Vector(Box::new(base_ctype), vs);
-                                self.types.typedefs.insert(declarator.name.clone(), vec_ctype);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // After updating vector typedefs, re-compute struct/union layouts that may
-        // contain vector typedef fields. Sema computed these layouts before vector_size
-        // was applied, so their field sizes may be wrong (e.g., float4 was treated as
-        // float instead of vector(float, 16)). We must update the EXISTING layout
-        // entries (by key) rather than creating new ones, because CType::Union/Struct
-        // references use the key assigned by sema.
-        if has_vector_typedefs {
-            self.recompute_vector_struct_layouts(tu);
-        }
-
         // Pre-pass: register struct/union layouts from all declarations and function
         // definitions so that function signature registration (below) can compute
         // correct SysV eightbyte classification for struct return types.

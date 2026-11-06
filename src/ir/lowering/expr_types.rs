@@ -1298,6 +1298,18 @@ impl Lowerer {
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
                         return self.get_expr_ctype(self.resolve_builtin_choose_expr(args));
                     }
+                    if name == "__builtin_shuffle" {
+                        return args.first().and_then(|a| self.get_expr_ctype(a));
+                    }
+                    if name == "__builtin_shufflevector" && args.len() > 2 {
+                        return match self.get_expr_ctype(&args[0]) {
+                            Some(CType::Vector(elem, _)) => {
+                                let size = elem.size() * (args.len() - 2);
+                                Some(CType::Vector(elem, size))
+                            }
+                            other => other,
+                        };
+                    }
                     if Self::is_polymorphic_atomic_builtin(name) {
                         if let Some(first_arg) = args.first() {
                             if let Some(CType::Pointer(inner, _)) = self.get_expr_ctype(first_arg) {

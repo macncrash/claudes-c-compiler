@@ -320,6 +320,11 @@ impl Lowerer {
                     if is_struct_elem {
                         let src_addr = self.get_struct_base_addr(expr);
                         self.emit_memcpy_at_offset(alloca, elem_offset, src_addr, elem_size);
+                    } else if matches!(&elem_ctype, Some(CType::Vector(..))) && self.expr_ctype(expr).is_vector() {
+                        // A vector's value is its address, like a struct's.
+                        let val = self.lower_expr(expr);
+                        let src_addr = self.operand_to_value(val);
+                        self.emit_memcpy_at_offset(alloca, elem_offset, src_addr, elem_size);
                     } else {
                         let val = self.lower_expr(expr);
                         // For vector compound literals, cast each element to the vector element type

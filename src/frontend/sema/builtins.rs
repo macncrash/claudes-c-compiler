@@ -664,7 +664,8 @@ pub fn is_builtin(name: &str) -> bool {
         return true;
     }
     // Builtins handled by name in try_lower_builtin_call (before map lookup)
-    if matches!(name, "__builtin_choose_expr" | "__builtin_unreachable" | "__builtin_trap") {
+    if matches!(name, "__builtin_choose_expr" | "__builtin_unreachable" | "__builtin_trap"
+        | "__builtin_shuffle" | "__builtin_shufflevector") {
         return true;
     }
     // Atomic builtins handled by pattern matching in expr_atomics.rs

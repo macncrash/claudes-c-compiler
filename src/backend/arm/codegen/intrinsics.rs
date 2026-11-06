@@ -914,7 +914,7 @@ impl ArmCodegen {
                     _ => false,
                 });
                 if untouched {
-                    selects.insert(dest, (x, y, m));
+                    selects.insert(t1.0, (x, y, m));
                     parts.insert(t1.0);
                     parts.insert(t2.0);
                 }
@@ -1318,7 +1318,12 @@ impl ArmCodegen {
             || matches!(op, VecOpKind::Xor) && self.vec_xor3.contains_key(&dest_ptr.0) {
             return;
         }
-        let select = self.vec_selects.get(&dest_ptr.0).copied().filter(|_| matches!(op, VecOpKind::Or));
+        // By its first And, which nothing else reads: the Or's destination may
+        // be a variable some other Or also writes.
+        let select = match (op, args.first()) {
+            (VecOpKind::Or, Some(Operand::Value(t))) => self.vec_selects.get(&t.0).copied(),
+            _ => None,
+        };
         // x ^ y ^ z: the folded Xor's operands, then the other one.
         let xor3 = match op {
             VecOpKind::Xor => args.iter().position(|a| matches!(a, Operand::Value(v) if self.vec_xor3.contains_key(&v.0))),

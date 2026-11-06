@@ -178,7 +178,10 @@ impl Lowerer {
         let ts = if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
             if let Some(first) = decl.declarators.first() {
                 if let Some(Initializer::Expr(ref init_expr)) = first.init {
-                    if let Some(ctype) = self.get_expr_ctype(init_expr) {
+                    if let Some(CType::Vector(elem, size)) = self.get_expr_ctype(init_expr) {
+                        // As for typeof: ctype_to_type_spec gives the element.
+                        TypeSpecifier::Vector(Box::new(Self::ctype_to_type_spec(&elem)), size)
+                    } else if let Some(ctype) = self.get_expr_ctype(init_expr) {
                         Self::ctype_to_type_spec(&ctype)
                     } else {
                         self.emit_warning(

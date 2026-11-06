@@ -11,6 +11,7 @@
 
 mod addr_arg_promote;
 pub(crate) mod acc_coalesce;
+pub(crate) mod vec_copies;
 pub(crate) mod block_place;
 mod bound_hoist;
 pub(crate) mod cfg_simplify;

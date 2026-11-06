@@ -387,6 +387,11 @@ impl SemanticAnalyzer {
                 } else {
                     type_builder::build_full_ctype_with_base(self, base_type.clone(), &declarator.derived)
                 };
+                // A struct laid out from here on needs the vector's size, not its element's.
+                let resolved_ctype = match decl.resolve_vector_size(resolved_ctype.size()) {
+                    Some(size) => CType::Vector(Box::new(resolved_ctype), size),
+                    None => resolved_ctype,
+                };
                 self.result.type_context.typedefs.insert(declarator.name.clone(), resolved_ctype);
                 let is_const = self.result.type_context.type_spec_base_const(&decl.type_spec, decl.is_const());
                 self.result.type_context.set_typedef_const_scoped(&declarator.name, is_const);

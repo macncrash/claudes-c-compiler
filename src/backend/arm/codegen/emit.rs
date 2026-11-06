@@ -296,7 +296,7 @@ pub struct ArmCodegen {
     /// Xors read only by one other Xor, which computes all three operands'
     /// Xor in one eor3 (fold_vec_xor3): first Xor result -> its operands.
     pub(super) vec_xor3: FxHashMap<u32, (u32, u32)>,
-    /// Bitwise selects (fold_vec_selects): Or result -> (x, y, mask), and
+    /// Bitwise selects (fold_vec_selects): the Or's first And -> (x, y, mask), and
     /// the results of the Ands they absorb.
     pub(super) vec_selects: FxHashMap<u32, (u32, u32, u32)>,
     pub(super) vec_select_parts: FxHashSet<u32>,

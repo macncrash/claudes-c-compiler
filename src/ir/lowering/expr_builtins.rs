@@ -66,6 +66,10 @@ impl Lowerer {
             }
         }
 
+        if name == "__builtin_shuffle" || name == "__builtin_shufflevector" {
+            return self.lower_vector_shuffle(name, args);
+        }
+
         // Handle __builtin_choose_expr(const_expr, expr1, expr2)
         // This is a compile-time selection: if const_expr is nonzero, returns expr1, else expr2.
         if name == "__builtin_choose_expr" {
@@ -262,6 +266,65 @@ impl Lowerer {
                 self.lower_builtin_intrinsic(intrinsic, name, args)
             }
         }
+    }
+
+    /// `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` and
+    /// `__builtin_shufflevector(a, b, i...)`: lane i of the result is lane
+    /// mask[i] of a followed by b. The two vectors are laid side by side, so
+    /// that one index reaches either. GCC takes a mask's lanes modulo the
+    /// lanes there are; a constant -1 means any lane.
+    fn lower_vector_shuffle(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        let source = self.expr_ctype(args.first()?);
+        let (elem, lanes) = source.vector_info().map(|(e, n)| (e.clone(), n))?;
+        let (width, elem_ty) = (elem.size(), IrType::from_ctype(&elem));
+        let total = lanes * width;
+        let by_list = name == "__builtin_shufflevector";
+        let second = if by_list || args.len() == 3 { Some(&args[1]) } else { None };
+        if (by_list && args.len() < 3) || (!by_list && !(2..=3).contains(&args.len())) {
+            return None;
+        }
+        let both = self.emit_entry_alloca(IrType::Ptr, 2 * total, 16, false);
+        let a = self.lower_expr(&args[0]);
+        let a = self.operand_to_value(a);
+        self.emit(Instruction::Memcpy { dest: both, src: a, size: total });
+        if let Some(b) = second {
+            let b = self.lower_expr(b);
+            let b = self.operand_to_value(b);
+            let upper = self.fresh_value();
+            self.emit(Instruction::GetElementPtr { dest: upper, base: both, offset: Operand::Const(IrConst::ptr_int(total as i64)), ty: IrType::I8 });
+            self.emit(Instruction::Memcpy { dest: upper, src: b, size: total });
+        }
+        let reachable = if second.is_some() { 2 * lanes } else { lanes } as i64;
+        let out_lanes = if by_list { args.len() - 2 } else { lanes };
+        let result = self.emit_entry_alloca(IrType::Ptr, out_lanes * width, 16, false);
+        let mask = if by_list {
+            None
+        } else {
+            let m = self.lower_expr(args.last()?);
+            Some(self.operand_to_value(m))
+        };
+        let lane_int = match width { 1 => IrType::U8, 2 => IrType::U16, 4 => IrType::U32, _ => IrType::U64 };
+        for i in 0..out_lanes {
+            let offset = if let Some(mask) = mask {
+                let at = self.fresh_value();
+                self.emit(Instruction::GetElementPtr { dest: at, base: mask, offset: Operand::Const(IrConst::ptr_int((i * width) as i64)), ty: IrType::I8 });
+                let index = self.fresh_value();
+                self.emit(Instruction::Load { dest: index, ptr: at, ty: lane_int, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+                let wide = self.emit_implicit_cast(Operand::Value(index), lane_int, IrType::I64);
+                let index = self.emit_binop_val(IrBinOp::And, wide, Operand::Const(IrConst::I64(reachable - 1)), IrType::I64);
+                let scaled = self.emit_binop_val(IrBinOp::Mul, Operand::Value(index), Operand::Const(IrConst::I64(width as i64)), IrType::I64);
+                Operand::Value(scaled)
+            } else {
+                let k = self.eval_const_expr(&args[i + 2]).and_then(|c| c.to_i64()).unwrap_or(0);
+                Operand::Const(IrConst::ptr_int((k.max(0) % reachable) * width as i64))
+            };
+            let from = self.fresh_value();
+            self.emit(Instruction::GetElementPtr { dest: from, base: both, offset, ty: IrType::I8 });
+            let lane = self.fresh_value();
+            self.emit(Instruction::Load { dest: lane, ptr: from, ty: elem_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+            self.emit_store_at_offset(result, i * width, Operand::Value(lane), elem_ty);
+        }
+        Some(Operand::Value(result))
     }
 
     /// Lower a builtin intrinsic (the BuiltinKind::Intrinsic arm of try_lower_builtin_call).
