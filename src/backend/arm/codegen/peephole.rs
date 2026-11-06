@@ -6172,9 +6172,10 @@ fn drop_leaf_frame_record_in(lines: &mut [String], kinds: &mut [LineKind], start
     // but other restores.
     let Some(save_at) = (body_start..end).find(|&j| live(j, kinds) && !lines[j].trim().starts_with('.')) else { return };
     let first_save = lines[save_at].trim().to_string();
+    // A single register's post-index reaches 255, a pair's 504.
     let saved = ["stp ", "str "].iter().find_map(|mn| {
         let regs = first_save.strip_prefix(mn)?.strip_suffix(", [sp, #16]")?;
-        (!regs.contains("sp")).then(|| (mn.trim().to_string(), regs.to_string()))
+        (!regs.contains("sp") && (*mn == "stp " || m <= 255)).then(|| (mn.trim().to_string(), regs.to_string()))
     });
     let restores: Option<Vec<usize>> = saved.as_ref().and_then(|(mn, regs)| {
         let restore = format!("{} {regs}, [sp, #16]", if mn == "stp" { "ldp" } else { "ldr" });
@@ -8640,6 +8641,26 @@ mod tests {
             let result = peephole_optimize(format!("{frame}{saves}{body}{extra}{restores}{tail}"));
             assert!(result.contains("stp x29, x30") && result.contains("ldp x29, x30"), "{}", result);
         }
+    }
+
+    /// `ldr x20, [sp], #256` does not assemble: past 255 a lone save stays a
+    /// store, with the record's stp and ldp as sp updates. A pair reaches further.
+    #[test]
+    fn test_leaf_frame_record_post_index_range() {
+        let f = |size: usize, save: &str, restore: &str| {
+            peephole_optimize(format!(
+                ".type f, %function\nf:\n.cfi_startproc\n    stp x29, x30, [sp, #-{size}]!\n    .cfi_def_cfa_offset {size}\n    .cfi_offset x29, -{size}\n    .cfi_offset x30, -{}\n    mov x29, sp\n    .cfi_def_cfa_register x29\n{save}    add x1, sp, #32\n    ldr x20, [x1]\n    add x0, x20, x21\n{restore}    ldp x29, x30, [sp], #{size}\n    ret\n.cfi_endproc\n.size f, .-f\n",
+                size - 8))
+        };
+        let lone = ("    str x20, [sp, #16]\n", "    ldr x20, [sp, #16]\n");
+        let result = f(272, lone.0, lone.1);
+        assert!(!result.contains("[sp], #256") && !result.contains("x29"), "{}", result);
+        assert!(result.contains("sub sp, sp, #256") && result.contains("add sp, sp, #256"), "{}", result);
+        assert!(result.contains("str x20, [sp]") || result.contains("str x20, [sp, #0]"), "{}", result);
+        let result = f(256, lone.0, lone.1);
+        assert!(result.contains("ldr x20, [sp], #240"), "{}", result);
+        let result = f(272, "    stp x20, x21, [sp, #16]\n", "    ldp x20, x21, [sp, #16]\n");
+        assert!(result.contains("ldp x20, x21, [sp], #256"), "{}", result);
     }
 
     #[test]

@@ -257,17 +257,28 @@ impl ArmCodegen {
         size_of.retain(|id, _| {
             (vec_used.contains(id) || lane_built.contains(id) && read_whole.contains(id)) && !bad.contains(id)
         });
-        // Variables a VecOp uses come first; the initializer-only ones get
-        // what is left after `const_count` hoisted constant broadcasts.
-        let mut vars: Vec<(bool, u32, i64)> = size_of.iter()
-            .map(|(&id, &size)| (!vec_used.contains(&id), id, size))
+        // Variables a VecOp uses come first, the most used of them first; the
+        // initializer-only ones get what is left after `const_count` hoisted
+        // constant broadcasts.
+        let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+        for inst in insts() {
+            if !matches!(inst, Instruction::Alloca { .. } | Instruction::GetElementPtr { .. }) {
+                inst.for_each_used_value(|v| {
+                    if let Some(&(var, _)) = lanes.get(&v) {
+                        *use_count.entry(var).or_insert(0) += 1;
+                    }
+                });
+            }
+        }
+        let mut vars: Vec<(bool, std::cmp::Reverse<u32>, u32, i64)> = size_of.iter()
+            .map(|(&id, &size)| (!vec_used.contains(&id), std::cmp::Reverse(use_count.get(&id).copied().unwrap_or(0)), id, size))
             .collect();
         vars.sort_unstable();
         let primary = vars.iter().filter(|v| !v.0).count();
         let limit = primary.max(ARM_VEC_VAR_REGS.len().saturating_sub(const_count));
         let mut regs = FxHashMap::default();
         let mut var_list = Vec::new();
-        for ((_, id, size), &reg) in vars.into_iter().zip(ARM_VEC_VAR_REGS.iter()).take(limit) {
+        for ((_, _, id, size), &reg) in vars.into_iter().zip(ARM_VEC_VAR_REGS.iter()).take(limit) {
             regs.insert(id, reg);
             var_list.push((reg, size as u8));
         }

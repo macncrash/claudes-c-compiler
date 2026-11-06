@@ -35,6 +35,7 @@ pub(crate) mod iv_widen;
 pub(crate) mod lftr;
 mod mem_inline;
 mod sroa;
+mod vec_split;
 pub(crate) mod index_base;
 pub(crate) mod licm;
 mod ext_elide;
@@ -400,6 +401,12 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
             if sroa::split_function(func) > 0 {
                 crate::ir::mem2reg::promote_function_allocas(func);
             }
+        }
+    }
+    // Local arrays of vectors: one local per vector (see vec_split.rs).
+    if target == crate::backend::Target::Aarch64 && !disabled.contains("vec_split") {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            vec_split::split_function(func);
         }
     }
     constant_fold::resolve_remaining_is_constant(module);

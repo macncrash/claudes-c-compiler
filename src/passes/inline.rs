@@ -185,6 +185,13 @@ const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 200;
 /// This only bounds runaway growth.
 const MAX_ALWAYS_INLINE_BUDGET_USER: usize = 50000;
 
+/// Rounds of the second pass, each inlining one site. Outside a kernel only the
+/// budget limits them: a limit here left 666 NEON intrinsics in one function as
+/// calls, each moving its vectors through memory.
+fn always_inline_second_pass_rounds() -> usize {
+    if crate::common::types::building_kernel() { MAX_ALWAYS_INLINE_SECOND_PASS_ROUNDS } else { MAX_ALWAYS_INLINE_BUDGET_USER }
+}
+
 fn always_inline_budget(kernel_budget: usize) -> usize {
     if crate::common::types::building_kernel() { kernel_budget } else { MAX_ALWAYS_INLINE_BUDGET_USER }
 }
@@ -685,7 +692,7 @@ fn inline_within_limits(module: &mut IrModule) -> usize {
         // must proceed regardless of caller size. The budget limit (400 inst)
         // provides the growth bound instead.
         let mut second_pass_budget = always_inline_budget(MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET);
-        for _round in 0..MAX_ALWAYS_INLINE_SECOND_PASS_ROUNDS {
+        for _round in 0..always_inline_second_pass_rounds() {
             let call_sites = find_inline_call_sites(&module.functions[func_idx], &callee_map, &skip_list, caller_has_section);
             if call_sites.is_empty() {
                 break;
@@ -2577,6 +2584,18 @@ mod tests {
         let caller = module.functions.iter().find(|f| f.name == "caller").unwrap();
         assert!(!caller.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Call { .. })));
         assert!(effective_size(&caller.blocks) >= 3 * big);
+    }
+
+    /// More calls than the rounds a kernel gets: each is one round, and
+    /// outside a kernel only the budget ends them.
+    #[test]
+    fn test_more_always_inline_calls_than_kernel_rounds() {
+        let calls = vec!["step"; MAX_ALWAYS_INLINE_SECOND_PASS_ROUNDS + 400];
+        let mut module = IrModule::new();
+        module.functions = vec![function("step", 2, &[], true), function("caller", 2, &calls, false)];
+        run(&mut module);
+        let caller = module.functions.iter().find(|f| f.name == "caller").unwrap();
+        assert!(!caller.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Call { .. })));
     }
 
     #[test]

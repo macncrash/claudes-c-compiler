@@ -43,6 +43,7 @@ The optimizer executes in four sequential phases:
      addr_arg_promote
      global_promote
      sroa, mem2reg (little-endian targets)
+     vec_split (AArch64)
          |
          v
  Phase 0.5: IsConstant Resolution
@@ -215,6 +216,10 @@ code:
    was otherwise loaded and stored on every iteration, each load waiting on
    the previous store.
 
+11a. **vec_split** (after sroa) -- a local array of vectors (up to 1024 bytes), in a function
+    doing vector work, every use of which stays inside one vector, becomes one
+    local per vector, which the backend can keep in a NEON register. Disabled
+    with `CCC_DISABLE_PASSES=vec_split`.
 11. **sroa** -- a local struct or array (up to 256 bytes) reached only by
    loads and stores at constant offsets, and by whole copies into or out of
    it, becomes one local per field, which mem2reg then promotes. Fields are
