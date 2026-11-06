@@ -511,6 +511,17 @@ resolved symbol references. The two budgets are independent, so the combined
 maximum is 200 + 400 = 600 always_inline instructions per caller. The second
 pass does not enforce caller size caps (hard cap, absolute cap) because these
 are correctness-critical inlines that must proceed regardless of caller size.
+Those budgets and the table's 500 are kernel figures: outside a kernel the
+budget is 50,000 instructions per caller.
+
+Outside a kernel, `always_inline` functions over the table's limits are expanded
+last, by `expand_large_always_inline`: bottom up, each body finished before it
+is copied, once the ordinary inlining has put the small helpers into it. An
+ordinary function that will hold such a body (`carrying_large_always_inline`) is
+not inlined itself, though it looks small until then: lz4's wrappers otherwise
+took a 28,000-line compressor into a dozen entry points. Recursive functions,
+those using variable arguments or a variable-length array, and bodies past the
+caller's budget stay calls.
 
 **Mechanics.** The inliner clones the callee's blocks with remapped value and
 block IDs, wires arguments by inserting stores into the callee's parameter
@@ -1178,7 +1189,8 @@ OP_MakeRecord, `memcpy(zPayload, (u8*)&v + 8 - len, len)` on a branch dead
 from the start) still took its address, mem_inline turned the copy into it
 (`memcpy(&v, &pRec->u.r, 8)`) into a store, and load_phi forwarded every
 load. `dce::eliminate_unread_local_stores` removes the stores to allocas used
-only as plain stores' addresses (not parameter allocas). Disabled with
+only as plain stores' addresses, directly or through GEPs (not parameter
+allocas). Disabled with
 `CCC_DISABLE_PASSES=unread_locals`.
 
 ### bound_hoist -- Loop Bound Hoisting

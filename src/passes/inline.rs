@@ -415,6 +415,75 @@ fn select_inline_site(
 /// Run the inlining pass on the module.
 /// Returns the number of call sites inlined.
 pub fn run(module: &mut IrModule) -> usize {
+    let total_inlined = inline_within_limits(module) + expand_large_always_inline(module);
+
+    // After ALL inlining is complete, resolve input_symbols for InlineAsm instructions.
+    // This must run after the entire inlining pass because multi-level inline chains
+    // (e.g., arch_static_branch → static_key_false → trace_tlb_flush) need all levels
+    // to be inlined before we can trace values back to their original GlobalAddr/Const.
+    // Running resolution per-function would fail for intermediate functions whose
+    // parameters haven't been replaced with concrete values yet.
+    for func_idx in 0..module.functions.len() {
+        if module.functions[func_idx].has_inlined_calls {
+            resolve_inline_asm_symbols(&mut module.functions[func_idx]);
+        }
+    }
+
+    total_inlined
+}
+
+/// Expand the always_inline functions too large for `inline_within_limits`,
+/// outside a kernel: lz4's match finder, with its flags constants at each call,
+/// stayed a function testing them in its inner loop.
+///
+/// This comes after the other inlining, and bottom up: the helpers inlined
+/// into these bodies by then would stay calls if the bodies went into a caller
+/// first, past its size limits.
+fn expand_large_always_inline(module: &mut IrModule) -> usize {
+    if crate::common::types::building_kernel() {
+        return 0;
+    }
+    let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
+    let mut global_max_block_id = module.functions.iter().flat_map(|f| &f.blocks)
+        .map(|b| b.label.0).max().unwrap_or(0);
+    let mut total = 0;
+    loop {
+        let mut large = build_callee_map_for(module, true);
+        if large.is_empty() {
+            return total;
+        }
+        // Those calling no other are finished, so go first. Each round
+        // finishes more, or inlined nothing and is the last.
+        let names: FxHashSet<String> = large.keys().cloned().collect();
+        large.retain(|_, c| !c.blocks.iter().flat_map(|b| &b.instructions).any(|i|
+            matches!(i, Instruction::Call { func, .. } if names.contains(func))));
+        let mut inlined = 0;
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            let has_section = func.section.is_some();
+            loop {
+                let sites = find_inline_call_sites(func, &large, &skip_list, has_section);
+                let size = effective_size(&func.blocks);
+                let site = sites.iter().find(|s|
+                    size + effective_size(&large[&s.callee_name].blocks) <= MAX_ALWAYS_INLINE_BUDGET_USER);
+                match site {
+                    Some(site) if inline_call_site(func, site, &large[&site.callee_name], &mut global_max_block_id) => inlined += 1,
+                    _ => break,
+                }
+            }
+        }
+        if inlined == 0 {
+            return total;
+        }
+        total += inlined;
+    }
+}
+
+fn inline_within_limits(module: &mut IrModule) -> usize {
     let mut total_inlined = 0;
     let debug_inline = std::env::var("CCC_INLINE_DEBUG").is_ok();
     let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
@@ -673,18 +742,6 @@ pub fn run(module: &mut IrModule) -> usize {
             }
         }
 
-    }
-
-    // After ALL inlining is complete, resolve input_symbols for InlineAsm instructions.
-    // This must run after the entire inlining pass because multi-level inline chains
-    // (e.g., arch_static_branch → static_key_false → trace_tlb_flush) need all levels
-    // to be inlined before we can trace values back to their original GlobalAddr/Const.
-    // Running resolution per-function would fail for intermediate functions whose
-    // parameters haven't been replaced with concrete values yet.
-    for func_idx in 0..module.functions.len() {
-        if module.functions[func_idx].has_inlined_calls {
-            resolve_inline_asm_symbols(&mut module.functions[func_idx]);
-        }
     }
 
     total_inlined
@@ -1465,9 +1522,54 @@ fn recursive_functions(module: &IrModule) -> FxHashSet<&str> {
 }
 
 fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
+    build_callee_map_for(module, false)
+}
+
+/// The functions that will hold a large always_inline body once it is expanded,
+/// by calling it directly or through smaller always_inline functions. They look
+/// small until then, and copied into their callers each brings a copy of the
+/// body: lz4's one-line wrappers took its 28,000-line compressor into a dozen
+/// entry points. An ordinary function among these stays a function, as clang's
+/// bottom-up order leaves it too, and its callers just call it.
+fn carrying_large_always_inline(module: &IrModule) -> FxHashSet<&str> {
+    if crate::common::types::building_kernel() {
+        return FxHashSet::default();
+    }
+    let calls_one_of = |f: &IrFunction, names: &FxHashSet<&str>| f.blocks.iter().flat_map(|b| &b.instructions)
+        .any(|i| matches!(i, Instruction::Call { func, .. } if names.contains(func.as_str())));
+    let forced: Vec<&IrFunction> = module.functions.iter()
+        .filter(|f| f.is_always_inline && !f.is_noinline && !f.is_declaration)
+        .collect();
+    let mut heavy: FxHashSet<&str> = forced.iter()
+        .filter(|f| effective_size(&f.blocks) > MAX_ALWAYS_INLINE_INSTRUCTIONS || f.blocks.len() > MAX_ALWAYS_INLINE_BLOCKS)
+        .map(|f| f.name.as_str())
+        .collect();
+    if heavy.is_empty() {
+        return heavy;
+    }
+    loop {
+        let more: Vec<&str> = forced.iter()
+            .filter(|f| !heavy.contains(f.name.as_str()) && calls_one_of(f, &heavy))
+            .map(|f| f.name.as_str())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        heavy.extend(more);
+    }
+    module.functions.iter()
+        .filter(|f| !f.is_declaration && calls_one_of(f, &heavy))
+        .map(|f| f.name.as_str())
+        .collect()
+}
+
+/// With `large`, only the always_inline functions the ordinary map leaves out
+/// for their size, and none on a cycle, which would never finish.
+fn build_callee_map_for(module: &IrModule, large: bool) -> HashMap<String, CalleeData> {
     let mut map = HashMap::new();
     let recursive = recursive_functions(module);
     let sole = sole_call_statics(module);
+    let carrying = if large { FxHashSet::default() } else { carrying_large_always_inline(module) };
 
     let debug_callee = std::env::var("CCC_INLINE_DEBUG").is_ok();
     for func in &module.functions {
@@ -1476,6 +1578,9 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         }
         // __attribute__((noinline)) takes precedence: never inline these functions
         if func.is_noinline {
+            continue;
+        }
+        if !func.is_always_inline && carrying.contains(func.name.as_str()) {
             continue;
         }
         // A recursive function inlined into a caller brings its own call
@@ -1581,8 +1686,11 @@ fn build_callee_map(module: &IrModule) -> HashMap<String, CalleeData> {
         let fits_normal = inst_count <= MAX_INLINE_INSTRUCTIONS && func.blocks.len() <= MAX_INLINE_BLOCKS;
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
         let exceeds_normal = !is_always_inline && !fits_normal && !cleaned_only;
+        if large && (!is_always_inline || fits_relaxed || recursive.contains(func.name.as_str())) {
+            continue;
+        }
         if is_always_inline {
-            if !fits_relaxed {
+            if !fits_relaxed && !large {
                 continue;
             }
         } else {
@@ -2400,6 +2508,85 @@ fn format_terminator(term: &Terminator) -> String {
 mod tests {
     use super::*;
     use crate::ir::reexports::{BasicBlock, BlockId, CallInfo};
+
+
+
+    /// A function of `size` casts (copies count for nothing) calling each of `calls`.
+    fn function(name: &str, size: usize, calls: &[&str], always_inline: bool) -> IrFunction {
+        let mut func = IrFunction::new(name.to_string(), IrType::I64, vec![], false);
+        func.is_always_inline = always_inline;
+        func.is_static = true;
+        func.next_value_id = size as u32 + 1;
+        let mut instructions: Vec<Instruction> = (0..size as u32)
+            .map(|i| Instruction::Cast { dest: Value(i), src: Operand::Const(IrConst::I64(1)), from_ty: IrType::I64, to_ty: IrType::I32 })
+            .collect();
+        for callee in calls {
+            instructions.push(Instruction::Call { func: callee.to_string(), info: CallInfo {
+                dest: None, args: Vec::new(), arg_types: Vec::new(), return_type: IrType::Void,
+                is_variadic: false, num_fixed_args: 0, struct_arg_sizes: Vec::new(),
+                struct_arg_aligns: Vec::new(), struct_arg_classes: Vec::new(), struct_arg_riscv_float_classes: Vec::new(),
+                is_sret: false, is_fastcall: false, ret_eightbyte_classes: Vec::new(),
+            } });
+        }
+        func.blocks.push(BasicBlock { label: BlockId(0), instructions, terminator: Terminator::Return(None), source_spans: Vec::new() });
+        func
+    }
+
+    #[test]
+    fn test_wrappers_of_a_large_always_inline_body() {
+        let big = MAX_ALWAYS_INLINE_INSTRUCTIONS + 1;
+        let mut module = IrModule::new();
+        module.functions = vec![
+            function("large", big, &[], true),
+            function("forced_step", 2, &["large"], true),
+            function("wrapper", 2, &["forced_step"], false),
+            function("direct", 2, &["large"], false),
+            function("calls_wrapper", 2, &["wrapper"], false),
+            function("unrelated", 2, &[], false),
+        ];
+        let carrying = carrying_large_always_inline(&module);
+        let mut names: Vec<&str> = carrying.iter().copied().collect();
+        names.sort_unstable();
+        // Weight passes through the always_inline step, and stops at the
+        // ordinary wrapper: its callers just call it.
+        assert_eq!(names, vec!["direct", "forced_step", "wrapper"]);
+    }
+
+    #[test]
+    fn test_nothing_carried_without_a_large_body() {
+        let mut module = IrModule::new();
+        module.functions = vec![
+            function("small", MAX_ALWAYS_INLINE_INSTRUCTIONS, &[], true),
+            function("wrapper", 2, &["small"], false),
+        ];
+        assert!(carrying_large_always_inline(&module).is_empty());
+    }
+
+    #[test]
+    fn test_large_body_expanded_bottom_up() {
+        let big = MAX_ALWAYS_INLINE_INSTRUCTIONS + 1;
+        let mut module = IrModule::new();
+        module.functions = vec![
+            function("outer", big, &["inner", "inner"], true),
+            function("inner", big, &[], true),
+            function("caller", 2, &["outer"], false),
+        ];
+        assert_eq!(expand_large_always_inline(&mut module), 3);
+        let caller = module.functions.iter().find(|f| f.name == "caller").unwrap();
+        assert!(!caller.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Call { .. })));
+        assert!(effective_size(&caller.blocks) >= 3 * big);
+    }
+
+    #[test]
+    fn test_large_recursive_body_left_alone() {
+        let big = MAX_ALWAYS_INLINE_INSTRUCTIONS + 1;
+        let mut module = IrModule::new();
+        module.functions = vec![
+            function("itself", big, &["itself"], true),
+            function("caller", 2, &["itself"], false),
+        ];
+        assert_eq!(expand_large_always_inline(&mut module), 0);
+    }
 
     /// A function calling each of `callees`, then returning.
     fn caller(name: &str, callees: &[&str]) -> IrFunction {

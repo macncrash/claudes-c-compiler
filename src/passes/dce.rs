@@ -12,7 +12,7 @@
 //! for removal), giving O(n) complexity instead of O(n*k) where k is the
 //! maximum dead chain length.
 
-use crate::common::fx_hash::FxHashSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{
     Instruction,
     IrFunction,
@@ -361,19 +361,42 @@ pub(crate) fn eliminate_unread_local_stores(func: &mut IrFunction) -> usize {
     if unread.is_empty() {
         return 0;
     }
+    // A GEP of a local reads nothing: what counts is what its result is used
+    // for. Each address maps to its local; one seen before its base's GEP is
+    // not here, so counts as a use of that base.
+    let mut local_of: FxHashMap<u32, u32> = unread.iter().map(|&v| (v, v)).collect();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::GetElementPtr { dest, base, .. } = inst {
+            if let Some(&local) = local_of.get(&base.0) {
+                local_of.insert(dest.0, local);
+            }
+        }
+    }
+    let mut read = |v: u32| {
+        if let Some(local) = local_of.get(&v) {
+            unread.remove(local);
+        }
+    };
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
                 Instruction::Alloca { .. } => {}
                 Instruction::Store { val, volatile: false, .. } => {
                     if let Operand::Value(v) = val {
-                        unread.remove(&v.0);
+                        read(v.0);
                     }
                 }
-                _ => inst.for_each_used_value(|v| { unread.remove(&v); }),
+                Instruction::GetElementPtr { dest, base, offset, .. }
+                    if local_of.contains_key(&dest.0) && local_of.contains_key(&base.0) =>
+                {
+                    if let Operand::Value(v) = offset {
+                        read(v.0);
+                    }
+                }
+                _ => inst.for_each_used_value(&mut read),
             }
         }
-        block.terminator.for_each_used_value(|v| { unread.remove(&v); });
+        block.terminator.for_each_used_value(&mut read);
     }
     if unread.is_empty() {
         return 0;
@@ -381,7 +404,8 @@ pub(crate) fn eliminate_unread_local_stores(func: &mut IrFunction) -> usize {
     let mut removed = 0;
     for block in &mut func.blocks {
         let keep: Vec<bool> = block.instructions.iter()
-            .map(|i| !matches!(i, Instruction::Store { ptr, .. } if unread.contains(&ptr.0)))
+            .map(|i| !matches!(i, Instruction::Store { ptr, .. }
+                if local_of.get(&ptr.0).is_some_and(|local| unread.contains(local))))
             .collect();
         if block.source_spans.len() == keep.len() {
             let mut k = keep.iter();
@@ -620,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_unread_local_stores_removed() {
-        // %0 is only stored to; %1 is also loaded; %2's address goes to a GEP.
+        // %0 is only stored to; %1 is also loaded; %2 is loaded through a GEP.
         let st = |v: i64, p: u32| Instruction::Store { val: Operand::Const(IrConst::I64(v)), ptr: Value(p), ty: IrType::I64,
             seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
         let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
@@ -636,6 +660,7 @@ mod tests {
                 st(4, 0),
                 Instruction::GetElementPtr { dest: Value(3), base: Value(2), offset: Operand::Const(IrConst::I64(4)), ty: IrType::Ptr },
                 Instruction::Load { dest: Value(4), ptr: Value(1), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
+                Instruction::Load { dest: Value(5), ptr: Value(3), ty: IrType::I64, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
             source_spans: Vec::new(),
@@ -645,5 +670,50 @@ mod tests {
             .filter_map(|i| match i { Instruction::Store { ptr, .. } => Some(ptr.0), _ => None })
             .collect();
         assert_eq!(stored, vec![1, 2]);
+    }
+
+    /// One function: a local, GEPs 1 and 2 deep, a store through each, then `last`.
+    fn stores_through_geps(last: Instruction) -> IrFunction {
+        let st = |p: u32| Instruction::Store { val: Operand::Const(IrConst::I8(0)), ptr: Value(p), ty: IrType::I8,
+            seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY };
+        let gep = |d: u32, b: u32| Instruction::GetElementPtr { dest: Value(d), base: Value(b), offset: Operand::Const(IrConst::I64(1)), ty: IrType::Ptr };
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 4, volatile: false },
+                gep(1, 0),
+                gep(2, 1),
+                st(0),
+                st(1),
+                st(2),
+                last,
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func
+    }
+
+    #[test]
+    fn test_stores_through_geps_of_an_unread_local() {
+        // Nothing reads it: an unrelated instruction last.
+        let mut func = stores_through_geps(Instruction::Copy { dest: Value(9), src: Operand::Const(IrConst::I64(0)) });
+        assert_eq!(eliminate_unread_local_stores(&mut func), 3);
+        // A load through the deepest GEP reads all of it.
+        let mut func = stores_through_geps(Instruction::Load { dest: Value(9), ptr: Value(2), ty: IrType::I8,
+            seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+        assert_eq!(eliminate_unread_local_stores(&mut func), 0);
+        // Its address stored somewhere has left.
+        let mut func = stores_through_geps(Instruction::Store { val: Operand::Value(Value(1)), ptr: Value(7), ty: IrType::Ptr,
+            seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+        assert_eq!(eliminate_unread_local_stores(&mut func), 0);
+        // A copy of the address may be used anywhere.
+        let mut func = stores_through_geps(Instruction::Copy { dest: Value(9), src: Operand::Value(Value(2)) });
+        assert_eq!(eliminate_unread_local_stores(&mut func), 0);
+        // A volatile store through it stays, and keeps the others.
+        let mut func = stores_through_geps(Instruction::Store { val: Operand::Const(IrConst::I8(1)), ptr: Value(2), ty: IrType::I8,
+            seg_override: AddressSpace::Default, volatile: true, alias: AliasClass::ANY });
+        assert_eq!(eliminate_unread_local_stores(&mut func), 0);
     }
 }
