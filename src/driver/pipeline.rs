@@ -1129,6 +1129,7 @@ impl Driver {
         if time_phases { eprintln!("[TIME] mem2reg: {:.3}s", t5.elapsed().as_secs_f64()); }
 
         let t6 = std::time::Instant::now();
+        crate::common::types::set_building_kernel(self.code_model_kernel || self.defines.iter().any(|d| d.name == "__KERNEL__"));
         run_passes(&mut module, self.opt_level, self.target, self.fwrapv);
         if time_phases { eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64()); }
 

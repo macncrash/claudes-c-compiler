@@ -179,6 +179,16 @@ const MAX_STATIC_NONINLINE_BLOCKS: usize = 4;
 /// are lowered as no-ops (not traps).
 const MAX_ALWAYS_INLINE_BUDGET_PER_CALLER: usize = 200;
 
+/// Budget for always_inline callees outside a kernel, which has no 16KB stack
+/// to protect. always_inline is a promise there: 42 such calls left as calls
+/// (load32, round_fn, g) cost BLAKE3's portable code a fifth of its time.
+/// This only bounds runaway growth.
+const MAX_ALWAYS_INLINE_BUDGET_USER: usize = 50000;
+
+fn always_inline_budget(kernel_budget: usize) -> usize {
+    if crate::common::types::building_kernel() { kernel_budget } else { MAX_ALWAYS_INLINE_BUDGET_USER }
+}
+
 /// Additional always_inline budget for the second (correctness) pass.
 /// After the main inlining loop exhausts max_rounds, any remaining
 /// always_inline call sites are processed in a second pass with this
@@ -470,7 +480,7 @@ pub fn run(module: &mut IrModule) -> usize {
         };
         let caller_in_cycle = in_cycle.contains(&module.functions[func_idx].name);
         let mut budget_remaining = MAX_INLINE_BUDGET_PER_CALLER;
-        let mut always_inline_budget_remaining = MAX_ALWAYS_INLINE_BUDGET_PER_CALLER;
+        let mut always_inline_budget_remaining = always_inline_budget(MAX_ALWAYS_INLINE_BUDGET_PER_CALLER);
         // Iterate to handle chains of inlined calls (A calls B calls C, all small inline).
         // Limit iterations to prevent infinite loops from recursive inline functions.
         let max_rounds = 200;
@@ -603,7 +613,7 @@ pub fn run(module: &mut IrModule) -> usize {
         // critical inlines (avoiding linker errors and BRK crashes), so they
         // must proceed regardless of caller size. The budget limit (400 inst)
         // provides the growth bound instead.
-        let mut second_pass_budget = MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET;
+        let mut second_pass_budget = always_inline_budget(MAX_ALWAYS_INLINE_SECOND_PASS_BUDGET);
         for _round in 0..MAX_ALWAYS_INLINE_SECOND_PASS_ROUNDS {
             let call_sites = find_inline_call_sites(&module.functions[func_idx], &callee_map, &skip_list, caller_has_section);
             if call_sites.is_empty() {

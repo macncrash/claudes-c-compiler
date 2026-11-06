@@ -1451,6 +1451,19 @@ impl ArmCodegen {
                 lines.push(format!("    {} {d}.{arr}, {b}.{arr}, #{shift_count}", if u { "usra" } else { "ssra" }));
                 lines
             }
+            VecOpKind::Tbl if args.len() == 2 => vec![format!("    tbl {d}.16b, {{{a}.16b}}, {b}.16b")],
+            // Two tables have to be in consecutive registers.
+            VecOpKind::Tbl => {
+                let mut lines = Vec::new();
+                if a != "v0" {
+                    lines.push(format!("    orr v0.16b, {a}.16b, {a}.16b"));
+                }
+                if b != "v1" {
+                    lines.push(format!("    orr v1.16b, {b}.16b, {b}.16b"));
+                }
+                lines.push(format!("    tbl {d}.16b, {{v0.16b, v1.16b}}, {c}.16b"));
+                lines
+            }
             VecOpKind::Add => vec![bin(if f { "fadd" } else { "add" })],
             VecOpKind::Sub => vec![bin(if f { "fsub" } else { "sub" })],
             VecOpKind::SatSub => vec![bin(if u { "uqsub" } else { "sqsub" })],
@@ -1516,6 +1529,9 @@ impl ArmCodegen {
         }
         if matches!(op, VecOpKind::Shr) && imm_shift.is_none() {
             held[1] = None;
+        }
+        if matches!(op, VecOpKind::Tbl) {
+            held = [None; 3];
         }
         self.vec_scratch = (self.state.out.buf.len(), held);
     }

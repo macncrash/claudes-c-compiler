@@ -5462,18 +5462,6 @@ vmull_high_p64(poly64x2_t __a, poly64x2_t __b)
 /*                    REVERSE OPERATIONS                               */
 /* ================================================================== */
 
-static __inline__ uint16x8_t __attribute__((__always_inline__))
-vrev32q_u16(uint16x8_t __a)
-{
-    /* Reverse 16-bit elements within each 32-bit word */
-    uint16x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __a[__i];
-    }
-    return __ret;
-}
-
 static __inline__ uint8x16_t __attribute__((__always_inline__))
 vrbitq_u8(uint8x16_t __a)
 {
@@ -5782,31 +5770,6 @@ vget_high_u32(uint32x4_t __a)
 
 /* === Shift: u32 === */
 
-/* vsriq_n_u32: shift right and insert - for each lane,
- * shift __b right by __n, and insert into __a preserving the top __n bits of __a
- * result[i] = (a[i] & ~((1u<<(32-n))-1)) | (b[i] >> n) */
-#define vsriq_n_u32(__a, __b, __n) __extension__ ({ \
-    uint32x4_t __r; \
-    unsigned int __mask = ~((1u << (32 - (__n))) - 1u); \
-    __r[0] = ((__a)[0] & __mask) | ((__b)[0] >> (__n)); \
-    __r[1] = ((__a)[1] & __mask) | ((__b)[1] >> (__n)); \
-    __r[2] = ((__a)[2] & __mask) | ((__b)[2] >> (__n)); \
-    __r[3] = ((__a)[3] & __mask) | ((__b)[3] >> (__n)); \
-    __r; \
-})
-
-/* vsliq_n_u32: shift left and insert - for each lane,
- * shift __b left by __n, and insert into __a preserving the low __n bits of __a */
-#define vsliq_n_u32(__a, __b, __n) __extension__ ({ \
-    uint32x4_t __r; \
-    unsigned int __mask = (1u << (__n)) - 1u; \
-    __r[0] = ((__a)[0] & __mask) | ((__b)[0] << (__n)); \
-    __r[1] = ((__a)[1] & __mask) | ((__b)[1] << (__n)); \
-    __r[2] = ((__a)[2] & __mask) | ((__b)[2] << (__n)); \
-    __r[3] = ((__a)[3] & __mask) | ((__b)[3] << (__n)); \
-    __r; \
-})
-
 /* === Compare: u8 === */
 
 /* vmaxq_u8: element-wise maximum of uint8x16_t */
@@ -6106,30 +6069,6 @@ vshrn_n_u16(uint16x8_t __a, int __n)
 }
 
 /* === Shift and insert === */
-
-/* vsli_n_u8: shift left and insert (64-bit, per-byte) */
-static __inline__ uint8x8_t __attribute__((__always_inline__))
-vsli_n_u8(uint8x8_t __a, uint8x8_t __b, int __n)
-{
-    uint8x8_t __ret;
-    unsigned char __mask = (unsigned char)((0xFF << __n) & 0xFF);
-    for (int __i = 0; __i < 8; __i++) {
-        __ret[__i] = (__a[__i] & ~__mask) | ((unsigned char)(__b[__i] << __n) & __mask);
-    }
-    return __ret;
-}
-
-/* vsriq_n_u8: shift right and insert (128-bit, per-byte) */
-static __inline__ uint8x16_t __attribute__((__always_inline__))
-vsriq_n_u8(uint8x16_t __a, uint8x16_t __b, int __n)
-{
-    uint8x16_t __ret;
-    unsigned char __mask = (unsigned char)(0xFF >> __n);
-    for (int __i = 0; __i < 16; __i++) {
-        __ret[__i] = (__a[__i] & ~__mask) | ((__b[__i] >> __n) & __mask);
-    }
-    return __ret;
-}
 
 /* === Multi-element structure loads === */
 
@@ -6773,6 +6712,316 @@ vget_high_u16(uint16x8_t __a)
     return __ret;
 }
 
+
+/* ===== Shift and insert, and reversal ===== */
+
+static __inline__ uint8x8_t __attribute__((__always_inline__))
+vsri_n_u8(uint8x8_t __a, uint8x8_t __b, int __n)
+{
+    unsigned char __keep = (unsigned char)(__n == 8 ? -1 : ~(~0ull >> (64 - 8) >> __n));
+    return (uint8x8_t)(((uint8x8_t)__a & (uint8x8_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | (__n == 8 ? (uint8x8_t)__a ^ (uint8x8_t)__a : (uint8x8_t)__b >> __n));
+}
+
+static __inline__ uint8x8_t __attribute__((__always_inline__))
+vsli_n_u8(uint8x8_t __a, uint8x8_t __b, int __n)
+{
+    unsigned char __keep = (unsigned char)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (uint8x8_t)(((uint8x8_t)__a & (uint8x8_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | ((uint8x8_t)__b << __n));
+}
+
+static __inline__ int8x8_t __attribute__((__always_inline__))
+vsri_n_s8(int8x8_t __a, int8x8_t __b, int __n)
+{
+    unsigned char __keep = (unsigned char)(__n == 8 ? -1 : ~(~0ull >> (64 - 8) >> __n));
+    return (int8x8_t)(((uint8x8_t)__a & (uint8x8_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | (__n == 8 ? (uint8x8_t)__a ^ (uint8x8_t)__a : (uint8x8_t)__b >> __n));
+}
+
+static __inline__ int8x8_t __attribute__((__always_inline__))
+vsli_n_s8(int8x8_t __a, int8x8_t __b, int __n)
+{
+    unsigned char __keep = (unsigned char)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (int8x8_t)(((uint8x8_t)__a & (uint8x8_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | ((uint8x8_t)__b << __n));
+}
+
+static __inline__ uint16x4_t __attribute__((__always_inline__))
+vsri_n_u16(uint16x4_t __a, uint16x4_t __b, int __n)
+{
+    unsigned short __keep = (unsigned short)(__n == 16 ? -1 : ~(~0ull >> (64 - 16) >> __n));
+    return (uint16x4_t)(((uint16x4_t)__a & (uint16x4_t){ __keep, __keep, __keep, __keep }) | (__n == 16 ? (uint16x4_t)__a ^ (uint16x4_t)__a : (uint16x4_t)__b >> __n));
+}
+
+static __inline__ uint16x4_t __attribute__((__always_inline__))
+vsli_n_u16(uint16x4_t __a, uint16x4_t __b, int __n)
+{
+    unsigned short __keep = (unsigned short)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (uint16x4_t)(((uint16x4_t)__a & (uint16x4_t){ __keep, __keep, __keep, __keep }) | ((uint16x4_t)__b << __n));
+}
+
+static __inline__ int16x4_t __attribute__((__always_inline__))
+vsri_n_s16(int16x4_t __a, int16x4_t __b, int __n)
+{
+    unsigned short __keep = (unsigned short)(__n == 16 ? -1 : ~(~0ull >> (64 - 16) >> __n));
+    return (int16x4_t)(((uint16x4_t)__a & (uint16x4_t){ __keep, __keep, __keep, __keep }) | (__n == 16 ? (uint16x4_t)__a ^ (uint16x4_t)__a : (uint16x4_t)__b >> __n));
+}
+
+static __inline__ int16x4_t __attribute__((__always_inline__))
+vsli_n_s16(int16x4_t __a, int16x4_t __b, int __n)
+{
+    unsigned short __keep = (unsigned short)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (int16x4_t)(((uint16x4_t)__a & (uint16x4_t){ __keep, __keep, __keep, __keep }) | ((uint16x4_t)__b << __n));
+}
+
+static __inline__ uint32x2_t __attribute__((__always_inline__))
+vsri_n_u32(uint32x2_t __a, uint32x2_t __b, int __n)
+{
+    unsigned int __keep = (unsigned int)(__n == 32 ? -1 : ~(~0ull >> (64 - 32) >> __n));
+    return (uint32x2_t)(((uint32x2_t)__a & (uint32x2_t){ __keep, __keep }) | (__n == 32 ? (uint32x2_t)__a ^ (uint32x2_t)__a : (uint32x2_t)__b >> __n));
+}
+
+static __inline__ uint32x2_t __attribute__((__always_inline__))
+vsli_n_u32(uint32x2_t __a, uint32x2_t __b, int __n)
+{
+    unsigned int __keep = (unsigned int)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (uint32x2_t)(((uint32x2_t)__a & (uint32x2_t){ __keep, __keep }) | ((uint32x2_t)__b << __n));
+}
+
+static __inline__ int32x2_t __attribute__((__always_inline__))
+vsri_n_s32(int32x2_t __a, int32x2_t __b, int __n)
+{
+    unsigned int __keep = (unsigned int)(__n == 32 ? -1 : ~(~0ull >> (64 - 32) >> __n));
+    return (int32x2_t)(((uint32x2_t)__a & (uint32x2_t){ __keep, __keep }) | (__n == 32 ? (uint32x2_t)__a ^ (uint32x2_t)__a : (uint32x2_t)__b >> __n));
+}
+
+static __inline__ int32x2_t __attribute__((__always_inline__))
+vsli_n_s32(int32x2_t __a, int32x2_t __b, int __n)
+{
+    unsigned int __keep = (unsigned int)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (int32x2_t)(((uint32x2_t)__a & (uint32x2_t){ __keep, __keep }) | ((uint32x2_t)__b << __n));
+}
+
+static __inline__ uint64x1_t __attribute__((__always_inline__))
+vsri_n_u64(uint64x1_t __a, uint64x1_t __b, int __n)
+{
+    unsigned long long __keep = (unsigned long long)(__n == 64 ? -1 : ~(~0ull >> (64 - 64) >> __n));
+    return (uint64x1_t)(((uint64x1_t)__a & (uint64x1_t){ __keep }) | (__n == 64 ? (uint64x1_t)__a ^ (uint64x1_t)__a : (uint64x1_t)__b >> __n));
+}
+
+static __inline__ uint64x1_t __attribute__((__always_inline__))
+vsli_n_u64(uint64x1_t __a, uint64x1_t __b, int __n)
+{
+    unsigned long long __keep = (unsigned long long)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (uint64x1_t)(((uint64x1_t)__a & (uint64x1_t){ __keep }) | ((uint64x1_t)__b << __n));
+}
+
+static __inline__ int64x1_t __attribute__((__always_inline__))
+vsri_n_s64(int64x1_t __a, int64x1_t __b, int __n)
+{
+    unsigned long long __keep = (unsigned long long)(__n == 64 ? -1 : ~(~0ull >> (64 - 64) >> __n));
+    return (int64x1_t)(((uint64x1_t)__a & (uint64x1_t){ __keep }) | (__n == 64 ? (uint64x1_t)__a ^ (uint64x1_t)__a : (uint64x1_t)__b >> __n));
+}
+
+static __inline__ int64x1_t __attribute__((__always_inline__))
+vsli_n_s64(int64x1_t __a, int64x1_t __b, int __n)
+{
+    unsigned long long __keep = (unsigned long long)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (int64x1_t)(((uint64x1_t)__a & (uint64x1_t){ __keep }) | ((uint64x1_t)__b << __n));
+}
+
+static __inline__ uint16x4_t __attribute__((__always_inline__))
+vrev32_u16(uint16x4_t __a)
+{
+    uint32x2_t __w = (uint32x2_t)__a;
+    return (uint16x4_t)((__w << 16) | (__w >> 16));
+}
+
+static __inline__ int16x4_t __attribute__((__always_inline__))
+vrev32_s16(int16x4_t __a)
+{
+    uint32x2_t __w = (uint32x2_t)__a;
+    return (int16x4_t)((__w << 16) | (__w >> 16));
+}
+
+static __inline__ uint8x8_t __attribute__((__always_inline__))
+vrev16_u8(uint8x8_t __a)
+{
+    uint16x4_t __w = (uint16x4_t)__a;
+    return (uint8x8_t)((__w << 8) | (__w >> 8));
+}
+
+static __inline__ int8x8_t __attribute__((__always_inline__))
+vrev16_s8(int8x8_t __a)
+{
+    uint16x4_t __w = (uint16x4_t)__a;
+    return (int8x8_t)((__w << 8) | (__w >> 8));
+}
+
+static __inline__ uint32x2_t __attribute__((__always_inline__))
+vrev64_u32(uint32x2_t __a)
+{
+    uint64x1_t __w = (uint64x1_t)__a;
+    return (uint32x2_t)((__w << 32) | (__w >> 32));
+}
+
+static __inline__ int32x2_t __attribute__((__always_inline__))
+vrev64_s32(int32x2_t __a)
+{
+    uint64x1_t __w = (uint64x1_t)__a;
+    return (int32x2_t)((__w << 32) | (__w >> 32));
+}
+
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vsriq_n_u8(uint8x16_t __a, uint8x16_t __b, int __n)
+{
+    unsigned char __keep = (unsigned char)(__n == 8 ? -1 : ~(~0ull >> (64 - 8) >> __n));
+    return (uint8x16_t)(((uint8x16_t)__a & (uint8x16_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | (__n == 8 ? (uint8x16_t)__a ^ (uint8x16_t)__a : (uint8x16_t)__b >> __n));
+}
+
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vsliq_n_u8(uint8x16_t __a, uint8x16_t __b, int __n)
+{
+    unsigned char __keep = (unsigned char)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (uint8x16_t)(((uint8x16_t)__a & (uint8x16_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | ((uint8x16_t)__b << __n));
+}
+
+static __inline__ int8x16_t __attribute__((__always_inline__))
+vsriq_n_s8(int8x16_t __a, int8x16_t __b, int __n)
+{
+    unsigned char __keep = (unsigned char)(__n == 8 ? -1 : ~(~0ull >> (64 - 8) >> __n));
+    return (int8x16_t)(((uint8x16_t)__a & (uint8x16_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | (__n == 8 ? (uint8x16_t)__a ^ (uint8x16_t)__a : (uint8x16_t)__b >> __n));
+}
+
+static __inline__ int8x16_t __attribute__((__always_inline__))
+vsliq_n_s8(int8x16_t __a, int8x16_t __b, int __n)
+{
+    unsigned char __keep = (unsigned char)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (int8x16_t)(((uint8x16_t)__a & (uint8x16_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | ((uint8x16_t)__b << __n));
+}
+
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vsriq_n_u16(uint16x8_t __a, uint16x8_t __b, int __n)
+{
+    unsigned short __keep = (unsigned short)(__n == 16 ? -1 : ~(~0ull >> (64 - 16) >> __n));
+    return (uint16x8_t)(((uint16x8_t)__a & (uint16x8_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | (__n == 16 ? (uint16x8_t)__a ^ (uint16x8_t)__a : (uint16x8_t)__b >> __n));
+}
+
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vsliq_n_u16(uint16x8_t __a, uint16x8_t __b, int __n)
+{
+    unsigned short __keep = (unsigned short)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (uint16x8_t)(((uint16x8_t)__a & (uint16x8_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | ((uint16x8_t)__b << __n));
+}
+
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vsriq_n_s16(int16x8_t __a, int16x8_t __b, int __n)
+{
+    unsigned short __keep = (unsigned short)(__n == 16 ? -1 : ~(~0ull >> (64 - 16) >> __n));
+    return (int16x8_t)(((uint16x8_t)__a & (uint16x8_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | (__n == 16 ? (uint16x8_t)__a ^ (uint16x8_t)__a : (uint16x8_t)__b >> __n));
+}
+
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vsliq_n_s16(int16x8_t __a, int16x8_t __b, int __n)
+{
+    unsigned short __keep = (unsigned short)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (int16x8_t)(((uint16x8_t)__a & (uint16x8_t){ __keep, __keep, __keep, __keep, __keep, __keep, __keep, __keep }) | ((uint16x8_t)__b << __n));
+}
+
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsriq_n_u32(uint32x4_t __a, uint32x4_t __b, int __n)
+{
+    unsigned int __keep = (unsigned int)(__n == 32 ? -1 : ~(~0ull >> (64 - 32) >> __n));
+    return (uint32x4_t)(((uint32x4_t)__a & (uint32x4_t){ __keep, __keep, __keep, __keep }) | (__n == 32 ? (uint32x4_t)__a ^ (uint32x4_t)__a : (uint32x4_t)__b >> __n));
+}
+
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsliq_n_u32(uint32x4_t __a, uint32x4_t __b, int __n)
+{
+    unsigned int __keep = (unsigned int)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (uint32x4_t)(((uint32x4_t)__a & (uint32x4_t){ __keep, __keep, __keep, __keep }) | ((uint32x4_t)__b << __n));
+}
+
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vsriq_n_s32(int32x4_t __a, int32x4_t __b, int __n)
+{
+    unsigned int __keep = (unsigned int)(__n == 32 ? -1 : ~(~0ull >> (64 - 32) >> __n));
+    return (int32x4_t)(((uint32x4_t)__a & (uint32x4_t){ __keep, __keep, __keep, __keep }) | (__n == 32 ? (uint32x4_t)__a ^ (uint32x4_t)__a : (uint32x4_t)__b >> __n));
+}
+
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vsliq_n_s32(int32x4_t __a, int32x4_t __b, int __n)
+{
+    unsigned int __keep = (unsigned int)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (int32x4_t)(((uint32x4_t)__a & (uint32x4_t){ __keep, __keep, __keep, __keep }) | ((uint32x4_t)__b << __n));
+}
+
+static __inline__ uint64x2_t __attribute__((__always_inline__))
+vsriq_n_u64(uint64x2_t __a, uint64x2_t __b, int __n)
+{
+    unsigned long long __keep = (unsigned long long)(__n == 64 ? -1 : ~(~0ull >> (64 - 64) >> __n));
+    return (uint64x2_t)(((uint64x2_t)__a & (uint64x2_t){ __keep, __keep }) | (__n == 64 ? (uint64x2_t)__a ^ (uint64x2_t)__a : (uint64x2_t)__b >> __n));
+}
+
+static __inline__ uint64x2_t __attribute__((__always_inline__))
+vsliq_n_u64(uint64x2_t __a, uint64x2_t __b, int __n)
+{
+    unsigned long long __keep = (unsigned long long)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (uint64x2_t)(((uint64x2_t)__a & (uint64x2_t){ __keep, __keep }) | ((uint64x2_t)__b << __n));
+}
+
+static __inline__ int64x2_t __attribute__((__always_inline__))
+vsriq_n_s64(int64x2_t __a, int64x2_t __b, int __n)
+{
+    unsigned long long __keep = (unsigned long long)(__n == 64 ? -1 : ~(~0ull >> (64 - 64) >> __n));
+    return (int64x2_t)(((uint64x2_t)__a & (uint64x2_t){ __keep, __keep }) | (__n == 64 ? (uint64x2_t)__a ^ (uint64x2_t)__a : (uint64x2_t)__b >> __n));
+}
+
+static __inline__ int64x2_t __attribute__((__always_inline__))
+vsliq_n_s64(int64x2_t __a, int64x2_t __b, int __n)
+{
+    unsigned long long __keep = (unsigned long long)(__n == 0 ? 0 : ~(~0ull << __n));
+    return (int64x2_t)(((uint64x2_t)__a & (uint64x2_t){ __keep, __keep }) | ((uint64x2_t)__b << __n));
+}
+
+static __inline__ uint16x8_t __attribute__((__always_inline__))
+vrev32q_u16(uint16x8_t __a)
+{
+    uint32x4_t __w = (uint32x4_t)__a;
+    return (uint16x8_t)((__w << 16) | (__w >> 16));
+}
+
+static __inline__ int16x8_t __attribute__((__always_inline__))
+vrev32q_s16(int16x8_t __a)
+{
+    uint32x4_t __w = (uint32x4_t)__a;
+    return (int16x8_t)((__w << 16) | (__w >> 16));
+}
+
+static __inline__ uint8x16_t __attribute__((__always_inline__))
+vrev16q_u8(uint8x16_t __a)
+{
+    uint16x8_t __w = (uint16x8_t)__a;
+    return (uint8x16_t)((__w << 8) | (__w >> 8));
+}
+
+static __inline__ int8x16_t __attribute__((__always_inline__))
+vrev16q_s8(int8x16_t __a)
+{
+    uint16x8_t __w = (uint16x8_t)__a;
+    return (int8x16_t)((__w << 8) | (__w >> 8));
+}
+
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vrev64q_u32(uint32x4_t __a)
+{
+    uint64x2_t __w = (uint64x2_t)__a;
+    return (uint32x4_t)((__w << 32) | (__w >> 32));
+}
+
+static __inline__ int32x4_t __attribute__((__always_inline__))
+vrev64q_s32(int32x4_t __a)
+{
+    uint64x2_t __w = (uint64x2_t)__a;
+    return (int32x4_t)((__w << 32) | (__w >> 32));
+}
 
 /* ===== Transposes ===== */
 

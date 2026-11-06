@@ -283,6 +283,9 @@ impl Lowerer {
         if (by_list && args.len() < 3) || (!by_list && !(2..=3).contains(&args.len())) {
             return None;
         }
+        if !by_list && width == 1 && total == 16 && self.target == crate::backend::Target::Aarch64 {
+            return Some(self.lower_byte_shuffle(args, &elem));
+        }
         let both = self.emit_entry_alloca(IrType::Ptr, 2 * total, 16, false);
         let a = self.lower_expr(&args[0]);
         let a = self.operand_to_value(a);
@@ -325,6 +328,37 @@ impl Lowerer {
             self.emit_store_at_offset(result, i * width, Operand::Value(lane), elem_ty);
         }
         Some(Operand::Value(result))
+    }
+
+    /// A 16-byte shuffle is one tbl. tbl gives 0 for an index out of range,
+    /// where a shuffle takes it modulo the lanes there are, so the mask is
+    /// reduced first.
+    fn lower_byte_shuffle(&mut self, args: &[Expr], elem: &CType) -> Operand {
+        use crate::ir::intrinsics::{VecElem, VecOpKind};
+        let mut sources = Vec::with_capacity(2);
+        for arg in &args[..args.len() - 1] {
+            let v = self.lower_expr(arg);
+            sources.push(Operand::Value(self.operand_to_value(v)));
+        }
+        let mask = self.lower_expr(&args[args.len() - 1]);
+        let mask = self.operand_to_value(mask);
+        let limit = self.emit_implicit_cast(Operand::Const(IrConst::I64(16 * sources.len() as i64 - 1)), IrType::I64, IrType::from_ctype(elem));
+        let reduced = self.emit_entry_alloca(IrType::Ptr, 16, 16, false);
+        self.emit(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::VecOp { op: VecOpKind::And, elem: VecElem::U8, bytes: 16, splat: 2 },
+            dest_ptr: Some(reduced),
+            args: vec![Operand::Value(mask), limit],
+        });
+        let result = self.emit_entry_alloca(IrType::Ptr, 16, 16, false);
+        sources.push(Operand::Value(reduced));
+        self.emit(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::VecOp { op: VecOpKind::Tbl, elem: VecElem::U8, bytes: 16, splat: 0 },
+            dest_ptr: Some(result),
+            args: sources,
+        });
+        Operand::Value(result)
     }
 
     /// Lower a builtin intrinsic (the BuiltinKind::Intrinsic arm of try_lower_builtin_call).

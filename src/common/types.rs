@@ -19,6 +19,17 @@ thread_local! {
     /// (long double == double, char* va_list, variadic args on the stack) and
     /// Mach-O assembly syntax.
     static TARGET_IS_DARWIN: Cell<bool> = const { Cell::new(false) };
+    /// Whether this is a Linux kernel build, with its small stacks.
+    static BUILDING_KERNEL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set whether this is a kernel build (-D__KERNEL__ or -mcmodel=kernel).
+pub fn set_building_kernel(kernel: bool) {
+    BUILDING_KERNEL.with(|c| c.set(kernel));
+}
+
+pub fn building_kernel() -> bool {
+    BUILDING_KERNEL.with(|c| c.get())
 }
 
 /// Set whether the target OS is Darwin (Apple arm64 ABI, Mach-O output).
