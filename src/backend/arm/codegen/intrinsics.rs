@@ -63,22 +63,14 @@ impl ArmCodegen {
         }
     }
 
-    /// Emit a unary F64 operation: fmov to d0, apply `op_inst`, fmov back, store result.
-    fn emit_f64_unary_neon(&mut self, dest: &Option<Value>, args: &[Operand], op_inst: &str) {
-        self.operand_to_x0(&args[0]);
-        self.state.emit("    fmov d0, x0");
-        self.state.emit_fmt(format_args!("    {} d0, d0", op_inst));
-        self.state.emit("    fmov x0, d0");
-        self.store_scalar_dest(dest, "x0");
-    }
-
-    /// Emit a unary F32 operation: fmov to s0, apply `op_inst`, fmov back, store result.
-    fn emit_f32_unary_neon(&mut self, dest: &Option<Value>, args: &[Operand], op_inst: &str) {
-        self.operand_to_x0(&args[0]);
-        self.state.emit("    fmov s0, w0");
-        self.state.emit_fmt(format_args!("    {} s0, s0", op_inst));
-        self.state.emit("    fmov w0, s0");
-        self.store_scalar_dest(dest, "w0");
+    /// A unary float operation, on FP registers: a value's own if it has one.
+    fn emit_fp_unary(&mut self, dest: &Option<Value>, args: &[Operand], op_inst: &str, ty: IrType) {
+        let Some(dest) = dest else { return };
+        let scratch = if ty == IrType::F64 { "d0" } else { "s0" };
+        let a = self.float_operand_to_fp_reg(&args[0], ty, scratch);
+        let d = self.dest_fp_reg(dest).unwrap_or_else(|| scratch.to_string());
+        self.state.emit_fmt(format_args!("    {op_inst} {d}, {a}"));
+        self.finish_float_result(dest, &d, ty);
     }
 
     /// Emit a non-temporal store: load value from args[0], store to dest_ptr.
@@ -1759,10 +1751,10 @@ impl ArmCodegen {
                 self.state.emit_fmt(format_args!("    {mnemonic} {d}, {a}, {b}, {c}"));
                 self.finish_float_result(dest, &d, ty);
             }
-            IntrinsicOp::SqrtF64 => self.emit_f64_unary_neon(dest, args, "fsqrt"),
-            IntrinsicOp::SqrtF32 => self.emit_f32_unary_neon(dest, args, "fsqrt"),
-            IntrinsicOp::FabsF64 => self.emit_f64_unary_neon(dest, args, "fabs"),
-            IntrinsicOp::FabsF32 => self.emit_f32_unary_neon(dest, args, "fabs"),
+            IntrinsicOp::SqrtF64 => self.emit_fp_unary(dest, args, "fsqrt", IrType::F64),
+            IntrinsicOp::SqrtF32 => self.emit_fp_unary(dest, args, "fsqrt", IrType::F32),
+            IntrinsicOp::FabsF64 => self.emit_fp_unary(dest, args, "fabs", IrType::F64),
+            IntrinsicOp::FabsF32 => self.emit_fp_unary(dest, args, "fabs", IrType::F32),
             // x86-specific SSE/AES-NI/CLMUL intrinsics - these are x86-only and should
             // not appear in ARM codegen in practice. Cross-compiled code that conditionally
             // uses these behind #ifdef __x86_64__ will have the calls dead-code eliminated.

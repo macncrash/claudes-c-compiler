@@ -431,14 +431,14 @@ impl GvnState {
             // - Segment-overridden loads: access thread-local or CPU-local storage
             //   that may differ between accesses even without visible stores
             // - Volatile loads: each must happen as written
-            // - Float, long double, i128 types: use different register paths in
-            //   codegen that complicate Copy instruction handling
+            // - Long double, i128, and doubles on 32-bit targets: wider than a
+            //   register, which complicates Copy instruction handling
             // - AtomicLoad: has ordering semantics (falls through to _ => None)
             Instruction::Load { dest, ptr, ty, seg_override, volatile, .. } => {
                 if *volatile || *seg_override != AddressSpace::Default {
                     return None;
                 }
-                if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
+                if ty.is_long_double() || ty.is_128bit() || (ty.is_float() && crate::common::types::target_is_32bit()) {
                     return None;
                 }
                 let (ptr_vn, off) = self.location(*ptr);

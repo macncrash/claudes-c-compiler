@@ -978,6 +978,8 @@ pub fn allocate_fp_registers(
                     if is_fp(to_ty) && !is_wide(from_ty) => Some((*dest, *to_ty)),
                 Instruction::Intrinsic { dest: Some(dest), op: IntrinsicOp::Fma { f64, .. }, .. } =>
                     Some((*dest, if *f64 { IrType::F64 } else { IrType::F32 })),
+                Instruction::Intrinsic { dest: Some(dest), op: IntrinsicOp::SqrtF32 | IntrinsicOp::FabsF32, .. } => Some((*dest, IrType::F32)),
+                Instruction::Intrinsic { dest: Some(dest), op: IntrinsicOp::SqrtF64 | IntrinsicOp::FabsF64, .. } => Some((*dest, IrType::F64)),
                 _ => None,
             };
             match (float_def, inst) {
@@ -1005,7 +1007,8 @@ pub fn allocate_fp_registers(
                 Instruction::Store { ty, .. } | Instruction::Select { ty, .. } => !is_wide(ty),
                 Instruction::Copy { .. } => true,
                 // (Only AArch64 emits it, through float_operand_to_fp_reg.)
-                Instruction::Intrinsic { op: IntrinsicOp::Fma { .. }, .. } => true,
+                Instruction::Intrinsic { op: IntrinsicOp::Fma { .. } | IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64
+                    | IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64, .. } => true,
                 _ => false,
             };
             if !safe_use {
@@ -1070,7 +1073,8 @@ pub fn allocate_fp_registers(
             let calls_helper = match inst {
                 // Whole-vector ops use only v0-v3 and the vector temp registers;
                 // a fused multiply-add only d0-d2 and its operands' registers.
-                Instruction::Intrinsic { op, .. } => !matches!(op, IntrinsicOp::VecOp { .. } | IntrinsicOp::Fma { .. }),
+                Instruction::Intrinsic { op, .. } => !matches!(op, IntrinsicOp::VecOp { .. } | IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64
+                    | IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 | IntrinsicOp::Fma { .. }),
                 Instruction::BinOp { ty, .. } | Instruction::UnaryOp { ty, .. }
                 | Instruction::Cmp { ty, .. } | Instruction::Load { ty, .. }
                 | Instruction::Store { ty, .. } => *ty == IrType::F128,

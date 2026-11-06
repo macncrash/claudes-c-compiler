@@ -156,6 +156,10 @@ impl ArmCodegen {
         if !matches!((ty, reg_is_f32), (IrType::F32, true) | (IrType::F64, false)) {
             return false;
         }
+        if let Some(mem) = self.ptr_in_reg(base).and_then(|r| Self::scaled_mem_operand(r, offset, if reg_is_f32 { 4 } else { 8 })) {
+            self.state.emit_fmt(format_args!("    {} {}, {}", instr, reg, mem));
+            return true;
+        }
         let Some(addr) = self.state.resolve_slot_addr(base.0) else { return false };
         match addr {
             SlotAddr::OverAligned(slot, id) => {
