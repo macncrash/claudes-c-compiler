@@ -11,6 +11,7 @@
 
 mod addr_arg_promote;
 pub(crate) mod acc_coalesce;
+pub(crate) mod local_bytes;
 pub(crate) mod vec_copies;
 pub(crate) mod block_place;
 mod bound_hoist;
@@ -246,12 +247,33 @@ impl DisabledPasses {
     }
 }
 
+/// Fold loads of known local bytes, and clear what that leaves: the stores to
+/// a local no longer read, and branches on the result.
+fn fold_local_bytes(module: &mut IrModule) {
+    if local_bytes::fold_module(module) == 0 {
+        return;
+    }
+    for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+        copy_prop::propagate_copies(func);
+        if dce::eliminate_unread_local_stores(func) > 0 {
+            dce::eliminate_dead_code(func);
+        }
+    }
+}
+
 /// Run Phase 0: function inlining and post-inline optimization passes.
 fn run_inline_phase(module: &mut IrModule, disabled: &str) {
     if disabled.contains("inline") {
         return;
     }
+    // Before inlining too: a helper this folds is small enough to inline.
+    if !disabled.contains("local_bytes") {
+        fold_local_bytes(module);
+    }
     inline::run(module);
+    if !disabled.contains("local_bytes") {
+        fold_local_bytes(module);
+    }
 
     // After inlining, convert extern inline gnu_inline functions to declarations.
     // These function bodies were only needed for inlining; they must not be emitted
