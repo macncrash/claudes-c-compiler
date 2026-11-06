@@ -35,9 +35,8 @@ make bench           # builds ./ocean-clang too, runs both with no window or GPU
 data. The two builds should print the same heights and checksum.
 
 At the time of writing, on one thread of an M3 Max, the ccc build takes about
-7.9 ms per frame and clang -O2 4.4 ms. The first macOS build of ccc took 80 ms.
-The remaining gap is mostly integer address arithmetic and clang's
-vectorization.
+5.1 ms per frame and clang -O2 4.4 ms. The first macOS build of ccc took 80 ms.
+The remaining gap is clang's vectorization: without it, clang takes 4.9 ms.
 
 ## Before and after
 
