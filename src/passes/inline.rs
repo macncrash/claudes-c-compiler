@@ -336,7 +336,9 @@ fn select_inline_site(
             .flatten()
             .filter(|c| c.insts <= max_insts && (c.blocks <= max_blocks || ((relaxed || caller_is_recursive) && c.non_return_blocks <= max_blocks))
                 && (c.insts <= MAX_SPECIALIZED_INLINE_INSTRUCTIONS || c.insts <= budget_remaining));
-        if callee_data.wide && !relaxed {
+        // Whatever its raw size, what cleans up to a tiny body costs a caller nothing.
+        let cleans_tiny = cleaned.is_some_and(|c| c.insts <= MAX_TINY_INLINE_INSTRUCTIONS && c.blocks <= 1);
+        if callee_data.wide && !relaxed && !cleans_tiny {
             continue;
         }
         if callee_data.in_cycle && (caller_in_cycle || caller_is_recursive || cleaned.is_none()) {
@@ -2642,6 +2644,33 @@ mod tests {
                                             MAX_INLINE_BUDGET_PER_CALLER, MAX_ALWAYS_INLINE_BUDGET_PER_CALLER, &mut cache);
             let (s, _, _, by_cleaned) = picked.expect("inlined for its cleaned-up size");
             assert_eq!((s.callee_name.as_str(), by_cleaned), (name, keeps_calls));
+        }
+    }
+
+    /// A callee wide as written is kept out of the largest callers, unless it
+    /// cleans up to a tiny body (lz4's LZ4_NbCommonBytes: 14 blocks written, 4
+    /// instructions cleaned, 140 calls with registers saved around each).
+    #[test]
+    fn wide_callees_enter_the_largest_callers_only_when_tiny_once_cleaned() {
+        let wide = || CalleeData { wide: true, ..cleaned_only_callee(30, 2 * MAX_INLINE_BLOCKS + 2) };
+        let mut callee_map: HashMap<String, CalleeData> = HashMap::new();
+        callee_map.insert("tiny".to_string(), wide());
+        callee_map.insert("two_blocks".to_string(), wide());
+        callee_map.insert("six_insts".to_string(), wide());
+        let mut cache: HashMap<String, Option<CleanedSize>> = HashMap::new();
+        cache.insert("tiny".to_string(),
+                     Some(CleanedSize { insts: MAX_TINY_INLINE_INSTRUCTIONS, blocks: 1, non_return_blocks: 1 }));
+        cache.insert("two_blocks".to_string(), Some(CleanedSize { insts: 4, blocks: 2, non_return_blocks: 2 }));
+        cache.insert("six_insts".to_string(),
+                     Some(CleanedSize { insts: MAX_TINY_INLINE_INSTRUCTIONS + 1, blocks: 1, non_return_blocks: 1 }));
+        let site = |name: &str| InlineCallSite {
+            block_idx: 0, inst_idx: 0, callee_name: name.to_string(), dest: None, args: vec![], const_args: vec![],
+            in_cleaned_body: false, in_loop: false,
+        };
+        for (name, inlined) in [("tiny", true), ("two_blocks", false), ("six_insts", false)] {
+            let picked = select_inline_site(&[site(name)], &callee_map, true, true, true, false, false, false,
+                                            MAX_INLINE_BUDGET_PER_CALLER, MAX_ALWAYS_INLINE_BUDGET_PER_CALLER, &mut cache);
+            assert_eq!(picked.is_some(), inlined, "{name}");
         }
     }
 
