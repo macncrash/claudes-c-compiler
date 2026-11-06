@@ -637,6 +637,7 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
             changed2 |= pass!(eliminate_low_half_only_extends(lines, kinds, n));
             changed2 |= pass!(eliminate_dead_upper_extends(lines, kinds, n));
             changed2 |= pass!(fold_shift_into_operand(lines, kinds, n));
+            changed2 |= pass!(fold_shifts_into_rotate(lines, kinds, n));
             changed2 |= pass!(fold_index_into_mem(lines, kinds, n));
             changed2 |= pass!(fold_scale_into_mem(lines, kinds, n));
             changed2 |= pass!(fold_offset_into_global_addr(lines, kinds, n));
@@ -4390,6 +4391,122 @@ fn fuse_overflow_test_into_flags(lines: &mut [String], kinds: &mut [LineKind], n
                 kinds[k] = LineKind::Nop;
             }
         }
+        changed = true;
+    }
+    changed
+}
+
+/// Whether register `r` holds a 32-bit result: the last write before line
+/// `i`, in the same straight-line run, is by a `w` destination, which clears
+/// the upper half.
+fn upper32_zero_before(lines: &[String], kinds: &[LineKind], i: usize, r: u8) -> bool {
+    for k in (0..i).rev() {
+        match kinds[k] {
+            LineKind::Nop => continue,
+            LineKind::Label | LineKind::Branch | LineKind::Call | LineKind::Ret => return false,
+            _ => {}
+        }
+        let Some((op, ops)) = split_insn(&lines[k]) else { return false };
+        if op.starts_with("ldp") || op.starts_with("stp") || ops.contains("]!") || ops.contains("], ") {
+            // Pairs and writeback write more than their first operand.
+            if ops.split(',').any(|o| gpr_operand(o.trim().trim_start_matches('[').trim_end_matches(']')) == Some(r)) {
+                return false;
+            }
+            continue;
+        }
+        if op.starts_with("str") || matches!(op, "cmp" | "cmn" | "tst" | "ccmp" | "ccmn" | "fcmp") {
+            continue;
+        }
+        let first = ops.split(',').next().unwrap_or("").trim();
+        if gpr_operand(first) == Some(r) {
+            return first.starts_with('w');
+        }
+    }
+    false
+}
+
+/// `lsl T, A, #l; orr D, T, A, lsr #r` with l + r the register's width is one
+/// `ror D, A, #r`, as is the same with the shifts swapped (T dead after unless
+/// it is D). Hashes and ciphers are full of these: BLAKE3's portable code had
+/// 436 for clang and none here.
+///
+/// Values of 32 bits are in `x` form in the `orr`, whose `lsr` then reads the
+/// upper half too, so there A must be a 32-bit result:
+/// `(uint32_t)x << 25 | x >> 7` of a 64-bit x is the same two instructions and
+/// no rotate. A copy `mov B, A` just before may leave the `orr` reading B.
+fn fold_shifts_into_rotate(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    let mut changed = false;
+    let mut live: Option<Vec<RegSet>> = None;
+    for i in 0..n {
+        let Some((first_op @ ("lsl" | "lsr"), ops)) = split_insn(&lines[i]) else { continue };
+        let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+        let [tt, aa, k] = p[..] else { continue };
+        let (Some(t), Some(a)) = (gpr_operand(tt), gpr_operand(aa)) else { continue };
+        let Some(k1) = k.strip_prefix('#').and_then(|v| v.parse::<u32>().ok()) else { continue };
+        let wide = tt.starts_with('x');
+        if wide != aa.starts_with('x') || k1 == 0 {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j >= n {
+            continue;
+        }
+        let Some(("orr", oops)) = split_insn(&lines[j]) else { continue };
+        let q: Vec<&str> = oops.split(',').map(str::trim).collect();
+        let [d, x, y, sh] = q[..] else { continue };
+        let (Some(dr), Some(xr), Some(b)) = (gpr_operand(d), gpr_operand(x), gpr_operand(y)) else { continue };
+        if xr != t {
+            continue;
+        }
+        let Some((op2, k2)) = sh.split_once(" #") else { continue };
+        let Ok(k2) = k2.parse::<u32>() else { continue };
+        let other = if first_op == "lsl" { "lsr" } else { "lsl" };
+        let bits = if wide { 64 } else { 32 };
+        if op2 != other || k1 + k2 != bits {
+            continue;
+        }
+        // The orr's width: an x orr of 32-bit values, or the shift's own.
+        let x_orr = d.starts_with('x');
+        if x_orr != x.starts_with('x') || x_orr != y.starts_with('x') || (wide && !x_orr) {
+            continue;
+        }
+        if !wide && x_orr && first_op != "lsl" {
+            continue;
+        }
+        // The same value on both sides, directly or through a copy just before.
+        let same = b == a && t != a;
+        let copied = {
+            let mut c = i;
+            while c > 0 && kinds[c - 1] == LineKind::Nop {
+                c -= 1;
+            }
+            c > 0 && split_insn(&lines[c - 1]).is_some_and(|(op, ops)| {
+                op == "mov" && {
+                    let m: Vec<&str> = ops.split(',').map(str::trim).collect();
+                    matches!(m[..], [mb, ma] if gpr_operand(mb) == Some(b) && gpr_operand(ma) == Some(a) && mb.starts_with(&ma[..1]))
+                }
+            })
+        };
+        if !same && !copied {
+            continue;
+        }
+        if !wide && x_orr && !upper32_zero_before(lines, kinds, i, b) {
+            continue;
+        }
+        if dr != t {
+            let live = live.get_or_insert_with(|| live_out_all(lines, kinds, n));
+            if live[j] & (1 << t) != 0 {
+                continue;
+            }
+        }
+        let right = if first_op == "lsl" { k2 } else { k1 };
+        let reg = |r: u8| format!("{}{}", if wide { 'x' } else { 'w' }, r);
+        lines[j] = format!("    ror {}, {}, #{}", reg(dr), reg(b), right);
+        kinds[j] = classify_line(&lines[j]);
+        kinds[i] = LineKind::Nop;
         changed = true;
     }
     changed
@@ -9283,6 +9400,27 @@ mod tests {
         \x20   sub x14, x11, #16\n    ldr q0, [x14]\n    dup v1.8h, w10\n    uqsub v0.8h, v0.8h, v1.8h\n    str q0, [x14]\n\
         \x20   sub x14, x11, #32\n    ldr q0, [x14]\n    dup v1.8h, w10\n    uqsub v0.8h, v0.8h, v1.8h\n    str q0, [x14]\n\
         \x20   sub x11, x11, #32\n    sub w13, w13, #16\n    cmp w13, #16\n    b.hs .L1\n.L9:\n";
+
+    #[test]
+    fn test_shift_pairs_become_rotates() {
+        let run = |body: &str| peephole_optimize(ret_x0(body));
+        // 64-bit, either order.
+        assert!(run("    lsr x12, x0, #51\n    orr x0, x12, x0, lsl #13\n").contains("ror x0, x0, #51"));
+        assert!(run("    lsl x12, x0, #13\n    orr x0, x12, x0, lsr #51\n").contains("ror x0, x0, #51"));
+        // 32-bit in an x orr, of a value known to be 32 bits.
+        assert!(run("    eor w1, w1, w2\n    lsl w12, w1, #25\n    orr x0, x12, x1, lsr #7\n").contains("ror w0, w1, #7"));
+        // Through a copy, with the shift overwriting its source.
+        assert!(run("    eor w0, w0, w2\n    mov w11, w0\n    lsl w0, w0, #25\n    orr x0, x0, x11, lsr #7\n").contains("ror w0, w11, #7"));
+        // A 64-bit source: (uint32_t)x << 25 | x >> 7 is no rotate.
+        let kept = run("    add x1, x1, x2\n    lsl w12, w1, #25\n    orr x0, x12, x1, lsr #7\n");
+        assert!(!kept.contains("ror"), "{kept}");
+        // Nothing known about the source.
+        let kept = run("    lsl w12, w1, #25\n    orr x0, x12, x1, lsr #7\n");
+        assert!(!kept.contains("ror"), "{kept}");
+        // Shifts that do not add up, and two different values.
+        assert!(!run("    lsr x12, x0, #50\n    orr x0, x12, x0, lsl #13\n").contains("ror"));
+        assert!(!run("    lsr x12, x1, #51\n    orr x0, x12, x0, lsl #13\n").contains("ror"));
+    }
 
     #[test]
     fn test_unrolled_vector_loop_broadcast_once_and_offsets_folded() {
