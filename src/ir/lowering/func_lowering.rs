@@ -492,6 +492,15 @@ impl Lowerer {
             self.terminate(Terminator::Return(ret_op));
         }
 
+        if let Some((dispatch, slot)) = self.func_mut().computed_goto.take() {
+            self.start_block(dispatch);
+            let target = self.fresh_value();
+            self.emit(Instruction::Load { dest: target, ptr: slot, ty: IrType::Ptr, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+            let mut possible_targets: Vec<_> = self.func().user_labels.values().copied().collect();
+            possible_targets.sort_by_key(|b| b.0);
+            self.terminate(Terminator::IndirectBranch { target: Operand::Value(target), possible_targets });
+        }
+
         // Every goto and &&label made a block for its label; only a definition
         // places that block in the function.
         let state = self.func();

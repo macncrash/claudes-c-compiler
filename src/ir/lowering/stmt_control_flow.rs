@@ -6,8 +6,9 @@ use crate::frontend::parser::ast::{
     ForInit,
     Stmt,
 };
-use crate::ir::reexports::{BlockId, Instruction, Terminator};
+use crate::ir::reexports::{Instruction, Terminator};
 use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, AliasClass, IrType};
 
 impl Lowerer {
     pub(super) fn lower_if_stmt(&mut self, cond: &Expr, then_stmt: &Stmt, else_stmt: Option<&Stmt>) {
@@ -268,9 +269,20 @@ impl Lowerer {
         if let Some(save_val) = self.func().vla_stack_save {
             self.emit(Instruction::StackRestore { ptr: save_val });
         }
+        // All of a function's computed gotos share one indirect branch, made by
+        // finalize_function. Each could otherwise reach every label, so every
+        // variable would merge at every label and each goto would copy them all.
         let target = self.lower_expr(expr);
-        let possible_targets: Vec<BlockId> = self.func_mut().user_labels.values().copied().collect();
-        self.terminate(Terminator::IndirectBranch { target, possible_targets });
+        let (dispatch, slot) = match self.func().computed_goto {
+            Some(shared) => shared,
+            None => {
+                let shared = (self.fresh_label(), self.emit_entry_alloca(IrType::Ptr, 8, 8, false));
+                self.func_mut().computed_goto = Some(shared);
+                shared
+            }
+        };
+        self.emit(Instruction::Store { val: target, ptr: slot, ty: IrType::Ptr, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+        self.terminate(Terminator::Branch(dispatch));
         let dead = self.fresh_label();
         self.start_block(dead);
     }

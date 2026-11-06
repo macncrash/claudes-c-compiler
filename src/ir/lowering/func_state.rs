@@ -109,6 +109,8 @@ pub(super) struct FunctionBuildState {
     pub switch_stack: Vec<SwitchFrame>,
     /// User-defined goto labels -> unique IR labels
     pub user_labels: FxHashMap<String, BlockId>,
+    /// The block all computed gotos jump to, and where they leave the target.
+    pub computed_goto: Option<(BlockId, Value)>,
     /// Set of user-defined goto labels that have been defined (label statement lowered).
     /// Used to distinguish forward gotos (label not yet defined) from backward gotos
     /// (label already defined) for VLA stack restore decisions.
@@ -179,6 +181,7 @@ impl FunctionBuildState {
             continue_labels: Vec::new(),
             switch_stack: Vec::new(),
             user_labels: FxHashMap::default(),
+            computed_goto: None,
             defined_user_labels: FxHashSet::default(),
             user_label_depths: FxHashMap::default(),
             scope_stack: Vec::new(),
