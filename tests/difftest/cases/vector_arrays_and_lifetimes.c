@@ -178,6 +178,47 @@ static NI uint32_t pressure(uint32_t x)
     return sum(t) + sum(a0) + sum(a17) + sum(a35);
 }
 
+/* pressure() fills v8-v15, whose low halves belong to its caller: doubles held
+ * across the call have to come back. */
+static NI double floats_across(double x)
+{
+    double a = x + 1, b = x * 2, c = x - 3, d = x / 4, e = x + 5, f = x * 6, g = x - 7, h = x / 8;
+    double i = a * b, j = c * d, k = e * f, l = g * h;
+    uint32_t r = pressure((uint32_t)x);
+    r ^= pressure((uint32_t)x + 1);
+    return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h + 9 * i + 10 * j + 11 * k + 12 * l + (double)(r & 1023);
+}
+
+/* The same, looked at directly: known values in d8 and d15 around the call, in
+ * one asm so that nothing else can touch them. */
+static NI uint64_t low_halves_kept(uint64_t x)
+{
+    uint32_t (*f)(uint32_t) = pressure;
+    uint64_t a, b;
+    __asm__ volatile("fmov d8, %2\n\tfmov d15, %3\n\tmov w0, #12\n\tblr %4\n\tfmov %0, d8\n\tfmov %1, d15"
+                     : "=&r"(a), "=&r"(b)
+                     : "r"(x), "r"(x * 3), "r"(f)
+                     : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+                       "x14", "x15", "x16", "x17", "x30", "memory", "cc",
+                       "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v15",
+                       "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
+                       "v28", "v29", "v30", "v31");
+    return (a == x) + 2 * (b == x * 3);
+}
+
+/* And vectors of its own in them, through the same call. */
+static NI uint32_t vectors_across(uint32_t x)
+{
+    ALL(DEF)
+    uint32x4_t t = vdupq_n_u32(x);
+    ALL(USE)
+    t = vaddq_u32(t, vdupq_n_u32(pressure(x)));
+    ALL(NEW)
+    t = vaddq_u32(t, vdupq_n_u32(clobber(x)));
+    ALL(USE)
+    return sum(t) + sum(a0) + sum(a9) + sum(a19) + sum(a35);
+}
+
 /* Struct members, whole-struct copies, and an array within a struct. */
 typedef struct { uint32x4_t a, b; } pair_t;
 typedef struct { uint32x4_t v[3]; uint32_t n; } holder_t;
@@ -234,6 +275,8 @@ int main(void)
     printf("%u %u\n", set_late(1), set_late(6));
     printf("%u\n", across_calls(11));
     printf("%u\n", pressure(12));
+    printf("%.3f %u\n", floats_across(21.5), vectors_across(15));
+    printf("%llu\n", (unsigned long long)low_halves_kept(0x1234567890abcdefull));
     printf("%u %u\n", in_structs(13), element_copies(14));
     printf("%u %u\n", branches(1, 1), branches(1, 0));
     return 0;

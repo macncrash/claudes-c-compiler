@@ -93,8 +93,11 @@ pub(super) const ARM_VEC_TEMP_REGS: [u8; 4] = [28, 29, 30, 31];
 /// NEON registers that hold vector-extension local variables for a whole
 /// function (see ArmCodegen::assign_vec_var_regs), then hoisted constant
 /// broadcasts. (v16-v19 are otherwise only inline asm scratch, around which
-/// variables are spilled and constants rebuilt.)
-pub(super) const ARM_VEC_VAR_REGS: [u8; 12] = [27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16];
+/// variables are spilled and constants rebuilt.) v8-v15 come last, as a
+/// function using them saves their low halves for its caller, like those a
+/// scalar float is given. They are worth that where a dependency chain would
+/// otherwise run through memory: BLAKE3 keeps 16 vectors live.
+pub(super) const ARM_VEC_VAR_REGS: [u8; 20] = [27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8];
 
 /// Offset added to FP register numbers when FP assignments are merged with
 /// GPR assignments for stack layout, so the two never compare equal.

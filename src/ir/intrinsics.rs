@@ -212,10 +212,47 @@ pub enum VecOpKind {
     /// Bytes of a table by index: args are the table, or two of them side by
     /// side, then the indices, in range (16 bytes; AArch64 tbl).
     Tbl,
+    /// Lanes of args[0] and args[1] interleaved (AArch64 trn, zip, uzp).
+    Permute(VecPermute),
     /// Fused (±(args[0] * args[1])) ± args[2]: on float lanes as
     /// IntrinsicOp::Fma, on integer lanes (8 to 32 bits) the exact
     /// multiply-accumulate; splat bit 4 broadcasts args[2].
     Fma { neg_product: bool, neg_addend: bool },
+}
+
+/// Which lanes a [`VecOpKind::Permute`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VecPermute {
+    Trn1, Trn2, Zip1, Zip2, Uzp1, Uzp2,
+}
+
+impl VecPermute {
+    pub const ALL: [VecPermute; 6] = [VecPermute::Trn1, VecPermute::Trn2, VecPermute::Zip1,
+                                      VecPermute::Zip2, VecPermute::Uzp1, VecPermute::Uzp2];
+
+    pub fn mnemonic(self) -> &'static str {
+        match self {
+            VecPermute::Trn1 => "trn1",
+            VecPermute::Trn2 => "trn2",
+            VecPermute::Zip1 => "zip1",
+            VecPermute::Zip2 => "zip2",
+            VecPermute::Uzp1 => "uzp1",
+            VecPermute::Uzp2 => "uzp2",
+        }
+    }
+
+    /// Lane `i` of `n` in the result, as an index into a followed by b.
+    pub fn lane(self, i: usize, n: usize) -> usize {
+        let odd = i % 2;
+        match self {
+            VecPermute::Trn1 => i - odd + odd * n,
+            VecPermute::Trn2 => i - odd + 1 + odd * n,
+            VecPermute::Zip1 => i / 2 + odd * n,
+            VecPermute::Zip2 => n / 2 + i / 2 + odd * n,
+            VecPermute::Uzp1 => 2 * i,
+            VecPermute::Uzp2 => 2 * i + 1,
+        }
+    }
 }
 
 /// The lane type of an [`IntrinsicOp::VecOp`].
@@ -279,5 +316,22 @@ impl IntrinsicOp {
             IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128 |
             IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each pattern at four lanes, as the Arm manual draws them.
+    #[test]
+    fn test_permute_lanes() {
+        let lanes = |p: VecPermute| (0..4).map(|i| p.lane(i, 4)).collect::<Vec<_>>();
+        assert_eq!(lanes(VecPermute::Trn1), [0, 4, 2, 6]);
+        assert_eq!(lanes(VecPermute::Trn2), [1, 5, 3, 7]);
+        assert_eq!(lanes(VecPermute::Zip1), [0, 4, 1, 5]);
+        assert_eq!(lanes(VecPermute::Zip2), [2, 6, 3, 7]);
+        assert_eq!(lanes(VecPermute::Uzp1), [0, 2, 4, 6]);
+        assert_eq!(lanes(VecPermute::Uzp2), [1, 3, 5, 7]);
     }
 }

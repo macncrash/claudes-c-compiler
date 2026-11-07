@@ -1475,6 +1475,7 @@ impl ArmCodegen {
                 lines.push(format!("    tbl {d}.16b, {{v0.16b, v1.16b}}, {c}.16b"));
                 lines
             }
+            VecOpKind::Permute(p) => vec![bin(p.mnemonic())],
             VecOpKind::Add => vec![bin(if f { "fadd" } else { "add" })],
             VecOpKind::Sub => vec![bin(if f { "fsub" } else { "sub" })],
             VecOpKind::SatSub => vec![bin(if u { "uqsub" } else { "sqsub" })],

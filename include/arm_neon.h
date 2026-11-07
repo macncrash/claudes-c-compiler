@@ -5228,37 +5228,37 @@ vst4_lane_u32(unsigned int *__p, uint32x2x4_t __a, int __lane)
 static __inline__ uint8x16_t __attribute__((__always_inline__))
 vcombine_u8(uint8x8_t __lo, uint8x8_t __hi)
 {
-    uint8x16_t __ret;
-    __builtin_memcpy(&__ret[0], &__lo[0], 8);
-    __builtin_memcpy(&__ret[8], &__hi[0], 8);
-    return __ret;
+    uint64x2_t __w;
+    __w[0] = *(unsigned long long *)&__lo;
+    __w[1] = *(unsigned long long *)&__hi;
+    return (uint8x16_t)__w;
 }
 
 static __inline__ int8x16_t __attribute__((__always_inline__))
 vcombine_s8(int8x8_t __lo, int8x8_t __hi)
 {
-    int8x16_t __ret;
-    __builtin_memcpy(&__ret[0], &__lo[0], 8);
-    __builtin_memcpy(&__ret[8], &__hi[0], 8);
-    return __ret;
+    uint64x2_t __w;
+    __w[0] = *(unsigned long long *)&__lo;
+    __w[1] = *(unsigned long long *)&__hi;
+    return (int8x16_t)__w;
 }
 
 static __inline__ uint64x2_t __attribute__((__always_inline__))
 vcombine_u64(uint64x1_t __lo, uint64x1_t __hi)
 {
-    uint64x2_t __ret;
-    __ret[0] = __lo[0];
-    __ret[1] = __hi[0];
-    return __ret;
+    uint64x2_t __w;
+    __w[0] = *(unsigned long long *)&__lo;
+    __w[1] = *(unsigned long long *)&__hi;
+    return (uint64x2_t)__w;
 }
 
 static __inline__ uint16x8_t __attribute__((__always_inline__))
 vcombine_u16(uint16x4_t __lo, uint16x4_t __hi)
 {
-    uint16x8_t __ret;
-    __builtin_memcpy(&__ret[0], &__lo[0], 8);
-    __builtin_memcpy(&__ret[4], &__hi[0], 8);
-    return __ret;
+    uint64x2_t __w;
+    __w[0] = *(unsigned long long *)&__lo;
+    __w[1] = *(unsigned long long *)&__hi;
+    return (uint16x8_t)__w;
 }
 
 /* --- Get high/low halves --- */
@@ -5266,57 +5266,57 @@ vcombine_u16(uint16x4_t __lo, uint16x4_t __hi)
 static __inline__ uint8x8_t __attribute__((__always_inline__))
 vget_low_u8(uint8x16_t __a)
 {
-    uint8x8_t __ret;
-    __builtin_memcpy(&__ret[0], &__a[0], 8);
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[0];
+    return *(uint8x8_t *)&__h;
 }
 
 static __inline__ uint8x8_t __attribute__((__always_inline__))
 vget_high_u8(uint8x16_t __a)
 {
-    uint8x8_t __ret;
-    __builtin_memcpy(&__ret[0], &__a[8], 8);
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[1];
+    return *(uint8x8_t *)&__h;
 }
 
 static __inline__ int8x8_t __attribute__((__always_inline__))
 vget_low_s8(int8x16_t __a)
 {
-    int8x8_t __ret;
-    __builtin_memcpy(&__ret[0], &__a[0], 8);
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[0];
+    return *(int8x8_t *)&__h;
 }
 
 static __inline__ int8x8_t __attribute__((__always_inline__))
 vget_high_s8(int8x16_t __a)
 {
-    int8x8_t __ret;
-    __builtin_memcpy(&__ret[0], &__a[8], 8);
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[1];
+    return *(int8x8_t *)&__h;
 }
 
 static __inline__ uint64x1_t __attribute__((__always_inline__))
 vget_low_u64(uint64x2_t __a)
 {
-    uint64x1_t __ret;
-    __ret[0] = __a[0];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[0];
+    return *(uint64x1_t *)&__h;
 }
 
 static __inline__ uint64x1_t __attribute__((__always_inline__))
 vget_high_u64(uint64x2_t __a)
 {
-    uint64x1_t __ret;
-    __ret[0] = __a[1];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[1];
+    return *(uint64x1_t *)&__h;
 }
 
 static __inline__ poly64x1_t __attribute__((__always_inline__))
 vget_low_p64(poly64x2_t __a)
 {
-    poly64x1_t __ret;
-    __ret[0] = __a[0];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[0];
+    return *(poly64x1_t *)&__h;
 }
 
 /* ================================================================== */
@@ -5730,12 +5730,10 @@ vcreate_u64(unsigned long long __a)
 static __inline__ uint32x4_t __attribute__((__always_inline__))
 vcombine_u32(uint32x2_t __lo, uint32x2_t __hi)
 {
-    uint32x4_t __ret;
-    __ret[0] = __lo[0];
-    __ret[1] = __lo[1];
-    __ret[2] = __hi[0];
-    __ret[3] = __hi[1];
-    return __ret;
+    uint64x2_t __w;
+    __w[0] = *(unsigned long long *)&__lo;
+    __w[1] = *(unsigned long long *)&__hi;
+    return (uint32x4_t)__w;
 }
 
 /* === Get low/high halves === */
@@ -5744,20 +5742,18 @@ vcombine_u32(uint32x2_t __lo, uint32x2_t __hi)
 static __inline__ uint32x2_t __attribute__((__always_inline__))
 vget_low_u32(uint32x4_t __a)
 {
-    uint32x2_t __ret;
-    __ret[0] = __a[0];
-    __ret[1] = __a[1];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[0];
+    return *(uint32x2_t *)&__h;
 }
 
 /* vget_high_u32: get high 64-bit half of uint32x4_t */
 static __inline__ uint32x2_t __attribute__((__always_inline__))
 vget_high_u32(uint32x4_t __a)
 {
-    uint32x2_t __ret;
-    __ret[0] = __a[2];
-    __ret[1] = __a[3];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[1];
+    return *(uint32x2_t *)&__h;
 }
 
 /* === Lane access === */
@@ -6236,32 +6232,28 @@ vmaxq_s16(int16x8_t __a, int16x8_t __b)
 static __inline__ float32x2_t __attribute__((__always_inline__))
 vget_low_f32(float32x4_t __a)
 {
-    float32x2_t __ret;
-    __ret[0] = __a[0];
-    __ret[1] = __a[1];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[0];
+    return *(float32x2_t *)&__h;
 }
 
 /* vget_high_f32: get high 64-bit half of float32x4_t as float32x2_t */
 static __inline__ float32x2_t __attribute__((__always_inline__))
 vget_high_f32(float32x4_t __a)
 {
-    float32x2_t __ret;
-    __ret[0] = __a[2];
-    __ret[1] = __a[3];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[1];
+    return *(float32x2_t *)&__h;
 }
 
 /* vcombine_f32: combine two float32x2_t into float32x4_t */
 static __inline__ float32x4_t __attribute__((__always_inline__))
 vcombine_f32(float32x2_t __lo, float32x2_t __hi)
 {
-    float32x4_t __ret;
-    __ret[0] = __lo[0];
-    __ret[1] = __lo[1];
-    __ret[2] = __hi[0];
-    __ret[3] = __hi[1];
-    return __ret;
+    uint64x2_t __w;
+    __w[0] = *(unsigned long long *)&__lo;
+    __w[1] = *(unsigned long long *)&__hi;
+    return (float32x4_t)__w;
 }
 
 /* vrev64q_f32: reverse floats within each 64-bit lane */
@@ -6503,16 +6495,7 @@ vqtbl3q_u8(uint8x16x3_t __a, uint8x16_t __b)
 static __inline__ uint16x8_t __attribute__((__always_inline__))
 vuzp1q_u16(uint16x8_t __a, uint16x8_t __b)
 {
-    uint16x8_t __ret;
-    __ret[0] = __a[0];
-    __ret[1] = __a[2];
-    __ret[2] = __a[4];
-    __ret[3] = __a[6];
-    __ret[4] = __b[0];
-    __ret[5] = __b[2];
-    __ret[6] = __b[4];
-    __ret[7] = __b[6];
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 2, 4, 6, 8, 10, 12, 14);
 }
 
 /* vuzp2q_u16: unzip odd elements from two uint16x8_t
@@ -6520,64 +6503,35 @@ vuzp1q_u16(uint16x8_t __a, uint16x8_t __b)
 static __inline__ uint16x8_t __attribute__((__always_inline__))
 vuzp2q_u16(uint16x8_t __a, uint16x8_t __b)
 {
-    uint16x8_t __ret;
-    __ret[0] = __a[1];
-    __ret[1] = __a[3];
-    __ret[2] = __a[5];
-    __ret[3] = __a[7];
-    __ret[4] = __b[1];
-    __ret[5] = __b[3];
-    __ret[6] = __b[5];
-    __ret[7] = __b[7];
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 3, 5, 7, 9, 11, 13, 15);
 }
 
 /* vuzp1q_u8: unzip even elements from two uint8x16_t */
 static __inline__ uint8x16_t __attribute__((__always_inline__))
 vuzp1q_u8(uint8x16_t __a, uint8x16_t __b)
 {
-    uint8x16_t __ret;
-    for (int __i = 0; __i < 8; __i++) {
-        __ret[__i] = __a[__i * 2];
-        __ret[__i + 8] = __b[__i * 2];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
 }
 
 /* vuzp2q_u8: unzip odd elements from two uint8x16_t */
 static __inline__ uint8x16_t __attribute__((__always_inline__))
 vuzp2q_u8(uint8x16_t __a, uint8x16_t __b)
 {
-    uint8x16_t __ret;
-    for (int __i = 0; __i < 8; __i++) {
-        __ret[__i] = __a[__i * 2 + 1];
-        __ret[__i + 8] = __b[__i * 2 + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
 }
 
 /* vuzp1q_u32: unzip even elements from two uint32x4_t */
 static __inline__ uint32x4_t __attribute__((__always_inline__))
 vuzp1q_u32(uint32x4_t __a, uint32x4_t __b)
 {
-    uint32x4_t __ret;
-    __ret[0] = __a[0];
-    __ret[1] = __a[2];
-    __ret[2] = __b[0];
-    __ret[3] = __b[2];
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 2, 4, 6);
 }
 
 /* vuzp2q_u32: unzip odd elements from two uint32x4_t */
 static __inline__ uint32x4_t __attribute__((__always_inline__))
 vuzp2q_u32(uint32x4_t __a, uint32x4_t __b)
 {
-    uint32x4_t __ret;
-    __ret[0] = __a[1];
-    __ret[1] = __a[3];
-    __ret[2] = __b[1];
-    __ret[3] = __b[3];
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 3, 5, 7);
 }
 
 /* vzip1q_u16: zip/interleave low halves of two uint16x8_t
@@ -6585,12 +6539,7 @@ vuzp2q_u32(uint32x4_t __a, uint32x4_t __b)
 static __inline__ uint16x8_t __attribute__((__always_inline__))
 vzip1q_u16(uint16x8_t __a, uint16x8_t __b)
 {
-    uint16x8_t __ret;
-    __ret[0] = __a[0]; __ret[1] = __b[0];
-    __ret[2] = __a[1]; __ret[3] = __b[1];
-    __ret[4] = __a[2]; __ret[5] = __b[2];
-    __ret[6] = __a[3]; __ret[7] = __b[3];
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 8, 1, 9, 2, 10, 3, 11);
 }
 
 /* vzip2q_u16: zip/interleave high halves of two uint16x8_t
@@ -6598,32 +6547,21 @@ vzip1q_u16(uint16x8_t __a, uint16x8_t __b)
 static __inline__ uint16x8_t __attribute__((__always_inline__))
 vzip2q_u16(uint16x8_t __a, uint16x8_t __b)
 {
-    uint16x8_t __ret;
-    __ret[0] = __a[4]; __ret[1] = __b[4];
-    __ret[2] = __a[5]; __ret[3] = __b[5];
-    __ret[4] = __a[6]; __ret[5] = __b[6];
-    __ret[6] = __a[7]; __ret[7] = __b[7];
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 4, 12, 5, 13, 6, 14, 7, 15);
 }
 
 /* vzip1q_u32: zip/interleave low halves of two uint32x4_t */
 static __inline__ uint32x4_t __attribute__((__always_inline__))
 vzip1q_u32(uint32x4_t __a, uint32x4_t __b)
 {
-    uint32x4_t __ret;
-    __ret[0] = __a[0]; __ret[1] = __b[0];
-    __ret[2] = __a[1]; __ret[3] = __b[1];
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 4, 1, 5);
 }
 
 /* vzip2q_u32: zip/interleave high halves of two uint32x4_t */
 static __inline__ uint32x4_t __attribute__((__always_inline__))
 vzip2q_u32(uint32x4_t __a, uint32x4_t __b)
 {
-    uint32x4_t __ret;
-    __ret[0] = __a[2]; __ret[1] = __b[2];
-    __ret[2] = __a[3]; __ret[3] = __b[3];
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 2, 6, 3, 7);
 }
 
 /* ================================================================== */
@@ -6692,24 +6630,18 @@ vmovl_high_u8(uint8x16_t __a)
 static __inline__ uint16x4_t __attribute__((__always_inline__))
 vget_low_u16(uint16x8_t __a)
 {
-    uint16x4_t __ret;
-    __ret[0] = __a[0];
-    __ret[1] = __a[1];
-    __ret[2] = __a[2];
-    __ret[3] = __a[3];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[0];
+    return *(uint16x4_t *)&__h;
 }
 
 /* vget_high_u16: get high half of uint16x8_t as uint16x4_t */
 static __inline__ uint16x4_t __attribute__((__always_inline__))
 vget_high_u16(uint16x8_t __a)
 {
-    uint16x4_t __ret;
-    __ret[0] = __a[4];
-    __ret[1] = __a[5];
-    __ret[2] = __a[6];
-    __ret[3] = __a[7];
-    return __ret;
+    uint64x2_t __w = (uint64x2_t)__a;
+    unsigned long long __h = __w[1];
+    return *(uint16x4_t *)&__h;
 }
 
 
@@ -7028,23 +6960,13 @@ vrev64q_s32(int32x4_t __a)
 static __inline__ uint8x8_t __attribute__((__always_inline__))
 vtrn1_u8(uint8x8_t __a, uint8x8_t __b)
 {
-    uint8x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 8, 2, 10, 4, 12, 6, 14);
 }
 
 static __inline__ uint8x8_t __attribute__((__always_inline__))
 vtrn2_u8(uint8x8_t __a, uint8x8_t __b)
 {
-    uint8x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 9, 3, 11, 5, 13, 7, 15);
 }
 
 static __inline__ uint8x8x2_t __attribute__((__always_inline__))
@@ -7059,23 +6981,13 @@ vtrn_u8(uint8x8_t __a, uint8x8_t __b)
 static __inline__ int8x8_t __attribute__((__always_inline__))
 vtrn1_s8(int8x8_t __a, int8x8_t __b)
 {
-    int8x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 8, 2, 10, 4, 12, 6, 14);
 }
 
 static __inline__ int8x8_t __attribute__((__always_inline__))
 vtrn2_s8(int8x8_t __a, int8x8_t __b)
 {
-    int8x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 9, 3, 11, 5, 13, 7, 15);
 }
 
 static __inline__ int8x8x2_t __attribute__((__always_inline__))
@@ -7090,23 +7002,13 @@ vtrn_s8(int8x8_t __a, int8x8_t __b)
 static __inline__ uint16x4_t __attribute__((__always_inline__))
 vtrn1_u16(uint16x4_t __a, uint16x4_t __b)
 {
-    uint16x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 4, 2, 6);
 }
 
 static __inline__ uint16x4_t __attribute__((__always_inline__))
 vtrn2_u16(uint16x4_t __a, uint16x4_t __b)
 {
-    uint16x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 5, 3, 7);
 }
 
 static __inline__ uint16x4x2_t __attribute__((__always_inline__))
@@ -7121,23 +7023,13 @@ vtrn_u16(uint16x4_t __a, uint16x4_t __b)
 static __inline__ int16x4_t __attribute__((__always_inline__))
 vtrn1_s16(int16x4_t __a, int16x4_t __b)
 {
-    int16x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 4, 2, 6);
 }
 
 static __inline__ int16x4_t __attribute__((__always_inline__))
 vtrn2_s16(int16x4_t __a, int16x4_t __b)
 {
-    int16x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 5, 3, 7);
 }
 
 static __inline__ int16x4x2_t __attribute__((__always_inline__))
@@ -7152,23 +7044,13 @@ vtrn_s16(int16x4_t __a, int16x4_t __b)
 static __inline__ uint32x2_t __attribute__((__always_inline__))
 vtrn1_u32(uint32x2_t __a, uint32x2_t __b)
 {
-    uint32x2_t __ret;
-    for (int __i = 0; __i < 2; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 2);
 }
 
 static __inline__ uint32x2_t __attribute__((__always_inline__))
 vtrn2_u32(uint32x2_t __a, uint32x2_t __b)
 {
-    uint32x2_t __ret;
-    for (int __i = 0; __i < 2; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 3);
 }
 
 static __inline__ uint32x2x2_t __attribute__((__always_inline__))
@@ -7183,23 +7065,13 @@ vtrn_u32(uint32x2_t __a, uint32x2_t __b)
 static __inline__ int32x2_t __attribute__((__always_inline__))
 vtrn1_s32(int32x2_t __a, int32x2_t __b)
 {
-    int32x2_t __ret;
-    for (int __i = 0; __i < 2; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 2);
 }
 
 static __inline__ int32x2_t __attribute__((__always_inline__))
 vtrn2_s32(int32x2_t __a, int32x2_t __b)
 {
-    int32x2_t __ret;
-    for (int __i = 0; __i < 2; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 3);
 }
 
 static __inline__ int32x2x2_t __attribute__((__always_inline__))
@@ -7214,23 +7086,13 @@ vtrn_s32(int32x2_t __a, int32x2_t __b)
 static __inline__ float32x2_t __attribute__((__always_inline__))
 vtrn1_f32(float32x2_t __a, float32x2_t __b)
 {
-    float32x2_t __ret;
-    for (int __i = 0; __i < 2; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 2);
 }
 
 static __inline__ float32x2_t __attribute__((__always_inline__))
 vtrn2_f32(float32x2_t __a, float32x2_t __b)
 {
-    float32x2_t __ret;
-    for (int __i = 0; __i < 2; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 3);
 }
 
 static __inline__ float32x2x2_t __attribute__((__always_inline__))
@@ -7245,23 +7107,13 @@ vtrn_f32(float32x2_t __a, float32x2_t __b)
 static __inline__ uint8x16_t __attribute__((__always_inline__))
 vtrn1q_u8(uint8x16_t __a, uint8x16_t __b)
 {
-    uint8x16_t __ret;
-    for (int __i = 0; __i < 16; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30);
 }
 
 static __inline__ uint8x16_t __attribute__((__always_inline__))
 vtrn2q_u8(uint8x16_t __a, uint8x16_t __b)
 {
-    uint8x16_t __ret;
-    for (int __i = 0; __i < 16; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31);
 }
 
 static __inline__ uint8x16x2_t __attribute__((__always_inline__))
@@ -7276,23 +7128,13 @@ vtrnq_u8(uint8x16_t __a, uint8x16_t __b)
 static __inline__ int8x16_t __attribute__((__always_inline__))
 vtrn1q_s8(int8x16_t __a, int8x16_t __b)
 {
-    int8x16_t __ret;
-    for (int __i = 0; __i < 16; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30);
 }
 
 static __inline__ int8x16_t __attribute__((__always_inline__))
 vtrn2q_s8(int8x16_t __a, int8x16_t __b)
 {
-    int8x16_t __ret;
-    for (int __i = 0; __i < 16; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31);
 }
 
 static __inline__ int8x16x2_t __attribute__((__always_inline__))
@@ -7307,23 +7149,13 @@ vtrnq_s8(int8x16_t __a, int8x16_t __b)
 static __inline__ uint16x8_t __attribute__((__always_inline__))
 vtrn1q_u16(uint16x8_t __a, uint16x8_t __b)
 {
-    uint16x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 8, 2, 10, 4, 12, 6, 14);
 }
 
 static __inline__ uint16x8_t __attribute__((__always_inline__))
 vtrn2q_u16(uint16x8_t __a, uint16x8_t __b)
 {
-    uint16x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 9, 3, 11, 5, 13, 7, 15);
 }
 
 static __inline__ uint16x8x2_t __attribute__((__always_inline__))
@@ -7338,23 +7170,13 @@ vtrnq_u16(uint16x8_t __a, uint16x8_t __b)
 static __inline__ int16x8_t __attribute__((__always_inline__))
 vtrn1q_s16(int16x8_t __a, int16x8_t __b)
 {
-    int16x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 8, 2, 10, 4, 12, 6, 14);
 }
 
 static __inline__ int16x8_t __attribute__((__always_inline__))
 vtrn2q_s16(int16x8_t __a, int16x8_t __b)
 {
-    int16x8_t __ret;
-    for (int __i = 0; __i < 8; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 9, 3, 11, 5, 13, 7, 15);
 }
 
 static __inline__ int16x8x2_t __attribute__((__always_inline__))
@@ -7369,23 +7191,13 @@ vtrnq_s16(int16x8_t __a, int16x8_t __b)
 static __inline__ uint32x4_t __attribute__((__always_inline__))
 vtrn1q_u32(uint32x4_t __a, uint32x4_t __b)
 {
-    uint32x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 4, 2, 6);
 }
 
 static __inline__ uint32x4_t __attribute__((__always_inline__))
 vtrn2q_u32(uint32x4_t __a, uint32x4_t __b)
 {
-    uint32x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 5, 3, 7);
 }
 
 static __inline__ uint32x4x2_t __attribute__((__always_inline__))
@@ -7400,23 +7212,13 @@ vtrnq_u32(uint32x4_t __a, uint32x4_t __b)
 static __inline__ int32x4_t __attribute__((__always_inline__))
 vtrn1q_s32(int32x4_t __a, int32x4_t __b)
 {
-    int32x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 4, 2, 6);
 }
 
 static __inline__ int32x4_t __attribute__((__always_inline__))
 vtrn2q_s32(int32x4_t __a, int32x4_t __b)
 {
-    int32x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 5, 3, 7);
 }
 
 static __inline__ int32x4x2_t __attribute__((__always_inline__))
@@ -7431,23 +7233,13 @@ vtrnq_s32(int32x4_t __a, int32x4_t __b)
 static __inline__ float32x4_t __attribute__((__always_inline__))
 vtrn1q_f32(float32x4_t __a, float32x4_t __b)
 {
-    float32x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 0];
-        __ret[__i + 1] = __b[__i + 0];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 0, 4, 2, 6);
 }
 
 static __inline__ float32x4_t __attribute__((__always_inline__))
 vtrn2q_f32(float32x4_t __a, float32x4_t __b)
 {
-    float32x4_t __ret;
-    for (int __i = 0; __i < 4; __i += 2) {
-        __ret[__i] = __a[__i + 1];
-        __ret[__i + 1] = __b[__i + 1];
-    }
-    return __ret;
+    return __builtin_shufflevector(__a, __b, 1, 5, 3, 7);
 }
 
 static __inline__ float32x4x2_t __attribute__((__always_inline__))

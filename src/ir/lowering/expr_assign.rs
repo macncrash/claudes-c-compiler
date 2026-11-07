@@ -887,6 +887,9 @@ impl Lowerer {
             return false; // Large vectors use sret, returned as pointer
         }
         match rhs {
+            // These leave the vector in memory, and give its address.
+            Expr::FunctionCall(func_expr, _, _)
+                if matches!(func_expr.as_ref(), Expr::Identifier(n, _) if n == "__builtin_shuffle" || n == "__builtin_shufflevector") => false,
             Expr::FunctionCall(func_expr, _, _) => {
                 // Check if it's a direct call to a known function with vector return
                 let stripped = {

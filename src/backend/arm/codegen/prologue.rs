@@ -126,13 +126,12 @@ impl ArmCodegen {
         if !self.general_regs_only {
             let liveness = cached_liveness.take()
                 .unwrap_or_else(|| crate::backend::liveness::compute_live_intervals(func));
+            // Registers holding vector values are not for scalars.
+            let for_scalars = |r: &PhysReg| !self.vec_regs.values().any(|&v| v == r.0)
+                && !self.vec_consts.iter().any(|c| c.3 == r.0);
             let config = crate::backend::regalloc::FpRegAllocConfig {
-                callee_saved_regs: ARM_FP_CALLEE_SAVED.to_vec(),
-                // Registers holding vector values are not for scalars.
-                caller_saved_regs: ARM_FP_CALLER_SAVED.iter().copied()
-                    .filter(|r| !self.vec_regs.values().any(|&v| v == r.0)
-                        && !self.vec_consts.iter().any(|c| c.3 == r.0))
-                    .collect(),
+                callee_saved_regs: ARM_FP_CALLEE_SAVED.iter().copied().filter(for_scalars).collect(),
+                caller_saved_regs: ARM_FP_CALLER_SAVED.iter().copied().filter(for_scalars).collect(),
             };
             let fp = crate::backend::regalloc::allocate_fp_registers(func, &liveness, &config);
             cached_liveness = Some(liveness);
@@ -143,6 +142,13 @@ impl ArmCodegen {
             }
             self.fp_reg_assignments = fp.assignments;
             self.used_fp_callee_saved = fp.used_callee_saved;
+        }
+        // A vector in v8-v15 owes the caller the low half like a float does.
+        for r in ARM_FP_CALLEE_SAVED {
+            let held = self.vec_regs.values().any(|&v| v == r.0) || self.vec_consts.iter().any(|c| c.3 == r.0);
+            if held && !self.used_fp_callee_saved.contains(&r) {
+                self.used_fp_callee_saved.push(r);
+            }
         }
 
         self.prestore_regs = ARM_CALLEE_SAVED.to_vec();

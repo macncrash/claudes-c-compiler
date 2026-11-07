@@ -11,9 +11,10 @@
 //!   %q = vec add %p, %r             %q = vec add %v1, %r
 //!
 //! sroa.rs does this for scalars. Here every use stays inside one vector, so
-//! splitting is only a renaming of addresses: a memcpy of 16 bytes or a 16-byte
-//! vector operation, at a multiple of 16, or a load or store within one (the
-//! zeroing an initializer starts with). Anything else, a variable index
+//! splitting is only a renaming of addresses: a 16-byte vector operation at a
+//! multiple of 16, or a load or store within one (the zeroing an initializer
+//! starts with). A memcpy of whole vectors, as of the uint32x4x2_t an
+//! intrinsic returns, becomes one per vector. Anything else, a variable index
 //! (BLAKE3's message words, by table), an access across two, an address that
 //! escapes, leaves the array as it is. So does every array of a function with
 //! no vector operation: a split only pays for what can reach a register. (An
@@ -39,7 +40,9 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
     }
     let params: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
     let mut sizes: FxHashMap<u32, usize> = FxHashMap::default();
-    for inst in func.blocks.first().map(|b| b.instructions.as_slice()).unwrap_or(&[]) {
+    // In any block: those of inlined functions are where the call was, and an
+    // alloca is a place in the frame wherever it is written.
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         if let Instruction::Alloca { dest, size, volatile: false, .. } = inst {
             if *size > VECTOR && *size <= MAX_SIZE && size.is_multiple_of(VECTOR) && !params.contains(&dest.0) {
                 sizes.insert(dest.0, *size);
@@ -92,6 +95,9 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
     let whole = |p: u32| addr.get(&p).is_none_or(|&(a, k)| {
         k >= 0 && (k as usize).is_multiple_of(VECTOR) && k as usize + VECTOR <= sizes[&a]
     });
+    let vectors = |p: u32, n: usize| addr.get(&p).is_none_or(|&(a, k)| {
+        n > 0 && n.is_multiple_of(VECTOR) && k >= 0 && (k as usize).is_multiple_of(VECTOR) && k as usize + n <= sizes[&a]
+    });
     let inside = |p: u32, n: usize| addr.get(&p).is_none_or(|&(a, k)| {
         k >= 0 && k as usize % VECTOR + n <= VECTOR && k as usize + n <= sizes[&a]
     });
@@ -132,7 +138,7 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
                 }
                 Instruction::Memcpy { dest, src, size } => {
                     for p in [dest.0, src.0] {
-                        if *size != VECTOR || !whole(p) {
+                        if !vectors(p, *size) {
                             reject(p);
                         }
                     }
@@ -216,10 +222,30 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
                     }
                     replaced.push(inst);
                 }
-                Instruction::Memcpy { dest, src, .. } => {
-                    *dest = renamed(*dest);
-                    *src = renamed(*src);
-                    replaced.push(inst);
+                Instruction::Memcpy { dest, src, size } if is_gone(dest) || is_gone(src) => {
+                    // Vector by vector: the address of each within its side.
+                    let (dest, src) = (*dest, *src);
+                    for i in 0..*size / VECTOR {
+                        let mut at = |p: Value| -> Value {
+                            match addr.get(&p.0) {
+                                Some(&(a, k)) if split.contains(&a) => fields[&(a, k as usize / VECTOR + i)],
+                                _ if i == 0 => p,
+                                _ => {
+                                    let next = Value(next_id);
+                                    next_id += 1;
+                                    replaced.push(Instruction::GetElementPtr {
+                                        dest: next,
+                                        base: p,
+                                        offset: Operand::Const(IrConst::I64((i * VECTOR) as i64)),
+                                        ty: IrType::Ptr,
+                                    });
+                                    next
+                                }
+                            }
+                        };
+                        let (d, s) = (at(dest), at(src));
+                        replaced.push(Instruction::Memcpy { dest: d, src: s, size: VECTOR });
+                    }
                 }
                 Instruction::Intrinsic { op: IntrinsicOp::VecOp { splat, .. }, dest_ptr, args, .. } => {
                     let splat = *splat;
@@ -335,9 +361,10 @@ mod tests {
         keep(vec![gep(3, 1, 8), memcpy(2, 3, 16)]);
         keep(vec![gep(3, 1, 32), memcpy(2, 3, 16)]);
         keep(vec![gep(3, 1, -16), memcpy(2, 3, 16)]);
-        // Copied whole, or in part.
-        keep(vec![memcpy(2, 1, 32)]);
+        // Copied in part, or past the end.
         keep(vec![memcpy(2, 1, 8)]);
+        keep(vec![memcpy(2, 1, 24)]);
+        keep(vec![gep(3, 1, 16), memcpy(2, 3, 32)]);
         // Across two vectors, and past the end.
         keep(vec![gep(3, 1, 12), store(3, IrType::I64, false)]);
         keep(vec![gep(3, 1, 12), load(3, IrType::I64, false)]);
@@ -351,6 +378,30 @@ mod tests {
         // An eight-byte operation, and a splat of what is at the address.
         keep(vec![vec_add(2, 1, 2, 8, 0)]);
         keep(vec![vec_add(2, 1, 2, 16, 1)]);
+    }
+
+    /// A copy of two vectors is two copies, to each vector and to its place
+    /// in what is not split.
+    #[test]
+    fn test_copies_of_several_vectors() {
+        let (n, out) = run(vec![alloca(1, 32), alloca(2, 16), vec_add(1, 1, 2, 16, 0), memcpy(9, 1, 32)]);
+        assert_eq!(n, 1);
+        let field = |i: usize| match &out[i] { Instruction::Alloca { dest, .. } => *dest, _ => panic!() };
+        let tail = &out[out.len() - 3..];
+        assert!(matches!(&tail[0], Instruction::Memcpy { dest, src, size: 16 } if dest.0 == 9 && *src == field(0)));
+        let Instruction::GetElementPtr { dest: next, base, offset: Operand::Const(c), .. } = &tail[1] else { panic!() };
+        assert_eq!((base.0, c.to_i64()), (9, Some(16)));
+        assert!(matches!(&tail[2], Instruction::Memcpy { dest, src, size: 16 } if dest == next && *src == field(1)));
+        // Both sides split, part way into one.
+        let (n, out) = run(vec![alloca(1, 48), alloca(2, 32), alloca(3, 16), vec_add(1, 1, 3, 16, 0),
+                                gep(4, 1, 16), memcpy(2, 4, 32)]);
+        assert_eq!(n, 2);
+        let copies: Vec<(u32, u32)> = out.iter().filter_map(|i| match i {
+            Instruction::Memcpy { dest, src, size: 16 } => Some((dest.0, src.0)),
+            _ => None,
+        }).collect();
+        // Fields are numbered in array order: %1's three, then %2's two.
+        assert_eq!(copies, vec![(103, 101), (104, 102)]);
     }
 
     /// What is within one vector goes to that vector, at its place there.

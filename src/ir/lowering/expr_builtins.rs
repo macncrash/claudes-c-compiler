@@ -286,6 +286,11 @@ impl Lowerer {
         if !by_list && width == 1 && total == 16 && self.target == crate::backend::Target::Aarch64 {
             return Some(self.lower_byte_shuffle(args, &elem));
         }
+        if by_list && self.target == crate::backend::Target::Aarch64 {
+            if let Some(result) = self.lower_permute(args, lanes, width) {
+                return Some(result);
+            }
+        }
         let both = self.emit_entry_alloca(IrType::Ptr, 2 * total, 16, false);
         let a = self.lower_expr(&args[0]);
         let a = self.operand_to_value(a);
@@ -327,6 +332,36 @@ impl Lowerer {
             self.emit(Instruction::Load { dest: lane, ptr: from, ty: elem_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
             self.emit_store_at_offset(result, i * width, Operand::Value(lane), elem_ty);
         }
+        Some(Operand::Value(result))
+    }
+
+    /// A shufflevector of lanes in one of the patterns AArch64 has an
+    /// instruction for: `(a, b, 0, 4, 2, 6)` is trn1. Lanes of -1 match any.
+    fn lower_permute(&mut self, args: &[Expr], lanes: usize, width: usize) -> Option<Operand> {
+        use crate::ir::intrinsics::{VecElem, VecOpKind, VecPermute};
+        if args.len() != lanes + 2 || lanes < 2 || !matches!(lanes * width, 8 | 16) {
+            return None;
+        }
+        if self.expr_ctype(&args[1]).vector_info().map(|(e, n)| (e.size(), n)) != Some((width, lanes)) {
+            return None;
+        }
+        let list: Vec<i64> = args[2..].iter()
+            .map(|a| self.eval_const_expr(a).and_then(|c| c.to_i64()))
+            .collect::<Option<_>>()?;
+        let permute = *VecPermute::ALL.iter()
+            .find(|p| list.iter().enumerate().all(|(i, &k)| k < 0 || k as usize == p.lane(i, lanes)))?;
+        let elem = match width { 1 => VecElem::U8, 2 => VecElem::U16, 4 => VecElem::U32, _ => VecElem::U64 };
+        let a = self.lower_expr(&args[0]);
+        let a = self.operand_to_value(a);
+        let b = self.lower_expr(&args[1]);
+        let b = self.operand_to_value(b);
+        let result = self.emit_entry_alloca(IrType::Ptr, lanes * width, 16, false);
+        self.emit(Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::VecOp { op: VecOpKind::Permute(permute), elem, bytes: (lanes * width) as u8, splat: 0 },
+            dest_ptr: Some(result),
+            args: vec![Operand::Value(a), Operand::Value(b)],
+        });
         Some(Operand::Value(result))
     }
 
