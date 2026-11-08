@@ -233,7 +233,7 @@ impl Lowerer {
                 self.eval_const_cast(target_type, inner)
             }
             Expr::Identifier(name, _) => {
-                self.eval_const_identifier(name)
+                self.eval_const_identifier(name).or_else(|| self.sema_enum_constant(name, expr))
             }
             Expr::Sizeof(arg, _) => {
                 if self.sizeof_is_runtime(arg) {
@@ -381,6 +381,20 @@ impl Lowerer {
             _ => return None,
         };
         Some(result)
+    }
+
+    /// An enum constant this lowering has not collected, which sema resolved:
+    /// one declared in a type name inside an expression (`sizeof(enum { Z })`,
+    /// a cast) or a parameter's type, never reached when the expression is
+    /// folded whole. Only for a name that is no variable here.
+    pub(super) fn sema_enum_constant(&self, name: &str, expr: &Expr) -> Option<IrConst> {
+        let variable = self.func_state.as_ref().is_some_and(|fs| fs.locals.contains_key(name)
+            || fs.static_local_names.contains_key(name))
+            || self.globals.contains_key(name);
+        if variable {
+            return None;
+        }
+        self.lookup_sema_const(expr)
     }
 
     fn eval_const_identifier(&self, name: &str) -> Option<IrConst> {

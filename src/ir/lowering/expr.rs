@@ -348,6 +348,9 @@ impl Lowerer {
             }
             return self.load_global_var(name.to_string(), &ginfo, self.alias_class(expr));
         }
+        if let Some(val) = self.sema_enum_constant(name, expr) {
+            return Operand::Const(val);
+        }
 
         // Note: implicit declaration warnings are emitted during sema, not here.
         // Apply __asm__("label") linker symbol redirect if present.

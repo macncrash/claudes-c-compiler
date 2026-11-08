@@ -1266,6 +1266,13 @@ impl Lowerer {
                     }
                     if scoped {
                         self.insert_enum_scoped(variant.name.clone(), next_val);
+                        // It hides a variable of the name from further out
+                        // (`int F; { enum { F = 3 }; int a[F]; }`) until the
+                        // block ends.
+                        if let Some(fs) = self.func_state.as_mut() {
+                            fs.shadow_local_for_scope(&variant.name);
+                            fs.shadow_static_for_scope(&variant.name);
+                        }
                     } else {
                         self.types.enum_constants.insert(variant.name.clone(), next_val);
                     }

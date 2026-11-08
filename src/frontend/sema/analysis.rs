@@ -254,6 +254,11 @@ impl SemanticAnalyzer {
         self.symbol_table.push_scope();
         self.result.type_context.push_scope();
 
+        // An enum declared in a parameter's type is in scope in the body.
+        for param in &func.params {
+            self.collect_enum_constants_from_type_spec(&param.type_spec);
+        }
+
         // Declare parameters in function scope
         for param in &func.params {
             if let Some(name) = &param.name {
@@ -1483,7 +1488,10 @@ impl SemanticAnalyzer {
                 self.analyze_expr(obj);
                 self.check_member_exists(obj, field_name, *span, true);
             }
-            Expr::Cast(_, inner, _) => {
+            // A type name can declare an enum, whose constants are in scope
+            // from there to the end of the block: `sizeof(enum { Z = 5 })`.
+            Expr::Cast(ts, inner, _) => {
+                self.collect_enum_constants_from_type_spec(ts);
                 self.analyze_expr(inner);
             }
             Expr::Sizeof(arg, span) => {
@@ -1493,6 +1501,7 @@ impl SemanticAnalyzer {
                         self.analyze_expr(inner);
                     }
                     SizeofArg::Type(ts) => {
+                        self.collect_enum_constants_from_type_spec(ts);
                         // Check for sizeof on incomplete struct/union types.
                         // sizeof(struct X) where struct X has no definition is an error.
                         // (Pointers to incomplete types are fine.)
@@ -1500,7 +1509,7 @@ impl SemanticAnalyzer {
                     }
                 }
             }
-            Expr::Alignof(..) | Expr::GnuAlignof(..) => {} // alignof(type) - no expr to check
+            Expr::Alignof(ts, _) | Expr::GnuAlignof(ts, _) => self.collect_enum_constants_from_type_spec(ts),
             Expr::AlignofExpr(inner, _) | Expr::GnuAlignofExpr(inner, _) => {
                 self.analyze_expr(inner);
             }
@@ -1514,13 +1523,15 @@ impl SemanticAnalyzer {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
             }
-            Expr::CompoundLiteral(_, init, _) => {
+            Expr::CompoundLiteral(ts, init, _) => {
+                self.collect_enum_constants_from_type_spec(ts);
                 self.analyze_initializer(init);
             }
             Expr::StmtExpr(compound, _) => {
                 self.analyze_compound_stmt(compound);
             }
-            Expr::VaArg(ap_expr, _, _) => {
+            Expr::VaArg(ap_expr, ts, _) => {
+                self.collect_enum_constants_from_type_spec(ts);
                 self.analyze_expr(ap_expr);
             }
             Expr::GenericSelection(controlling, associations, _) => {
