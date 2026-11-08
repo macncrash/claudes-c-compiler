@@ -48,6 +48,11 @@ impl SymbolTable {
         }
     }
 
+    /// The depth of the scope declaring `name` nearest in, 0 being the file's.
+    pub fn lookup_depth(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().rposition(|scope| scope.symbols.contains_key(name))
+    }
+
     pub fn lookup(&self, name: &str) -> Option<&Symbol> {
         for scope in self.scopes.iter().rev() {
             if let Some(sym) = scope.symbols.get(name) {

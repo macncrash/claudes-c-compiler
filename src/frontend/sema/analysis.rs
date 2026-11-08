@@ -130,6 +130,9 @@ pub struct SemanticAnalyzer {
     result: SemaResult,
     /// Current enum counter for auto-incrementing enum values.
     enum_counter: i64,
+    /// Binary operators found not constant, so that their parents do not ask
+    /// again (see SemaConstEval::not_const).
+    not_const_binops: crate::common::fx_hash::FxHashSet<crate::frontend::parser::ast::ExprId>,
     // Anonymous struct/union keys are generated via TypeContext::next_anon_struct_id()
     // to ensure a single shared counter across both declaration processing and
     // expression type inference, avoiding key collisions between the two paths.
@@ -153,6 +156,7 @@ impl SemanticAnalyzer {
             symbol_table: SymbolTable::new(),
             result: SemaResult::default(),
             enum_counter: 0,
+            not_const_binops: Default::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
         };
@@ -1337,6 +1341,9 @@ impl SemanticAnalyzer {
             Expr::Cast(_, inner, _) => self.try_eval_constant_bool(inner),
             // Enum constants (e.g., kernel's `true` defined as `enum { false = 0, true = 1 }`)
             Expr::Identifier(name, _) => {
+                if self.result.type_context.enum_constant_shadowed(name, &self.symbol_table) {
+                    return None;
+                }
                 self.result.type_context.enum_constants.get(name).map(|&val| val != 0)
             }
             _ => None,
@@ -1599,9 +1606,12 @@ impl SemanticAnalyzer {
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
+            not_const: Some(&self.not_const_binops),
         };
         if let Some(val) = evaluator.eval_const_expr(expr) {
             self.result.const_values.insert(expr.id(), val);
+        } else if matches!(expr, Expr::BinaryOp(..)) {
+            self.not_const_binops.insert(expr.id());
         }
     }
 
@@ -1915,6 +1925,7 @@ impl SemanticAnalyzer {
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
+            not_const: Some(&self.not_const_binops),
         };
         evaluator.eval_const_expr(expr)?.to_i64()
     }

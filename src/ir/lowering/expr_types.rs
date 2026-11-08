@@ -789,8 +789,19 @@ impl Lowerer {
                 // Logical NOT produces C int (I32 on ILP32, I64 on LP64)
                 crate::common::types::target_int_ir_type()
             }
+            // Lowering a binary operator asks its type, which walks its left
+            // side: at every level of a sum of n terms, n^2 steps. The answer
+            // is kept until the next statement or declaration.
             Expr::BinaryOp(op, lhs, rhs, _) => {
-                self.get_binop_type(op, lhs, rhs)
+                if self.func_state.is_none() {
+                    return self.get_binop_type(op, lhs, rhs);
+                }
+                if let Some(&ty) = self.binop_ir_types.borrow().get(&expr.id()) {
+                    return ty;
+                }
+                let ty = self.get_binop_type(op, lhs, rhs);
+                self.binop_ir_types.borrow_mut().insert(expr.id(), ty);
+                ty
             }
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.get_expr_type(lhs)
@@ -830,7 +841,10 @@ impl Lowerer {
                 if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
                     return IrType::Ptr;
                 }
-                if let Some(ty) = self.types.enumerator_ctype(name) {
+                // A local of the name shadows an enum constant: `enum { K };
+                // { long long K; }` (see eval_const_identifier).
+                let is_local = self.func_state.as_ref().is_some_and(|fs| fs.locals.contains_key(name));
+                if let Some(ty) = self.types.enumerator_ctype(name).filter(|_| !is_local) {
                     return IrType::from_ctype(&ty);
                 }
                 if let Some(vi) = self.lookup_var_info(name) {
@@ -1051,7 +1065,7 @@ impl Lowerer {
     /// Look up the CType of an expression from sema's pre-computed annotation map.
     /// Returns None if sema did not annotate this expression (e.g., because the
     /// type depends on lowering-specific state like alloca info).
-    fn lookup_sema_expr_type(&self, expr: &Expr) -> Option<CType> {
+    pub(super) fn lookup_sema_expr_type(&self, expr: &Expr) -> Option<CType> {
         self.sema_expr_types.get(&expr.id()).cloned()
     }
 

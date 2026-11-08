@@ -107,6 +107,26 @@ impl Lowerer {
                 return None;
             }
         }
+        // Lowering a binary operator asks whether it is constant, which asks
+        // the same of its operands: a sum of n terms, nested to the left, took
+        // n^2 steps (20,000 terms, over 15 seconds). Within one statement of a
+        // function no declaration comes between the questions, so the answer
+        // for a node that is not constant is kept until the next statement or
+        // declaration (forget_statement_memos).
+        if matches!(expr, Expr::BinaryOp(..)) && self.func_state.is_some() {
+            if self.not_const_binops.borrow().contains(&expr.id()) {
+                return None;
+            }
+            let value = self.eval_const_expr_unmemoized(expr);
+            if value.is_none() {
+                self.not_const_binops.borrow_mut().insert(expr.id());
+            }
+            return value;
+        }
+        self.eval_const_expr_unmemoized(expr)
+    }
+
+    fn eval_const_expr_unmemoized(&self, expr: &Expr) -> Option<IrConst> {
         // Fast path: consult sema's pre-computed constant values.
         // This avoids re-evaluating expressions that sema already handled.
         // We skip the sema lookup for:

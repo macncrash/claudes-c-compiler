@@ -135,6 +135,11 @@ pub struct Lowerer {
     /// TODO: Once ExprId is backed by a counter-based scheme instead of pointer
     /// addresses, the ABA discriminant check can be removed entirely.
     pub(super) expr_ctype_cache: RefCell<FxHashMap<ExprId, (Discriminant<Expr>, Option<CType>)>>,
+    /// Binary operators of the statement being lowered that are not constant
+    /// (see eval_const_expr), and the IR types of those asked (get_expr_type).
+    /// Cleared at each statement and declaration (forget_statement_memos).
+    pub(super) not_const_binops: RefCell<FxHashSet<ExprId>>,
+    pub(super) binop_ir_types: RefCell<FxHashMap<ExprId, IrType>>,
     /// Diagnostic engine for emitting structured errors and warnings during lowering.
     /// Threaded from the driver through the compilation pipeline so that lowering-phase
     /// diagnostics get the same source location rendering and warning control as
@@ -225,6 +230,8 @@ impl Lowerer {
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),
             expr_ctype_cache: RefCell::new(FxHashMap::default()),
+            not_const_binops: RefCell::new(FxHashSet::default()),
+            binop_ir_types: RefCell::new(FxHashMap::default()),
             diagnostics: RefCell::new(diagnostics),
             materialized_compound_literals: FxHashMap::default(),
             gnu89_inline,
@@ -1123,6 +1130,18 @@ impl Lowerer {
         chars.push(0); // null terminator
         self.module.char16_string_literals.push((label.clone(), chars));
         label
+    }
+
+    /// Within one statement or declaration nothing is declared between two
+    /// questions about the same expression; across them a declaration can
+    /// change the answers.
+    pub(super) fn forget_statement_memos(&self) {
+        if !self.not_const_binops.borrow().is_empty() {
+            self.not_const_binops.borrow_mut().clear();
+        }
+        if !self.binop_ir_types.borrow().is_empty() {
+            self.binop_ir_types.borrow_mut().clear();
+        }
     }
 
     pub(super) fn emit(&mut self, mut inst: Instruction) {

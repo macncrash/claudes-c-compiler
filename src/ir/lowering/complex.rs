@@ -439,6 +439,14 @@ impl Lowerer {
             Expr::BinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
                 | BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
                 | BinOp::Shl | BinOp::Shr, lhs, rhs, _) => {
+                // Operands sema typed as plain integers or reals are neither
+                // vectors nor complex, so need no walk: one at every level of a
+                // sum of n terms made n^2 steps (20,000 terms, over 15 seconds).
+                let plain = |e: &Expr| self.lookup_sema_expr_type(e)
+                    .is_some_and(|t| t.is_integer() || t.is_floating());
+                if plain(lhs) && plain(rhs) {
+                    return self.get_expr_ctype(expr).unwrap_or(CType::Int);
+                }
                 let lt = self.expr_ctype(lhs);
                 let rt = self.expr_ctype(rhs);
                 // GCC vector extensions: if either operand is a vector, result is that vector type

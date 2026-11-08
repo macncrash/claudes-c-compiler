@@ -128,6 +128,9 @@ pub struct TypeContext {
     pub struct_layouts: RefCell<FxHashMap<String, RcLayout>>,
     /// Enum constant values
     pub enum_constants: FxHashMap<String, i64>,
+    /// The scope depth each enum constant was declared at (0 for the file),
+    /// where its symbol is too: see enum_constant_shadowed.
+    pub enum_constant_depths: FxHashMap<String, usize>,
     /// The types of enum constants that are not int: those whose value int
     /// cannot hold (see set_enumerator_types).
     pub enum_constant_types: FxHashMap<String, CType>,
@@ -185,6 +188,7 @@ impl TypeContext {
         let mut tc = Self {
             struct_layouts: RefCell::new(FxHashMap::default()),
             enum_constants: FxHashMap::default(),
+            enum_constant_depths: FxHashMap::default(),
             enum_constant_types: FxHashMap::default(),
             typedefs: FxHashMap::default(),
             typedef_alignments: FxHashMap::default(),
@@ -395,6 +399,7 @@ impl TypeContext {
         if let Some(frame) = self.scope_stack.get_mut().pop() {
             for key in frame.enums_added {
                 self.enum_constants.remove(&key);
+                self.enum_constant_depths.remove(&key);
                 self.enum_constant_types.remove(&key);
             }
             let layouts = self.struct_layouts.get_mut();
@@ -489,7 +494,17 @@ impl TypeContext {
                 frame.enums_added.push(name.clone());
             }
         }
+        self.enum_constant_depths.insert(name.clone(), self.scope_stack.get_mut().len());
         self.enum_constants.insert(name, value);
+    }
+
+    /// Whether a name that is an enum constant means a variable declared in a
+    /// scope further in (`enum { K = 10 }; { int K = 12; K + 1; }`). The
+    /// constant has a symbol of its own at its depth, which is what is found
+    /// when nothing shadows it.
+    pub fn enum_constant_shadowed(&self, name: &str, symbols: &crate::common::symbol_table::SymbolTable) -> bool {
+        let depth = self.enum_constant_depths.get(name).copied().unwrap_or(0);
+        symbols.lookup_depth(name).is_some_and(|d| d > depth)
     }
 
     /// Record the types of a completed enum's constants: int when the value

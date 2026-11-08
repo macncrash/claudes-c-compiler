@@ -151,7 +151,8 @@ impl<'a> ExprTypeChecker<'a> {
                 if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
                     return Some(CType::Pointer(Box::new(CType::Char), AccessQuals::NONE));
                 }
-                if let Some(ty) = self.types.enumerator_ctype(name) {
+                if let Some(ty) = self.types.enumerator_ctype(name)
+                    .filter(|_| !self.types.enum_constant_shadowed(name, self.symbols)) {
                     return Some(ty);
                 }
                 if let Some(sym) = self.symbols.lookup(name) {
@@ -708,6 +709,7 @@ impl<'a> ExprTypeChecker<'a> {
             functions: self.functions,
             const_values: None,
             expr_types: self.expr_types,
+            not_const: None,
         };
         evaluator.eval_const_expr(expr)?.to_i64()
     }

@@ -79,6 +79,7 @@ impl Lowerer {
     }
 
     pub(super) fn lower_local_decl(&mut self, decl: &Declaration) {
+        self.forget_statement_memos();
         let mut resolved_type_spec = None;
         let type_spec = self.resolve_local_type_spec(decl, &mut resolved_type_spec);
 
@@ -1150,6 +1151,7 @@ impl Lowerer {
 
     /// Main statement lowering dispatcher. Delegates to per-statement-type methods.
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) {
+        self.forget_statement_memos();
         // Set the current span for debug info tracking. All instructions emitted
         // while lowering this statement will inherit this source location.
         if let Some(span) = stmt.span() {

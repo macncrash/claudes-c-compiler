@@ -35,7 +35,7 @@ use crate::frontend::parser::ast::{
 use super::type_context::TypeContext;
 use super::analysis::FunctionInfo;
 use crate::common::symbol_table::SymbolTable;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Map from AST expression node identity to its pre-computed compile-time constant.
 ///
@@ -64,6 +64,8 @@ pub struct SemaConstEval<'a> {
     pub const_values: Option<&'a FxHashMap<ExprId, IrConst>>,
     /// Pre-computed expression types from bottom-up sema walk.
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
+    /// Binary operators the bottom-up walk found not constant.
+    pub not_const: Option<&'a FxHashSet<ExprId>>,
 }
 
 impl<'a> SemaConstEval<'a> {
@@ -79,6 +81,11 @@ impl<'a> SemaConstEval<'a> {
             if let Some(cached) = cache.get(&expr.id()) {
                 return Some(*cached);
             }
+        }
+        // And one that was not: each level of a sum of n terms asked its whole
+        // left side again, n^2 steps (20,000 terms took seconds).
+        if matches!(expr, Expr::BinaryOp(..)) && self.not_const.is_some_and(|s| s.contains(&expr.id())) {
+            return None;
         }
 
         match expr {
@@ -273,7 +280,9 @@ impl<'a> SemaConstEval<'a> {
             // Identifier: enum constants
             Expr::Identifier(name, _) => {
                 if let Some(&val) = self.types.enum_constants.get(name) {
-                    return Some(IrConst::I64(val));
+                    if !self.types.enum_constant_shadowed(name, self.symbols) {
+                        return Some(IrConst::I64(val));
+                    }
                 }
                 None
             }
