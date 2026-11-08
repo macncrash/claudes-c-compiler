@@ -1903,8 +1903,22 @@ impl CType {
         } else if r_unsigned && r_rank >= l_rank {
             r
         } else {
-            // The signed type has higher rank and can represent all values
-            if l_unsigned { r } else { l }
+            // The signed type has higher rank. It is the result only if it can
+            // represent every value of the unsigned one, so is wider: long long
+            // and unsigned long are both 8 bytes on LP64, and give unsigned
+            // long long (C11 6.3.1.8).
+            let (signed, unsigned) = if l_unsigned { (r, l) } else { (l, r) };
+            if signed.size() > unsigned.size() {
+                signed
+            } else {
+                match signed {
+                    CType::Int => CType::UInt,
+                    CType::Long => CType::ULong,
+                    CType::LongLong => CType::ULongLong,
+                    CType::Int128 => CType::UInt128,
+                    other => other,
+                }
+            }
         }
     }
 

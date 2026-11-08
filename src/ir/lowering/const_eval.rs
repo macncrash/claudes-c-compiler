@@ -158,8 +158,9 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
-                let promoted = shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
-                const_arith::negate_const(promoted)
+                let is_unsigned = self.is_expr_unsigned_for_const(inner);
+                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
+                self.wrap_unsigned_int(inner, is_unsigned, const_arith::negate_const(promoted)?)
             }
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 let l = self.eval_const_expr(lhs);
@@ -226,8 +227,9 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
-                let promoted = shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
-                const_arith::bitnot_const(promoted)
+                let is_unsigned = self.is_expr_unsigned_for_const(inner);
+                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
+                self.wrap_unsigned_int(inner, is_unsigned, const_arith::bitnot_const(promoted)?)
             }
             Expr::Cast(ref target_type, inner, _) => {
                 self.eval_const_cast(target_type, inner)
@@ -321,6 +323,10 @@ impl Lowerer {
     fn eval_const_cast(&self, target_type: &TypeSpecifier, inner: &Expr) -> Option<IrConst> {
         let target_ir_ty = self.type_spec_to_ir(target_type);
         let src_val = self.eval_const_expr(inner)?;
+        // To _Bool is a test against zero, not a truncation to a byte.
+        if matches!(self.type_spec_to_ctype(target_type), CType::Bool) {
+            return Some(IrConst::I64(src_val.is_nonzero() as i64));
+        }
 
         // Handle float source types: use value-based conversion, not bit manipulation
         if let IrConst::LongDouble(fv, bytes) = &src_val {
@@ -544,6 +550,9 @@ impl Lowerer {
     fn eval_const_expr_as_bits(&self, expr: &Expr) -> Option<(u64, bool)> {
         match expr {
             Expr::Cast(ref target_type, inner, _) => {
+                if matches!(self.type_spec_to_ctype(target_type), CType::Bool) {
+                    return Some((self.eval_const_expr(inner)?.is_nonzero() as u64, false));
+                }
                 let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
                 let target_ir_ty = self.type_spec_to_ir(target_type);
                 let target_width = target_ir_ty.size() * 8;
@@ -595,14 +604,24 @@ impl Lowerer {
         }
     }
 
+    /// -x or ~x of an unsigned int wraps at 32 bits: its constants are I64,
+    /// and without this -1338556541u came out a negative 64-bit value.
+    fn wrap_unsigned_int(&self, inner: &Expr, is_unsigned: bool, result: IrConst) -> Option<IrConst> {
+        match (is_unsigned, self.get_expr_type(inner).size(), result.to_i64()) {
+            (true, 4, Some(v)) => Some(IrConst::I64(v as u32 as i64)),
+            _ => Some(result),
+        }
+    }
+
     /// Evaluate a constant binary operation.
     /// Delegates to `shared_const_eval::eval_binop_with_types` which implements
     /// C's usual arithmetic conversions (C11 6.3.1.8).
     fn eval_const_binop(&self, op: &BinOp, lhs: &IrConst, rhs: &IrConst, lhs_ty: IrType, rhs_ty: IrType) -> Option<IrConst> {
         shared_const_eval::eval_binop_with_types(
             op, lhs, rhs,
-            lhs_ty.size().max(4), lhs_ty.is_unsigned(),
-            rhs_ty.size().max(4), rhs_ty.is_unsigned(),
+            // A type narrower than int promotes to int, signed.
+            lhs_ty.size().max(4), lhs_ty.is_unsigned() && lhs_ty.size() >= 4,
+            rhs_ty.size().max(4), rhs_ty.is_unsigned() && rhs_ty.size() >= 4,
         )
     }
 

@@ -102,8 +102,18 @@ impl<'a> SemaConstEval<'a> {
             }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
-                let promoted = shared_const_eval::promote_sub_int(val, self.is_expr_unsigned(inner));
-                const_arith::negate_const(promoted)
+                let is_unsigned = self.is_expr_unsigned(inner);
+                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
+                let result = const_arith::negate_const(promoted)?;
+                // -x of an unsigned int wraps at 32 bits, as ~x does below:
+                // -1338556541u is 2956410755, not a negative 64-bit value.
+                let inner_size = self.lookup_expr_type(inner)
+                    .or_else(|| self.infer_expr_ctype(inner))
+                    .map(|ct| self.ctype_size(&ct));
+                match (is_unsigned, inner_size, result.to_i64()) {
+                    (true, Some(4), Some(v)) => Some(IrConst::I64(v as u32 as i64)),
+                    _ => Some(result),
+                }
             }
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
@@ -116,12 +126,11 @@ impl<'a> SemaConstEval<'a> {
                 // Check the promoted type's actual width via the inner expression type.
                 let inner_ctype = self.lookup_expr_type(inner)
                     .or_else(|| self.infer_expr_ctype(inner));
+                // Exactly 4: a narrower unsigned type promotes to int, signed,
+                // so ~(unsigned char)255 is -256.
                 let is_32bit_type = inner_ctype.as_ref().map_or(
                     matches!(result, IrConst::I32(_)),
-                    |ct| {
-                        let size = self.ctype_size(ct);
-                        size <= 4
-                    },
+                    |ct| self.ctype_size(ct) == 4,
                 );
                 if is_32bit_type && is_unsigned {
                     // Truncate to 32-bit unsigned: mask to 0xFFFFFFFF and store as I64
@@ -158,10 +167,12 @@ impl<'a> SemaConstEval<'a> {
                     let rhs_ctype = self.lookup_expr_type(rhs)
                         .or_else(|| self.infer_expr_ctype(rhs))
                         .or_else(|| Self::ctype_from_ir_const(rv));
+                    // After promotion: a type narrower than int becomes int,
+                    // signed, unsigned char and unsigned short included.
                     let lhs_size = lhs_ctype.as_ref().map_or(4, |ct| self.ctype_size(ct).max(4));
-                    let lhs_unsigned = lhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
+                    let lhs_unsigned = lhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned() && self.ctype_size(ct) >= 4);
                     let rhs_size = rhs_ctype.as_ref().map_or(4, |ct| self.ctype_size(ct).max(4));
-                    let rhs_unsigned = rhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
+                    let rhs_unsigned = rhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned() && self.ctype_size(ct) >= 4);
                     let result = shared_const_eval::eval_binop_with_types(
                         op, lv, rv, lhs_size, lhs_unsigned, rhs_size, rhs_unsigned,
                     );
@@ -206,6 +217,11 @@ impl<'a> SemaConstEval<'a> {
             Expr::Cast(ref target_type, inner, _) => {
                 let target_ctype = self.type_spec_to_ctype(target_type);
                 let src_val = self.eval_const_expr(inner)?;
+                // To _Bool is a test against zero, not a truncation: (_Bool)6
+                // is 1, (_Bool)0.5 is 1, (_Bool)-0.0 is 0.
+                if matches!(target_ctype, CType::Bool) {
+                    return Some(IrConst::I64(src_val.is_nonzero() as i64));
+                }
 
                 // Handle float source types: use value-based conversion
                 // For LongDouble, use full x87 precision for integer conversions
@@ -346,10 +362,18 @@ impl<'a> SemaConstEval<'a> {
             // Ternary conditional
             Expr::Conditional(cond, then_e, else_e, _) => {
                 let cond_val = self.eval_const_expr(cond)?;
-                if cond_val.is_nonzero() {
-                    self.eval_const_expr(then_e)
-                } else {
-                    self.eval_const_expr(else_e)
+                let chosen = if cond_val.is_nonzero() { then_e } else { else_e };
+                let value = self.eval_const_expr(chosen)?;
+                // The value has the conditional's type, both branches' common
+                // one: in `c ? (int)-1 : 2147483647u` it is 4294967295.
+                let integer = |e: &Expr| self.lookup_expr_type(e).is_some_and(|t| t.is_integer());
+                match (self.lookup_expr_type(expr), integer(then_e) && integer(else_e)) {
+                    (Some(ct), true) if ct.is_integer() && matches!(self.ctype_size(&ct), 4 | 8) => {
+                        let (bits, _) = shared_const_eval::irconst_to_bits(&value);
+                        let (bits, _) = const_arith::truncate_and_extend_bits(bits, self.ctype_size(&ct) * 8, !ct.is_unsigned());
+                        Some(IrConst::I64(bits as i64))
+                    }
+                    _ => Some(value),
                 }
             }
 
@@ -397,8 +421,11 @@ impl<'a> SemaConstEval<'a> {
     fn eval_const_expr_as_bits(&self, expr: &Expr) -> Option<(u64, bool)> {
         match expr {
             Expr::Cast(ref target_type, inner, _) => {
-                let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
                 let target_ctype = self.type_spec_to_ctype(target_type);
+                if matches!(target_ctype, CType::Bool) {
+                    return Some((self.eval_const_expr(inner)?.is_nonzero() as u64, false));
+                }
+                let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
                 let target_width = self.ctype_size(&target_ctype) * 8;
                 let target_signed = !target_ctype.is_unsigned() && !target_ctype.is_pointer_like();
                 Some(const_arith::truncate_and_extend_bits(bits, target_width, target_signed))
