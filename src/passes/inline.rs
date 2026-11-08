@@ -698,16 +698,24 @@ fn inline_within_limits(module: &mut IrModule) -> usize {
                 break;
             }
 
-            // Only look for always_inline callees
+            // Only look for always_inline callees, and outside a kernel the
+            // tiny ones their bodies bring: zstd's ZSTD_wildcopy, inlined
+            // here, left ZSTD_copy16, one 16-byte load and store, a call at
+            // 100 sites of its decompression loop.
             let mut found = false;
             for site in &call_sites {
                 let callee_data = &callee_map[&site.callee_name];
-                if !callee_data.is_always_inline {
-                    continue;
-                }
                 let callee_inst_count: usize = effective_size(&callee_data.blocks);
                 let is_tiny = callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS
                     && callee_data.blocks.len() <= 1;
+                if !callee_data.is_always_inline {
+                    let mut tiny_once_cleaned = || specialized_size_cached(&mut spec_cache, &callee_map, &site.callee_name, &site.const_args)
+                        .is_some_and(|c| c.insts <= MAX_TINY_INLINE_INSTRUCTIONS && c.blocks <= 1);
+                    if crate::common::types::building_kernel() || callee_data.in_cycle || caller_is_recursive
+                        || !(is_tiny || tiny_once_cleaned()) {
+                        continue;
+                    }
+                }
                 let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
                     && callee_data.blocks.len() <= MAX_SMALL_INLINE_BLOCKS;
                 // Tiny and small always_inline callees always pass; others must fit
@@ -2596,6 +2604,25 @@ mod tests {
         run(&mut module);
         let caller = module.functions.iter().find(|f| f.name == "caller").unwrap();
         assert!(!caller.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Call { .. })));
+    }
+
+    /// Tiny calls an always_inline body brings in the second pass are inlined
+    /// too: more sites than the first pass has rounds, each `wrap` calling `leaf`.
+    #[test]
+    fn test_tiny_calls_brought_by_the_second_pass() {
+        let calls = vec!["wrap"; 300];
+        let mut module = IrModule::new();
+        module.functions = vec![
+            function("leaf", 2, &[], false),
+            function("wrap", 2, &["leaf"], true),
+            function("caller", 2, &calls, false),
+        ];
+        run(&mut module);
+        let caller = module.functions.iter().find(|f| f.name == "caller").unwrap();
+        let left: Vec<&str> = caller.blocks.iter().flat_map(|b| &b.instructions)
+            .filter_map(|i| match i { Instruction::Call { func, .. } => Some(func.as_str()), _ => None })
+            .collect();
+        assert!(left.is_empty(), "{} calls left, to {:?}", left.len(), left.first());
     }
 
     #[test]
