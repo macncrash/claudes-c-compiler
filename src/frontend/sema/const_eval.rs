@@ -282,11 +282,13 @@ impl<'a> SemaConstEval<'a> {
                 // (not target) to correctly interpret the bit pattern. E.g.,
                 // (double)(unsigned long)0xFFFFFFFFFFFFFFFF should produce
                 // 18446744073709551615.0, not -1.0.
+                // The value converts whole: truncated to a float's 4 bytes,
+                // (float)4611686018427387904l was 0.
                 if matches!(target_ctype, CType::Float | CType::Double | CType::LongDouble) {
                     let src_signed = self.lookup_expr_type(inner)
                         .or_else(|| self.infer_expr_ctype(inner))
                         .is_none_or(|ct| !ct.is_unsigned());
-                    return self.bits_to_irconst(truncated, &target_ctype, src_signed);
+                    return self.bits_to_irconst(bits, &target_ctype, src_signed);
                 }
 
                 // Convert to IrConst based on target CType
@@ -373,6 +375,24 @@ impl<'a> SemaConstEval<'a> {
                         let (bits, _) = const_arith::truncate_and_extend_bits(bits, self.ctype_size(&ct) * 8, !ct.is_unsigned());
                         Some(IrConst::I64(bits as i64))
                     }
+                    // An integer branch of a floating conditional converts by
+                    // its own signedness: 1 ? 18446744073709551615ul : 0.0.
+                    (Some(ct), false) if ct.is_floating() && integer(chosen) => {
+                        let (bits, _) = shared_const_eval::irconst_to_bits(&value);
+                        let signed = !self.lookup_expr_type(chosen).is_some_and(|t| t.is_unsigned());
+                        self.bits_to_irconst(bits, &ct, signed)
+                    }
+                    // A float branch of a double conditional widens, or its
+                    // float precision spreads to what uses it.
+                    (Some(CType::Double), false) => match value {
+                        IrConst::F32(f) => Some(IrConst::F64(f as f64)),
+                        other => Some(other),
+                    },
+                    (Some(CType::LongDouble), false) => match value {
+                        IrConst::F32(f) => Some(IrConst::long_double(f as f64)),
+                        IrConst::F64(f) => Some(IrConst::long_double(f)),
+                        other => Some(other),
+                    },
                     _ => Some(value),
                 }
             }

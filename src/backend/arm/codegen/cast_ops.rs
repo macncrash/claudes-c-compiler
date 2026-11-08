@@ -58,7 +58,16 @@ impl ArmCodegen {
                 }
             }
 
-            CastKind::UnsignedToFloat { to_f64, .. } => {
+            // The bits above the source's width are not known to be zero: a
+            // short sign-extended by its load and cast to unsigned is the same
+            // register, so (double)(unsigned)(short)-9 converted 2^64 - 9.
+            CastKind::UnsignedToFloat { to_f64, from_ty } => {
+                match from_ty.size() {
+                    1 => self.state.emit("    and x0, x0, #0xff"),
+                    2 => self.state.emit("    and x0, x0, #0xffff"),
+                    4 => self.state.emit("    mov w0, w0"),
+                    _ => {}
+                }
                 if to_f64 {
                     self.state.emit("    ucvtf d0, x0");
                     self.state.emit("    fmov x0, d0");

@@ -394,7 +394,31 @@ pub fn eval_const_binop(op: &BinOp, lhs: &IrConst, rhs: &IrConst, is_32bit: bool
     let rhs_is_float = matches!(rhs, IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..));
 
     if lhs_is_float || rhs_is_float {
-        return eval_const_binop_float(op, lhs, rhs);
+        // An integer operand converts to the other's floating type first, by
+        // its own signedness: long + float is done in float, and
+        // 18446744073709551615ul > 1.0 compares 2^64, not -1.
+        let to_float = |v: &IrConst, unsigned: bool, like: &IrConst| -> IrConst {
+            if matches!(v, IrConst::F32(_) | IrConst::F64(_) | IrConst::LongDouble(..)) {
+                return *v;
+            }
+            let wide = match v {
+                IrConst::I128(x) => *x,
+                _ => match v.to_i64() {
+                    Some(x) if unsigned => x as u64 as i128,
+                    Some(x) => x as i128,
+                    None => return *v,
+                },
+            };
+            match like {
+                IrConst::F32(_) => IrConst::F32(if unsigned { wide as u128 as f32 } else { wide as f32 }),
+                IrConst::LongDouble(..) if unsigned => IrConst::long_double_from_u128(wide as u128),
+                IrConst::LongDouble(..) => IrConst::long_double_from_i128(wide),
+                _ => IrConst::F64(if unsigned { wide as u128 as f64 } else { wide as f64 }),
+            }
+        };
+        let l = to_float(lhs, lhs_unsigned, rhs);
+        let r = to_float(rhs, rhs_unsigned, lhs);
+        return eval_const_binop_float(op, &l, &r);
     }
 
     // Use native i128 arithmetic when either operand is I128 to avoid truncation.
