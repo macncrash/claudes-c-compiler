@@ -844,7 +844,7 @@ impl Lowerer {
                             Initializer::Expr(_) => {
                                 // Flat/brace-elided init: pass remaining items to fill
                                 // this struct element field-by-field.
-                                let consumed = self.fill_struct_global_bytes(&items[sub_idx..], &elem_layout, bytes, elem_offset);
+                                let consumed = self.fill_struct_global_bytes(Self::elided_run(&items[sub_idx..]), &elem_layout, bytes, elem_offset);
                                 sub_idx += consumed;
                             }
                         }

@@ -102,6 +102,45 @@ impl Lowerer {
                 // items for subsequent array positions (C11 6.7.9p17).
                 CType::Array(elem_ty, Some(arr_size)) if has_nested => {
                     let arr_size = *arr_size;
+                    // .g[1] = { [2] = x } or .g[1][1] = 5, 6 in a multi-dimensional
+                    // array of scalars: by leaf position, from the designated one.
+                    let field_ty = field_layout.ty.clone();
+                    if Self::scalar_multidim_leaf(&field_ty).is_some()
+                        && item.designators[1..].iter().all(|d| matches!(d, Designator::Index(_)))
+                    {
+                        let leaf_size = self.leaf_elem_size(&field_ty).max(1);
+                        let (mut pos, mut depth, mut t) = (0usize, 0usize, &field_ty);
+                        for d in &item.designators[1..] {
+                            if let (Designator::Index(e), CType::Array(inner, _)) = (d, t) {
+                                let i = self.eval_const_expr(e).and_then(|c| c.to_usize()).unwrap_or(0);
+                                pos += i * (self.resolve_ctype_size(inner) / leaf_size);
+                                depth += 1;
+                                t = inner;
+                            }
+                        }
+                        let used = self.fill_scalar_multidim_bytes(&items[item_idx..], &field_ty, bytes, field_offset, Some((pos, depth)));
+                        item_idx += used.max(1);
+                        current_field_idx = field_idx + 1;
+                        continue;
+                    }
+                    // .p[1] = 6, 7, 8 for an array of structs: the values fill
+                    // p[1] without braces, then continue to p[2].
+                    if matches!(elem_ty.as_ref(), CType::Struct(_))
+                        && item.designators.len() == 2
+                        && matches!(item.designators[1], Designator::Index(_))
+                        && matches!(item.init, Initializer::Expr(_))
+                    {
+                        if let Some(start) = self.extract_index_designator(item, true) {
+                            let elem_size = self.resolve_ctype_size(elem_ty);
+                            let elem_ir_ty = IrType::from_ctype(elem_ty);
+                            item_idx = self.fill_flat_array_of_composites(
+                                items, item_idx, elem_ty, arr_size, elem_size, elem_ir_ty,
+                                bytes, field_offset, start,
+                            );
+                            current_field_idx = field_idx + 1;
+                            continue;
+                        }
+                    }
                     let desig_idx = self.fill_nested_designator_array(item, elem_ty, arr_size, bytes, field_offset);
                     item_idx += 1;
                     // Continue consuming subsequent non-designated items for positions
@@ -483,6 +522,14 @@ impl Lowerer {
         idx
     }
 
+    /// The items a brace-elided aggregate may take from a parent list: up to
+    /// the next designated one after the first, since a designator always
+    /// names a member of the enclosing braced list.
+    pub(super) fn elided_run(items: &[InitializerItem]) -> &[InitializerItem] {
+        let end = items.iter().skip(1).position(|it| !it.designators.is_empty()).map_or(items.len(), |p| p + 1);
+        &items[..end]
+    }
+
     /// Fill a composite (struct/union) field from an initializer.
     /// Returns the number of items consumed.
     pub(super) fn fill_composite_field(
@@ -505,15 +552,17 @@ impl Lowerer {
                 // If the item has a designator (e.g., `.y = 42` where y is a struct),
                 // strip it so the scalar is treated as a positional init for the first
                 // field of the sub-struct (C11 6.7.9p13).
+                // Values without braces continue into the struct until the next
+                // designator, which belongs to the enclosing list: in
+                // { .l = 300, -2, .d = 5 } the .d was taken by the struct and lost.
+                let run = Self::elided_run(items);
                 if !items[0].designators.is_empty() {
-                    let stripped = InitializerItem {
-                        designators: vec![],
-                        init: items[0].init.clone(),
-                    };
-                    self.fill_struct_global_bytes(&[stripped], sub_layout, bytes, field_offset);
-                    1
+                    let mut owned = run.to_vec();
+                    owned[0].designators.clear();
+                    let consumed = self.fill_struct_global_bytes(&owned, sub_layout, bytes, field_offset);
+                    consumed.max(1)
                 } else {
-                    let consumed = self.fill_struct_global_bytes(items, sub_layout, bytes, field_offset);
+                    let consumed = self.fill_struct_global_bytes(run, sub_layout, bytes, field_offset);
                     if consumed == 0 { 1 } else { consumed }
                 }
             }
@@ -535,6 +584,24 @@ impl Lowerer {
         let item = &items[item_idx];
         let elem_size = self.resolve_ctype_size(elem_ty);
         let elem_ir_ty = IrType::from_ctype(elem_ty);
+
+        // Multi-dimensional arrays of scalars go by leaf position, with row
+        // designators: .g = { [1] = { [1] = -72 } } wrote row 0.
+        let arr_ty = CType::Array(Box::new(elem_ty.clone()), Some(arr_size));
+        if Self::scalar_multidim_leaf(&arr_ty).is_some() {
+            return match &item.init {
+                Initializer::List(sub_items) => {
+                    self.fill_scalar_multidim_bytes(sub_items, &arr_ty, bytes, field_offset, None);
+                    ArrayFillResult { new_item_idx: item_idx + 1, skip_update: false }
+                }
+                Initializer::Expr(_) => {
+                    let per_elem = elem_size / self.leaf_elem_size(elem_ty).max(1);
+                    let start = Some((array_start_idx.unwrap_or(0) * per_elem, 1));
+                    let used = self.fill_scalar_multidim_bytes(&items[item_idx..], &arr_ty, bytes, field_offset, start);
+                    ArrayFillResult { new_item_idx: item_idx + used.max(1), skip_update: true }
+                }
+            };
+        }
 
         match &item.init {
             Initializer::List(sub_items) => {
@@ -611,6 +678,123 @@ impl Lowerer {
         }
     }
 
+    /// The leaf of a multi-dimensional array of plain scalars, if `ty` is one.
+    fn scalar_multidim_leaf(ty: &CType) -> Option<&CType> {
+        let CType::Array(first, Some(_)) = ty else { return None };
+        let mut leaf: &CType = first;
+        let mut dims = 1;
+        while let CType::Array(inner, Some(_)) = leaf {
+            leaf = inner;
+            dims += 1;
+        }
+        let plain = !matches!(leaf, CType::Struct(_) | CType::Union(_) | CType::Array(..) | CType::Vector(..))
+            && !leaf.is_complex();
+        (dims > 1 && plain).then_some(leaf)
+    }
+
+    /// Fill a multi-dimensional array of scalars, `arr_ty`, at `offset` by
+    /// leaf position: a scalar fills the next leaf, a braced list fills the
+    /// outermost sub-array starting there (C11 6.7.9p20), a string fills a
+    /// char row, and [i] designators move the position. With
+    /// `start` = (leaf position, designator depth) set, `items` continue a parent
+    /// list from that leaf and end at the next designated item. Returns the
+    /// number of items used.
+    pub(super) fn fill_scalar_multidim_bytes(
+        &self,
+        items: &[InitializerItem],
+        arr_ty: &CType,
+        bytes: &mut [u8],
+        offset: usize,
+        start: Option<(usize, usize)>,
+    ) -> usize {
+        let mut extents = Vec::new();
+        let mut leaf = arr_ty;
+        while let CType::Array(elem, Some(n)) = leaf {
+            extents.push(*n);
+            leaf = elem.as_ref();
+        }
+        if extents.is_empty() {
+            return 0;
+        }
+        let mut strides = vec![1usize; extents.len()];
+        for k in (0..extents.len() - 1).rev() {
+            strides[k] = strides[k + 1] * extents[k + 1];
+        }
+        let total = strides[0] * extents[0];
+        let leaf_size = self.resolve_ctype_size(leaf);
+        let leaf_ir_ty = IrType::from_ctype(leaf);
+        let leaf_is_char = matches!(leaf, CType::Char | CType::UChar);
+        let row = extents[extents.len() - 1];
+        let continuing = start.is_some();
+        let mut pos = start.map_or(0, |(p, _)| p);
+        let mut i = 0;
+        while i < items.len() {
+            let item = &items[i];
+            if !item.designators.is_empty() && (!continuing || i != 0) {
+                if continuing {
+                    break;
+                }
+                let mut p = 0;
+                for (k, d) in item.designators.iter().enumerate() {
+                    match d {
+                        Designator::Index(e) if k < extents.len() => {
+                            p += self.eval_const_expr(e).and_then(|c| c.to_usize()).unwrap_or(0) * strides[k];
+                        }
+                        _ => break,
+                    }
+                }
+                pos = p;
+            }
+            if pos >= total {
+                break;
+            }
+            match &item.init {
+                Initializer::Expr(Expr::StringLiteral(s, _)) if leaf_is_char => {
+                    let row_start = pos - pos % row;
+                    Self::write_string_to_bytes(bytes, offset + row_start * leaf_size, s, row);
+                    pos = row_start + row;
+                }
+                Initializer::Expr(e) => {
+                    let val = h::bool_normalized(leaf, self.eval_const_expr(e).unwrap_or(IrConst::I64(0)));
+                    self.write_const_to_bytes(bytes, offset + pos * leaf_size, &val, leaf_ir_ty);
+                    pos += 1;
+                }
+                Initializer::List(sub) => {
+                    // A designated first item's braces fill the subobject its
+                    // designators name: .g[1][0] = { ... } is a row, not a plane.
+                    let k = match start {
+                        Some((_, depth)) if i == 0 && depth >= 1 => (depth - 1).min(extents.len() - 1),
+                        _ => (0..extents.len()).find(|&k| pos.is_multiple_of(strides[k])).unwrap_or(extents.len() - 1),
+                    };
+                    if strides[k] == 1 && k == extents.len() - 1 {
+                        // Braces around a scalar, or a string for a char row.
+                        match sub.first().map(|s| &s.init) {
+                            Some(Initializer::Expr(Expr::StringLiteral(s, _))) if leaf_is_char => {
+                                Self::write_string_to_bytes(bytes, offset + pos * leaf_size, s, row);
+                                pos += row;
+                            }
+                            Some(init) => {
+                                let val = h::bool_normalized(leaf, self.eval_init_scalar(init));
+                                self.write_const_to_bytes(bytes, offset + pos * leaf_size, &val, leaf_ir_ty);
+                                pos += 1;
+                            }
+                            None => pos += 1,
+                        }
+                    } else {
+                        let mut sub_ty = leaf.clone();
+                        for &n in extents[k + 1..].iter().rev() {
+                            sub_ty = CType::Array(Box::new(sub_ty), Some(n));
+                        }
+                        self.fill_scalar_multidim_bytes(sub, &sub_ty, bytes, offset + pos * leaf_size, None);
+                        pos += strides[k];
+                    }
+                }
+            }
+            i += 1;
+        }
+        i
+    }
+
     /// Fill a multi-dimensional array field from a braced initializer list.
     /// Handles arrays like `int a[2][3]`, `struct S a[2][2][2]`, `union U a[3][4]`, etc.
     /// Each sub-item at this level represents one element of the outermost dimension.
@@ -660,7 +844,7 @@ impl Lowerer {
                         while sub_idx < sub_items.len() && ci < composites_per_outer {
                             let comp_offset = elem_offset + ci * composite_size;
                             let consumed = self.fill_struct_global_bytes(
-                                &sub_items[sub_idx..], &composite_layout, bytes, comp_offset,
+                                Self::elided_run(&sub_items[sub_idx..]), &composite_layout, bytes, comp_offset,
                             );
                             sub_idx += consumed.max(1);
                             ci += 1;
@@ -850,23 +1034,40 @@ impl Lowerer {
         let sub_layout = self.get_composite_layout(elem_ty);
         let mut sub_idx = 0usize;
         let mut ai = 0usize;
-        while ai < arr_size && sub_idx < sub_items.len() {
+        while sub_idx < sub_items.len() {
             // Handle designated array index initializers (e.g., [3] = { ... })
+            let mut indexed = false;
             if let Some(Designator::Index(ref idx_expr)) = sub_items[sub_idx].designators.first() {
                 if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
                     ai = idx;
                 }
+                indexed = true;
             }
-            if ai >= arr_size { break; }
+            if ai >= arr_size { sub_idx += 1; continue; }  // excess: a later [i] may come back
             let elem_offset = field_offset + ai * elem_size;
+            // [0].s = 5 names a member of element 0: its rest goes to the struct.
+            if indexed && sub_items[sub_idx].designators.len() > 1 {
+                let mut rest = sub_items[sub_idx].clone();
+                rest.designators.remove(0);
+                self.fill_struct_global_bytes(std::slice::from_ref(&rest), &sub_layout, bytes, elem_offset);
+                sub_idx += 1;
+                continue;
+            }
             match &sub_items[sub_idx].init {
                 Initializer::List(inner_items) => {
                     self.fill_struct_global_bytes(inner_items, &sub_layout, bytes, elem_offset);
                     sub_idx += 1;
                 }
                 Initializer::Expr(_) => {
-                    let consumed = self.fill_struct_global_bytes(&sub_items[sub_idx..], &sub_layout, bytes, elem_offset);
-                    sub_idx += consumed;
+                    let run = Self::elided_run(&sub_items[sub_idx..]);
+                    let consumed = if indexed {
+                        let mut owned = run.to_vec();
+                        owned[0].designators.clear();
+                        self.fill_struct_global_bytes(&owned, &sub_layout, bytes, elem_offset)
+                    } else {
+                        self.fill_struct_global_bytes(run, &sub_layout, bytes, elem_offset)
+                    };
+                    sub_idx += consumed.max(1);
                 }
             }
             ai += 1;
@@ -885,7 +1086,7 @@ impl Lowerer {
                     ai = idx;
                 }
             }
-            if ai >= arr_size { break; }
+            if ai >= arr_size { ai += 1; continue; }
             let elem_offset = field_offset + ai * elem_size;
             let val = self.eval_init_scalar(&sub_item.init);
             self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
@@ -906,7 +1107,7 @@ impl Lowerer {
                     ai = idx;
                 }
             }
-            if ai >= arr_size { break; }
+            if ai >= arr_size { ai += 1; continue; }
             let elem_offset = field_offset + ai * elem_size;
             self.write_complex_field_to_bytes(bytes, elem_offset, complex_ctype, &sub_item.init);
             ai += 1;
@@ -944,9 +1145,28 @@ impl Lowerer {
         if matches!(elem_ty, CType::Struct(_)) {
             for ai in start_ai..arr_size {
                 if item_idx >= items.len() { break; }
+                let next = &items[item_idx];
                 let elem_offset = field_offset + ai * elem_size;
-                let consumed = self.fill_struct_global_bytes(&items[item_idx..], &sub_layout, bytes, elem_offset);
-                item_idx += consumed;
+                if ai > start_ai {
+                    // A designator ends the elision; a braced item is the
+                    // next element whole: { 1, 2, 3, 4, 5, { 6, ... }, 11 }.
+                    if !next.designators.is_empty() { break; }
+                    if let Initializer::List(sub) = &next.init {
+                        self.fill_struct_global_bytes(sub, &sub_layout, bytes, elem_offset);
+                        item_idx += 1;
+                        continue;
+                    }
+                }
+                let run = Self::elided_run(&items[item_idx..]);
+                // The first item's designator (.p[1] = 6) chose this element.
+                let consumed = if ai == start_ai && !next.designators.is_empty() {
+                    let mut owned = run.to_vec();
+                    owned[0].designators.clear();
+                    self.fill_struct_global_bytes(&owned, &sub_layout, bytes, elem_offset)
+                } else {
+                    self.fill_struct_global_bytes(run, &sub_layout, bytes, elem_offset)
+                };
+                item_idx += consumed.max(1);
             }
         } else {
             // Union: take one item per element
@@ -1163,13 +1383,22 @@ impl Lowerer {
                         let flat_struct_base = (elem_offset - base_offset) / struct_size;
                         let mut fi = flat_struct_base;
                         while item_idx < items.len() && fi < max_structs {
+                            // A braced or designated item is the next element's,
+                            // not the next struct's first field:
+                            // { { 1 }, 2, 3, 4, { 7, 8, 9 } } kept only the 7.
+                            if fi > flat_struct_base
+                                && (matches!(items[item_idx].init, Initializer::List(_))
+                                    || !items[item_idx].designators.is_empty())
+                            {
+                                break;
+                            }
                             let byte_off = base_offset + fi * struct_size;
                             if byte_off + struct_size > bytes.len() { break; }
-                            let consumed = self.fill_struct_global_bytes(&items[item_idx..], layout, bytes, byte_off);
+                            let consumed = self.fill_struct_global_bytes(Self::elided_run(&items[item_idx..]), layout, bytes, byte_off);
                             item_idx += consumed.max(1);
                             fi += 1;
                         }
-                        // Skip the normal current_idx increment since we consumed everything
+                        current_idx = (fi * struct_size).div_ceil(this_stride);
                         continue;
                     }
                 }

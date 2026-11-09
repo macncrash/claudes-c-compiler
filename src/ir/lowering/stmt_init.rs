@@ -792,9 +792,10 @@ impl Lowerer {
                         item_idx += 1;
                         continue; // flat_idx already advanced
                     } else {
-                        // Leaf: this List is a single struct initializer
-                        let elem_base = self.emit_gep_offset(alloca, base_byte_offset, IrType::I8);
-                        self.lower_local_struct_init(sub_items, elem_base, s_layout);
+                        // Leaf: this List is a single struct initializer, by the
+                        // same rules as a lone local struct (brace elision in
+                        // its members: { { 1, 2, ... } } for struct P p[2]).
+                        self.emit_struct_init(sub_items, alloca, s_layout, base_byte_offset);
                     }
                 }
                 Initializer::Expr(e) => {
@@ -807,7 +808,7 @@ impl Lowerer {
                         self.emit_memcpy_at_offset(alloca, base_byte_offset, src_addr, struct_size);
                     } else {
                         // Flat scalar init without braces (e.g., `struct t a[2] = {1,2,3,4}`)
-                        let consumed = self.emit_struct_init(&items[item_idx..], alloca, s_layout, base_byte_offset);
+                        let consumed = self.emit_struct_init(Self::elided_run(&items[item_idx..]), alloca, s_layout, base_byte_offset);
                         item_idx += consumed.max(1);
                         *flat_idx += 1;
                         continue;
@@ -865,8 +866,7 @@ impl Lowerer {
             } else if let CType::Struct(ref key) | CType::Union(ref key) = field.ty {
                 let sub_layout = self.types.borrow_struct_layouts().get(&**key).cloned();
                 if let Some(sub_layout) = sub_layout {
-                    let dest = self.emit_gep_offset(alloca, field_offset, IrType::I8);
-                    self.lower_local_struct_init(sub_items, dest, &sub_layout);
+                    self.emit_struct_init(sub_items, alloca, &sub_layout, field_offset);
                 }
             } else if let Some(first) = sub_items.first() {
                 if let Initializer::Expr(e) = &first.init {
