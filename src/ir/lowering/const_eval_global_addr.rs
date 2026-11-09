@@ -66,6 +66,89 @@ impl Lowerer {
     /// - `(type *)&x` (cast of address expression)
     /// - `&x + n` or `&x - n` (pointer arithmetic on global address)
     pub(super) fn eval_global_addr_expr(&self, expr: &Expr) -> Option<GlobalInit> {
+        // The general walk catches chains the patterns below miss, which
+        // were emitted as null: &so.in[1].s[1], so.m[1], &sarr[2].in[1].i.
+        self.eval_global_addr_pattern(expr).or_else(|| {
+            let (name, off, _) = self.const_pointer_value(expr)?;
+            Some(if off == 0 { GlobalInit::GlobalAddr(name) } else { GlobalInit::GlobalAddrOffset(name, off) })
+        })
+    }
+
+    /// The address of an lvalue built from a global by members, constant
+    /// subscripts and dereferences of constant pointers, as (symbol, byte
+    /// offset, the lvalue's type).
+    fn const_lvalue_addr(&self, expr: &Expr) -> Option<(String, i64, CType)> {
+        match expr {
+            Expr::Identifier(name, _) => {
+                let global = self.resolve_to_global_name(name)?;
+                let ty = self.globals.get(&global)?.c_type.clone()?;
+                Some((global, 0, ty))
+            }
+            Expr::MemberAccess(base, field, _) => {
+                let (global, off, ty) = self.const_lvalue_addr(base)?;
+                self.const_field_addr(global, off, &ty, field)
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                let (global, off, ty) = self.const_pointer_value(base)?;
+                self.const_field_addr(global, off, &ty, field)
+            }
+            Expr::ArraySubscript(base, index, _) => {
+                let (ptr, idx) = match self.const_pointer_value(base) {
+                    Some(p) => (p, index),
+                    None => (self.const_pointer_value(index)?, base),
+                };
+                let i = self.const_to_i64(&self.eval_const_expr(idx)?)?;
+                let size = self.ctype_size(&ptr.2) as i64;
+                Some((ptr.0, ptr.1 + i * size, ptr.2))
+            }
+            Expr::Deref(inner, _) => self.const_pointer_value(inner),
+            _ => None,
+        }
+    }
+
+    fn const_field_addr(&self, global: String, off: i64, ty: &CType, field: &str) -> Option<(String, i64, CType)> {
+        let key = match ty {
+            CType::Struct(key) | CType::Union(key) => key,
+            _ => return None,
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        let layout = layouts.get(&**key)?.clone();
+        let (field_off, field_ty) = layout.field_offset(field, &*layouts)?;
+        Some((global, off + field_off as i64, field_ty))
+    }
+
+    /// A constant pointer value as (symbol, byte offset, pointee type): an
+    /// address, an array that decays, a pointer cast, or one of these plus or
+    /// minus a constant scaled by the pointee's size.
+    fn const_pointer_value(&self, expr: &Expr) -> Option<(String, i64, CType)> {
+        match expr {
+            Expr::AddressOf(inner, _) => self.const_lvalue_addr(inner),
+            Expr::Cast(ts, inner, _) => {
+                let (global, off, _) = self.const_pointer_value(inner)?;
+                match self.type_spec_to_ctype(ts) {
+                    CType::Pointer(pointee, _) => Some((global, off, *pointee)),
+                    _ => None,
+                }
+            }
+            Expr::BinaryOp(op @ (BinOp::Add | BinOp::Sub), lhs, rhs, _) => {
+                let (ptr, n, negate) = match self.const_pointer_value(lhs) {
+                    Some(p) => (p, rhs, matches!(op, BinOp::Sub)),
+                    None if matches!(op, BinOp::Add) => (self.const_pointer_value(rhs)?, lhs, false),
+                    None => return None,
+                };
+                let k = self.const_to_i64(&self.eval_const_expr(n)?)?;
+                // GNU: arithmetic on void * counts bytes.
+                let size = (self.ctype_size(&ptr.2) as i64).max(1);
+                Some((ptr.0, ptr.1 + if negate { -k * size } else { k * size }, ptr.2))
+            }
+            _ => match self.const_lvalue_addr(expr)? {
+                (global, off, CType::Array(elem, _)) => Some((global, off, *elem)),
+                _ => None,
+            },
+        }
+    }
+
+    fn eval_global_addr_pattern(&self, expr: &Expr) -> Option<GlobalInit> {
         match expr {
             // &x -> GlobalAddr("x")
             Expr::AddressOf(inner, _) => {
