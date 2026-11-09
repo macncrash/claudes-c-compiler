@@ -108,17 +108,8 @@ impl Lowerer {
                     if Self::scalar_multidim_leaf(&field_ty).is_some()
                         && item.designators[1..].iter().all(|d| matches!(d, Designator::Index(_)))
                     {
-                        let leaf_size = self.leaf_elem_size(&field_ty).max(1);
-                        let (mut pos, mut depth, mut t) = (0usize, 0usize, &field_ty);
-                        for d in &item.designators[1..] {
-                            if let (Designator::Index(e), CType::Array(inner, _)) = (d, t) {
-                                let i = self.eval_const_expr(e).and_then(|c| c.to_usize()).unwrap_or(0);
-                                pos += i * (self.resolve_ctype_size(inner) / leaf_size);
-                                depth += 1;
-                                t = inner;
-                            }
-                        }
-                        let used = self.fill_scalar_multidim_bytes(&items[item_idx..], &field_ty, bytes, field_offset, Some((pos, depth)));
+                        let start = self.multidim_designated_start(&field_ty, &item.designators[1..]);
+                        let used = self.fill_scalar_multidim_bytes(&items[item_idx..], &field_ty, bytes, field_offset, Some(start));
                         item_idx += used.max(1);
                         current_field_idx = field_idx + 1;
                         continue;
@@ -679,7 +670,23 @@ impl Lowerer {
     }
 
     /// The leaf of a multi-dimensional array of plain scalars, if `ty` is one.
-    fn scalar_multidim_leaf(ty: &CType) -> Option<&CType> {
+    /// The leaf position and depth that index designators ([1][2]) name in
+    /// the multi-dimensional array `arr_ty`.
+    pub(super) fn multidim_designated_start(&self, arr_ty: &CType, desigs: &[Designator]) -> (usize, usize) {
+        let leaf_size = self.leaf_elem_size(arr_ty).max(1);
+        let (mut pos, mut depth, mut t) = (0usize, 0usize, arr_ty);
+        for d in desigs {
+            if let (Designator::Index(e), CType::Array(inner, _)) = (d, t) {
+                let i = self.eval_const_expr(e).and_then(|c| c.to_usize()).unwrap_or(0);
+                pos += i * (self.resolve_ctype_size(inner) / leaf_size);
+                depth += 1;
+                t = inner;
+            }
+        }
+        (pos, depth)
+    }
+
+    pub(super) fn scalar_multidim_leaf(ty: &CType) -> Option<&CType> {
         let CType::Array(first, Some(_)) = ty else { return None };
         let mut leaf: &CType = first;
         let mut dims = 1;
@@ -687,7 +694,8 @@ impl Lowerer {
             leaf = inner;
             dims += 1;
         }
-        let plain = !matches!(leaf, CType::Struct(_) | CType::Union(_) | CType::Array(..) | CType::Vector(..))
+        let plain = !matches!(leaf, CType::Struct(_) | CType::Union(_) | CType::Array(..) | CType::Vector(..)
+            | CType::Pointer(..) | CType::Function(_))
             && !leaf.is_complex();
         (dims > 1 && plain).then_some(leaf)
     }

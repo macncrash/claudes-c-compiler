@@ -138,24 +138,18 @@ impl Lowerer {
         let mut bytes = vec![0u8; total_size];
         let mut ptr_ranges: Vec<(usize, GlobalInit)> = Vec::new();
 
-        if h::has_array_field_designators(items) {
-            // Handle [N].field = value pattern (e.g., postgres mcxt_methods[]).
-            self.fill_array_field_designator_items(
-                items, layout, struct_size, num_elems, 0, &mut bytes, &mut ptr_ranges,
-            );
-        } else {
-            // Original path: items correspond 1-to-1 to array elements (no [N].field designators).
-            // Each item is either a braced list for one struct element or a single expression.
-            self.fill_struct_array_sequential(
-                items, layout, num_elems,
-                &mut bytes, &mut ptr_ranges,
-            );
-        }
+        // Elements in order, by braced lists, values with brace elision, and
+        // [N] = ... or [N].field = ... designators (e.g., postgres mcxt_methods[]).
+        self.fill_struct_array_sequential(
+            items, layout, num_elems, 0,
+            &mut bytes, &mut ptr_ranges,
+        );
 
         Self::build_compound_from_bytes_and_ptrs(bytes, ptr_ranges, total_size)
     }
 
-    /// Fill struct fields from an initializer item list into the byte buffer and ptr_ranges.
+    /// Fill struct fields from an initializer item list into the byte buffer and ptr_ranges;
+    /// returns the number of items used.
     /// Used both for braced init lists `{ field1, field2, ... }` and for unwrapped compound
     /// literals `((struct S) { field1, field2, ... })` in struct array initializers.
     ///
@@ -169,7 +163,7 @@ impl Lowerer {
         base_offset: usize,
         bytes: &mut [u8],
         ptr_ranges: &mut Vec<(usize, GlobalInit)>,
-    ) {
+    ) -> usize {
         let mut current_field_idx = 0usize;
         let mut item_idx = 0usize;
         while item_idx < sub_items.len() {
@@ -200,7 +194,50 @@ impl Lowerer {
             let field = &layout.fields[field_idx];
             let field_offset = base_offset + field.offset;
 
-            if h::has_nested_field_designator(sub_item) {
+            // A multi-dimensional array of scalars, by leaf position, as in the
+            // byte path: g[2][3] = { 1, 2, 3, 4 } stored a value per row.
+            let nested = h::has_nested_field_designator(sub_item);
+            if Self::scalar_multidim_leaf(&field.ty).is_some()
+                && (!nested || sub_item.designators[1..].iter().all(|d| matches!(d, Designator::Index(_))))
+            {
+                let field_ty = field.ty.clone();
+                let used = match (&sub_item.init, nested) {
+                    (Initializer::List(sub), false) => {
+                        self.fill_scalar_multidim_bytes(sub, &field_ty, bytes, field_offset, None);
+                        1
+                    }
+                    _ => {
+                        let start = if nested {
+                            self.multidim_designated_start(&field_ty, &sub_item.designators[1..])
+                        } else {
+                            (0, 1)
+                        };
+                        self.fill_scalar_multidim_bytes(&sub_items[item_idx..], &field_ty, bytes, field_offset, Some(start))
+                    }
+                };
+                item_idx += used.max(1);
+                current_field_idx = field_idx + 1;
+                if layout.is_union && desig_name.is_none() { break; }
+                continue;
+            }
+
+            // .p[1] = 4, 5, ... for an array of structs: the values fill p[1]
+            // member by member, then continue to p[2].
+            if nested && sub_item.designators.len() == 2 && matches!(sub_item.init, Initializer::Expr(_)) {
+                if let (CType::Array(ref elem_ty, Some(arr_size)), Designator::Index(_)) = (&field.ty, &sub_item.designators[1]) {
+                    if let (CType::Struct(_), Some(elem_layout)) = (elem_ty.as_ref(), self.get_struct_layout_for_ctype(elem_ty)) {
+                        let mut run = Self::elided_run(&sub_items[item_idx..]).to_vec();
+                        run[0].designators.remove(0);
+                        let used = self.fill_struct_array_sequential(&run, &elem_layout, *arr_size, field_offset, bytes, ptr_ranges);
+                        item_idx += used.max(1);
+                        current_field_idx = field_idx + 1;
+                        if layout.is_union && desig_name.is_none() { break; }
+                        continue;
+                    }
+                }
+            }
+
+            if nested {
                 self.fill_nested_designator_with_ptrs(
                     sub_item, &field.ty, field_offset,
                     bytes, ptr_ranges,
@@ -272,6 +309,7 @@ impl Lowerer {
             item_idx += 1;
             if layout.is_union && desig_name.is_none() { break; }
         }
+        item_idx
     }
 
     /// Emit a single struct field initialization into the byte buffer and ptr_ranges.
@@ -303,6 +341,15 @@ impl Lowerer {
                 bytes, ptr_ranges,
             );
         } else if let Initializer::List(ref inner_items) = item.init {
+            // { "yz" } for a char array member: the string's bytes.
+            if let (CType::Array(ref elem, Some(n)), [only]) = (&field.ty, inner_items.as_slice()) {
+                if let (true, Initializer::Expr(Expr::StringLiteral(s, _))) =
+                    (matches!(elem.as_ref(), CType::Char | CType::UChar) && only.designators.is_empty(), &only.init)
+                {
+                    Self::write_string_to_bytes(bytes, field_offset, s, *n);
+                    return;
+                }
+            }
             if is_ptr_array {
                 let arr_size = match &field.ty {
                     CType::Array(_, Some(s)) => *s,
@@ -345,9 +392,10 @@ impl Lowerer {
         items: &[InitializerItem],
         layout: &crate::common::types::StructLayout,
         num_elems: usize,
+        array_base: usize,
         bytes: &mut [u8],
         ptr_ranges: &mut Vec<(usize, GlobalInit)>,
-    ) {
+    ) -> usize {
         let struct_size = layout.size;
         // Track the current sequential index for items without designators
         let mut current_idx = 0usize;
@@ -362,11 +410,28 @@ impl Lowerer {
             }
             let elem_idx = current_idx;
             if elem_idx >= num_elems {
+                // Past the end: the rest is the next member's when the array
+                // was filled by elision; excess skipped while a later [i]
+                // could still come back.
+                if items[item_idx..].iter().all(|it| it.designators.is_empty()) {
+                    break;
+                }
                 current_idx += 1;
                 item_idx += 1;
                 continue;
             }
-            let base_offset = elem_idx * struct_size;
+            let base_offset = array_base + elem_idx * struct_size;
+
+            // [i].f = v names a member of element i; values after it continue
+            // through that element's later members.
+            if item.designators.len() > 1 && matches!(item.designators.first(), Some(Designator::Index(_))) {
+                let mut run = Self::elided_run(&items[item_idx..]).to_vec();
+                run[0].designators.remove(0);
+                let consumed = self.fill_struct_fields_from_items(&run, layout, base_offset, bytes, ptr_ranges);
+                item_idx += consumed.max(1);
+                current_idx += 1;
+                continue;
+            }
 
             match &item.init {
                 Initializer::List(sub_items) => {
@@ -401,32 +466,22 @@ impl Lowerer {
                         }
                         item_idx += 1;
                     } else {
-                        // Flat initialization: consume items field-by-field for this struct.
-                        // Each item corresponds to one field, not one struct element.
-                        let mut current_field_idx = 0usize;
-                        while item_idx < items.len() && current_field_idx < layout.fields.len() {
-                            let sub_item = &items[item_idx];
-                            // If this item has an array index designator, it starts a new element
-                            if !sub_item.designators.is_empty() && item_idx != 0 {
-                                break;
-                            }
-                            let field = &layout.fields[current_field_idx];
-                            let field_offset = base_offset + field.offset;
-
-                            self.emit_struct_field_init_compound(
-                                sub_item, field, field_offset,
-                                bytes, ptr_ranges,
-                            );
-                            current_field_idx += 1;
-                            item_idx += 1;
-                            // For unions, only initialize the first member
-                            if layout.is_union { break; }
-                        }
+                        // Flat initialization: the values fill this element's members
+                        // with brace elision (an int a[3] member takes three), up to
+                        // the next designator. One value per member put
+                        // { 50, 65537, 1, 100, "x", 7, ... } a pointer past the array.
+                        let mut run = Self::elided_run(&items[item_idx..]).to_vec();
+                        run[0].designators.clear();
+                        let consumed = self.fill_struct_fields_from_items(
+                            &run, layout, base_offset, bytes, ptr_ranges,
+                        );
+                        item_idx += consumed.max(1);
                     }
                 }
             }
             current_idx += 1;
         }
+        item_idx
     }
 
     /// Process `[N].field = value` designated initializer items for a struct array.
@@ -704,6 +759,16 @@ impl Lowerer {
         ptr_ranges: &mut Vec<(usize, GlobalInit)>,
     ) -> usize {
         let elem_size = self.resolve_ctype_size(elem_ty);
+        // Struct elements take their members' values with brace elision, as an
+        // array of structs does at top level: one value per element put
+        // { 39, -1, 255, 1, "s1", ... } a value in each struct.
+        if matches!(elem_ty, CType::Struct(_)) {
+            if let Some(elem_layout) = self.get_struct_layout_for_ctype(elem_ty) {
+                let mut run = Self::elided_run(items).to_vec();
+                run[0].designators.clear();
+                return self.fill_struct_array_sequential(&run, &elem_layout, arr_size, field_offset, bytes, ptr_ranges).max(1);
+            }
+        }
         let mut consumed = 0usize;
         while consumed < arr_size && consumed < items.len() {
             let item = &items[consumed];
@@ -799,30 +864,15 @@ impl Lowerer {
             // Array field: check if elements are structs/unions with pointer fields
             if let Some(elem_layout) = self.get_struct_layout_for_ctype(elem_ty) {
                 if elem_layout.has_pointer_fields(&*self.types.borrow_struct_layouts()) {
-                    // Array of structs with pointer fields: handle each element
-                    let struct_size = elem_layout.size;
-                    for (ai, item) in items.iter().enumerate() {
-                        let elem_offset = offset + ai * struct_size;
-                        match &item.init {
-                            Initializer::List(sub_items) => {
-                                self.fill_nested_struct_with_ptrs(
-                                    sub_items, &elem_layout, elem_offset, bytes, ptr_ranges,
-                                );
-                            }
-                            Initializer::Expr(expr) => {
-                                // Single expression for first field of struct element
-                                if !elem_layout.fields.is_empty() {
-                                    let field = &elem_layout.fields[0];
-                                    let field_offset = elem_offset + field.offset;
-                                    self.write_expr_to_bytes_or_ptrs(
-                                        expr, &field.ty, field_offset,
-                                        field.bit_offset, field.bit_width,
-                                        bytes, ptr_ranges,
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    // Array of structs with pointer fields: elements by braced
+                    // lists, brace elision and [i] designators, as at top level.
+                    // One item per element put { -1, 65537, ..., "x", -1 } one
+                    // value in each struct.
+                    let arr_size = match field_ty {
+                        CType::Array(_, Some(s)) => *s,
+                        _ => items.len(),
+                    };
+                    self.fill_struct_array_sequential(items, &elem_layout, arr_size, offset, bytes, ptr_ranges);
                 } else {
                     // Array of structs without pointer fields: byte serialization.
                     // Handles both braced sub-items (List) and flat/brace-elided

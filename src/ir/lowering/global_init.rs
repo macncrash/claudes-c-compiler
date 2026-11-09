@@ -1220,11 +1220,19 @@ impl Lowerer {
         layout: &StructLayout,
     ) -> GlobalInit {
         let has_addr_fields = self.struct_init_has_addr_fields(items, layout);
+        let fam_extra = self.compute_fam_extra_size(items, layout);
+        if has_addr_fields && !layout.is_union && fam_extra == 0 {
+            // As one element of an array, by the path that handles brace
+            // elision and designators around address fields: the compound
+            // path stored { { -1, 65537, ..., "x", -1 } } one value per struct.
+            let whole = InitializerItem { designators: Vec::new(), init: Initializer::List(items.to_vec()) };
+            return self.lower_struct_array_with_ptrs(std::slice::from_ref(&whole), layout, 1);
+        }
         if has_addr_fields {
             return self.lower_struct_global_init_compound(items, layout);
         }
 
-        let total_size = layout.size + self.compute_fam_extra_size(items, layout);
+        let total_size = layout.size + fam_extra;
         let mut bytes = vec![0u8; total_size];
         self.fill_struct_global_bytes(items, layout, &mut bytes, 0);
         let values: Vec<IrConst> = bytes.iter().map(|&b| IrConst::I8(b as i8)).collect();

@@ -488,6 +488,10 @@ impl Lowerer {
         let ptr_sz = crate::common::types::target_ptr_size();
         let mut deduped: Vec<(usize, GlobalInit)> = Vec::new();
         for (off, init) in ptr_ranges {
+            // An excess initializer past the end is dropped, not a crash.
+            if off + ptr_sz > total_size.min(bytes.len()) {
+                continue;
+            }
             if let Some(last) = deduped.last_mut() {
                 if off == last.0 {
                     // Same offset: last-designator-wins (replace previous)
