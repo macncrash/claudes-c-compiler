@@ -674,7 +674,7 @@ impl Lowerer {
             }
         } else if let (Some(bo), Some(bw)) = (bit_offset, bit_width) {
             let ir_ty = IrType::from_ctype(ty);
-            let val = self.eval_init_scalar(&Initializer::Expr(expr.clone()));
+            let val = h::bool_normalized(ty, self.eval_init_scalar(&Initializer::Expr(expr.clone())));
             self.write_bitfield_to_bytes(bytes, offset, &val, ir_ty, bo, bw);
         } else if let Expr::StringLiteral(s, _) = expr {
             // String literal initializing a char array field (e.g., {"hello", &ptr} in a struct

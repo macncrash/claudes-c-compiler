@@ -237,7 +237,9 @@ impl Lowerer {
 
                 // Allocate a byte buffer for the storage unit and pack all
                 // bitfield values into it using read-modify-write.
-                let mut unit_bytes = vec![0u8; storage_unit_size];
+                // Room for a packed field that runs past its 8-byte storage
+                // type, as a 64-bit field starting mid-byte does.
+                let mut unit_bytes = vec![0u8; storage_unit_size + 8];
 
                 // Track the highest bit used so we know exactly how many bytes
                 // the bitfields actually occupy (the storage unit type may be
@@ -256,7 +258,7 @@ impl Lowerer {
 
                     let inits = &field_inits[fi];
                     let val = if !inits.is_empty() {
-                        self.eval_init_scalar(&inits[0].init)
+                        h::bool_normalized(&layout.fields[fi].ty, self.eval_init_scalar(&inits[0].init))
                     } else {
                         IrConst::I32(0) // Zero-init for missing initializers
                     };
@@ -275,11 +277,26 @@ impl Lowerer {
                 // may belong to subsequent non-bitfield fields and must not be
                 // overwritten with zeros from the storage unit buffer.
                 let actual_bytes_used = (max_bit_end as usize).div_ceil(8);
-                let effective_size = actual_bytes_used.min(storage_unit_size);
+                let effective_size = actual_bytes_used.min(unit_bytes.len());
 
                 // When the storage unit overlaps with already-written data
                 // (due to align_down placement), skip the overlapping bytes.
                 let skip = current_offset.saturating_sub(storage_unit_offset);
+                // The overlapped bytes were the previous unit's: this unit's
+                // bits in them are merged, or a field starting there lost them.
+                let merge = skip.min(effective_size);
+                if merge > 0 && merge <= elements.len() {
+                    let base = elements.len() - skip;
+                    let all_bytes = elements[base..base + merge].iter()
+                        .all(|e| matches!(e, GlobalInit::Scalar(IrConst::I8(_))));
+                    if all_bytes {
+                        for (k, e) in elements[base..base + merge].iter_mut().enumerate() {
+                            if let GlobalInit::Scalar(IrConst::I8(x)) = e {
+                                *x |= unit_bytes[k] as i8;
+                            }
+                        }
+                    }
+                }
                 // Emit only the non-overlapping portion of the actually-used bytes
                 if skip < effective_size {
                     push_bytes_as_elements(&mut elements, &unit_bytes[skip..effective_size]);

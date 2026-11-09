@@ -579,13 +579,12 @@ impl StructLayoutBuilder {
 
     /// Handle zero-width bitfield: force alignment to next storage unit boundary.
     fn layout_zero_width_bitfield(&mut self, field_align: usize) {
+        // The next field starts at the next boundary of the zero-width type
+        // after the bits used, not after the previous field's storage unit:
+        // in { short a : 4; char : 0; long b : 14; } b is at byte 1, not 2.
         if self.in_bitfield {
-            if self.is_packed_1 {
-                let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-                self.offset = align_up((total_bits as usize).div_ceil(8), 1);
-            } else {
-                self.offset = self.bf_unit_offset + self.bf_unit_size;
-            }
+            let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
+            self.offset = (total_bits as usize).div_ceil(8);
         }
         self.offset = align_up(self.offset, field_align);
         self.in_bitfield = false;
@@ -647,16 +646,12 @@ impl StructLayoutBuilder {
             true
         };
 
-        // Determine placement bit position
-        let placed_abs_bit = if !self.in_bitfield {
-            if straddles {
-                (align_up(self.offset, field_align) as u64) * 8
-            } else {
-                abs_bit_pos
-            }
-        } else if straddles {
-            self.offset = self.bf_unit_offset + self.bf_unit_size;
-            (align_up(self.offset, field_align) as u64) * 8
+        // A field that would straddle moves to the next boundary of its own
+        // alignment, not past the previous field's storage unit: in
+        // { long a : 14; short b : 16; } b is at byte 2, not 8.
+        let placed_abs_bit = if straddles {
+            let align_bits = (field_align.max(1) as u64) * 8;
+            abs_bit_pos.div_ceil(align_bits) * align_bits
         } else {
             abs_bit_pos
         };
@@ -721,13 +716,12 @@ impl StructLayoutBuilder {
 
     /// Finalize the layout: account for trailing bitfield and padding.
     fn finalize(mut self) -> StructLayout {
+        // The size is the bits used, rounded to the struct's alignment, not
+        // the end of the last storage unit: under #pragma pack(2),
+        // { int a : 4; } is 2 bytes.
         if self.in_bitfield {
-            if self.is_packed_1 {
-                let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-                self.offset = (total_bits as usize).div_ceil(8);
-            } else {
-                self.offset = self.bf_unit_offset + self.bf_unit_size;
-            }
+            let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
+            self.offset = (total_bits as usize).div_ceil(8);
         }
 
         let size = align_up(self.offset, self.max_align);
@@ -837,7 +831,20 @@ impl StructLayout {
         let mut b = StructLayoutBuilder::new(fields.len(), max_field_align);
 
         for field in fields {
+            // On Darwin a zero-width bit-field aligns what follows to its
+            // type's natural alignment, even in a packed struct, and does not
+            // raise the struct's: { long long : 0; int x; } is 4 bytes.
+            if field.bit_width == Some(0) && target_is_darwin() {
+                b.layout_zero_width_bitfield(field.ty.align_ctx(ctx));
+                continue;
+            }
+            // An unnamed bit-field's type places it but does not align the
+            // struct (SysV psABI): { unsigned a : 10; long long : 10; } is 4.
+            let struct_align = b.max_align;
             let (field_align, field_size) = b.compute_field_alignment(field, max_field_align, ctx);
+            if field.name.is_empty() && field.bit_width.is_some_and(|w| w > 0) {
+                b.max_align = struct_align;
+            }
 
             if let Some(bw) = field.bit_width {
                 if bw == 0 {

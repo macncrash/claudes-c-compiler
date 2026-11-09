@@ -193,6 +193,12 @@ pub(super) fn push_zero_bytes(elements: &mut Vec<crate::ir::reexports::GlobalIni
     }
 }
 
+/// A value stored to a _Bool converts to 0 or 1 (C11 6.3.1.2): a 1-bit
+/// _Bool bit-field initialized with 32768 holds 1, not its low bit.
+pub(super) fn bool_normalized(ty: &crate::common::types::CType, val: crate::ir::reexports::IrConst) -> crate::ir::reexports::IrConst {
+    if *ty == crate::common::types::CType::Bool { val.bool_normalize() } else { val }
+}
+
 /// Convert a byte buffer to GlobalInit elements by pushing each byte as I8.
 /// This is the standard bytes-to-compound conversion used throughout the
 /// compound initialization path when a sub-structure has no address fields.

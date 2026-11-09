@@ -1073,6 +1073,7 @@ impl Lowerer {
                                         let field_ir_ty = IrType::from_ctype(&field.ty);
                                         let write_offset = elem_offset + sub_byte_offset + field.offset;
                                         if let (Some(bo), Some(bw)) = (field.bit_offset, field.bit_width) {
+                                            let val = h::bool_normalized(&field.ty, val);
                                             self.write_bitfield_to_bytes(bytes, write_offset, &val, field_ir_ty, bo, bw);
                                         } else if write_offset + field_ir_ty.size() <= bytes.len() {
                                             self.write_const_to_bytes(bytes, write_offset, &val, field_ir_ty);
@@ -1147,6 +1148,7 @@ impl Lowerer {
                             if let Some(field) = layout.fields.iter().find(|f| &f.name == fname) {
                                 let field_ir_ty = IrType::from_ctype(&field.ty);
                                 if let (Some(bo), Some(bw)) = (field.bit_offset, field.bit_width) {
+                                    let val = h::bool_normalized(&field.ty, val);
                                     self.write_bitfield_to_bytes(bytes, elem_offset + field.offset, &val, field_ir_ty, bo, bw);
                                 } else {
                                     self.write_const_to_bytes(bytes, elem_offset + field.offset, &val, field_ir_ty);
@@ -1264,18 +1266,20 @@ impl Lowerer {
     /// Write a bitfield value into a byte buffer at the given offset.
     /// Uses read-modify-write to pack the value at the correct bit position.
     pub(super) fn write_bitfield_to_bytes(&self, bytes: &mut [u8], offset: usize, val: &IrConst, ty: IrType, bit_offset: u32, bit_width: u32) {
-        let int_val = val.to_u64().unwrap_or(0);
+        // In 128 bits: a packed field's storage widens past 8 bytes when it
+        // starts mid-byte, as a 64-bit field after 3 bits does.
+        let int_val = val.to_u64().unwrap_or(0) as u128;
 
-        let size = ty.size();
-        let mask = if bit_width >= 64 { u64::MAX } else { (1u64 << bit_width) - 1 };
+        let size = ty.size().max((bit_offset + bit_width).div_ceil(8) as usize).min(16);
+        let mask = if bit_width >= 64 { u64::MAX as u128 } else { (1u128 << bit_width) - 1 };
         let field_val = (int_val & mask) << bit_offset;
         let clear_mask = !(mask << bit_offset);
 
         // Read current storage unit value (little-endian)
-        let mut current = 0u64;
+        let mut current = 0u128;
         for i in 0..size {
             if offset + i < bytes.len() {
-                current |= (bytes[offset + i] as u64) << (i * 8);
+                current |= (bytes[offset + i] as u128) << (i * 8);
             }
         }
 
