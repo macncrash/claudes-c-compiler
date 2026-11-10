@@ -16,6 +16,42 @@ impl ArmCodegen {
 
         self.load_va_list_ptr(va_list_ptr, "x1");
 
+        if result_ty.is_128bit() && !is_f128 {
+            // __int128: 16-byte aligned on the stack; on Linux an even GP
+            // register pair while two remain (AAPCS64 va_arg, rounding
+            // __gr_offs up to 16).
+            let label_id = self.state.next_label_id();
+            let label_stack = format!(".Lva_stack_{}", label_id);
+            let label_done = format!(".Lva_done_{}", label_id);
+            if !target_is_darwin() {
+                self.state.emit("    ldrsw x2, [x1, #24]");
+                self.state.emit_fmt(format_args!("    tbz x2, #63, {}", label_stack));
+                self.state.emit("    add x2, x2, #15");
+                self.state.emit("    and x2, x2, #-16");
+                self.state.emit("    add w4, w2, #16");
+                self.state.emit("    str w4, [x1, #24]");
+                self.state.emit("    cmp w4, #0");
+                self.state.emit_fmt(format_args!("    b.gt {}", label_stack));
+                self.state.emit("    ldr x3, [x1, #8]");
+                self.state.emit("    add x3, x3, x2");
+                self.state.emit("    ldr x0, [x3]");
+                self.state.emit("    ldr x1, [x3, #8]");
+                self.state.emit_fmt(format_args!("    b {}", label_done));
+            }
+            self.state.emit_fmt(format_args!("{}:", label_stack));
+            self.state.emit("    ldr x3, [x1]");
+            self.state.emit("    add x3, x3, #15");
+            self.state.emit("    and x3, x3, #-16");
+            self.state.emit("    add x4, x3, #16");
+            self.state.emit("    str x4, [x1]");
+            self.state.emit("    ldr x0, [x3]");
+            self.state.emit("    ldr x1, [x3, #8]");
+            self.state.emit_fmt(format_args!("{}:", label_done));
+            self.state.reg_cache.invalidate_all();
+            self.store_x0_x1_to(dest);
+            return;
+        }
+
         if target_is_darwin() {
             self.state.emit("    ldr x3, [x1]");
             if result_ty == IrType::F32 {

@@ -363,13 +363,14 @@ impl Lowerer {
                         || (!self.func_mut().locals.contains_key(name) && self.globals.contains_key(name) && !self.known_functions.contains(name));
                     if is_fptr_var {
                         // Indirect call through variable: use struct size to determine ABI
-                        struct_size > 8
+                        // (an AArch64 HFA result is lowered as sret at any size)
+                        struct_size > 8 || self.get_call_return_hfa(func_expr).is_some()
                     } else {
                         self.func_meta.sigs.get(name.as_str()).is_some_and(|s| s.sret_size.is_some() || s.two_reg_ret_size.is_some())
                     }
                 } else {
                     // Indirect call through expression: determine from return type
-                    struct_size > 8
+                    struct_size > 8 || self.get_call_return_hfa(func_expr).is_some()
                 };
 
                 if returns_address {
@@ -475,7 +476,11 @@ impl Lowerer {
                     // 9+ byte structs: sret or two-reg return, both produce addresses
                     return false;
                 }
-                // Small struct (<= 8 bytes): produces packed data unless somehow sret
+                // Small struct (<= 8 bytes): produces packed data unless somehow sret.
+                // An AArch64 HFA result is lowered as sret (an indirect call's too).
+                if self.get_call_return_hfa(func_expr).is_some() {
+                    return false;
+                }
                 if let Expr::Identifier(name, _) = func_expr.as_ref() {
                     self.func_meta.sigs.get(name.as_str()).is_none_or(|s| s.sret_size.is_none() && s.two_reg_ret_size.is_none())
                 } else {

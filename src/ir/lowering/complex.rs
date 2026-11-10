@@ -821,6 +821,16 @@ impl Lowerer {
         }
     }
 
+    /// AArch64: the class marking the real half of a complex value split into
+    /// two FP arguments. A complex value is an HFA of two members (AAPCS64
+    /// C.3): both halves go in FP registers, or both on the stack and no
+    /// later argument takes an FP register. `classify_args_core` reads it on
+    /// a scalar argument; no struct size goes with it.
+    pub(super) fn complex_pair_class(&self, comp_ty: IrType) -> Option<crate::common::types::RiscvFloatClass> {
+        (self.target == crate::backend::Target::Aarch64)
+            .then(|| crate::common::types::RiscvFloatClass::Hfa { count: 2, elem_size: comp_ty.size() })
+    }
+
     /// Decompose complex arguments at a call site for ABI compliance.
     /// Replaces complex double/float pointer arguments with (real, imag) pairs.
     /// ABI conventions:
@@ -837,6 +847,7 @@ impl Lowerer {
         struct_arg_sizes: &mut Vec<Option<usize>>,
         struct_arg_aligns: &mut Vec<Option<usize>>,
         struct_arg_classes: &mut Vec<Vec<crate::common::types::EightbyteClass>>,
+        struct_arg_float_classes: &mut Vec<Option<crate::common::types::RiscvFloatClass>>,
         param_ctypes: &Option<Vec<CType>>,
         args: &[Expr],
         is_variadic_call: bool,
@@ -857,6 +868,8 @@ impl Lowerer {
         let mut new_struct_sizes = Vec::with_capacity(struct_arg_sizes.len() * 2);
         let mut new_struct_aligns = Vec::with_capacity(struct_arg_aligns.len() * 2);
         let mut new_struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = Vec::with_capacity(struct_arg_classes.len() * 2);
+        // Kept in step with the arguments: a later HFA's class must stay with it.
+        let mut new_float_classes = Vec::with_capacity(struct_arg_float_classes.len() * 2);
 
         for (i, (val, ty)) in arg_vals.iter().zip(arg_types.iter()).enumerate() {
             let ctype = pctypes.get(i);
@@ -893,6 +906,7 @@ impl Lowerer {
                 new_struct_sizes.push(None); // packed scalar, not a struct
                 new_struct_aligns.push(None);
                 new_struct_classes.push(Vec::new());
+                new_float_classes.push(None);
                 continue;
             }
 
@@ -928,6 +942,7 @@ impl Lowerer {
                     crate::common::types::EightbyteClass::Sse,
                     crate::common::types::EightbyteClass::Sse,
                 ]);
+                new_float_classes.push(None);
                 continue;
             }
 
@@ -957,13 +972,20 @@ impl Lowerer {
                 new_struct_sizes.push(None); // decomposed scalar
                 new_struct_aligns.push(None);
                 new_struct_classes.push(Vec::new());
+                new_float_classes.push(self.complex_pair_class(comp_ty));
+                new_float_classes.push(None);
             } else {
                 new_vals.push(*val);
                 new_types.push(*ty);
                 new_struct_sizes.push(struct_arg_sizes.get(i).copied().flatten());
                 new_struct_aligns.push(struct_arg_aligns.get(i).copied().flatten());
                 new_struct_classes.push(struct_arg_classes.get(i).cloned().unwrap_or_default());
+                new_float_classes.push(struct_arg_float_classes.get(i).copied().flatten());
             }
+        }
+        // Only replaced when it covered the arguments (it may be empty).
+        if struct_arg_float_classes.len() == arg_vals.len() {
+            *struct_arg_float_classes = new_float_classes;
         }
 
         *arg_vals = new_vals;

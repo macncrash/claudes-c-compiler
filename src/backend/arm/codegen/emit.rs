@@ -1789,25 +1789,16 @@ impl ArmCodegen {
 
     /// Phase 3: Move GP int args from temp regs to actual arg registers.
     pub(super) fn emit_call_move_temps_to_arg_regs(&mut self, args: &[Operand], arg_classes: &[CallArgClass]) {
-        let mut int_reg_idx = 0usize;
+        // The register comes from the classification: counting here instead
+        // assumed __int128 pairs start at an even register, which Apple's ABI
+        // does not do.
         let mut gp_tmp_idx = 0usize;
         for (i, _) in args.iter().enumerate() {
-            match arg_classes[i] {
-                CallArgClass::I128RegPair { .. } => {
-                    if !int_reg_idx.is_multiple_of(2) { int_reg_idx += 1; }
-                    int_reg_idx += 2;
+            if let CallArgClass::IntReg { reg_idx } = arg_classes[i] {
+                if gp_tmp_idx < 8 && reg_idx < 8 {
+                    self.state.emit_fmt(format_args!("    mov {}, {}", ARM_ARG_REGS[reg_idx], ARM_TMP_REGS[gp_tmp_idx]));
                 }
-                CallArgClass::StructByValReg { size, .. } => {
-                    int_reg_idx += if size <= 8 { 1 } else { 2 };
-                }
-                CallArgClass::IntReg { .. } => {
-                    if gp_tmp_idx < 8 && int_reg_idx < 8 {
-                        self.state.emit_fmt(format_args!("    mov {}, {}", ARM_ARG_REGS[int_reg_idx], ARM_TMP_REGS[gp_tmp_idx]));
-                        int_reg_idx += 1;
-                    }
-                    gp_tmp_idx += 1;
-                }
-                _ => {}
+                gp_tmp_idx += 1;
             }
         }
     }

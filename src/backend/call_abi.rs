@@ -58,9 +58,11 @@ pub enum CallArgClass {
     F128Stack,
     /// I128 argument overflows to the stack (16-byte aligned).
     I128Stack,
-    /// Apple arm64: a named HFA on the stack, aligned to its element and
-    /// taking exactly its size: { float h[3]; } takes 12 bytes, not 16.
-    StructHfaStack { size: usize, elem_size: usize },
+    /// AArch64: a struct on the stack at its own alignment, taking exactly its
+    /// size. A named HFA on Apple arm64 is aligned to its element ({ float
+    /// h[3]; } takes 12 bytes, not 16); a 16-byte aligned struct starts at a
+    /// 16-byte boundary (AAPCS64 C.14).
+    StructStackAligned { size: usize, align: usize },
     /// Zero-size struct argument (e.g., `struct { char x[0]; }`).
     /// Per GCC behavior, zero-size struct arguments consume no register or stack space.
     ZeroSizeSkip,
@@ -72,7 +74,7 @@ impl CallArgClass {
         matches!(self, CallArgClass::Stack | CallArgClass::StackPacked { .. } |
                  CallArgClass::F128Stack | CallArgClass::I128Stack |
                  CallArgClass::StructByValStack { .. } |
-                 CallArgClass::StructHfaStack { .. } |
+                 CallArgClass::StructStackAligned { .. } |
                  CallArgClass::LargeStructStack { .. } |
                  CallArgClass::StructSplitRegStack { .. })
     }
@@ -82,7 +84,7 @@ impl CallArgClass {
         match self {
             CallArgClass::F128Stack | CallArgClass::I128Stack => 16,
             CallArgClass::StackPacked { size } => *size,
-            CallArgClass::StructHfaStack { elem_size, .. } => *elem_size,
+            CallArgClass::StructStackAligned { align, .. } => *align,
             _ => crate::common::types::target_ptr_size(),
         }
     }
@@ -104,7 +106,7 @@ impl CallArgClass {
             }
             CallArgClass::Stack => slot_size,
             CallArgClass::StackPacked { size } => *size,
-            CallArgClass::StructHfaStack { size, .. } => *size,
+            CallArgClass::StructStackAligned { size, .. } => *size,
             _ => 0,
         }
     }
@@ -438,6 +440,15 @@ fn classify_args_core(
 
     for info in args {
         let force_gp = is_variadic && config.variadic_floats_in_gp && info.is_float && !info.is_long_double;
+        // The real half of a split complex value (`complex_pair_class`): if
+        // both halves do not fit in FP registers, both go on the stack.
+        if let (true, None, Some(crate::common::types::RiscvFloatClass::Hfa { count, .. })) =
+            (config.use_hfa_classification, info.struct_size, info.riscv_float_class)
+        {
+            if float_idx + count > config.max_float_regs {
+                float_idx = config.max_float_regs;
+            }
+        }
 
         if let Some(size) = info.struct_size {
             // Zero-size structs consume no register or stack space per GCC behavior.
@@ -752,6 +763,9 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
         let param_ty = func.params.get(i).map(|p| p.ty);
         let packed_hfa = match (config.pack_stack_scalars, c, func.params.get(i).and_then(|p| p.riscv_float_class)) {
             (true, CoreArgClass::StructByValStack { .. }, Some(crate::common::types::RiscvFloatClass::Hfa { elem_size, .. })) => Some(elem_size as i64),
+            // A 16-byte aligned struct starts at a 16-byte boundary (AAPCS64 C.14).
+            (_, CoreArgClass::StructByValStack { .. }, _) if config.use_hfa_classification
+                && func.params.get(i).and_then(|p| p.struct_align).is_some_and(|a| a >= 16) => Some(16),
             _ => None,
         };
         if let Some(align) = packed_hfa {

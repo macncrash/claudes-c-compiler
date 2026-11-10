@@ -188,7 +188,8 @@ impl Lowerer {
                     // ComplexLongDouble on ARM64 only)
                     let comp_ty = Self::complex_component_ir_type(&param_ctype);
                     let real_idx = params.len();
-                    params.push(IrParam { ty: comp_ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None });
+                    let pair = self.complex_pair_class(comp_ty);
+                    params.push(IrParam { ty: comp_ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: pair });
                     let imag_idx = params.len();
                     params.push(IrParam { ty: comp_ty, struct_size: None, struct_align: None, struct_eightbyte_classes: Vec::new(), riscv_float_class: None });
                     param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));

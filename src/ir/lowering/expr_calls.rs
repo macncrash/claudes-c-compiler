@@ -218,7 +218,7 @@ impl Lowerer {
         } else {
             None
         };
-        self.decompose_complex_call_args(&mut arg_vals, &mut arg_types, &mut struct_arg_sizes, &mut struct_arg_aligns, &mut struct_arg_classes, &param_ctypes_for_decompose, args, call_is_variadic);
+        self.decompose_complex_call_args(&mut arg_vals, &mut arg_types, &mut struct_arg_sizes, &mut struct_arg_aligns, &mut struct_arg_classes, &mut struct_arg_riscv_float_classes, &param_ctypes_for_decompose, args, call_is_variadic);
 
         let dest = self.fresh_value();
 
@@ -251,19 +251,7 @@ impl Lowerer {
                 };
                 if let Some(sig) = variadic_sig {
                     if !sig.param_ctypes.is_empty() {
-                        let decomposes_cld = self.decomposes_complex_long_double();
-                        let decomposes_cd = self.decomposes_complex_double();
-                        let decomposes_cf = self.decomposes_complex_float();
-                        sig.param_ctypes.iter().map(|ct| {
-                            match ct {
-                                CType::ComplexDouble if decomposes_cd => 2,
-                                // Fixed ComplexFloat params are decomposed into 2 FP regs
-                                // on 64-bit targets (not x86-64 packed, not i686 struct)
-                                CType::ComplexFloat if decomposes_cf && !self.uses_packed_complex_float() => 2,
-                                CType::ComplexLongDouble if decomposes_cld => 2,
-                                _ => 1,
-                            }
-                        }).sum()
+                        self.ir_param_count(sig.param_ctypes.iter())
                     } else if !sig.param_types.is_empty() {
                         sig.param_types.len()
                     } else {
@@ -993,8 +981,24 @@ impl Lowerer {
             | "open" | "fcntl" | "ioctl" | "execl" | "execlp" | "execle")
     }
 
+    /// The number of IR arguments for these C parameters: complex ones that
+    /// are split into (real, imag) count twice.
+    fn ir_param_count<'a>(&self, params: impl Iterator<Item = &'a CType>) -> usize {
+        let decomposes_cld = self.decomposes_complex_long_double();
+        let decomposes_cd = self.decomposes_complex_double();
+        let decomposes_cf = self.decomposes_complex_float();
+        params.map(|ct| match ct {
+            CType::ComplexDouble if decomposes_cd => 2,
+            // Fixed ComplexFloat params are decomposed into 2 FP regs
+            // on 64-bit targets (not x86-64 packed, not i686 struct)
+            CType::ComplexFloat if decomposes_cf && !self.uses_packed_complex_float() => 2,
+            CType::ComplexLongDouble if decomposes_cld => 2,
+            _ => 1,
+        }).sum()
+    }
+
     /// If `func_expr` has a variadic function (pointer) type, return the number
-    /// of named parameters.
+    /// of named parameters (IR arguments, see `ir_param_count`).
     fn func_ptr_variadic_fixed_params(&self, func_expr: &Expr) -> Option<usize> {
         let mut expr = func_expr;
         loop {
@@ -1002,8 +1006,10 @@ impl Lowerer {
                 while let CType::Pointer(inner, _) = ctype {
                     ctype = *inner;
                 }
+                // Counted after complex parameters are split in two, as
+                // decompose_complex_call_args does to the arguments.
                 return match ctype {
-                    CType::Function(ft) if ft.variadic => Some(ft.params.len()),
+                    CType::Function(ft) if ft.variadic => Some(self.ir_param_count(ft.params.iter().map(|(t, _)| t))),
                     _ => None,
                 };
             }

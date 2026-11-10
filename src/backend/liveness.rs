@@ -1256,7 +1256,10 @@ pub fn is_reg_args_only_call(info: &crate::ir::reexports::CallInfo) -> bool {
     };
     let struct_ok = info.struct_arg_sizes.iter().enumerate().all(|(i, s)| s.is_none() || hfa(i).is_some());
     let hfa_return = info.is_sret && hfa(0).is_some();
-    let hfa_regs: usize = (0..info.args.len()).filter(|&i| !(hfa_return && i == 0)).filter_map(hfa).sum();
+    // Struct arguments only: a split complex value's halves are counted as floats.
+    let hfa_regs: usize = (0..info.args.len())
+        .filter(|&i| !(hfa_return && i == 0) && info.struct_arg_sizes.get(i).copied().flatten().is_some())
+        .filter_map(hfa).sum();
     let floats = info.arg_types.iter().filter(|t| t.is_float()).count();
     !info.is_variadic
         && (!info.is_sret || hfa_return)

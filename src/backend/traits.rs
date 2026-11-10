@@ -495,7 +495,18 @@ pub trait ArchCodegen {
                 if let (CallArgClass::StructByValStack { size }, Some(Some(crate::common::types::RiscvFloatClass::Hfa { elem_size, .. })))
                     = (*cls, struct_arg_riscv_float_classes.get(i))
                 {
-                    *cls = CallArgClass::StructHfaStack { size, elem_size: *elem_size };
+                    *cls = CallArgClass::StructStackAligned { size, align: *elem_size };
+                }
+            }
+        }
+        // AArch64: a 16-byte aligned struct on the stack starts at a 16-byte
+        // boundary (AAPCS64 C.14), named or variadic.
+        if config.use_hfa_classification {
+            for (cls, align) in arg_classes.iter_mut().zip(struct_arg_aligns) {
+                if let (CallArgClass::StructByValStack { size }, Some(a)) = (*cls, *align) {
+                    if a >= 16 {
+                        *cls = CallArgClass::StructStackAligned { size, align: 16 };
+                    }
                 }
             }
         }
@@ -1669,7 +1680,7 @@ pub fn call_gp_arg_mask(classes: &[super::call_abi::CallArgClass], is_sret: bool
             C::StructMixedIntSseReg { int_reg_idx, .. } | C::StructMixedSseIntReg { int_reg_idx, .. } => int_reg_idx,
             C::FloatReg { .. } | C::F128Reg { .. } | C::StructSseReg { .. } | C::StructHfaReg { .. }
             | C::Stack | C::StackPacked { .. } | C::F128Stack | C::I128Stack | C::ZeroSizeSkip => continue,
-            C::StructByValStack { .. } | C::LargeStructStack { .. } | C::StructHfaStack { .. } => {
+            C::StructByValStack { .. } | C::LargeStructStack { .. } | C::StructStackAligned { .. } => {
                 all = true;
                 continue;
             }

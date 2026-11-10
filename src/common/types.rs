@@ -1103,7 +1103,7 @@ impl StructLayout {
         // Flatten all scalar fields (recursing into nested structs/arrays)
         let mut float_fields: Vec<(usize, usize)> = Vec::new(); // (offset, size_bytes: 4=float, 8=double)
         let mut int_fields: Vec<(usize, usize)> = Vec::new(); // (offset, size_bytes)
-        if !Self::collect_riscv_fields(&self.fields, 0, &mut float_fields, &mut int_fields, 2, ctx) {
+        if !Self::collect_riscv_fields(&self.fields, 0, &mut float_fields, &mut int_fields, 2, false, ctx) {
             return None;
         }
 
@@ -1158,7 +1158,8 @@ impl StructLayout {
         }
         let mut float_fields: Vec<(usize, usize)> = Vec::new();
         let mut int_fields: Vec<(usize, usize)> = Vec::new();
-        if !Self::collect_riscv_fields(&self.fields, 0, &mut float_fields, &mut int_fields, 4, ctx) {
+        // A complex member counts as two members of its part type (AAPCS64 4.3.5).
+        if !Self::collect_riscv_fields(&self.fields, 0, &mut float_fields, &mut int_fields, 4, true, ctx) {
             return None;
         }
         let count = float_fields.len();
@@ -1181,8 +1182,16 @@ impl StructLayout {
         float_fields: &mut Vec<(usize, usize)>,
         int_fields: &mut Vec<(usize, usize)>,
         max_fields: usize,
+        split_complex: bool,
         ctx: &dyn StructLayoutProvider,
     ) -> bool {
+        // The float part size of a complex type taken as two members, if so.
+        let complex_part = |ty: &CType| match ty {
+            CType::ComplexFloat if split_complex => Some(4),
+            CType::ComplexDouble if split_complex => Some(8),
+            CType::ComplexLongDouble if split_complex && long_double_is_f64() => Some(8),
+            _ => None,
+        };
         for field in fields {
             // Skip zero-width bitfields (padding only)
             if field.bit_width == Some(0) {
@@ -1194,6 +1203,11 @@ impl StructLayout {
             }
             let offset = base_offset + field.offset;
             match &field.ty {
+                ty if complex_part(ty).is_some() => {
+                    let part = complex_part(ty).unwrap_or(0);
+                    float_fields.push((offset, part));
+                    float_fields.push((offset + part, part));
+                }
                 CType::Float => {
                     float_fields.push((offset, 4));
                 }
@@ -1210,7 +1224,7 @@ impl StructLayout {
                             // Unions break FP classification
                             return false;
                         }
-                        if !Self::collect_riscv_fields(&layout.fields, offset, float_fields, int_fields, max_fields, ctx) {
+                        if !Self::collect_riscv_fields(&layout.fields, offset, float_fields, int_fields, max_fields, split_complex, ctx) {
                             return false;
                         }
                     } else {
@@ -1226,6 +1240,11 @@ impl StructLayout {
                     for i in 0..*count {
                         let elem_offset = offset + i * elem_size;
                         match elem_ty.as_ref() {
+                            ty if complex_part(ty).is_some() => {
+                                let part = complex_part(ty).unwrap_or(0);
+                                float_fields.push((elem_offset, part));
+                                float_fields.push((elem_offset + part, part));
+                            }
                             CType::Float => float_fields.push((elem_offset, 4)),
                             CType::Double => float_fields.push((elem_offset, 8)),
                             CType::LongDouble if long_double_is_f64() => float_fields.push((elem_offset, 8)),
@@ -1234,7 +1253,7 @@ impl StructLayout {
                                     if layout.is_union {
                                         return false;
                                     }
-                                    if !Self::collect_riscv_fields(&layout.fields, elem_offset, float_fields, int_fields, max_fields, ctx) {
+                                    if !Self::collect_riscv_fields(&layout.fields, elem_offset, float_fields, int_fields, max_fields, split_complex, ctx) {
                                         return false;
                                     }
                                 } else {

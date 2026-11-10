@@ -31,7 +31,9 @@ impl ArmCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig {
             max_int_regs: 8, max_float_regs: 8,
-            align_i128_pairs: true,
+            // AAPCS64 starts a 16-byte aligned argument at an even register;
+            // Apple's arm64 ABI does not (an __int128 after an int is in x1:x2).
+            align_i128_pairs: !crate::common::types::target_is_darwin(),
             f128_in_fp_regs: true, f128_in_gp_pairs: false,
             variadic_floats_in_gp: false,
             large_struct_by_ref: true,
@@ -68,8 +70,8 @@ impl ArmCodegen {
                 let align = cls.stack_align() as i64;
                 stack_offset = (stack_offset + align - 1) / align * align;
                 match cls {
-                    CallArgClass::StructHfaStack { size, elem_size } => {
-                        // Copied element by element: it may start at a 4-byte offset.
+                    CallArgClass::StructStackAligned { size, align } => {
+                        // Copied in 4-byte steps when it may start at a 4-byte offset.
                         match arg {
                             Operand::Value(v) => {
                                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -88,7 +90,7 @@ impl ArmCodegen {
                             }
                             Operand::Const(_) => { self.operand_to_x0(arg); }
                         }
-                        let (reg, step) = if elem_size == 8 { ("x1", 8) } else { ("w1", 4) };
+                        let (reg, step) = if align >= 8 { ("x1", 8) } else { ("w1", 4) };
                         for k in 0..size / step {
                             let off = (k * step) as i64;
                             self.emit_load_from_reg(reg, "x0", off, "ldr");

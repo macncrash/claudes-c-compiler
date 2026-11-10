@@ -1189,6 +1189,17 @@ impl Lowerer {
 
             let ap_val = self.lower_va_list_pointer(ap_expr);
             let va_list_ptr = self.operand_to_value(ap_val);
+            // Apple arm64: a 16-byte aligned struct is in a 16-byte aligned
+            // slot (as an __int128 is). va_list there is the stack pointer.
+            if self.target == Target::Aarch64 && crate::common::types::target_is_darwin() && struct_align >= 16 {
+                let cur = self.fresh_value();
+                self.emit(Instruction::Load { dest: cur, ptr: va_list_ptr, ty: IrType::Ptr, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+                let bumped = self.fresh_value();
+                self.emit(Instruction::BinOp { dest: bumped, op: IrBinOp::Add, lhs: Operand::Value(cur), rhs: Operand::Const(IrConst::I64(15)), ty: IrType::Ptr });
+                let aligned = self.fresh_value();
+                self.emit(Instruction::BinOp { dest: aligned, op: IrBinOp::And, lhs: Operand::Value(bumped), rhs: Operand::Const(IrConst::I64(-16)), ty: IrType::Ptr });
+                self.emit(Instruction::Store { val: Operand::Value(aligned), ptr: va_list_ptr, ty: IrType::Ptr, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+            }
             let num_slots = struct_size.div_ceil(8);
             let alloc_size = if struct_size > 0 { num_slots * 8 } else { 8 };
             let alloca = self.fresh_value();
