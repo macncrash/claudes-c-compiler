@@ -1,8 +1,8 @@
 {
  "meta": {
   "platform": "darwin-arm64",
-  "date": "2026-11-09",
-  "ccc_rev": "f5899577",
+  "date": "2026-11-10",
+  "ccc_rev": "1a3a852f",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -677,6 +677,9 @@
    "status": "pass"
   },
   "cases/abi_args": {
+   "status": "pass"
+  },
+  "cases/abi_complex_and_int128": {
    "status": "pass"
   },
   "cases/abi_hfa": {
@@ -5622,7 +5625,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16fd92d6f 0x16fd92d6f 0x16fd92d6f 0x16fd92d6f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b026d6f 0x16b026d6f 0x16b026d6f 0x16b026d6f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
