@@ -211,8 +211,32 @@ impl Lowerer {
         let builtin_info = builtins::resolve_builtin(name)?;
         match &builtin_info.kind {
             BuiltinKind::LibcAlias(libc_name) => {
-                let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
-                let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                // Each argument is converted as for a call of the library
+                // function: to its parameter type (__builtin_fabsf(double)
+                // passed the double's bits as a float), or past the fixed
+                // parameters with the default argument promotions.
+                let params: Option<Vec<IrType>> =
+                    self.func_meta.sigs.get(libc_name.as_str()).map(|s| s.param_types.clone());
+                let mut arg_types: Vec<IrType> = Vec::with_capacity(args.len());
+                let mut arg_vals: Vec<Operand> = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    let ty = self.get_expr_type(a);
+                    let val = self.lower_expr(a);
+                    let to = match params.as_ref().and_then(|p| p.get(i)) {
+                        Some(&p) if p.is_float() || p.is_integer() => p,
+                        Some(_) => ty,
+                        None if ty == IrType::F32 => IrType::F64,
+                        None if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) => IrType::I32,
+                        None => ty,
+                    };
+                    let val = if to != ty && (ty.is_float() || ty.is_integer()) {
+                        self.emit_implicit_cast(val, ty, to)
+                    } else {
+                        val
+                    };
+                    arg_types.push(if to != ty && (ty.is_float() || ty.is_integer()) { to } else { ty });
+                    arg_vals.push(val);
+                }
                 let dest = self.fresh_value();
                 let libc_sig = self.func_meta.sigs.get(libc_name.as_str());
                 // Without a visible declaration (e.g. __builtin_printf with no

@@ -163,6 +163,17 @@ impl IrConst {
         }
     }
 
+    /// Returns true if every bit of this constant is zero: unlike is_zero,
+    /// false for -0.0, whose sign bit data emission must keep.
+    pub fn is_zero_bits(&self) -> bool {
+        match self {
+            IrConst::F32(v) => v.to_bits() == 0,
+            IrConst::F64(v) => v.to_bits() == 0,
+            IrConst::LongDouble(v, bytes) => v.to_bits() == 0 && bytes.iter().all(|&b| b == 0),
+            _ => self.is_zero(),
+        }
+    }
+
     /// Create a LongDouble constant from an f64 value (low precision - bytes derived from f64).
     /// Use this when no full-precision source text is available.
     pub fn long_double(v: f64) -> IrConst {

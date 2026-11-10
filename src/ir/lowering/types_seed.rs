@@ -258,6 +258,30 @@ impl Lowerer {
         for name in d_dd {
             self.insert_builtin_sig(name, F64, vec![F64, F64], Vec::new());
         }
+        // Every other libm function known as a builtin, in all three
+        // precisions, so a call converts its arguments: a long double is a
+        // double on Apple arm64.
+        {
+            use crate::frontend::sema::builtins::{LIBM_BUILTINS, LIBM_FLOAT_INT, LIBM_UNARY_COUNT};
+            let ld = if crate::common::types::long_double_is_f64() { F64 } else { F128 };
+            for (i, base) in LIBM_BUILTINS.iter().enumerate() {
+                for (sfx, t) in [("", F64), ("f", F32), ("l", ld)] {
+                    let name = format!("{base}{sfx}");
+                    if !self.func_meta.sigs.contains_key(&name) {
+                        let params = if i < LIBM_UNARY_COUNT { vec![t] } else { vec![t, t] };
+                        self.insert_builtin_sig(&name, t, params, Vec::new());
+                    }
+                }
+            }
+            for base in LIBM_FLOAT_INT {
+                for (sfx, t) in [("", F64), ("f", F32), ("l", ld)] {
+                    let name = format!("{base}{sfx}");
+                    if !self.func_meta.sigs.contains_key(&name) {
+                        self.insert_builtin_sig(&name, t, vec![t, I32], Vec::new());
+                    }
+                }
+            }
+        }
         // int/long returning functions
         self.insert_builtin_sig("abs", I32, vec![I32], Vec::new());
         self.insert_builtin_sig("labs", I64, vec![I64], Vec::new());

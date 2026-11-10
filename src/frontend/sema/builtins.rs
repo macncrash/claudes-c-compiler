@@ -6,6 +6,39 @@
 use crate::common::fx_hash::FxHashMap;
 use std::sync::LazyLock;
 
+/// libm functions of one or two floating arguments with a floating result
+/// (also in `float` and `long double` forms, suffixed f and l), known as
+/// __builtin_ calls.
+pub const LIBM_BUILTINS: &[&str] = &[
+    "fabs", "sqrt", "cbrt", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh",
+    "asinh", "acosh", "atanh", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p", "logb",
+    "ceil", "floor", "round", "trunc", "rint", "nearbyint", "erf", "erfc", "tgamma", "lgamma",
+    // The rest take two arguments.
+    "atan2", "pow", "fmod", "remainder", "copysign", "fmin", "fmax", "fdim", "hypot", "nextafter",
+];
+
+/// How many of LIBM_BUILTINS take one argument (the rest take two).
+pub const LIBM_UNARY_COUNT: usize = 33;
+
+/// libm functions taking a floating value and an int (ldexp, scalbn).
+pub const LIBM_FLOAT_INT: &[&str] = &["ldexp", "scalbn"];
+
+/// The C result type of a libm builtin from the lists above:
+/// `__builtin_fminf` is a float, `__builtin_fminl` a long double.
+pub fn libm_builtin_ctype(name: &str) -> Option<crate::common::types::CType> {
+    use crate::common::types::CType;
+    let rest = name.strip_prefix("__builtin_")?;
+    let known = |b: &str| LIBM_BUILTINS.contains(&b) || LIBM_FLOAT_INT.contains(&b);
+    if known(rest) {
+        return Some(CType::Double);
+    }
+    match rest.split_at(rest.len().checked_sub(1)?) {
+        (b, "f") if known(b) => Some(CType::Float),
+        (b, "l") if known(b) => Some(CType::LongDouble),
+        _ => None,
+    }
+}
+
 /// Static mapping of __builtin_* names to their libc equivalents.
 static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::new(|| {
     let mut m = FxHashMap::default();
@@ -68,6 +101,16 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_nextafter", BuiltinInfo::simple("nextafter"));
     m.insert("__builtin_nextafterf", BuiltinInfo::simple("nextafterf"));
     m.insert("__builtin_nextafterl", BuiltinInfo::simple("nextafterl"));
+    // The rest of libm, each as __builtin_NAME, NAMEf and NAMEl: clang and
+    // GCC know them all, and ccc called __builtin_fminf as an undeclared
+    // function, which no library defines.
+    for base in LIBM_BUILTINS.iter().chain(LIBM_FLOAT_INT) {
+        for sfx in ["", "f", "l"] {
+            let lib = format!("{base}{sfx}");
+            let key: &'static str = Box::leak(format!("__builtin_{lib}").into_boxed_str());
+            m.entry(key).or_insert_with(|| BuiltinInfo::simple(&lib));
+        }
+    }
     // TODO: __builtin_nan(s) ignores the string payload argument (NaN payload).
     // For common usage with "" this is correct; full payload support needs custom lowering.
     m.insert("__builtin_nan", BuiltinInfo::constant_f64(f64::NAN));

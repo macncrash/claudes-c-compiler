@@ -798,7 +798,10 @@ impl<'a> ExprTypeChecker<'a> {
     /// Return CType for known builtins.
     /// This is the CType-level equivalent of the lowerer's builtin_return_type (IrType).
     /// TODO: consolidate with sema/builtins.rs BuiltinInfo to avoid duplication.
-    fn builtin_return_ctype(name: &str) -> Option<CType> {
+    pub(crate) fn builtin_return_ctype(name: &str) -> Option<CType> {
+        if let Some(ct) = crate::frontend::sema::builtins::libm_builtin_ctype(name) {
+            return Some(ct);
+        }
         match name {
             // Float-returning builtins
             "__builtin_inf" | "__builtin_huge_val"

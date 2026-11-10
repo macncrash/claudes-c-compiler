@@ -290,9 +290,23 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     let mut use_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
     let mut exposed_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
 
+    // An alloca read as a float after an integer store, or the other way,
+    // reinterprets bits (__builtin_signbit stores a double and loads an
+    // I64): a promoted Copy would convert the value instead.
+    let mut float_access: FxHashSet<u32> = FxHashSet::default();
+    let mut int_access: FxHashSet<u32> = FxHashSet::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let mut stored_here: FxHashSet<u32> = FxHashSet::default();
         for inst in &block.instructions {
+            if let Instruction::Load { ptr, ty, .. } | Instruction::Store { ptr, ty, .. } = inst {
+                if candidate_set.contains(&ptr.0) {
+                    if ty.is_float() {
+                        float_access.insert(ptr.0);
+                    } else {
+                        int_access.insert(ptr.0);
+                    }
+                }
+            }
             match inst {
                 Instruction::Load { ptr, volatile: true, .. } | Instruction::Store { ptr, volatile: true, .. }
                     if candidate_set.contains(&ptr.0) => {
@@ -379,6 +393,8 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
             }
         }
     }
+
+    disqualified.extend(float_access.intersection(&int_access).copied());
 
     // Build set of parameter alloca values for filtering below
     let param_alloca_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();

@@ -299,6 +299,18 @@ impl Lowerer {
     /// Return the IR type for known builtins that return float or specific types.
     /// Returns None for builtins without special return type handling.
     pub(super) fn builtin_return_type(name: &str) -> Option<IrType> {
+        let ty = Self::builtin_return_type_by_name(name).or_else(|| {
+            crate::frontend::sema::builtins::libm_builtin_ctype(name).map(|ct| match ct {
+                CType::Float => IrType::F32,
+                CType::LongDouble => IrType::F128,
+                _ => IrType::F64,
+            })
+        })?;
+        // On Apple arm64 a long double is a double.
+        Some(if ty == IrType::F128 && crate::common::types::long_double_is_f64() { IrType::F64 } else { ty })
+    }
+
+    fn builtin_return_type_by_name(name: &str) -> Option<IrType> {
         match name {
             // Float-returning builtins
             "__builtin_inf" | "__builtin_huge_val" => Some(IrType::F64),
@@ -1372,6 +1384,11 @@ impl Lowerer {
                     if let Some(func_info) = self.sema_functions.get(name.as_str()) {
                         return Some(func_info.return_type.clone());
                     }
+                    // A builtin's result type (__typeof__(__builtin_fabs(y))
+                    // was an unresolved typeof, made an int).
+                    if let Some(ct) = crate::frontend::sema::type_checker::ExprTypeChecker::builtin_return_ctype(name) {
+                        return Some(ct);
+                    }
                 }
                 // For indirect calls through function pointer variables,
                 // extract the return type from the pointer's CType.
@@ -1404,7 +1421,13 @@ impl Lowerer {
                 self.resolve_generic_selection_ctype(controlling, associations)
             }
             Expr::StmtExpr(compound, _) => {
-                self.get_stmt_expr_ctype(compound, None)
+                // Sema typed the last expression in the statement
+                // expression's own scope. The lowerer's resolution below
+                // looks names up in the enclosing scope first, so in
+                // `float n = ({ double n = x; n; })` it typed the inner n as
+                // the outer float.
+                self.lookup_sema_expr_type(expr)
+                    .or_else(|| self.get_stmt_expr_ctype(compound, None))
             }
             // sizeof and alignof always produce size_t (unsigned long on 64-bit,
             // unsigned int on 32-bit). This is needed so typeof(sizeof(...)) resolves

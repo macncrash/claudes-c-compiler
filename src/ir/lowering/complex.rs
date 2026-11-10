@@ -770,53 +770,70 @@ impl Lowerer {
 
     /// Try to evaluate a complex constant expression, returning (real, imag) as f64.
     fn eval_complex_const(&self, expr: &Expr) -> Option<(f64, f64)> {
+        let (re, im) = self.eval_complex_parts(expr)?;
+        Some((re, im.unwrap_or(0.0)))
+    }
+
+    /// The value of a constant expression as a real part and, if it is
+    /// complex, an imaginary part. A real operand stays real (C11 Annex G):
+    /// `-1.0` converted to complex is (-1, +0), not -(1, 0) = (-1, -0), and
+    /// a real times a complex scales both parts without 0 * d terms.
+    fn eval_complex_parts(&self, expr: &Expr) -> Option<(f64, Option<f64>)> {
         match expr {
             // Imaginary literals: 4.0i -> (0, 4.0)
-            Expr::ImaginaryLiteral(val, _) => Some((0.0, *val)),
-            Expr::ImaginaryLiteralF32(val, _) => Some((0.0, *val)),
-            Expr::ImaginaryLiteralLongDouble(val, _, _) => Some((0.0, *val)),
-            // Binary add: real + imag, or complex + complex
+            Expr::ImaginaryLiteral(val, _) => Some((0.0, Some(*val))),
+            Expr::ImaginaryLiteralF32(val, _) => Some((0.0, Some(*val))),
+            Expr::ImaginaryLiteralLongDouble(val, _, _) => Some((0.0, Some(*val))),
             Expr::BinaryOp(BinOp::Add, lhs, rhs, _) => {
-                let l = self.eval_complex_const(lhs)?;
-                let r = self.eval_complex_const(rhs)?;
-                Some((l.0 + r.0, l.1 + r.1))
+                let (a, ai) = self.eval_complex_parts(lhs)?;
+                let (b, bi) = self.eval_complex_parts(rhs)?;
+                let im = match (ai, bi) {
+                    (Some(x), Some(y)) => Some(x + y),
+                    (Some(x), None) | (None, Some(x)) => Some(x),
+                    (None, None) => None,
+                };
+                Some((a + b, im))
             }
-            // Binary sub: real - imag
             Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) => {
-                let l = self.eval_complex_const(lhs)?;
-                let r = self.eval_complex_const(rhs)?;
-                Some((l.0 - r.0, l.1 - r.1))
+                let (a, ai) = self.eval_complex_parts(lhs)?;
+                let (b, bi) = self.eval_complex_parts(rhs)?;
+                let im = match (ai, bi) {
+                    (Some(x), Some(y)) => Some(x - y),
+                    (Some(x), None) => Some(x),
+                    (None, Some(y)) => Some(-y),
+                    (None, None) => None,
+                };
+                Some((a - b, im))
             }
-            // Binary mul: for simple cases like 2*I or val*I
             Expr::BinaryOp(BinOp::Mul, lhs, rhs, _) => {
-                let l = self.eval_complex_const(lhs)?;
-                let r = self.eval_complex_const(rhs)?;
-                // (a+bi)(c+di) = (ac-bd) + (ad+bc)i
-                let real = l.0 * r.0 - l.1 * r.1;
-                let imag = l.0 * r.1 + l.1 * r.0;
-                Some((real, imag))
+                let (a, ai) = self.eval_complex_parts(lhs)?;
+                let (b, bi) = self.eval_complex_parts(rhs)?;
+                Some(match (ai, bi) {
+                    // (a+xi)(b+yi) = (ab-xy) + (ay+xb)i
+                    (Some(x), Some(y)) => (a * b - x * y, Some(a * y + x * b)),
+                    (Some(x), None) => (a * b, Some(x * b)),
+                    (None, Some(y)) => (a * b, Some(a * y)),
+                    (None, None) => (a * b, None),
+                })
             }
-            // Unary negation
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
-                let v = self.eval_complex_const(inner)?;
-                Some((-v.0, -v.1))
+                let (a, ai) = self.eval_complex_parts(inner)?;
+                Some((-a, ai.map(|x| -x)))
             }
-            // Unary plus
-            Expr::UnaryOp(UnaryOp::Plus, inner, _) => {
-                self.eval_complex_const(inner)
-            }
-            // Cast to complex
-            Expr::Cast(_, inner, _) => {
-                self.eval_complex_const(inner)
-            }
-            // Real number literal -> (val, 0)
-            _ => {
-                if let Some(val) = self.eval_const_expr(expr) {
-                    let f = val.to_f64()?;
-                    Some((f, 0.0))
+            Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_complex_parts(inner),
+            // A cast to a complex type gives a real value a +0 imaginary
+            // part; one to a real type drops the imaginary part.
+            Expr::Cast(ts, inner, _) => {
+                let (a, ai) = self.eval_complex_parts(inner)?;
+                if self.type_spec_to_ctype(ts).is_complex() {
+                    Some((a, Some(ai.unwrap_or(0.0))))
                 } else {
-                    None
+                    Some((a, None))
                 }
+            }
+            _ => {
+                let f = self.eval_const_expr(expr)?.to_f64()?;
+                Some((f, None))
             }
         }
     }

@@ -1429,11 +1429,11 @@ fn emit_init_data(out: &mut AsmOutput, init: &GlobalInit, fallback_ty: IrType, t
                     const_ty
                 };
 
-                if val.is_zero() {
+                if val.is_zero_bits() {
                     // Count consecutive zero elements and emit as a single .zero
                     let elem_size = elem_ty.size();
                     let mut zero_count = 1usize;
-                    while i + zero_count < values.len() && values[i + zero_count].is_zero() {
+                    while i + zero_count < values.len() && values[i + zero_count].is_zero_bits() {
                         zero_count += 1;
                     }
                     let zero_bytes = zero_count * elem_size;
