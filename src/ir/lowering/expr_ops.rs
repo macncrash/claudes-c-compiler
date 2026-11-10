@@ -540,7 +540,8 @@ impl Lowerer {
                 }
                 let then_ty = if self.expr_is_pointer(then_expr) { IrType::Ptr } else { self.get_expr_type(then_expr) };
                 let else_ty = if self.expr_is_pointer(else_expr) { IrType::Ptr } else { self.get_expr_type(else_expr) };
-                let common_ty = Self::common_type(then_ty, else_ty);
+                let common_ty = self.conditional_int_type(then_expr, else_expr)
+                    .unwrap_or_else(|| Self::common_type(then_ty, else_ty));
                 return self.emit_implicit_cast(then_val, then_ty, common_ty);
             } else {
                 let else_val = self.lower_expr(else_expr);
@@ -551,7 +552,8 @@ impl Lowerer {
                 }
                 let then_ty = if self.expr_is_pointer(then_expr) { IrType::Ptr } else { self.get_expr_type(then_expr) };
                 let else_ty = if self.expr_is_pointer(else_expr) { IrType::Ptr } else { self.get_expr_type(else_expr) };
-                let common_ty = Self::common_type(then_ty, else_ty);
+                let common_ty = self.conditional_int_type(then_expr, else_expr)
+                    .unwrap_or_else(|| Self::common_type(then_ty, else_ty));
                 return self.emit_implicit_cast(else_val, else_ty, common_ty);
             }
         }
@@ -581,7 +583,8 @@ impl Lowerer {
         let mut else_ty = self.get_expr_type(else_expr);
         if self.expr_is_pointer(then_expr) { then_ty = IrType::Ptr; }
         if self.expr_is_pointer(else_expr) { else_ty = IrType::Ptr; }
-        let common_ty = Self::common_type(then_ty, else_ty);
+        let common_ty = self.conditional_int_type(then_expr, else_expr)
+            .unwrap_or_else(|| Self::common_type(then_ty, else_ty));
 
         // Detect struct-typed ternary where branches produce inconsistent
         // representations: compound literals and struct derefs produce alloca

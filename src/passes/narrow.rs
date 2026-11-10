@@ -21,14 +21,18 @@
 //! the shift type: AShr with sign-extended LHS, LShr with zero-extended
 //! LHS. This is because the extension bits are exactly what the shift
 //! brings in, so the narrow-width shift produces the same low bits.
+//! A shift is narrowed only by a constant below the narrow width, and a
+//! right shift only to 32 bits: a narrower one reads register bits above
+//! its type, which a value of that type need not hold extended.
 //! Phase 4b treats a 32-bit Add/Sub/Mul/And/Or/Xor consumer like that
 //! Cast: it reads only the low 32 bits of its operands.
 //! Phase 5 (no Cast) is restricted to bitwise ops (And, Or, Xor) since
-//! arithmetic ops can produce different upper bits due to carries.
+//! arithmetic ops can produce different upper bits due to carries, and to
+//! zero-extended operands, as the 32-bit op leaves the high half zero.
 //!
 //! Similarly, comparisons (Cmp) where both operands are widened from
-//! the same type can be narrowed, since sign/zero extension preserves
-//! the ordering of values.
+//! the same type of 32 bits can be narrowed, since sign/zero extension
+//! preserves the ordering of values.
 
 use crate::ir::reexports::{
     Instruction,
@@ -314,6 +318,10 @@ pub(crate) fn reads_low_bits(func: &IrFunction, uses: &[Vec<Option<(usize, usize
     uses[v as usize].iter().all(|u| {
         let Some((b, i)) = *u else { return false };
         match &func.blocks[b].instructions[i] {
+            // A cast between the signedness of one size is the register as
+            // it is: its uses read what it does.
+            Instruction::Cast { dest, from_ty, to_ty, .. } if from_ty.is_integer() && to_ty.size() == from_ty.size() =>
+                depth < 4 && reads_low_bits(func, uses, dest.0, bits, depth + 1),
             Instruction::Cast { to_ty, .. } => fits(to_ty),
             Instruction::Store { val: Operand::Value(x), ptr, ty, .. } => x.0 == v && ptr.0 != v && fits(ty),
             Instruction::BinOp { dest, op, lhs, rhs, ty: IrType::I64 | IrType::U64 | IrType::I32 | IrType::U32 } => {
@@ -358,6 +366,30 @@ fn narrow_binops_with_cast(
     let mut changes = 0;
     // Widening casts to retarget to the narrow type an operation now reads.
     let mut retype: Vec<(Value, IrType)> = Vec::new();
+    // Below 32 bits the narrowed operation leaves the register above its
+    // type unspecified (`mul w` of two chars), where the cast extended it
+    // (`sxtb`). A promoted local of the type is read as its register, as
+    // `!v` compares it with 0 at 64 bits, so such a cast is replaced only
+    // when every use reads no more than its bits (a byte store).
+    let low_only: Vec<bool> = {
+        let mut uses: Vec<Vec<Option<(usize, usize)>>> = vec![Vec::new(); max_id + 1];
+        for (b, block) in func.blocks.iter().enumerate() {
+            for (i, inst) in block.instructions.iter().enumerate() {
+                inst.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { u.push(Some((b, i))) });
+            }
+            block.terminator.for_each_used_value(|v| if let Some(u) = uses.get_mut(v as usize) { u.push(None) });
+        }
+        let mut low = vec![false; max_id + 1];
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            if let Instruction::Cast { dest, to_ty, .. } = inst {
+                let id = dest.0 as usize;
+                if id <= max_id && to_ty.is_integer() && to_ty.size() < 4 {
+                    low[id] = reads_low_bits(func, &uses, dest.0, to_ty.size() * 8, 0);
+                }
+            }
+        }
+        low
+    };
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
@@ -371,6 +403,9 @@ fn narrow_binops_with_cast(
 
                 let src_id = src_val.0 as usize;
                 if src_id > max_id {
+                    continue;
+                }
+                if to_ty.size() < 4 && !low_only.get(dest.0 as usize).copied().unwrap_or(false) {
                     continue;
                 }
 
@@ -398,13 +433,18 @@ fn narrow_binops_with_cast(
                 // via matching extension (sign-ext for AShr, zero-ext for LShr),
                 // the upper bits are just copies of the sign/zero bit, and the
                 // lower bits of the result are identical to doing the shift in
-                // the narrow type.
+                // the narrow type. Only to 32 bits: a shift narrower than the
+                // register reads the bits above the type, which a value of it
+                // need not hold extended ((int16_t)u16 is the same register),
+                // so (int16_t)(uint16_t)0x8000 >> 3 gave 0x1000.
                 let is_safe_op = matches!(binop_info.op,
                     IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul |
                     IrBinOp::And | IrBinOp::Or | IrBinOp::Xor |
                     IrBinOp::Shl
                 );
-                let is_safe_shift = if binop_info.op == IrBinOp::AShr {
+                let is_safe_shift = if to_ty.size() < 4 {
+                    false
+                } else if binop_info.op == IrBinOp::AShr {
                     // AShr narrowing is safe when the LHS was sign-extended
                     // from a signed type of the same size as the target.
                     // sext(x, I32->I64) >> k has the same low 32 bits as
@@ -421,6 +461,18 @@ fn narrow_binops_with_cast(
                 };
                 if !is_safe_op && !is_safe_shift {
                     continue;
+                }
+                // A shift's count must be a constant below the narrow width:
+                // the 64-bit shift by 34 of (x << 12) << 22, truncated, is 0,
+                // but a 32-bit shift takes its count mod 32. A count in a
+                // value can be that wide too ((uint32_t)((uint64_t)x << n)).
+                if matches!(binop_info.op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr) {
+                    let bits = (to_ty.size() * 8) as i64;
+                    let in_range = matches!(&binop_info.rhs, Operand::Const(c)
+                        if c.to_i64().is_some_and(|k| (0..bits).contains(&k)));
+                    if !in_range {
+                        continue;
+                    }
                 }
 
                 // BinOp result must only be used by this narrowing cast
@@ -637,19 +689,23 @@ fn narrow_binops_without_cast(
                 let lhs_narrow_ty = operand_narrow_type(lhs, &load_type_map, widen_map, narrowed_map);
                 let rhs_narrow_ty = operand_narrow_type(rhs, &load_type_map, widen_map, narrowed_map);
 
+                // The 32-bit op leaves the high half zero, which is the 64-bit
+                // result only when every operand had it zero: values extended
+                // from unsigned types and constants in [0, u32::MAX].
+                // sext(a) ^ sext(b) has the sign in its high half, and
+                // zext(a) | -1 has ones there.
+                let const_fits = |op: &Operand, t: IrType| match op {
+                    Operand::Const(c) => try_narrow_const_for_cmp(c, t).is_some(),
+                    _ => false,
+                };
                 let target_ty = match (lhs_narrow_ty, rhs_narrow_ty) {
-                    (Some(lt), Some(rt)) if lt == rt => lt,
-                    (Some(lt), Some(rt)) if lt.size() == rt.size() => lt,
-                    (Some(t), None) => {
-                        if try_narrow_const_operand(rhs, t).is_some() { t } else { continue; }
-                    }
-                    (None, Some(t)) => {
-                        if try_narrow_const_operand(lhs, t).is_some() { t } else { continue; }
-                    }
+                    (Some(lt), Some(rt)) if lt.size() == rt.size() && lt.is_unsigned() && rt.is_unsigned() => lt,
+                    (Some(t), None) if t.is_unsigned() && const_fits(rhs, t) => t,
+                    (None, Some(t)) if t.is_unsigned() && const_fits(lhs, t) => t,
                     _ => continue,
                 };
 
-                // Only narrow to I32/U32 (sub-int types are unsafe without
+                // Only narrow to U32 (sub-int types are unsafe without
                 // an explicit Cast; see Phase 4 for sub-int handling).
                 if target_ty.size() < 4 {
                     continue;
@@ -679,6 +735,20 @@ fn narrow_binops_without_cast(
                     if const_becomes_all_ones(lhs) || const_becomes_all_ones(rhs) {
                         continue;
                     }
+                }
+
+                // Likewise any operation simplify takes for its operand (x | 0,
+                // x ^ 0, x | x, x & x): the operand then stands for the
+                // 32-bit result, and an operand narrowed through a widening
+                // need not have its high half zero ((uint32_t)b of a signed
+                // char is its `sxtb` register, so (uint32_t)b | 0 was
+                // sign-extended).
+                let is_zero = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64() == Some(0));
+                if (matches!(op, IrBinOp::Or | IrBinOp::Xor) && (is_zero(lhs) || is_zero(rhs)))
+                    || (matches!(op, IrBinOp::Or | IrBinOp::And)
+                        && matches!((&*lhs, &*rhs), (Operand::Value(a), Operand::Value(b)) if a.0 == b.0))
+                {
+                    continue;
                 }
 
                 let new_lhs = try_narrow_operand(lhs, target_ty, Some(&load_type_map), widen_map, narrowed_map);
@@ -735,6 +805,13 @@ fn narrow_cmps(
                 } else {
                     continue;
                 };
+                // Not below 32 bits: those compare the low 32 bits of the
+                // register, and a value of a narrow type need not hold its
+                // extension there ((int16_t)u16 is the same register, so
+                // (int16_t)(uint16_t)0xfffe < 1 was false).
+                if narrow_ty.size() < 4 {
+                    continue;
+                }
 
                 let is_signed_cmp = matches!(op,
                     IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);

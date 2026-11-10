@@ -87,7 +87,10 @@ impl ArmCodegen {
             if op == IrBinOp::URem {
                 self.operand_to_x0(lhs);
                 let mask = (1u64 << shift) - 1;
-                if use_32bit {
+                if mask == 0 {
+                    // x % 1: no logical immediate is 0.
+                    self.state.emit("    mov x0, #0");
+                } else if use_32bit {
                     self.state.emit_fmt(format_args!("    and w0, w0, #{}", mask));
                 } else {
                     self.state.emit_fmt(format_args!("    and x0, x0, #{}", mask));

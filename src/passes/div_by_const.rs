@@ -161,6 +161,10 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
     // Values widened from 8- or 16-bit integers, or masked to 16 bits: their
     // range, for small_magic.
     let mut small_range: Vec<Option<(i64, i64)>> = vec![None; max_id + 1];
+    // A value of an integer type of up to 32 bits fits in i32 when the type
+    // is signed or narrower: a U32 reaches 2^32 - 1, which the signed
+    // expansion took for -1 ((int64_t)u / 7 with u = 0xff000200 was negative).
+    let fits_i32 = |ty: &IrType| ty.is_signed() || ty.size() < 4;
     // And from the values' ranges: `(r % 36) * (r % 36)`, widened to 64 bits
     // because it cannot overflow, is below 1296.
     for (id, r) in super::simplify::value_ranges(func, max_id).into_iter().enumerate() {
@@ -212,10 +216,8 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                         if id <= max_id {
                             if ty.is_unsigned() {
                                 is_known_u32[id] = true;
-                                is_known_i32[id] = true;
-                            } else {
-                                is_known_i32[id] = true;
                             }
+                            if fits_i32(ty) { is_known_i32[id] = true; }
                         }
                     }
                 }
@@ -227,10 +229,10 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                             && (*to_ty == IrType::I64 || *to_ty == IrType::U64)
                         {
                             if from_ty.is_unsigned() {
-                                // Zero-extension: value fits in both u32 and i32 ranges
-                                // (unsigned <=32-bit values are always non-negative and <= 2^32-1)
+                                // Zero-extension: value fits in u32 range, and in i32
+                                // range when narrower than 32 bits.
                                 is_known_u32[id] = true;
-                                is_known_i32[id] = true;
+                                if fits_i32(from_ty) { is_known_i32[id] = true; }
                             } else {
                                 // Sign-extension from signed type: value fits in i32 range
                                 // but NOT necessarily in u32 range (e.g. -128 sign-extended
@@ -242,9 +244,11 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                             }
                         }
                         // (b) Narrowing/truncation to <=32-bit
+                        // A signed one is held sign-extended to 64 bits
+                        // (`sxtb`), and a 64-bit division reads it so.
                         if to_ty.is_integer() && to_ty.size() <= 4 {
-                            is_known_u32[id] = true;
-                            is_known_i32[id] = true;
+                            if to_ty.is_unsigned() { is_known_u32[id] = true; }
+                            if fits_i32(to_ty) { is_known_i32[id] = true; }
                         }
                     }
                 }
@@ -253,8 +257,8 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                     if ty.is_integer() && ty.size() <= 4 {
                         let id = dest.0 as usize;
                         if id <= max_id {
-                            is_known_u32[id] = true;
-                            is_known_i32[id] = true;
+                            if ty.is_unsigned() { is_known_u32[id] = true; }
+                            if fits_i32(ty) { is_known_i32[id] = true; }
                         }
                     }
                 }
@@ -268,7 +272,7 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                             if ty.is_unsigned() || *op == IrBinOp::And || *op == IrBinOp::LShr {
                                 is_known_u32[id] = true;
                             }
-                            is_known_i32[id] = true;
+                            if fits_i32(ty) { is_known_i32[id] = true; }
                         }
                     }
                 }

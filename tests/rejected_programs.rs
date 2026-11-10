@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 const TIME_LIMIT: Duration = Duration::from_secs(30);
 
 /// Compile `source`, and check it stops with a diagnostic holding `expected`.
-fn assert_rejected(name: &str, source: &str, expected: &str) {
+/// Returns the diagnostics.
+fn assert_rejected(name: &str, source: &str, expected: &str) -> String {
     let path: PathBuf = std::env::temp_dir().join(format!("ccc-rejected-{}-{name}.c", std::process::id()));
     std::fs::write(&path, source).unwrap();
     // To a file: a diagnostic quotes its line, which can be longer than a pipe holds.
@@ -39,6 +40,7 @@ fn assert_rejected(name: &str, source: &str, expected: &str) {
     assert_eq!(status.code(), Some(1), "{name}: {stderr}");
     assert!(!stderr.contains("internal error") && !stderr.contains("panicked"), "{name}: {stderr}");
     assert!(stderr.contains(expected), "{name}: {stderr}");
+    stderr
 }
 
 const MAIN: &str = "int main(void) { return 0; }\n";
@@ -94,7 +96,9 @@ fn struct_that_holds_itself() {
 fn thousands_of_errors_on_one_line() {
     // Each error quoted the whole line: minutes, for one bad macro.
     let line = "int a = ) ; ".repeat(40_000);
-    assert_rejected("errors", &format!("{line}\n{MAIN}"), "too many errors, stopping");
+    let stderr = assert_rejected("errors", &format!("{line}\n{MAIN}"), "too many errors, stopping");
+    // And it is quoted only around the caret: 100 errors, not 100 copies of 480KB.
+    assert!(stderr.len() < 100_000, "{} bytes of diagnostics", stderr.len());
 }
 
 #[test]
@@ -103,13 +107,19 @@ fn nesting_without_end() {
     let n = 25_000;
     let body = |s: String| format!("int f(int a) {{\n{s}\nreturn a;\n}}\n{MAIN}");
     let nest = |open: &str, close: &str, mid: &str| format!("{}{mid}{}", open.repeat(n), close.repeat(n));
-    let too_deep = "nesting is too deep";
-    assert_rejected("parens", &body(format!("a = {};", nest("(", ")", "a"))), too_deep);
-    assert_rejected("blocks", &body(nest("{", "}", "a++;")), too_deep);
-    assert_rejected("ifs", &body(nest("if (a) {", "}", "a++;")), too_deep);
-    assert_rejected("unary", &body(format!("a = {}a;", "- ".repeat(n))), too_deep);
-    assert_rejected("ternary", &body(format!("a = {}a;", "a ? a : ".repeat(n))), too_deep);
-    assert_rejected("labels", &body(format!("{}a++;", (0..n).map(|i| format!("l{i}: ")).collect::<String>())), too_deep);
-    assert_rejected("init", &format!("int x = {};\n{MAIN}", nest("{", "}", "1")), too_deep);
-    assert_rejected("structs", &format!("struct {} v;\n{MAIN}", nest("{ struct ", " m; }", "{ int a; }")), too_deep);
+    // The diagnostic ends the parse: the levels that unwind after it each
+    // missed their closing token, and once quoted the whole line saying so
+    // (300MB of errors). A long line is quoted only around the caret.
+    let rejected = |name: &str, source: &str| {
+        let stderr = assert_rejected(name, source, "nesting is too deep");
+        assert!(stderr.len() < 1000, "{name}: {} bytes of diagnostics", stderr.len());
+    };
+    rejected("parens", &body(format!("a = {};", nest("(", ")", "a"))));
+    rejected("blocks", &body(nest("{", "}", "a++;")));
+    rejected("ifs", &body(nest("if (a) {", "}", "a++;")));
+    rejected("unary", &body(format!("a = {}a;", "- ".repeat(n))));
+    rejected("ternary", &body(format!("a = {}a;", "a ? a : ".repeat(n))));
+    rejected("labels", &body(format!("{}a++;", (0..n).map(|i| format!("l{i}: ")).collect::<String>())));
+    rejected("init", &format!("int x = {};\n{MAIN}", nest("{", "}", "1")));
+    rejected("structs", &format!("struct {} v;\n{MAIN}", nest("{ struct ", " m; }", "{ int a; }")));
 }

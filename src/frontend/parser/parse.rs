@@ -307,6 +307,9 @@ pub struct Parser {
     pub error_count: usize,
     /// Levels of `nested` being parsed.
     nesting: usize,
+    /// Set after a diagnostic that ends the parse (too many errors, nesting
+    /// too deep): the levels that unwind after it report nothing more.
+    stopped: bool,
     /// Structured diagnostic engine for error/warning reporting with source snippets.
     pub(super) diagnostics: DiagnosticEngine,
     /// Map of enum constant names to their integer values.
@@ -340,6 +343,7 @@ impl Parser {
             pragma_default_visibility: None,
             error_count: 0,
             nesting: 0,
+            stopped: false,
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
             unevaluable_enum_constants: FxHashSet::default(),
@@ -362,19 +366,35 @@ impl Parser {
     /// Emit a parse error at the given span. Updates error_count and prints
     /// the error with source location and snippet (if source manager is set).
     pub(super) fn emit_error(&mut self, message: impl Into<String>, span: Span) {
+        self.report(crate::common::error::Diagnostic::error(message).with_span(span));
+    }
+
+    /// Count a parse error and print it, unless the parse has stopped.
+    fn report(&mut self, diag: crate::common::error::Diagnostic) {
+        if self.stopped {
+            return;
+        }
         self.error_count += 1;
-        self.diagnostics.error(message, span);
+        self.diagnostics.emit(&diag);
         self.stop_after_too_many_errors();
     }
 
     /// Errors quote their line, and one macro can put a whole file on a line:
     /// 18,000 errors on a line of 80,000 tokens took over two minutes.
     fn stop_after_too_many_errors(&mut self) {
-        if self.error_count == MAX_ERRORS {
+        if !self.stopped && self.error_count >= MAX_ERRORS {
             let span = self.peek_span();
             self.diagnostics.error("too many errors, stopping", span);
-            self.pos = self.tokens.len();
+            self.stop();
         }
+    }
+
+    /// End the parse: skip the rest of the tokens, and report nothing more
+    /// while the levels of the descent unwind (each would miss its closing
+    /// token at the end of input).
+    fn stop(&mut self) {
+        self.stopped = true;
+        self.pos = self.tokens.len();
     }
 
     /// Run one level of the recursive descent. Past MAX_NESTING it is an
@@ -384,7 +404,7 @@ impl Parser {
             if !self.at_eof() {
                 let span = self.peek_span();
                 self.emit_error("nesting is too deep", span);
-                self.pos = self.tokens.len();
+                self.stop();
             }
             return give_up;
         }
@@ -530,9 +550,7 @@ impl Parser {
             )
             .with_span(span)
             .with_fix_hint(format!("insert {}", expected));
-            self.error_count += 1;
-            self.diagnostics.emit(&diag);
-            self.stop_after_too_many_errors();
+            self.report(diag);
             span
         }
     }
@@ -567,9 +585,7 @@ impl Parser {
                     format!("to match this {}", open_tok)
                 ).with_span(open_span)
             );
-            self.error_count += 1;
-            self.diagnostics.emit(&diag);
-            self.stop_after_too_many_errors();
+            self.report(diag);
             span
         }
     }
@@ -589,9 +605,7 @@ impl Parser {
             )
             .with_span(span)
             .with_fix_hint(format!("insert {}", expected));
-            self.error_count += 1;
-            self.diagnostics.emit(&diag);
-            self.stop_after_too_many_errors();
+            self.report(diag);
             span
         }
     }

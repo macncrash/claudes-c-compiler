@@ -694,7 +694,10 @@ And rewrites to operate directly at the narrow type:
 This is safe for operations where the low bits are width-independent when
 truncated: Add, Sub, Mul, And, Or, Xor, and Shl. Right shifts are safe when
 the extension type matches the shift type (arithmetic shift with sign extension,
-logical shift with zero extension). The BinOp result must have exactly one use
+logical shift with zero extension), by a constant count below the narrow width
+(a 32-bit shift takes its count mod 32), and right shifts only to 32 bits: a
+narrower one reads the register above its type, which a 16-bit value need not
+hold extended (`(int16_t)u16` is the same register). The BinOp result must have exactly one use
 (the narrowing cast). For a 32-bit result, an operand that is the one use of a
 widening cast from a smaller type also qualifies: the cast then widens to the
 32-bit type instead (`(ush)v << n` with an int shift becomes a 32-bit shift
@@ -717,14 +720,16 @@ or and truncates the or to 16 bits, so the extension goes (a `sxtw` or an
 
 **Phase 2: Narrow binary operations without explicit cast.** On 64-bit targets,
 narrows I64 bitwise operations (And, Or, Xor) to I32 when all operands are
-provably 32-bit values, even without an explicit narrowing cast. This handles
+provably 32-bit values zero-extended (unsigned types, constants in [0, 2^32)),
+as the 32-bit operation leaves the high half zero: `sext(a) ^ sext(b)` has the
+sign there. This handles
 cases where the result is consumed by another operation rather than an explicit
 truncation. Uses both the widening cast map and a load-type map to identify
 narrow operands. Disabled on 32-bit targets and restricted to I32/U32 output
 to avoid sub-int register complications.
 
 **Phase 3: Narrow comparisons.** When both operands of a comparison were
-widened from the same type, narrows the comparison to operate at the original
+widened from the same 32-bit type, narrows the comparison to operate at the original
 type. Signed comparisons (Slt/Sle/Sgt/Sge) require the source type to be
 signed; unsigned comparisons (Ult/Ule/Ugt/Uge) require unsigned; Eq/Ne are
 safe with either sign. The RHS operand can be a constant if it round-trips

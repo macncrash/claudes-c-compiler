@@ -848,13 +848,18 @@ impl DiagnosticEngine {
         let loc = sm.resolve_span(span);
         let col = loc.column as usize;
 
+        // A long line (one macro can put a whole file on a line) is shown only
+        // around the caret, as clang does: quoting all of it in each of many
+        // errors once wrote hundreds of megabytes.
+        let (shown, col, room) = snippet_window(&source_line, col);
+
         // Print the source line with indentation
-        eprintln!(" {}", source_line);
+        eprintln!(" {}", shown);
 
         // Build the caret line: spaces up to the column, then ^ with tildes
         if col > 0 {
             let padding = " ".repeat(col);
-            let span_len = (span.end.saturating_sub(span.start)) as usize;
+            let span_len = ((span.end.saturating_sub(span.start)) as usize).min(room);
             let underline = if span_len > 1 {
                 format!("^{}", "~".repeat(span_len - 1))
             } else {
@@ -879,6 +884,30 @@ impl Default for DiagnosticEngine {
 /// in "in expansion of macro" diagnostic notes. These macros are expanded
 /// ubiquitously in C code and showing them would produce noise rather than
 /// helping the user understand the error.
+/// Lines longer than this are quoted only around the caret.
+const SNIPPET_MAX: usize = 160;
+
+/// The part of `line` to quote for a caret at 1-based column `col`, the
+/// caret's column in it, and how many columns from the caret it shows.
+fn snippet_window(line: &str, col: usize) -> (std::borrow::Cow<'_, str>, usize, usize) {
+    if line.len() <= SNIPPET_MAX {
+        return (line.into(), col, line.len().saturating_sub(col.saturating_sub(1)).max(1));
+    }
+    let at = col.saturating_sub(1).min(line.len());
+    let mut start = at.saturating_sub(SNIPPET_MAX / 2);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + SNIPPET_MAX).min(line.len());
+    while !line.is_char_boundary(end) {
+        end += 1;
+    }
+    let lead = if start > 0 { "..." } else { "" };
+    let tail = if end < line.len() { "..." } else { "" };
+    let shown = format!("{lead}{}{tail}", &line[start..end]);
+    (shown.into(), col - start + lead.len(), (end - at).max(1))
+}
+
 fn is_uninteresting_macro(name: &str) -> bool {
     // GCC/Clang builtin function-style macros
     if name.starts_with("__builtin_") {

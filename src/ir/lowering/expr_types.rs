@@ -716,6 +716,36 @@ impl Lowerer {
 
     // expr_is_const_qualified is defined in expr.rs as pub(super)
     /// Get the IR type for an expression (best-effort, based on locals/globals info).
+    /// The IR type of `c ? a : b` with integer branches: the usual
+    /// arithmetic conversion of their C types. Their IR types do not tell
+    /// it, as an int literal is I64 on LP64: `b ? b : (5u | 1)` is unsigned
+    /// int, but was I64, and extended a negative short `b` with its sign.
+    pub(super) fn conditional_int_type(&self, then_expr: &Expr, else_expr: &Expr) -> Option<IrType> {
+        let then_ct = self.promoted_branch_ctype(then_expr);
+        let else_ct = self.promoted_branch_ctype(else_expr);
+        (then_ct.is_integer() && else_ct.is_integer())
+            .then(|| IrType::from_ctype(&CType::usual_arithmetic_conversion(&then_ct, &else_ct)))
+    }
+
+    /// An operand's C type for the usual arithmetic conversions: a bit-field
+    /// of up to 31 bits (32 if signed) promotes to int, whatever its declared
+    /// type (`unsigned bf : 5` is int, so `c ? s.bf : -1` is -1, not 2^32 - 1).
+    fn promoted_branch_ctype(&self, expr: &Expr) -> CType {
+        let bf_info = match expr {
+            Expr::MemberAccess(base, field, _) => self.resolve_member_access_full(base, field),
+            Expr::PointerMemberAccess(base, field, _) => self.resolve_pointer_member_access_full(base, field),
+            _ => return self.expr_ctype(expr),
+        };
+        match bf_info {
+            (_, field_ty, Some(bf)) => match bitfield_promoted_type(field_ty, Some(bf)) {
+                IrType::I32 => CType::Int,
+                IrType::U32 => CType::UInt,
+                _ => self.expr_ctype(expr),
+            },
+            _ => self.expr_ctype(expr),
+        }
+    }
+
     pub(super) fn get_expr_type(&self, expr: &Expr) -> IrType {
         use crate::common::types::target_is_32bit;
         let is_32bit = target_is_32bit();
@@ -807,6 +837,9 @@ impl Lowerer {
                 self.get_expr_type(lhs)
             }
             Expr::Conditional(_, then_expr, else_expr, _) => {
+                if let Some(ty) = self.conditional_int_type(then_expr, else_expr) {
+                    return ty;
+                }
                 let then_ty = self.get_expr_type(then_expr);
                 let else_ty = self.get_expr_type(else_expr);
                 Self::common_type(then_ty, else_ty)

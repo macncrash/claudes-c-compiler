@@ -261,7 +261,11 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
             Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty }
                 if (ext.get(v.0 as usize).copied().flatten().is_some_and(|e| covers(e, from_ty))
                     || (from_ty == IrType::I32 && uses[dest.0 as usize] > 1 && int_ops[v.0 as usize] == Some(IrType::I32)))
-                    && from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size() =>
+                    && from_ty.is_integer() && to_ty.is_integer() && to_ty.size() > from_ty.size()
+                    // Not to 128 bits: the high register is the extension
+                    // (the int64 division by a constant multiplies an
+                    // int8_t widened to I128 and took its high half as 0).
+                    && to_ty.size() <= 8 =>
             {
                 *inst = Instruction::Copy { dest, src: Operand::Value(v) };
                 ext[dest.0 as usize] = ext[v.0 as usize].or(Some(IrType::I32));
@@ -384,6 +388,11 @@ fn low_bits_only(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32
         match &func.blocks[b].instructions[i] {
             // A narrowing, or a widening that extends from at most `bits`
             // (`and #0xffff` of a U16).
+            // A cast between the signedness of one size is the register as it
+            // is, so its uses read what it does (`(int32_t)a` tested whole
+            // by a select).
+            Instruction::Cast { dest, from_ty, to_ty, .. } if from_ty.is_integer() && to_ty.size() == from_ty.size() =>
+                low_bits_only(func, uses, dest.0, bits, seen),
             Instruction::Cast { from_ty, to_ty, .. } => fits(to_ty) || (fits(from_ty) && to_ty.is_integer() && to_ty.size() > from_ty.size()),
             Instruction::Store { val: Operand::Value(x), ptr, ty, .. } => x.0 == v && ptr.0 != v && fits(ty),
             Instruction::Copy { dest, .. } | Instruction::Phi { dest, .. } => low_bits_only(func, uses, dest.0, bits, seen),
