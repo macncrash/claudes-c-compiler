@@ -58,6 +58,9 @@ pub enum CallArgClass {
     F128Stack,
     /// I128 argument overflows to the stack (16-byte aligned).
     I128Stack,
+    /// Apple arm64: a named HFA on the stack, aligned to its element and
+    /// taking exactly its size: { float h[3]; } takes 12 bytes, not 16.
+    StructHfaStack { size: usize, elem_size: usize },
     /// Zero-size struct argument (e.g., `struct { char x[0]; }`).
     /// Per GCC behavior, zero-size struct arguments consume no register or stack space.
     ZeroSizeSkip,
@@ -69,6 +72,7 @@ impl CallArgClass {
         matches!(self, CallArgClass::Stack | CallArgClass::StackPacked { .. } |
                  CallArgClass::F128Stack | CallArgClass::I128Stack |
                  CallArgClass::StructByValStack { .. } |
+                 CallArgClass::StructHfaStack { .. } |
                  CallArgClass::LargeStructStack { .. } |
                  CallArgClass::StructSplitRegStack { .. })
     }
@@ -78,6 +82,7 @@ impl CallArgClass {
         match self {
             CallArgClass::F128Stack | CallArgClass::I128Stack => 16,
             CallArgClass::StackPacked { size } => *size,
+            CallArgClass::StructHfaStack { elem_size, .. } => *elem_size,
             _ => crate::common::types::target_ptr_size(),
         }
     }
@@ -99,6 +104,7 @@ impl CallArgClass {
             }
             CallArgClass::Stack => slot_size,
             CallArgClass::StackPacked { size } => *size,
+            CallArgClass::StructHfaStack { size, .. } => *size,
             _ => 0,
         }
     }
@@ -417,7 +423,14 @@ fn classify_args_core(
     args: &[ArgInfo<'_>],
     is_variadic: bool,
     config: &CallAbiConfig,
+    sret_dedicated: bool,
 ) -> CoreClassification {
+    // A hidden result pointer passed in its own register (x8 on AArch64) is
+    // classified as argument 0 in GP index 0 but takes no argument register:
+    // the real arguments use indices 1..=max, which callers and callees map
+    // one lower. Without this an argument that overflowed for another reason
+    // (an HFA once the FP registers ran out) was moved into x7.
+    let max_int = config.max_int_regs + usize::from(sret_dedicated);
     let mut result = Vec::with_capacity(args.len());
     let mut int_idx = 0usize;
     let mut float_idx = 0usize;
@@ -467,7 +480,7 @@ fn classify_args_core(
                     }
                     SysvStructRegClass::Stack => {
                         result.push(CoreArgClass::StructByValStack { size });
-                        int_idx = config.max_int_regs;
+                        int_idx = max_int;
                     }
                 }
                 int_idx += gp_used;
@@ -498,7 +511,7 @@ fn classify_args_core(
                             }
                         }
                         RiscvFloatClass::FloatAndInt { .. } => {
-                            if float_idx < config.max_float_regs && int_idx < config.max_int_regs {
+                            if float_idx < config.max_float_regs && int_idx < max_int {
                                 result.push(CoreArgClass::StructMixedSseIntReg { fp_reg_idx: float_idx, int_reg_idx: int_idx, size });
                                 float_idx += 1;
                                 int_idx += 1;
@@ -506,7 +519,7 @@ fn classify_args_core(
                             }
                         }
                         RiscvFloatClass::IntAndFloat { .. } => {
-                            if int_idx < config.max_int_regs && float_idx < config.max_float_regs {
+                            if int_idx < max_int && float_idx < config.max_float_regs {
                                 result.push(CoreArgClass::StructMixedIntSseReg { int_reg_idx: int_idx, fp_reg_idx: float_idx, size });
                                 int_idx += 1;
                                 float_idx += 1;
@@ -527,20 +540,20 @@ fn classify_args_core(
                             int_idx += 1; // skip to even register
                         }
                     }
-                    if int_idx + regs_needed <= config.max_int_regs {
+                    if int_idx + regs_needed <= max_int {
                         result.push(CoreArgClass::StructByValReg { base_reg_idx: int_idx, size });
                         int_idx += regs_needed;
-                    } else if regs_needed == 2 && int_idx < config.max_int_regs && config.allow_struct_split_reg_stack {
+                    } else if regs_needed == 2 && int_idx < max_int && config.allow_struct_split_reg_stack {
                         result.push(CoreArgClass::StructSplitRegStack { reg_idx: int_idx, size });
-                        int_idx = config.max_int_regs;
+                        int_idx = max_int;
                     } else {
                         result.push(CoreArgClass::StructByValStack { size });
-                        int_idx = config.max_int_regs;
+                        int_idx = max_int;
                     }
                 }
             } else if config.large_struct_by_ref {
                 // AAPCS64 / RISC-V: large composites passed by reference.
-                if int_idx < config.max_int_regs {
+                if int_idx < max_int {
                     result.push(CoreArgClass::LargeStructByRefReg { reg_idx: int_idx, size });
                     int_idx += 1;
                 } else {
@@ -553,12 +566,12 @@ fn classify_args_core(
             if config.align_i128_pairs && !int_idx.is_multiple_of(2) {
                 int_idx += 1;
             }
-            if int_idx + 1 < config.max_int_regs {
+            if int_idx + 1 < max_int {
                 result.push(CoreArgClass::I128RegPair { base_reg_idx: int_idx });
                 int_idx += 2;
             } else {
                 result.push(CoreArgClass::I128Stack);
-                int_idx = config.max_int_regs;
+                int_idx = max_int;
             }
         } else if info.is_long_double {
             if config.f128_in_fp_regs {
@@ -572,12 +585,12 @@ fn classify_args_core(
                 if config.align_i128_pairs && !int_idx.is_multiple_of(2) {
                     int_idx += 1;
                 }
-                if int_idx + 1 < config.max_int_regs {
+                if int_idx + 1 < max_int {
                     result.push(CoreArgClass::F128GpPair { base_reg_idx: int_idx });
                     int_idx += 2;
                 } else {
                     result.push(CoreArgClass::F128Stack);
-                    int_idx = config.max_int_regs;
+                    int_idx = max_int;
                 }
             } else {
                 result.push(CoreArgClass::F128Stack);
@@ -587,7 +600,7 @@ fn classify_args_core(
             float_idx += 1;
         } else if info.is_float && !force_gp {
             result.push(CoreArgClass::Stack);
-        } else if int_idx < config.max_int_regs {
+        } else if int_idx < max_int {
             result.push(CoreArgClass::IntReg { reg_idx: int_idx });
             int_idx += 1;
         } else {
@@ -621,6 +634,24 @@ pub fn classify_call_args(
     is_variadic: bool,
     config: &CallAbiConfig,
 ) -> Vec<CallArgClass> {
+    classify_call_args_with_sret(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes,
+                                 struct_arg_riscv_float_classes, is_variadic, config, false)
+}
+
+/// `classify_call_args`, with `sret_dedicated` set when argument 0 is a hidden
+/// result pointer that goes in its own register (see `classify_args_core`).
+#[allow(clippy::too_many_arguments)]
+pub fn classify_call_args_with_sret(
+    args: &[Operand],
+    arg_types: &[IrType],
+    struct_arg_sizes: &[Option<usize>],
+    struct_arg_aligns: &[Option<usize>],
+    struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
+    struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+    is_variadic: bool,
+    config: &CallAbiConfig,
+    sret_dedicated: bool,
+) -> Vec<CallArgClass> {
     // Build ArgInfo slice from call-site arrays.
     let arg_infos: Vec<ArgInfo<'_>> = args.iter().enumerate().map(|(i, arg)| {
         let arg_ty = if i < arg_types.len() { Some(arg_types[i]) } else { None };
@@ -639,7 +670,7 @@ pub fn classify_call_args(
         }
     }).collect();
 
-    let core = classify_args_core(&arg_infos, is_variadic, config);
+    let core = classify_args_core(&arg_infos, is_variadic, config, sret_dedicated);
 
     // Convert CoreArgClass -> CallArgClass (drop by-ref variants that only appear
     // when large_struct_by_ref is true, which maps to IntReg/Stack on the caller side).
@@ -709,40 +740,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
     // The force_gp check is: is_variadic && config.variadic_floats_in_gp && is_float.
     // For non-variadic functions, config.variadic_floats_in_gp is false, so force_gp
     // is false regardless of the is_variadic flag — making this safe.
-    let mut core = classify_args_core(&arg_infos, true, config);
-
-    // AArch64 ABI: when sret uses a dedicated register (x8), the classification initially
-    // assigns the sret pointer to IntReg(0), consuming one GP register slot. On the caller
-    // side (emit_call in traits.rs), the sret arg is reclassified to ZeroSizeSkip, all
-    // other GP reg indices are shifted down by 1, and the first stack-overflow GP arg is
-    // promoted to the freed register slot (max_int_regs-1, i.e. x7).
-    //
-    // We must apply the same promotion on the callee side so that caller and callee agree
-    // on where each argument lives. The emit_store_gp_params method already handles
-    // the register index shift (sret_shift=1), but it does NOT promote stack args.
-    // Apply the promotion here to match the caller-side logic.
-    if func.uses_sret && config.sret_uses_dedicated_reg && core.classes.len() > 1 {
-        // Use max_int_regs (not max_int_regs-1) because emit_store_gp_params applies
-        // sret_shift=1, computing actual_idx = reg_idx - 1. So reg_idx=8 maps to x7.
-        let freed_reg = config.max_int_regs;
-        // Promote the first GP stack-overflow arg to the freed register slot.
-        for i in 1..core.classes.len() {
-            match core.classes[i] {
-                CoreArgClass::Stack => {
-                    let is_float = func.params.get(i).map(|p| p.ty.is_float()).unwrap_or(false);
-                    if !is_float {
-                        core.classes[i] = CoreArgClass::IntReg { reg_idx: freed_reg };
-                        break;
-                    }
-                }
-                CoreArgClass::StructByValStack { size } if size <= 8 => {
-                    core.classes[i] = CoreArgClass::StructByValReg { base_reg_idx: freed_reg, size };
-                    break;
-                }
-                _ => {}
-            }
-        }
-    }
+    let core = classify_args_core(&arg_infos, true, config, func.uses_sret && config.sret_uses_dedicated_reg);
 
     // Convert CoreArgClass -> ParamClass, assigning stack offsets.
     let slot_size = crate::common::types::target_ptr_size();
@@ -752,7 +750,13 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
 
     for (i, c) in core.classes.iter().enumerate() {
         let param_ty = func.params.get(i).map(|p| p.ty);
-        if config.pack_stack_scalars && matches!(c,
+        let packed_hfa = match (config.pack_stack_scalars, c, func.params.get(i).and_then(|p| p.riscv_float_class)) {
+            (true, CoreArgClass::StructByValStack { .. }, Some(crate::common::types::RiscvFloatClass::Hfa { elem_size, .. })) => Some(elem_size as i64),
+            _ => None,
+        };
+        if let Some(align) = packed_hfa {
+            stack_offset = (stack_offset + align - 1) / align * align;
+        } else if config.pack_stack_scalars && matches!(c,
             CoreArgClass::StructByValStack { .. } | CoreArgClass::LargeStructStack { .. }
             | CoreArgClass::StructSplitRegStack { .. } | CoreArgClass::LargeStructByRefStack { .. })
         {
@@ -803,7 +807,11 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
             }
             CoreArgClass::StructByValStack { size } | CoreArgClass::LargeStructStack { size } => {
                 let off = stack_offset;
-                stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
+                stack_offset += if packed_hfa.is_some() {
+                    size as i64
+                } else {
+                    (size as i64 + slot_align_mask) & !slot_align_mask
+                };
                 if matches!(*c, CoreArgClass::LargeStructStack { .. }) {
                     ParamClass::LargeStructStack { offset: off, size }
                 } else {

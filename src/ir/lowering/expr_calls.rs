@@ -279,6 +279,14 @@ impl Lowerer {
         } else {
             (false, arg_vals.len())
         };
+        // The hidden result pointer prepended above is a fixed argument too:
+        // without it the last named one was passed as variadic, on the stack
+        // on Darwin, for struct T f(int, double, ...) returning an HFA or in memory.
+        let num_fixed_args = if call_variadic && sret_alloca.is_some() {
+            (num_fixed_args + 1).min(arg_vals.len())
+        } else {
+            num_fixed_args
+        };
 
         // Dispatch: direct call, function pointer call, or indirect call
         let call_ret_ty = self.emit_call_instruction(effective_func, dest, arg_vals, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, call_variadic, num_fixed_args, two_reg_size, sret_size, call_ret_classes);

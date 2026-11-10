@@ -9,7 +9,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{IrType, RiscvFloatClass};
 use super::emit::{ARM_VEC_TEMP_REGS, ARM_VEC_VAR_REGS};
 use super::emit::ArmCodegen;
-use crate::backend::call_abi::{CallAbiConfig, CallArgClass, classify_call_args};
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, classify_call_args_with_sret};
 
 /// Where vector variables in registers are stored to their save slots and
 /// reloaded (vec_vars_live_across), as masks of `1 << reg`: around each
@@ -223,16 +223,22 @@ impl ArmCodegen {
                     if let Instruction::CallIndirect { func_ptr: Operand::Value(v), .. } = inst {
                         reject(v.0);
                     }
-                    let classes = classify_call_args(&info.args, &info.arg_types, &info.struct_arg_sizes,
+                    let classes = classify_call_args_with_sret(&info.args, &info.arg_types, &info.struct_arg_sizes,
                         &info.struct_arg_aligns, &info.struct_arg_classes, &info.struct_arg_riscv_float_classes,
-                        info.is_variadic, config);
+                        info.is_variadic, config, info.is_sret && config.sret_uses_dedicated_reg);
                     let has_f128 = info.arg_types.contains(&IrType::F128);
                     for (i, arg) in info.args.iter().enumerate() {
                         let Operand::Value(v) = arg else { continue };
                         if !lanes.contains_key(&v.0) {
                             continue;
                         }
-                        let in_reg = matches!(classes.get(i), Some(CallArgClass::StructHfaReg { count: 1, .. }))
+                        // On Darwin a variadic argument goes on the stack whatever its
+                        // class (emit_call): a one-double HFA kept in a register was
+                        // passed from memory never written.
+                        let unnamed = info.is_variadic && config.variadic_args_on_stack && i >= info.num_fixed_args;
+                        let one_reg_hfa = !unnamed
+                            && matches!(classes.get(i), Some(CallArgClass::StructHfaReg { count: 1, .. }));
+                        let in_reg = one_reg_hfa
                             && !(info.is_sret && i == 0) && !has_f128
                             && size_of.contains_key(&v.0)
                             && info.struct_arg_sizes.get(i) == Some(&Some(size_of[&v.0] as usize));

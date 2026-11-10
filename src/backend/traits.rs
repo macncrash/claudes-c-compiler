@@ -441,50 +441,22 @@ pub trait ArchCodegen {
                  ret_eightbyte_classes: &[crate::common::types::EightbyteClass]) {
         use super::call_abi::*;
         let config = self.call_abi_config();
-        let mut arg_classes = classify_call_args(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, is_variadic, &config);
+        let sret_dedicated = is_sret && self.sret_uses_dedicated_reg() && !args.is_empty();
+        let mut arg_classes = classify_call_args_with_sret(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, is_variadic, &config, sret_dedicated);
 
         // AArch64 ABI: the sret pointer goes in x8 (indirect result register),
         // NOT in x0 as a regular argument.  Reclassify: mark arg[0] as ZeroSizeSkip
         // (it will be handled by emit_call_sret_setup) and shift all other GP
         // register indices down by one so that x0 is available for the first
         // real argument.
-        // Additionally, since the sret pointer freed up a GP register slot (the
-        // classification used one for sret that actually goes in x8), promote
-        // the first GP stack-overflow arg to use the freed register (x7).
-        let sret_operand = if is_sret && self.sret_uses_dedicated_reg() && !args.is_empty() {
+        // The classification gave the real arguments GP indices 1..=8 for this.
+        let sret_operand = if sret_dedicated {
             arg_classes[0] = CallArgClass::ZeroSizeSkip;
-            // Find the max GP register index used after shifting, to know
-            // which register slot is now free for promotion.
-            let max_int_regs = config.max_int_regs; // 8 for ARM64
             for cls in arg_classes.iter_mut().skip(1) {
                 match cls {
                     CallArgClass::IntReg { reg_idx } if *reg_idx > 0 => { *reg_idx -= 1; }
                     CallArgClass::I128RegPair { base_reg_idx } if *base_reg_idx > 0 => { *base_reg_idx -= 1; }
                     CallArgClass::StructByValReg { base_reg_idx, .. } if *base_reg_idx > 0 => { *base_reg_idx -= 1; }
-                    _ => {}
-                }
-            }
-            // Promote the first single-register GP stack arg to the freed slot (max_int_regs - 1).
-            // The classification originally overflowed this arg because sret consumed a slot.
-            // IMPORTANT: Only promote non-float Stack args. Float args that overflowed from
-            // FP registers should stay on the stack, not be moved to a GP register.
-            let freed_reg = max_int_regs - 1; // x7
-            for i in 1..arg_classes.len() {
-                match &arg_classes[i] {
-                    CallArgClass::Stack => {
-                        // Check if this arg is a float type -- floats that overflowed
-                        // from FP registers must stay on the stack, not go in GP regs.
-                        let is_float = i < arg_types.len() && arg_types[i].is_float();
-                        if !is_float {
-                            arg_classes[i] = CallArgClass::IntReg { reg_idx: freed_reg };
-                            break;
-                        }
-                    }
-                    CallArgClass::StructByValStack { size } if *size <= 8 => {
-                        let sz = *size;
-                        arg_classes[i] = CallArgClass::StructByValReg { base_reg_idx: freed_reg, size: sz };
-                        break;
-                    }
                     _ => {}
                 }
             }
@@ -515,9 +487,15 @@ pub trait ArchCodegen {
         // Apple arm64: named scalars on the stack are packed at their own size.
         if config.pack_stack_scalars {
             let named = if is_variadic { num_fixed_args } else { arg_classes.len() };
-            for (cls, ty) in arg_classes.iter_mut().zip(arg_types).take(named) {
+            for (i, (cls, ty)) in arg_classes.iter_mut().zip(arg_types).take(named).enumerate() {
                 if matches!(cls, CallArgClass::Stack) {
                     *cls = CallArgClass::StackPacked { size: ty.size().max(1) };
+                }
+                // And named HFAs at their element's alignment and own size.
+                if let (CallArgClass::StructByValStack { size }, Some(Some(crate::common::types::RiscvFloatClass::Hfa { elem_size, .. })))
+                    = (*cls, struct_arg_riscv_float_classes.get(i))
+                {
+                    *cls = CallArgClass::StructHfaStack { size, elem_size: *elem_size };
                 }
             }
         }
@@ -1691,7 +1669,7 @@ pub fn call_gp_arg_mask(classes: &[super::call_abi::CallArgClass], is_sret: bool
             C::StructMixedIntSseReg { int_reg_idx, .. } | C::StructMixedSseIntReg { int_reg_idx, .. } => int_reg_idx,
             C::FloatReg { .. } | C::F128Reg { .. } | C::StructSseReg { .. } | C::StructHfaReg { .. }
             | C::Stack | C::StackPacked { .. } | C::F128Stack | C::I128Stack | C::ZeroSizeSkip => continue,
-            C::StructByValStack { .. } | C::LargeStructStack { .. } => {
+            C::StructByValStack { .. } | C::LargeStructStack { .. } | C::StructHfaStack { .. } => {
                 all = true;
                 continue;
             }

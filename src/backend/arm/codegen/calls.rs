@@ -68,6 +68,34 @@ impl ArmCodegen {
                 let align = cls.stack_align() as i64;
                 stack_offset = (stack_offset + align - 1) / align * align;
                 match cls {
+                    CallArgClass::StructHfaStack { size, elem_size } => {
+                        // Copied element by element: it may start at a 4-byte offset.
+                        match arg {
+                            Operand::Value(v) => {
+                                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                                    let reg_name = callee_saved_name(reg);
+                                    self.state.emit_fmt(format_args!("    mov x0, {}", reg_name));
+                                } else if let Some(slot) = self.state.get_slot(v.0) {
+                                    let adjusted = slot.0 + src_adjust;
+                                    if self.state.is_alloca(v.0) {
+                                        self.emit_alloca_addr("x0", v.0, adjusted);
+                                    } else {
+                                        self.emit_load_from_sp("x0", adjusted, "ldr");
+                                    }
+                                } else {
+                                    self.state.emit("    mov x0, #0");
+                                }
+                            }
+                            Operand::Const(_) => { self.operand_to_x0(arg); }
+                        }
+                        let (reg, step) = if elem_size == 8 { ("x1", 8) } else { ("w1", 4) };
+                        for k in 0..size / step {
+                            let off = (k * step) as i64;
+                            self.emit_load_from_reg(reg, "x0", off, "ldr");
+                            self.emit_store_to_raw_sp(reg, stack_offset + off, "str");
+                        }
+                        stack_offset += size as i64;
+                    }
                     CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
                         let n_dwords = size.div_ceil(8);
                         match arg {
