@@ -439,12 +439,15 @@ pub fn peephole_optimize(asm: String) -> String {
     if !skip.contains(&"coalesce_arg_copies") && coalesce_arg_copies(&mut lines, &mut kinds, n) {
         eliminate_self_moves(&mut kinds, n);
     }
+    clear_deleted_lines(&mut lines, &kinds);
 
     if !skip.contains(&"pair_adjacent_loads") {
         pair_adjacent_loads(&mut lines, &mut kinds, n);
+        clear_deleted_lines(&mut lines, &kinds);
     }
     if !skip.contains(&"pair_adjacent_stores") {
         pair_adjacent_stores(&mut lines, &mut kinds, n);
+        clear_deleted_lines(&mut lines, &kinds);
     }
 
     // Calls that return straight into the epilogue branch to the callee
@@ -583,19 +586,42 @@ fn local_chunks(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<(u
 }
 
 /// Phases 1 to 3 over `lines`, the whole file or one function.
+/// Blank the text of deleted lines (kind Nop): output skips them, and no
+/// pass should see their old instruction.
+fn clear_deleted_lines(lines: &mut [String], kinds: &[LineKind]) {
+    for (line, kind) in lines.iter_mut().zip(kinds) {
+        if *kind == LineKind::Nop && !line.is_empty() {
+            line.clear();
+        }
+    }
+}
+
 fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
     let n = lines.len();
     // Phase 1: Iterative local passes (up to 8 rounds)
     let mut changed = true;
     let mut rounds = 0;
+    // Each pass that changed something blanks the lines it deleted, so a
+    // later pass matching on text never takes a deleted line for a live one
+    // (narrow_load_for_copy once revived a load forward_held_slots removed,
+    // reading a slot whose store had gone too).
+    macro_rules! step {
+        ($e:expr) => {{
+            let c = $e;
+            if c {
+                clear_deleted_lines(lines, kinds);
+            }
+            c
+        }};
+    }
     while changed && rounds < 8 {
         changed = false;
-        changed |= eliminate_adjacent_store_load(lines, kinds, n);
-        changed |= eliminate_redundant_branches(lines, kinds, n);
-        changed |= eliminate_self_moves(kinds, n);
-        changed |= eliminate_move_chains(lines, kinds, n);
-        changed |= fuse_branch_over_branch(lines, kinds, n);
-        changed |= eliminate_unreferenced_labels(lines, kinds, n);
+        changed |= step!(eliminate_adjacent_store_load(lines, kinds, n));
+        changed |= step!(eliminate_redundant_branches(lines, kinds, n));
+        changed |= step!(eliminate_self_moves(kinds, n));
+        changed |= step!(eliminate_move_chains(lines, kinds, n));
+        changed |= step!(fuse_branch_over_branch(lines, kinds, n));
+        changed |= step!(eliminate_unreferenced_labels(lines, kinds, n));
         rounds += 1;
     }
 
@@ -609,15 +635,16 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
     // Copy propagation and dead store elimination are independent and safe.
     if !skip.contains(&"propagate_register_copies") { propagate_register_copies(lines, kinds, n); }
     if !skip.contains(&"global_dead_store_elimination") { global_dead_store_elimination(lines, kinds, n); }
+    clear_deleted_lines(lines, kinds);
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     macro_rules! pass {
         ($name:ident($($arg:expr),*)) => {
-            !skip.contains(&stringify!($name)) && $name($($arg),*)
+            !skip.contains(&stringify!($name)) && step!($name($($arg),*))
         };
     }
     if !skip.contains(&"coalesce_arg_copies") {
-        coalesce_arg_copies(lines, kinds, n);
+        step!(coalesce_arg_copies(lines, kinds, n));
     }
     {
         let mut changed2 = true;
@@ -3008,6 +3035,12 @@ fn narrow_load_for_copy(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
     let mut changed = false;
     let live = live_out_all(lines, kinds, n);
     for i in 0..n {
+        // A deleted line keeps its text: a load forwarded away by
+        // forward_held_slots must not come back as `ldr wB` of a slot whose
+        // store went too.
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
         let load = lines[i].clone();
         let Some(("ldr" | "ldrsw", ops)) = split_insn(&load) else { continue };
         let (dst, mem) = first_and_rest(ops);
@@ -8420,7 +8453,9 @@ mod tests {
 
     #[test]
     fn test_adjacent_store_load_same_reg() {
-        let input = "    str x0, [sp, #16]\n    ldr x0, [sp, #16]\n    ret\n";
+        // A later reload into another register, after x0 changes, keeps the
+        // store live (with nothing reading the slot, the store goes too).
+        let input = "    str x0, [sp, #16]\n    ldr x0, [sp, #16]\n    add x0, x0, #1\n    ldr x2, [sp, #16]\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("str x0, [sp, #16]"));
         assert!(!result.contains("ldr x0, [sp, #16]"));
