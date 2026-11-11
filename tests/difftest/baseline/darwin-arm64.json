@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-10",
-  "ccc_rev": "e76bfbf7",
+  "ccc_rev": "bd66be2f",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -796,6 +796,9 @@
   "cases/computed_goto_interpreter": {
    "status": "pass"
   },
+  "cases/computed_goto_merge_values": {
+   "status": "pass"
+  },
   "cases/constant_trip_loops": {
    "status": "pass"
   },
@@ -955,6 +958,9 @@
   "cases/local_struct_fields": {
    "status": "pass"
   },
+  "cases/logical_op_side_effects_with_constant": {
+   "status": "pass"
+  },
   "cases/longest_match_paths": {
    "status": "pass"
   },
@@ -1019,6 +1025,9 @@
    "status": "pass"
   },
   "cases/merged_narrow_values": {
+   "status": "pass"
+  },
+  "cases/mul_high_operand_slot": {
    "status": "pass"
   },
   "cases/names_in_nested_scopes": {
@@ -1186,6 +1195,9 @@
   "cases/structs_unions": {
    "status": "pass"
   },
+  "cases/switch_case_converted_to_controlling_type": {
+   "status": "pass"
+  },
   "cases/switch_dispatch_loop": {
    "status": "pass"
   },
@@ -1198,7 +1210,13 @@
   "cases/thread_local": {
    "status": "pass"
   },
+  "cases/truncated_shift_by_register": {
+   "status": "pass"
+  },
   "cases/typeof_const_globals_typedefs": {
+   "status": "pass"
+  },
+  "cases/typeof_stmt_expr_shadowing": {
    "status": "pass"
   },
   "cases/types_long_double_enum": {
@@ -5643,7 +5661,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16d04ed6f 0x16d04ed6f 0x16d04ed6f 0x16d04ed6f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16bd16d6f 0x16bd16d6f 0x16bd16d6f 0x16bd16d6f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
