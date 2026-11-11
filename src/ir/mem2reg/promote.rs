@@ -295,6 +295,12 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     // I64): a promoted Copy would convert the value instead.
     let mut float_access: FxHashSet<u32> = FxHashSet::default();
     let mut int_access: FxHashSet<u32> = FxHashSet::default();
+    // Likewise one accessed at two sizes: a byte stored into a local of a
+    // struct copied whole (`x = *p; x.c = 9; *p = x`, the copies made 8-byte
+    // loads and stores and `gep x, 0` folded to x) is part of the value,
+    // which promotion would make the byte alone.
+    let mut access_size: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut mixed_size: FxHashSet<u32> = FxHashSet::default();
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let mut stored_here: FxHashSet<u32> = FxHashSet::default();
         for inst in &block.instructions {
@@ -304,6 +310,9 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
                         float_access.insert(ptr.0);
                     } else {
                         int_access.insert(ptr.0);
+                    }
+                    if *access_size.entry(ptr.0).or_insert(ty.size()) != ty.size() {
+                        mixed_size.insert(ptr.0);
                     }
                 }
             }
@@ -395,6 +404,7 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     }
 
     disqualified.extend(float_access.intersection(&int_access).copied());
+    disqualified.extend(mixed_size);
 
     // Build set of parameter alloca values for filtering below
     let param_alloca_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
