@@ -19,7 +19,7 @@
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{BasicBlock, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value};
 use super::copy_prop::{replace_operands_in_instruction, replace_operands_in_terminator};
 use super::loop_analysis;
 
@@ -327,7 +327,7 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
     for ((b, w), at) in placed {
         let t = trunc[&(b, w)];
         narrow.insert(t.0, Value(w));
-        func.blocks[b].instructions.insert(at,
+        insert_at(&mut func.blocks[b], at,
             Instruction::Cast { dest: t, src: Operand::Value(Value(w)), from_ty: IrType::I64, to_ty: narrow_ty });
     }
     for (v, cast) in after_def {
@@ -337,11 +337,25 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
             Some((b, (k + 1).max(phis)))
         });
         let (b, at) = def.unwrap_or((0, 0));
-        func.blocks[b].instructions.insert(at, cast);
+        insert_at(&mut func.blocks[b], at, cast);
     }
-    func.blocks[pre].instructions.extend(pre_insts);
+    let block = &mut func.blocks[pre];
+    if let Some(&span) = block.source_spans.last() {
+        block.source_spans.extend(std::iter::repeat_n(span, pre_insts.len()));
+    }
+    block.instructions.extend(pre_insts);
     func.next_value_id = next_id;
     true
+}
+
+/// Insert `inst` at `at` in `block`, with the span of the instruction it
+/// follows (or precedes), so the spans stay one per instruction.
+fn insert_at(block: &mut BasicBlock, at: usize, inst: Instruction) {
+    if !block.source_spans.is_empty() {
+        let span = block.source_spans[at.saturating_sub(1).min(block.source_spans.len() - 1)];
+        block.source_spans.insert(at.min(block.source_spans.len()), span);
+    }
+    block.instructions.insert(at, inst);
 }
 
 #[cfg(test)]
