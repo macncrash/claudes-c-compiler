@@ -2508,8 +2508,9 @@ fn format_terminator(term: &Terminator) -> String {
         Terminator::CondBranch { cond, true_label, false_label } => {
             format!("condbr {}, .L{}, .L{}", format_operand(cond), true_label.0, false_label.0)
         }
-        Terminator::IndirectBranch { target, .. } => {
-            format!("indirectbr {}", format_operand(target))
+        Terminator::IndirectBranch { target, possible_targets } => {
+            let t: Vec<String> = possible_targets.iter().map(|b| format!(".L{}", b.0)).collect();
+            format!("indirectbr {} [{}]", format_operand(target), t.join(", "))
         }
         Terminator::Switch { val, cases, default, .. } => {
             let cases_str: Vec<String> = cases.iter()

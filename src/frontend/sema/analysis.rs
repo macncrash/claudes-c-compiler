@@ -308,9 +308,17 @@ impl SemanticAnalyzer {
 
         // Handle __auto_type: infer base type from the first declarator's
         // initializer expression rather than defaulting to int.
+        let mut auto_init_walked = false;
         let base_type = if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
             if let Some(first) = decl.declarators.first() {
                 if let Some(Initializer::Expr(ref init_expr)) = first.init {
+                    // Walk a statement expression first so its own scopes
+                    // type it (see collect_enum_constants_from_type_spec);
+                    // the walk below then skips this initializer.
+                    if Self::has_stmt_expr_operand(init_expr) {
+                        self.analyze_expr(init_expr);
+                        auto_init_walked = true;
+                    }
                     let checker = super::type_checker::ExprTypeChecker {
                         symbols: &self.symbol_table,
                         types: &self.result.type_context,
@@ -434,7 +442,7 @@ impl SemanticAnalyzer {
             return; // typedefs don't declare variables
         }
 
-        for init_decl in &decl.declarators {
+        for (decl_idx, init_decl) in decl.declarators.iter().enumerate() {
             let mut full_type = if init_decl.derived.is_empty() {
                 base_type.clone()
             } else {
@@ -538,7 +546,9 @@ impl SemanticAnalyzer {
 
             // Analyze initializer expressions
             if let Some(init) = &init_decl.init {
-                self.analyze_initializer(init);
+                if !(auto_init_walked && decl_idx == 0) {
+                    self.analyze_initializer(init);
+                }
                 // Check for invalid pointer <-> float conversions in scalar initializers
                 if let Initializer::Expr(init_expr) = init {
                     let var_ty = self.symbol_table.lookup(&init_decl.name)
@@ -817,10 +827,35 @@ impl SemanticAnalyzer {
                     self.collect_enum_constants_from_type_spec(&field.type_spec);
                 }
             }
-            TypeSpecifier::Array(inner, _) | TypeSpecifier::Pointer(inner, _) => {
+            TypeSpecifier::Array(inner, _) | TypeSpecifier::Pointer(inner, _)
+            | TypeSpecifier::TypeofType(inner) => {
                 self.collect_enum_constants_from_type_spec(inner);
             }
+            // typeof's operand is never evaluated, so it is not otherwise
+            // walked. A statement expression in it must be, in its own
+            // scopes: otherwise its type is inferred with the enclosing
+            // scope's symbols, and in the nested kernel max
+            // `({ typeof(i) _x = i; typeof(({ double _x = d; ... _x; })) _y; })`
+            // the inner _x was taken for the outer int.
+            TypeSpecifier::Typeof(expr) if Self::has_stmt_expr_operand(expr) => {
+                self.analyze_expr(expr);
+            }
             _ => {}
+        }
+    }
+
+    /// Whether an expression is a statement expression, possibly under
+    /// casts, dereferences, address-of, unary operators or ?:.
+    fn has_stmt_expr_operand(expr: &Expr) -> bool {
+        match expr {
+            Expr::StmtExpr(..) => true,
+            Expr::Cast(_, e, _) | Expr::Deref(e, _) | Expr::AddressOf(e, _)
+            | Expr::UnaryOp(_, e, _) => Self::has_stmt_expr_operand(e),
+            Expr::Conditional(_, a, b, _) =>
+                Self::has_stmt_expr_operand(a) || Self::has_stmt_expr_operand(b),
+            Expr::BinaryOp(_, a, b, _) =>
+                Self::has_stmt_expr_operand(a) || Self::has_stmt_expr_operand(b),
+            _ => false,
         }
     }
 

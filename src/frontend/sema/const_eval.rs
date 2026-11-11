@@ -187,7 +187,9 @@ impl<'a> SemaConstEval<'a> {
                         || Self::expr_is_always_nonzero(lhs);
                     let r_nonzero = r.as_ref().is_some_and(|v| v.is_nonzero())
                         || Self::expr_is_always_nonzero(rhs);
-                    if l_nonzero || r_nonzero {
+                    // A decisive right operand folds only when the left one is
+                    // known too: x++ || 1 is 1, but x++ must still run.
+                    if l_nonzero || (r_nonzero && (l.is_some() || Self::expr_is_always_nonzero(lhs))) {
                         return Some(IrConst::I64(1));
                     }
                     if l.as_ref().is_some_and(|v| !v.is_nonzero())
@@ -198,7 +200,7 @@ impl<'a> SemaConstEval<'a> {
                 }
                 if *op == BinOp::LogicalAnd {
                     if l.as_ref().is_some_and(|v| !v.is_nonzero())
-                        || r.as_ref().is_some_and(|v| !v.is_nonzero())
+                        || (r.as_ref().is_some_and(|v| !v.is_nonzero()) && l.is_some())
                     {
                         return Some(IrConst::I64(0));
                     }

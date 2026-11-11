@@ -26,10 +26,16 @@ impl Lowerer {
         // Non-integer types (pointers, floats, etc.) are rejected by sema; this Ptr
         // arm is a defensive fallback to avoid crashes if sema is bypassed.
         let raw_expr_ty = self.get_expr_type(expr);
-        let switch_expr_ty = match raw_expr_ty {
+        // The case labels convert to the promoted C type, which an integer
+        // constant's IR type (I64) is not: in switch (0), case
+        // 0x8000000000000000ULL is case 0.
+        let c_ty = self.get_expr_ctype(expr).map(|ct| IrType::from_ctype(&ct))
+            .filter(|t| t.is_integer())
+            .unwrap_or(raw_expr_ty);
+        let switch_expr_ty = match c_ty {
             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
             IrType::Ptr => crate::common::types::target_int_ir_type(),
-            _ => raw_expr_ty,
+            _ => c_ty,
         };
         let val = self.lower_expr(expr);
         let val = if switch_expr_ty != raw_expr_ty {

@@ -607,8 +607,8 @@ fn local_phases(lines: &mut [String], kinds: &mut [LineKind], skip: &[&str]) {
     // block but produces wrong output. Until this is fixed, GSF is skipped.
     //
     // Copy propagation and dead store elimination are independent and safe.
-    propagate_register_copies(lines, kinds, n);
-    global_dead_store_elimination(lines, kinds, n);
+    if !skip.contains(&"propagate_register_copies") { propagate_register_copies(lines, kinds, n); }
+    if !skip.contains(&"global_dead_store_elimination") { global_dead_store_elimination(lines, kinds, n); }
 
     // Phase 3: Local cleanup after global passes (up to 4 rounds)
     macro_rules! pass {
@@ -3810,6 +3810,11 @@ fn low_half_form(line: &str) -> Option<String> {
         return None;
     }
     let p: Vec<&str> = ops.split(',').map(str::trim).collect();
+    // A shift by a register counts mod 64 in the x form and mod 32 in the
+    // w form: (uint32_t)(1 << 32) is 0, but lsl w0, w9, w0 makes it 1.
+    if m == "lsl" && !p.get(2).is_some_and(|c| c.starts_with('#')) {
+        return None;
+    }
     let mut out = Vec::with_capacity(p.len());
     for op in &p {
         if let Some(r) = gpr_operand(op).filter(|_| op.starts_with('x')) {
@@ -7354,6 +7359,12 @@ fn coalesce_arg_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
                 }
                 Flow::Jump { .. } => None,
             });
+        }
+        // A jump whose targets are unknown (a computed goto's `br`) reaches
+        // labels that then miss it as a predecessor, and a web walked back
+        // from one would take it for entered by fallthrough only.
+        if succs.iter().any(|s| s.is_none()) {
+            continue;
         }
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); end - start];
         for (i, s) in succs.iter().enumerate() {

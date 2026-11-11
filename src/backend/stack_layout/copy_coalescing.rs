@@ -214,6 +214,11 @@ pub(super) fn compute_immediately_consumed(func: &IrFunction, lhs_first_binop: b
             if i + 1 < insts.len() {
                 // Use must be in instruction i+1, as the first Operand.
                 let next = &insts[i + 1];
+                // Nor a 128-bit consumer, which may not read the accumulator
+                // there: the arm backend emits a widening for a 64-bit
+                // multiply-high as nothing and reads its operand at the umulh,
+                // after loading the multiplier has reused x0.
+                if involves_i128_or_f128(next) { continue; }
                 if is_safe_sole_consumer(next, dest.0, lhs_first_binop) {
                     result.insert(dest.0);
                 }

@@ -274,10 +274,18 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
             continue;
         }
         let target_block_id = func.blocks[block_idx].label;
-        if phis.len() == 1 {
+        // An indirect branch's edges cannot be split, so its copies go before
+        // the branch, where they would also overwrite the phi's value on the
+        // paths to its other targets, which may still read it (a computed
+        // goto back to a loop label, the old value used past the loop). The
+        // branch then writes a temporary that the block copies in.
+        let indirect_pred = phis.iter().flat_map(|p| &p.incoming).any(|(_, pl)| {
+            ctx.label_to_idx.get(pl).is_some_and(|&i| ctx.is_indirect_branch[i] && ctx.multi_succ[i])
+        });
+        if phis.len() == 1 && !indirect_pred {
             emit_single_phi_copies(&phis[0], target_block_id, &mut ctx);
         } else {
-            emit_multi_phi_copies(phis, block_idx, target_block_id, &mut ctx);
+            emit_multi_phi_copies(phis, block_idx, target_block_id, indirect_pred, &mut ctx);
         }
     }
 
@@ -320,7 +328,7 @@ fn emit_single_phi_copies(phi: &PhiInfo, target_block_id: BlockId, ctx: &mut Phi
 /// Shared temporaries are only allocated for phis involved in copy cycles.
 fn emit_multi_phi_copies(
     phis: &[PhiInfo], block_idx: usize, target_block_id: BlockId,
-    ctx: &mut PhiElimCtx,
+    all_temps: bool, ctx: &mut PhiElimCtx,
 ) {
     // Collect unique predecessor labels.
     let mut pred_label_set: FxHashSet<BlockId> = FxHashSet::default();
@@ -339,9 +347,11 @@ fn emit_multi_phi_copies(
         .collect();
 
     // Find which phis are globally conflicting (need temporaries on any edge).
-    let globally_needs_temp = find_globally_conflicting_phis(
-        phis, &pred_labels, &phi_src_maps, &ctx.label_to_idx,
-    );
+    let globally_needs_temp: FxHashSet<usize> = if all_temps {
+        (0..phis.len()).collect()
+    } else {
+        find_globally_conflicting_phis(phis, &pred_labels, &phi_src_maps, &ctx.label_to_idx)
+    };
 
     // Allocate shared temporaries.
     let mut phi_temps: Vec<Option<Value>> = vec![None; phis.len()];
