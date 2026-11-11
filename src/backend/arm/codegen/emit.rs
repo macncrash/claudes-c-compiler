@@ -90,6 +90,11 @@ pub(super) const ARM_FP_CALLER_SAVED: [PhysReg; 16] = [
 /// (see ArmCodegen::assign_vec_temp_regs).
 pub(super) const ARM_VEC_TEMP_REGS: [u8; 4] = [28, 29, 30, 31];
 
+/// More registers for vector temporaries when v28-v31 are all live: a loop
+/// of vector products read lane by lane into float sums keeps a dozen live.
+/// Vector variables (ARM_VEC_VAR_REGS) skip any a temporary takes.
+pub(super) const ARM_VEC_TEMP_EXTRA_REGS: [u8; 12] = [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+
 /// NEON registers that hold vector-extension local variables for a whole
 /// function (see ArmCodegen::assign_vec_var_regs), then hoisted constant
 /// broadcasts. (v16-v19 are otherwise only inline asm scratch, around which

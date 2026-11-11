@@ -494,6 +494,22 @@ pub(crate) fn encode_neon_dup(operands: &[Operand]) -> Result<EncodeResult, Stri
     }
     let (rd, arr_d) = get_neon_reg(operands, 0)?;
 
+    // DUP <V>d, Vn.T[index] (scalar form, also spelled mov): one lane into
+    // the low element of a b/h/s/d register, the rest zeroed.
+    if let (Some(Operand::Reg(rd_name)), Some(Operand::RegLane { reg, elem_size, index })) = (operands.first(), operands.get(1)) {
+        let rn = parse_reg_num(reg).ok_or("invalid NEON register")?;
+        let kind = rd_name.chars().next().map(|c| c.to_ascii_lowercase());
+        let imm5 = match (kind, elem_size.as_str()) {
+            (Some('b'), "b") => ((*index & 0xF) << 1) | 0b00001,
+            (Some('h'), "h") => ((*index & 0x7) << 2) | 0b00010,
+            (Some('s'), "s") => ((*index & 0x3) << 3) | 0b00100,
+            (Some('d'), "d") => ((*index & 0x1) << 4) | 0b01000,
+            _ => return Err(format!("unsupported scalar dup: {} from .{}", rd_name, elem_size)),
+        };
+        // DUP <V>d, Vn.T[i]: 01 0 11110 000 imm5 0 0000 1 Rn Rd
+        return Ok(EncodeResult::Word(0x5e000400 | (imm5 << 16) | (rn << 5) | rd));
+    }
+
     // DUP Vd.T, Rn (general form - broadcast GP reg to vector)
     if let Some(Operand::Reg(rn_name)) = operands.get(1) {
         let rn = parse_reg_num(rn_name).ok_or("invalid rn")?;

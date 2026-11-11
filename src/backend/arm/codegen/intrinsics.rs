@@ -7,7 +7,7 @@ use crate::ir::reexports::{BlockId, CallInfo, Instruction, IntrinsicOp, IrConst,
 use crate::backend::state::SlotAddr;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{IrType, RiscvFloatClass};
-use super::emit::{ARM_VEC_TEMP_REGS, ARM_VEC_VAR_REGS};
+use super::emit::{ARM_VEC_TEMP_EXTRA_REGS, ARM_VEC_TEMP_REGS, ARM_VEC_VAR_REGS};
 use super::emit::ArmCodegen;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, classify_call_args_with_sret};
 
@@ -281,10 +281,12 @@ impl ArmCodegen {
             .collect();
         vars.sort_unstable();
         let primary = vars.iter().filter(|v| !v.0).count();
-        let limit = primary.max(ARM_VEC_VAR_REGS.len().saturating_sub(const_count));
+        // Not the registers temporaries took (ARM_VEC_TEMP_EXTRA_REGS).
+        let free: Vec<u8> = ARM_VEC_VAR_REGS.iter().copied().filter(|r| !temps.values().any(|t| t == r)).collect();
+        let limit = primary.max(free.len().saturating_sub(const_count));
         let mut regs = FxHashMap::default();
         let mut var_list = Vec::new();
-        for ((_, _, id, size), &reg) in vars.into_iter().zip(ARM_VEC_VAR_REGS.iter()).take(limit) {
+        for ((_, _, id, size), &reg) in vars.into_iter().zip(free.iter()).take(limit) {
             regs.insert(id, reg);
             var_list.push((reg, size as u8));
         }
@@ -657,7 +659,7 @@ impl ArmCodegen {
     /// instruction is fully handled), and spill vector variables ahead of
     /// anything that may clobber their registers.
     pub(super) fn vec_before_instruction(&mut self, inst: &Instruction) -> bool {
-        if self.vec_vars.is_empty() && self.vec_consts.is_empty() {
+        if self.vec_vars.is_empty() && self.vec_consts.is_empty() && self.vec_lanes.is_empty() {
             return false;
         }
         match inst {
@@ -666,6 +668,15 @@ impl ArmCodegen {
                 let (reg, off) = self.vec_lanes[&ptr.0];
                 let n = ty.size() as i64;
                 let (lane, idx) = (Self::lane_suffix(n), off / n);
+                if matches!(ty, IrType::F32 | IrType::F64) {
+                    // Straight into the float's register (dup is mov's
+                    // scalar form), not through x0.
+                    let f32 = *ty == IrType::F32;
+                    let fp = self.dest_fp_reg(dest).unwrap_or_else(|| (if f32 { "s0" } else { "d0" }).to_string());
+                    self.state.emit_fmt(format_args!("    dup {}, v{}.{}[{}]", fp, reg, lane, idx));
+                    self.finish_float_result(dest, &fp, *ty);
+                    return true;
+                }
                 match ty {
                     IrType::I8 | IrType::I16 => {
                         self.state.emit_fmt(format_args!("    umov w0, v{}.{}[{}]", reg, lane, idx));
@@ -1073,25 +1084,55 @@ impl ArmCodegen {
         }
     }
 
-    pub(super) fn assign_vec_temp_regs(func: &IrFunction) -> FxHashMap<u32, u8> {
+    /// A temporary may also be written by a whole Memcpy (a vector load)
+    /// and read one lane at a time by Loads, through the alloca or a
+    /// constant GEP from it (a float sum of a vector's lanes). Also returns
+    /// those lane pointers: value -> (temporary, byte offset).
+    pub(super) fn assign_vec_temp_regs(func: &IrFunction) -> (FxHashMap<u32, u8>, FxHashMap<u32, (u32, i64)>) {
         let mut regs = FxHashMap::default();
         let alloca_sizes: FxHashMap<u32, usize> = func.blocks.iter()
             .flat_map(|b| &b.instructions)
             .filter_map(|inst| match inst {
-                Instruction::Alloca { dest, size: size @ (8 | 16), .. } => Some((dest.0, *size)),
+                Instruction::Alloca { dest, size: size @ (8 | 16), align, volatile: false, .. } if *align <= 16 =>
+                    Some((dest.0, *size)),
                 _ => None,
             })
             .collect();
         if alloca_sizes.is_empty() {
-            return regs;
+            return (regs, FxHashMap::default());
         }
-        // Each candidate's uses: (block, index, kind). Kind: 0 = written by a
-        // VecOp, 1 = read whole by a VecOp or Memcpy, 2 = anything else.
+        // Constant GEPs into a candidate: value -> (alloca, byte offset). A
+        // GEP is only an address; its loads are the uses that count.
+        let lane_geps: FxHashMap<u32, (u32, i64)> = func.blocks.iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| match inst {
+                Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } if alloca_sizes.contains_key(&base.0) =>
+                    Some((dest.0, (base.0, c.to_i64()?))),
+                _ => None,
+            })
+            .collect();
+        // A load of one aligned lane (up to 8 bytes) of a candidate.
+        let lane_load = |ptr: u32, ty: &IrType| -> Option<u32> {
+            let (var, off) = lane_geps.get(&ptr).copied().or_else(|| alloca_sizes.contains_key(&ptr).then_some((ptr, 0)))?;
+            let n = ty.size() as i64;
+            (matches!(n, 1 | 2 | 4 | 8) && !ty.is_128bit() && *ty != IrType::F128
+                && off >= 0 && off % n == 0 && off + n <= alloca_sizes[&var] as i64).then_some(var)
+        };
+        // Each candidate's uses: (block, index, kind). Kind: 0 = written
+        // whole by a VecOp or Memcpy, 1 = read whole by a VecOp or Memcpy,
+        // or one lane by a Load, 2 = anything else.
         let mut uses: FxHashMap<u32, Vec<(usize, usize, u8)>> = FxHashMap::default();
         for (bi, block) in func.blocks.iter().enumerate() {
             for (ii, inst) in block.instructions.iter().enumerate() {
                 let mut kinds: Vec<(u32, u8)> = Vec::new();
                 match inst {
+                    Instruction::GetElementPtr { dest, .. } if lane_geps.contains_key(&dest.0) => {}
+                    Instruction::Load { ptr, ty, .. } if lane_geps.contains_key(&ptr.0) || alloca_sizes.contains_key(&ptr.0) => {
+                        match lane_load(ptr.0, ty) {
+                            Some(var) => kinds.push((var, 1)),
+                            None => kinds.push((lane_geps.get(&ptr.0).map_or(ptr.0, |l| l.0), 2)),
+                        }
+                    }
                     Instruction::Intrinsic { op: IntrinsicOp::VecOp { bytes, splat, .. }, dest_ptr, args, .. } => {
                         if let Some(d) = dest_ptr {
                             let whole = alloca_sizes.get(&d.0) == Some(&(*bytes as usize));
@@ -1105,8 +1146,10 @@ impl ArmCodegen {
                             }
                         }
                     }
+                    // A whole copy into a candidate (from memory: a vector
+                    // load) starts a new value, like a VecOp.
                     Instruction::Memcpy { dest, src, size } => {
-                        kinds.push((dest.0, 2));
+                        kinds.push((dest.0, if alloca_sizes.get(&dest.0) == Some(size) && dest != src { 0 } else { 2 }));
                         kinds.push((src.0, if alloca_sizes.get(&src.0) == Some(size) { 1 } else { 2 }));
                     }
                     // A call returning a short vector in v0 writes its result
@@ -1125,16 +1168,19 @@ impl ArmCodegen {
                             }
                         }
                     }
-                    Instruction::InlineAsm { .. } => return FxHashMap::default(),
+                    Instruction::InlineAsm { .. } => return (FxHashMap::default(), FxHashMap::default()),
                     other => other.for_each_used_value(|id| kinds.push((id, 2))),
                 }
                 for (id, kind) in kinds {
+                    // Any other use of a lane GEP is one of its alloca.
+                    let id = lane_geps.get(&id).map_or(id, |l| l.0);
                     if alloca_sizes.contains_key(&id) {
                         uses.entry(id).or_default().push((bi, ii, kind));
                     }
                 }
             }
             block.terminator.for_each_used_value(|id| {
+                let id = lane_geps.get(&id).map_or(id, |l| l.0);
                 if alloca_sizes.contains_key(&id) {
                     uses.entry(id).or_default().push((bi, usize::MAX, 2));
                 }
@@ -1159,15 +1205,22 @@ impl ArmCodegen {
         ranges.sort_unstable();
         // Greedy assignment per block: a register is free again at the
         // instruction that last reads it (NEON ops read before they write).
+        // v28-v31 first, then up from v16 (variables take theirs down from
+        // v27, avoiding these): every register a temporary takes is lost to
+        // scalar floats for the whole function, so few are reused.
         let mut busy: Vec<(usize, usize, u8)> = Vec::new(); // (block, last read, reg)
         for (bi, prod, last, id) in ranges {
             busy.retain(|&(b, end, _)| b == bi && end > prod);
-            if let Some(&reg) = ARM_VEC_TEMP_REGS.iter().find(|r| busy.iter().all(|b| b.2 != **r)) {
+            if let Some(&reg) = ARM_VEC_TEMP_REGS.iter().chain(&ARM_VEC_TEMP_EXTRA_REGS).find(|r| busy.iter().all(|b| b.2 != **r)) {
                 busy.push((bi, last, reg));
                 regs.insert(id, reg);
             }
         }
-        regs
+        let lanes = lane_geps.iter().map(|(&p, &l)| (p, l))
+            .chain(regs.keys().map(|&id| (id, (id, 0))))
+            .filter(|(_, (var, _))| regs.contains_key(var))
+            .collect();
+        (regs, lanes)
     }
 
     /// The result buffer of a call returning a one-member HFA (a short

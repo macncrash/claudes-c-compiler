@@ -27,7 +27,7 @@ impl ArmCodegen {
 
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
-        let mut temp_regs = Self::assign_vec_temp_regs(func);
+        let (mut temp_regs, temp_lanes) = Self::assign_vec_temp_regs(func);
         let const_count = Self::assign_vec_const_regs(func, &super::emit::ARM_VEC_VAR_REGS).len();
         let (var_regs, vars, lanes, fresh, spills) =
             Self::assign_vec_var_regs(func, &temp_regs, &self.call_abi_config_impl(), const_count);
@@ -44,7 +44,12 @@ impl ArmCodegen {
                 Some((*p, reg, size))
             })
             .collect();
-        self.vec_lanes = lanes;
+        // A temporary's lane pointers, in the register it has after the
+        // folds above (which may move one to another register).
+        let temp_lanes: Vec<(u32, (u8, i64))> = temp_lanes.into_iter()
+            .filter_map(|(p, (var, off))| self.vec_regs.get(&var).map(|&r| (p, (r, off))))
+            .collect();
+        self.vec_lanes = lanes.into_iter().chain(temp_lanes).collect();
         self.vec_not_folds = Self::fold_vec_nots(func, &self.vec_regs, &self.vec_lanes);
         (self.vec_selects, self.vec_select_parts) = Self::fold_vec_selects(func, &self.vec_regs, &self.vec_lanes, &self.vec_not_folds);
         self.vec_shift_adds = Self::fold_vec_shift_adds(func, &self.vec_regs, &self.vec_lanes);
