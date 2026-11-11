@@ -34,9 +34,11 @@ make bench           # builds ./ocean-clang too, runs both with no window or GPU
 `--bench N` simulates N frames and prints timing plus a checksum of the vertex
 data. The two builds should print the same heights and checksum.
 
-At the time of writing, on one thread of an M3 Max, the ccc build takes about
-5.1 ms per frame and clang -O2 4.4 ms. The first macOS build of ccc took 80 ms.
-The remaining gap is clang's vectorization: without it, clang takes 4.9 ms.
+At the time of writing, on one thread of an M3 Max, the ccc build and the
+clang -O2 build both take about 4.4 ms per frame (4.3 ms at best). The first
+macOS build of ccc took 80 ms. The wave loop is vectorized like clang's: four
+waves at a time, each of the six sums still adding its terms in order, so
+the checksum is the same.
 
 ## Before and after
 

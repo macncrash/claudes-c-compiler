@@ -99,6 +99,10 @@ The optimizer executes in four sequential phases:
      loop_vectorize
          |
          v
+ Phase 10c1b: Float Sum Loop Vectorization (AArch64)
+     reduce_vectorize
+         |
+         v
  Phase 10c2: GEP Offset Cancellation
      gep_linear
          |
@@ -1290,6 +1294,33 @@ backend's broadcast hoisting and offset folding, slide_hash's step is
 `ldur`, `uqsub`, `stur` per 16 bytes: deflate at level 1 retires 62M (2%)
 fewer instructions, though it is no faster, the slide being memory-bound.
 
+### reduce_vectorize -- Float Sum Loop Vectorization
+
+Runs once after loop_vectorize, for AArch64. A loop whose header holds only
+phis and the exit test `i < n`, and whose one body block adds float terms
+into scalar sums (`s += t`, `s -= t`, `s = t + s`, or an Fma into s) and
+does nothing else with memory but load floats, gets a vector loop in front
+of it doing four iterations per step while four remain. Each float of the
+body becomes a 16-byte vector: a load stepping 4 bytes per iteration one
+vector load, one stepping 8 bytes with its neighbour also loaded (cos/sin
+pairs) two loads deinterleaved by uzp1/uzp2, a load not stepping a
+broadcast, and add, sub, mul, div, neg and fma lane by lane. Each sum then
+adds its four lanes in order, so it sees the same terms in the same order
+and gets the scalar loop's result. The one exception is an Fma into a sum,
+whose product is rounded before the add: FP_CONTRACT lets a contraction be
+made or not at each place, and clang's vectorized loops do the same; with
+-ffp-contract=off there is none. The original loop does the 0-3 iterations
+left, from the vector loop's state.
+
+The counter is a 32-bit int widened (iv_widen), a byte offset from one, or
+lftr's pointer below an end pointer, so four more steps cannot overflow.
+Addresses are linear forms in the counter and the stepped phis; loads of one
+struct's arrays share a base, and each scaled counter term is computed
+once. The ocean simulation's Gerstner wave loop (24 waves, six sums of
+products of cos/sin pairs and five per-wave arrays) went from 5.1 to 4.3 ms
+per frame, clang's time, with the backend keeping these vector temporaries
+in registers and reading lane 0 of one as a scalar.
+
 ### pressure_hoist -- Pressure Hoisting
 
 Runs once after lftr. A pure, non-trapping instruction that is the only use of
@@ -2044,7 +2075,7 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`load_phi`, `unread_locals`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_promote`, `index_base`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
+`load_phi`, `unread_locals`, `bound_hoist`, `iv_widen`, `lftr`, `gep_linear`, `pressure_hoist`, `gep_reassoc`, `remat`, `ret_dup`, `loop_rotate`, `loop_hoist`, `loop_promote`, `index_base`, `loop_layout`, `step_to_load`, `range_fold`, `const_hoist`, `addr_arg_promote`, `edge_addr`, `loop_vectorize`, `reduce_vectorize`, `step_sink`, `latch_dup`, `ext_elide`, `addr_sink`, `loop_unroll`, and `tbaa` (strict aliasing; see above).
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -2092,6 +2123,7 @@ behavior across iterations.
 | `load_phi.rs`            | Loads given the values their location holds at merges |
 | `loop_unroll.rs`         | Small constant-trip loops unrolled in full             |
 | `loop_vectorize.rs`      | In-place element loops done 16 bytes at a time (AArch64) |
+| `reduce_vectorize.rs`    | Float sum loops done 4 iterations at a time, in order (AArch64) |
 | `mem_inline.rs`          | Small constant-length memcpy/memset done in place      |
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |

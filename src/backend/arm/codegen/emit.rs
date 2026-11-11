@@ -264,6 +264,10 @@ pub struct ArmCodegen {
     /// Pointers to a lane of a vector variable (the alloca itself, or a
     /// constant GEP from it): value ID -> (register, byte offset).
     pub(super) vec_lanes: FxHashMap<u32, (u8, i64)>,
+    /// Float loads of lane 0 of a vector in a register whose one use is the
+    /// float op right after: value -> that register's scalar name (s28),
+    /// which the op reads directly; the load emits nothing.
+    pub(super) vec_lane0_alias: FxHashMap<u32, String>,
     /// Constant broadcasts used by vector ops in loops, kept in a register
     /// for the whole function: (constant, lane type, vector bytes, register).
     /// Built after the parameter stores and rebuilt after anything that may
@@ -364,6 +368,7 @@ impl ArmCodegen {
             vec_regs: FxHashMap::default(),
             vec_vars: Vec::new(),
             vec_lanes: FxHashMap::default(),
+            vec_lane0_alias: FxHashMap::default(),
             vec_consts: Vec::new(),
             vec_consts_on_entry: 0,
             vec_const_rebuilds: FxHashMap::default(),
@@ -432,7 +437,8 @@ impl ArmCodegen {
     /// Name of the FP register holding an operand (`s8`/`d8`), if it has one.
     pub(super) fn operand_fp_reg(&self, op: &Operand) -> Option<String> {
         match op {
-            Operand::Value(v) => self.fp_reg_assignments.get(&v.0).map(|&(r, f32)| fp_reg_name(r, f32)),
+            Operand::Value(v) => self.vec_lane0_alias.get(&v.0).cloned()
+                .or_else(|| self.fp_reg_assignments.get(&v.0).map(|&(r, f32)| fp_reg_name(r, f32))),
             _ => None,
         }
     }

@@ -3,7 +3,7 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use crate::ir::reexports::{BlockId, CallInfo, Instruction, IntrinsicOp, IrConst, IrFunction, Operand, Value, VecElem, VecOpKind};
+use crate::ir::reexports::{BlockId, CallInfo, Instruction, IntrinsicOp, IrBinOp, IrConst, IrFunction, Operand, Value, VecElem, VecOpKind};
 use crate::backend::state::SlotAddr;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{IrType, RiscvFloatClass};
@@ -654,6 +654,36 @@ impl ArmCodegen {
         fresh
     }
 
+    /// Float loads of lane 0 of a vector in a register (vec_lanes) whose only
+    /// use is a float add, sub, mul or div right after: that op can read the
+    /// register's low lane as a scalar (s28 of v28), so the load needs no dup.
+    pub(super) fn lane0_aliases(&self, func: &IrFunction) -> FxHashMap<u32, String> {
+        let mut aliases = FxHashMap::default();
+        if self.vec_lanes.is_empty() {
+            return aliases;
+        }
+        let mut uses: FxHashMap<u32, usize> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|v| *uses.entry(v).or_default() += 1);
+            }
+            block.terminator.for_each_used_value(|v| *uses.entry(v).or_default() += 2);
+        }
+        for block in &func.blocks {
+            for pair in block.instructions.windows(2) {
+                let Instruction::Load { dest, ptr, ty: ty @ (IrType::F32 | IrType::F64), volatile: false, .. } = &pair[0] else { continue };
+                let Some(&(reg, 0)) = self.vec_lanes.get(&ptr.0) else { continue };
+                let reads = matches!(&pair[1], Instruction::BinOp {
+                    op: IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::SDiv, lhs, rhs, ty: t, ..
+                } if t == ty && [lhs, rhs].iter().any(|o| matches!(o, Operand::Value(v) if v == dest)));
+                if reads && uses.get(&dest.0) == Some(&1) {
+                    aliases.insert(dest.0, format!("{}{}", if *ty == IrType::F32 { 's' } else { 'd' }, reg));
+                }
+            }
+        }
+        aliases
+    }
+
     /// Before an instruction: emit the lane loads and stores, GEPs and
     /// copies that involve a vector variable (returns true when the
     /// instruction is fully handled), and spill vector variables ahead of
@@ -664,6 +694,8 @@ impl ArmCodegen {
         }
         match inst {
             Instruction::GetElementPtr { dest, .. } if self.vec_lanes.contains_key(&dest.0) => true,
+            // Read by the next op straight from the vector register.
+            Instruction::Load { dest, .. } if self.vec_lane0_alias.contains_key(&dest.0) => true,
             Instruction::Load { dest, ptr, ty, .. } if self.vec_lanes.contains_key(&ptr.0) => {
                 let (reg, off) = self.vec_lanes[&ptr.0];
                 let n = ty.size() as i64;
@@ -1211,7 +1243,25 @@ impl ArmCodegen {
         let mut busy: Vec<(usize, usize, u8)> = Vec::new(); // (block, last read, reg)
         for (bi, prod, last, id) in ranges {
             busy.retain(|&(b, end, _)| b == bi && end > prod);
-            if let Some(&reg) = ARM_VEC_TEMP_REGS.iter().chain(&ARM_VEC_TEMP_EXTRA_REGS).find(|r| busy.iter().all(|b| b.2 != **r)) {
+            let free = |r: u8| busy.iter().all(|b| b.2 != r);
+            // An Fma accumulates in its result register: best the addend's
+            // (free here if this was its last read), and not a factor's,
+            // which would cost two moves.
+            let (pref, factors) = match &func.blocks[bi].instructions[prod] {
+                Instruction::Intrinsic { op: IntrinsicOp::VecOp { op: VecOpKind::Fma { .. }, splat, .. }, args, .. } if args.len() == 3 => {
+                    let reg = |i: usize| match args[i] {
+                        Operand::Value(v) if splat & (1 << i) == 0 => regs.get(&v.0).copied(),
+                        _ => None,
+                    };
+                    (reg(2).filter(|&r| free(r)), [reg(0), reg(1)])
+                }
+                _ => (None, [None, None]),
+            };
+            let pool = || ARM_VEC_TEMP_REGS.iter().chain(&ARM_VEC_TEMP_EXTRA_REGS).copied();
+            let pick = pref
+                .or_else(|| pool().find(|&r| free(r) && !factors.contains(&Some(r))))
+                .or_else(|| pool().find(|&r| free(r)));
+            if let Some(reg) = pick {
                 busy.push((bi, last, reg));
                 regs.insert(id, reg);
             }
