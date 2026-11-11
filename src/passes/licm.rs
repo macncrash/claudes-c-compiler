@@ -116,7 +116,7 @@ fn hoist_constant_locals_once(func: &mut IrFunction, loops: &[NaturalLoop]) -> u
         let mut grew = false;
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
             if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
-                if let (Some(&(root, off)), Some(k), false) = (derived.get(&base.0), c.to_i64(), derived.contains_key(&dest.0)) {
+                if let (Some(&(root, off)), Some(k), false) = (derived.get(&base.0), c.to_i64_exact(), derived.contains_key(&dest.0)) {
                     derived.insert(dest.0, (root, off + k));
                     grew = true;
                 }
@@ -880,7 +880,7 @@ fn folded_addresses(func: &IrFunction) -> FxHashSet<u32> {
     let mut geps: FxHashSet<u32> = FxHashSet::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         if let Instruction::GetElementPtr { dest, offset: Operand::Const(c), .. } = inst {
-            if c.to_i64().is_some_and(|k| (0..4096).contains(&k)) {
+            if c.to_i64_exact().is_some_and(|k| (0..4096).contains(&k)) {
                 geps.insert(dest.0);
             }
         }

@@ -41,9 +41,9 @@ pub(crate) fn split_module(module: &mut IrModule) -> usize {
 /// `base + k` for a constant k, as a GEP or a 64-bit add.
 fn const_offset(inst: &Instruction) -> Option<(Value, Value, i64)> {
     match inst {
-        Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => Some((*dest, *base, c.to_i64()?)),
+        Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => Some((*dest, *base, c.to_i64_exact()?)),
         Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, ty: IrType::I64 | IrType::U64 } => match (lhs, rhs) {
-            (Operand::Value(b), Operand::Const(c)) | (Operand::Const(c), Operand::Value(b)) => Some((*dest, *b, c.to_i64()?)),
+            (Operand::Value(b), Operand::Const(c)) | (Operand::Const(c), Operand::Value(b)) => Some((*dest, *b, c.to_i64_exact()?)),
             _ => None,
         },
         _ => None,

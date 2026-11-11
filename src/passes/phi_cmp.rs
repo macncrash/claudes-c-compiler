@@ -96,7 +96,7 @@ pub(crate) fn sink_compares(func: &mut IrFunction) -> usize {
 fn same(a: &Operand, b: &Operand) -> bool {
     match (a, b) {
         (Operand::Value(x), Operand::Value(y)) => x == y,
-        (Operand::Const(x), Operand::Const(y)) => x.to_i64().is_some() && x.to_i64() == y.to_i64() && std::mem::discriminant(x) == std::mem::discriminant(y),
+        (Operand::Const(x), Operand::Const(y)) => x.to_i64_exact().is_some() && x.to_i64_exact() == y.to_i64_exact() && std::mem::discriminant(x) == std::mem::discriminant(y),
         _ => false,
     }
 }

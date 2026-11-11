@@ -116,7 +116,7 @@ fn vec_elem(ty: IrType) -> Option<VecElem> {
 fn step_of(inst: &Instruction, base: Value) -> Option<i64> {
     let is_base = |op: &Operand| matches!(op, Operand::Value(v) if *v == base);
     let k = |op: &Operand| match op {
-        Operand::Const(c) => c.to_i64(),
+        Operand::Const(c) => c.to_i64_exact(),
         Operand::Value(_) => None,
     };
     match inst {
@@ -160,7 +160,7 @@ fn analyze(func: &IrFunction, header: usize, pre: usize) -> Option<Plan> {
     let mut test_at = None;
     let counter_next = match def(cond).map(|k| &block.instructions[k]) {
         Some(Instruction::Cmp { op: IrCmpOp::Ne, lhs: Operand::Value(v), rhs: Operand::Const(c), .. })
-            if c.to_i64() == Some(0) => { test_at = def(cond); *v }
+            if c.to_i64_exact() == Some(0) => { test_at = def(cond); *v }
         _ => cond,
     };
     let &(counter, counter_ty, counter_init, _) = phis.iter().find(|p| p.3 == counter_next)?;
@@ -306,7 +306,7 @@ fn lane_of(
                 IrCmpOp::Ult | IrCmpOp::Ule => (false_val, true_val),
                 _ => return None,
             };
-            if !matches!(zero, Operand::Const(z) if z.to_i64() == Some(0)) || !invariant(rhs) {
+            if !matches!(zero, Operand::Const(z) if z.to_i64_exact() == Some(0)) || !invariant(rhs) {
                 return None;
             }
             if !matches!(lane_of(block, lhs, x, bits, invariant, seen)?, Lane::Elem { zext: true }) {
@@ -324,7 +324,7 @@ fn lane_of(
 fn same(a: &Operand, b: &Operand) -> bool {
     match (a, b) {
         (Operand::Value(x), Operand::Value(y)) => x == y,
-        (Operand::Const(x), Operand::Const(y)) => x.to_i64().is_some() && x.to_i64() == y.to_i64(),
+        (Operand::Const(x), Operand::Const(y)) => x.to_i64_exact().is_some() && x.to_i64_exact() == y.to_i64_exact(),
         _ => false,
     }
 }
@@ -529,7 +529,7 @@ mod tests {
         // The unrolled step: four times 16 bytes below the pointer.
         let body = &func.blocks[4].instructions;
         let offsets: Vec<i64> = body.iter().filter_map(|i| match i {
-            Instruction::GetElementPtr { offset: Operand::Const(c), .. } => c.to_i64(),
+            Instruction::GetElementPtr { offset: Operand::Const(c), .. } => c.to_i64_exact(),
             _ => None,
         }).collect();
         assert_eq!(offsets, [-16, -32, -48, -64, -64], "{body:?}");

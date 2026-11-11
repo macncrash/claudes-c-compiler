@@ -114,7 +114,7 @@ trait OperandExt {
 impl OperandExt for Operand {
     fn as_i64(&self) -> Option<i64> {
         match self {
-            Operand::Const(c) => c.to_i64(),
+            Operand::Const(c) => c.to_i64_exact(),
             Operand::Value(_) => None,
         }
     }
@@ -124,7 +124,7 @@ impl OperandExt for Operand {
 /// sign extension of a 32-bit value.
 fn bounded(func: &IrFunction, op: &Operand) -> bool {
     match op {
-        Operand::Const(c) => c.to_i64().is_some_and(|v| (i32::MIN as i64..=i32::MAX as i64).contains(&v)),
+        Operand::Const(c) => c.to_i64_exact().is_some_and(|v| (i32::MIN as i64..=i32::MAX as i64).contains(&v)),
         Operand::Value(v) => def_of(func, *v).is_some_and(|(b, k)| matches!(func.blocks[b].instructions[k],
             Instruction::Cast { from_ty: IrType::I32, to_ty: IrType::I64, .. })),
     }

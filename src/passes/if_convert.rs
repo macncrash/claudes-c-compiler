@@ -531,7 +531,7 @@ fn is_value_const_in_block(block: &BasicBlock, op: &Operand) -> bool {
 fn same_value_or_both_zero(a: &Operand, b: &Operand) -> bool {
     match (a, b) {
         (Operand::Const(ca), Operand::Const(cb)) => {
-            ca.to_i64() == Some(0) && cb.to_i64() == Some(0)
+            ca.to_i64_exact() == Some(0) && cb.to_i64_exact() == Some(0)
         }
         (Operand::Value(va), Operand::Value(vb)) => va.0 == vb.0,
         _ => false,

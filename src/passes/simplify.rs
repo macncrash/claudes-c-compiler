@@ -107,7 +107,7 @@ fn simplify_msb(func: &mut IrFunction) -> usize {
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         if let Instruction::BinOp { dest, op: IrBinOp::Sub, lhs: Operand::Const(k), rhs: Operand::Value(c), .. } = inst {
             if let Some(Some(width)) = clz_width.get(c.0 as usize) {
-                if k.to_i64() == Some(width - 1) {
+                if k.to_i64_exact() == Some(width - 1) {
                     set_def(&mut msb_of, dest.0, (*c, width - 1));
                 }
             }
@@ -237,7 +237,7 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
             let (dest, ok) = match inst {
                 Instruction::Copy { dest, src } => (dest, operand_is_boolean(src, &is_boolean)),
                 Instruction::Phi { dest, ty, incoming } if ty.is_integer() => (dest, incoming.iter().all(|(op, _)| match op {
-                    Operand::Const(c) => matches!(c.to_i64(), Some(0 | 1)),
+                    Operand::Const(c) => matches!(c.to_i64_exact(), Some(0 | 1)),
                     _ => operand_is_boolean(op, &is_boolean),
                 })),
                 _ => continue,
@@ -304,7 +304,7 @@ fn fold_range_checks(func: &mut IrFunction) -> usize {
         if !ty.is_integer() || !(ty.size() == 4 || ty.size() == 8 && wide_ok) {
             continue;
         }
-        let Some(k) = c.to_i64() else { continue };
+        let Some(k) = c.to_i64_exact() else { continue };
         let signed = matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
         let k = match (ty.size(), signed) {
             (4, true) => k as i32 as i128,
@@ -504,7 +504,7 @@ pub(crate) fn value_ranges(func: &IrFunction, max_id: usize) -> Vec<Range> {
     let get = |op: &Operand, ranges: &[Range]| -> Range {
         match op {
             Operand::Value(v) => ranges.get(v.0 as usize).copied().flatten(),
-            Operand::Const(c) => c.to_i64().map(|k| (k as i128, k as i128)),
+            Operand::Const(c) => c.to_i64_exact().map(|k| (k as i128, k as i128)),
         }
     };
     // Two sweeps: in the second, a phi gets the union of its incoming
@@ -520,7 +520,7 @@ pub(crate) fn value_ranges(func: &IrFunction, max_id: usize) -> Vec<Range> {
                 Instruction::Phi { incoming, ty, .. } if sweep == 1 && ty.is_integer() && ty.size() >= 4 => {
                     incoming.iter().try_fold(None, |acc: Range, (op, _)| {
                         let r = match op {
-                            Operand::Const(c) => c.to_i64().filter(|k| (0..=i32::MAX as i64).contains(k)).map(|k| (k as i128, k as i128)),
+                            Operand::Const(c) => c.to_i64_exact().filter(|k| (0..=i32::MAX as i64).contains(k)).map(|k| (k as i128, k as i128)),
                             Operand::Value(_) => get(op, &first),
                         }?;
                         Some(Some(acc.map_or(r, |a| (a.0.min(r.0), a.1.max(r.1)))))
@@ -638,7 +638,7 @@ fn operand_is_boolean(op: &Operand, is_boolean: &[bool]) -> bool {
             let id = v.0 as usize;
             id < is_boolean.len() && is_boolean[id]
         }
-        Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),
+        Operand::Const(c) => matches!(c.to_i64_exact(), Some(0) | Some(1)),
     }
 }
 
@@ -928,7 +928,7 @@ fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCons
     }
 
     // Integer-to-integer/float constant cast
-    if let Some(raw_val) = c.to_i64() {
+    if let Some(raw_val) = c.to_i64_exact() {
         // Normalize source value according to from_ty signedness.
         // Signed types sign-extend; unsigned types zero-extend.
         let val = from_ty.truncate_i64(raw_val);
@@ -1089,7 +1089,7 @@ fn simplify_cmp(
         _ => return None,
     };
 
-    let const_i64 = cval.to_i64();
+    let const_i64 = cval.to_i64_exact();
     let is_zero_const = const_i64 == Some(0);
     let is_one_const = const_i64 == Some(1);
 
@@ -1252,11 +1252,11 @@ fn simplify_gep(
     // GEP chain folding: GEP(GEP(inner_base, c1), c2) => GEP(inner_base, c1 + c2)
     // Only safe when both offsets are constants (we can compute the sum at compile time).
     if let Operand::Const(outer_c) = offset {
-        if let Some(outer_val) = outer_c.to_i64() {
+        if let Some(outer_val) = outer_c.to_i64_exact() {
             let base_idx = base.0 as usize;
             if let Some(Some(inner_gep)) = gep_defs.get(base_idx) {
                 if let Operand::Const(inner_c) = &inner_gep.offset {
-                    if let Some(inner_val) = inner_c.to_i64() {
+                    if let Some(inner_val) = inner_c.to_i64_exact() {
                         let combined = inner_val.wrapping_add(outer_val);
                         if combined == 0 {
                             // Combined offset is zero => just copy the original base
@@ -1284,7 +1284,7 @@ fn simplify_gep(
 fn const_power_of_two(op: &Operand) -> Option<u32> {
     match op {
         Operand::Const(c) => {
-            let val = c.to_i64()?;
+            let val = c.to_i64_exact()?;
             if val > 0 && (val & (val - 1)) == 0 {
                 Some(val.trailing_zeros())
             } else {
@@ -1609,7 +1609,7 @@ fn is_all_ones(op: &Operand, ty: IrType) -> bool {
                     false
                 }
             } else {
-                match c.to_i64() {
+                match c.to_i64_exact() {
                     Some(val) => {
                         // After truncation to the type's width, all-ones is -1.
                         ty.truncate_i64(val) == ty.truncate_i64(-1)
@@ -1670,7 +1670,7 @@ fn is_neg_one(op: &Operand, ty: IrType) -> bool {
                     false
                 }
             } else {
-                match c.to_i64() {
+                match c.to_i64_exact() {
                     Some(val) => ty.truncate_i64(val) == ty.truncate_i64(-1),
                     None => false,
                 }
@@ -1788,14 +1788,14 @@ fn try_reassociate_add(
     if matches!(ty, IrType::I128 | IrType::U128) { return None; }
     // Pattern: (x + C1) + C2 or (x - C1) + C2
     if let Operand::Const(c2) = rhs {
-        let c2_val = c2.to_i64()?;
+        let c2_val = c2.to_i64_exact()?;
         if let Some(def) = get_binop_def(lhs, binop_defs) {
             if def.ty == ty {
                 match def.op {
                     IrBinOp::Add => {
                         // (x + C1) + C2 => x + (C1 + C2)
                         if let Operand::Const(c1) = &def.rhs {
-                            let c1_val = c1.to_i64()?;
+                            let c1_val = c1.to_i64_exact()?;
                             let combined = combine_add_consts(c1_val, c2_val, ty);
                             if combined == 0 {
                                 return Some(Instruction::Copy { dest, src: def.lhs });
@@ -1809,7 +1809,7 @@ fn try_reassociate_add(
                         }
                         // (C1 + x) + C2 => x + (C1 + C2)
                         if let Operand::Const(c1) = &def.lhs {
-                            let c1_val = c1.to_i64()?;
+                            let c1_val = c1.to_i64_exact()?;
                             let combined = combine_add_consts(c1_val, c2_val, ty);
                             if combined == 0 {
                                 return Some(Instruction::Copy { dest, src: def.rhs });
@@ -1825,7 +1825,7 @@ fn try_reassociate_add(
                     IrBinOp::Sub => {
                         // (x - C1) + C2 => x + (C2 - C1)
                         if let Operand::Const(c1) = &def.rhs {
-                            let c1_val = c1.to_i64()?;
+                            let c1_val = c1.to_i64_exact()?;
                             let combined = ty.truncate_i64(c2_val.wrapping_sub(c1_val));
                             if combined == 0 {
                                 return Some(Instruction::Copy { dest, src: def.lhs });
@@ -1845,11 +1845,11 @@ fn try_reassociate_add(
     }
     // Pattern: C2 + (x + C1) -- commuted case
     if let Operand::Const(c2) = lhs {
-        let c2_val = c2.to_i64()?;
+        let c2_val = c2.to_i64_exact()?;
         if let Some(def) = get_binop_def(rhs, binop_defs) {
             if def.ty == ty && def.op == IrBinOp::Add {
                 if let Operand::Const(c1) = &def.rhs {
-                    let c1_val = c1.to_i64()?;
+                    let c1_val = c1.to_i64_exact()?;
                     let combined = combine_add_consts(c1_val, c2_val, ty);
                     if combined == 0 {
                         return Some(Instruction::Copy { dest, src: def.lhs });
@@ -1862,7 +1862,7 @@ fn try_reassociate_add(
                     });
                 }
                 if let Operand::Const(c1) = &def.lhs {
-                    let c1_val = c1.to_i64()?;
+                    let c1_val = c1.to_i64_exact()?;
                     let combined = combine_add_consts(c1_val, c2_val, ty);
                     if combined == 0 {
                         return Some(Instruction::Copy { dest, src: def.rhs });
@@ -1893,7 +1893,7 @@ fn try_reassociate_sub(
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
     if matches!(ty, IrType::I128 | IrType::U128) { return None; }
     let c2_val = match rhs {
-        Operand::Const(c) => c.to_i64()?,
+        Operand::Const(c) => c.to_i64_exact()?,
         _ => return None,
     };
     let def = get_binop_def(lhs, binop_defs)?;
@@ -1904,7 +1904,7 @@ fn try_reassociate_sub(
         IrBinOp::Add => {
             // (x + C1) - C2 => x + (C1 - C2)
             if let Operand::Const(c1) = &def.rhs {
-                let c1_val = c1.to_i64()?;
+                let c1_val = c1.to_i64_exact()?;
                 let combined = ty.truncate_i64(c1_val.wrapping_sub(c2_val));
                 if combined == 0 {
                     return Some(Instruction::Copy { dest, src: def.lhs });
@@ -1918,7 +1918,7 @@ fn try_reassociate_sub(
             }
             // (C1 + x) - C2 => x + (C1 - C2)
             if let Operand::Const(c1) = &def.lhs {
-                let c1_val = c1.to_i64()?;
+                let c1_val = c1.to_i64_exact()?;
                 let combined = ty.truncate_i64(c1_val.wrapping_sub(c2_val));
                 if combined == 0 {
                     return Some(Instruction::Copy { dest, src: def.rhs });
@@ -1934,7 +1934,7 @@ fn try_reassociate_sub(
         IrBinOp::Sub => {
             // (x - C1) - C2 => x - (C1 + C2)
             if let Operand::Const(c1) = &def.rhs {
-                let c1_val = c1.to_i64()?;
+                let c1_val = c1.to_i64_exact()?;
                 let combined = combine_add_consts(c1_val, c2_val, ty);
                 if combined == 0 {
                     return Some(Instruction::Copy { dest, src: def.lhs });
@@ -1966,7 +1966,7 @@ fn try_reassociate_bitwise(
     if matches!(ty, IrType::I128 | IrType::U128) { return None; }
     // Pattern: (x op C1) op C2
     let c2_val = match rhs {
-        Operand::Const(c) => c.to_i64()?,
+        Operand::Const(c) => c.to_i64_exact()?,
         _ => return None,
     };
     let def = get_binop_def(lhs, binop_defs)?;
@@ -1975,9 +1975,9 @@ fn try_reassociate_bitwise(
     }
     // (x op C1) op C2 => x op (C1 op C2)
     let (non_const_operand, c1_val) = if let Operand::Const(c1) = &def.rhs {
-        (def.lhs, c1.to_i64()?)
+        (def.lhs, c1.to_i64_exact()?)
     } else if let Operand::Const(c1) = &def.lhs {
-        (def.rhs, c1.to_i64()?)
+        (def.rhs, c1.to_i64_exact()?)
     } else {
         return None;
     };
@@ -2047,7 +2047,7 @@ fn try_reassociate_shift(
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
     if matches!(ty, IrType::I128 | IrType::U128) { return None; }
     let c2_val = match rhs {
-        Operand::Const(c) => c.to_i64()?,
+        Operand::Const(c) => c.to_i64_exact()?,
         _ => return None,
     };
     if c2_val < 0 { return None; }
@@ -2058,7 +2058,7 @@ fn try_reassociate_shift(
     }
     // (x shift C1) shift C2 => x shift (C1 + C2)
     let c1_val = match &def.rhs {
-        Operand::Const(c) => c.to_i64()?,
+        Operand::Const(c) => c.to_i64_exact()?,
         _ => return None,
     };
     if c1_val < 0 { return None; }
@@ -2104,7 +2104,7 @@ fn try_reassociate_mul(
     // Helper: try pattern (expr * C1) * C2 where expr is on one side and C2 on the other.
     let try_pattern = |expr_side: &Operand, const_side: &Operand| -> Option<Instruction> {
         let c2_val = match const_side {
-            Operand::Const(c) => c.to_i64()?,
+            Operand::Const(c) => c.to_i64_exact()?,
             _ => return None,
         };
         let def = get_binop_def(expr_side, binop_defs)?;
@@ -2113,9 +2113,9 @@ fn try_reassociate_mul(
         }
         // Find the constant in the inner multiply: (x * C1) or (C1 * x)
         let (non_const, c1_val) = if let Operand::Const(c1) = &def.rhs {
-            (def.lhs, c1.to_i64()?)
+            (def.lhs, c1.to_i64_exact()?)
         } else if let Operand::Const(c1) = &def.lhs {
-            (def.rhs, c1.to_i64()?)
+            (def.rhs, c1.to_i64_exact()?)
         } else {
             return None;
         };
@@ -2901,7 +2901,7 @@ mod tests {
             try_simplify(inst, &[], &[], &defs, &[], &[], &[], &[])
         };
         let is_const = |r: Option<Instruction>, v: i64| matches!(r,
-            Some(Instruction::Copy { src: Operand::Const(c), .. }) if c.to_i64() == Some(v));
+            Some(Instruction::Copy { src: Operand::Const(c), .. }) if c.to_i64_exact() == Some(v));
 
         // x == y && x != y, x < y && y < x: never
         assert!(is_const(run(&and, cmp(IrCmpOp::Eq, 10, 11), cmp(IrCmpOp::Ne, 10, 11)), 0));
@@ -3098,7 +3098,7 @@ mod tests {
         let result = simplify_default(&inst).unwrap();
         match result {
             Instruction::Copy { src: Operand::Const(c), .. } => {
-                assert_eq!(c.to_i64(), Some(-1i32 as i64));
+                assert_eq!(c.to_i64_exact(), Some(-1i32 as i64));
             }
             _ => panic!("Expected Copy with all-ones, got {:?}", result),
         }

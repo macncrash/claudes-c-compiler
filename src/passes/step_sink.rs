@@ -338,7 +338,7 @@ pub(crate) fn group_loads(func: &mut IrFunction) -> usize {
     let mut const_gep: crate::common::fx_hash::FxHashMap<u32, (Value, i64)> = Default::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
-            if let Some(k) = c.to_i64() {
+            if let Some(k) = c.to_i64_exact() {
                 const_gep.insert(dest.0, (*base, k));
             }
         }

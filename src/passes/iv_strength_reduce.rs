@@ -438,7 +438,7 @@ fn find_basic_ivs(
                     };
 
                     if let Some(Operand::Const(c)) = step_operand {
-                        if let Some(step) = c.to_i64() {
+                        if let Some(step) = c.to_i64_exact() {
                             ivs.push(BasicIV {
                                 phi_dest: *dest,
                                 ty: *ty,
@@ -533,7 +533,7 @@ fn find_derived_exprs(
                     match (lhs, rhs) {
                         (Operand::Value(v), Operand::Const(c))
                         | (Operand::Const(c), Operand::Value(v)) => {
-                            if let (Some(idx), Some(s)) = (find_iv(v.0), c.to_i64()) {
+                            if let (Some(idx), Some(s)) = (find_iv(v.0), c.to_i64_exact()) {
                                 (*dest, idx, s)
                             } else {
                                 continue;
@@ -546,7 +546,7 @@ fn find_derived_exprs(
                 Instruction::BinOp {
                     dest, op: IrBinOp::Shl, lhs: Operand::Value(v), rhs: Operand::Const(c), ..
                 } => {
-                    if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {
+                    if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64_exact()) {
                         if (0..64).contains(&shift) {
                             (*dest, idx, 1i64 << shift)
                         } else {
@@ -623,7 +623,7 @@ fn look_through_casts(val_id: u32, loop_defs: &FxHashMap<u32, &Instruction>) -> 
 /// Try to resolve an operand to a constant i64 value, looking through Copies.
 fn try_resolve_const(op: &Operand, func: &IrFunction) -> Option<i64> {
     match op {
-        Operand::Const(c) => c.to_i64(),
+        Operand::Const(c) => c.to_i64_exact(),
         Operand::Value(v) => {
             for block in &func.blocks {
                 for inst in &block.instructions {

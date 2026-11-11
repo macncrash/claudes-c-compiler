@@ -114,7 +114,7 @@ fn expand(inst: &Instruction, wide_stores: bool, fresh: &mut dyn FnMut() -> Valu
         return None;
     }
     let Operand::Const(len) = info.args[2] else { return None };
-    let len = len.to_i64()?;
+    let len = len.to_i64_exact()?;
     let Operand::Value(dest) = info.args[0] else { return None };
     if !(0..=MAX_INLINE).contains(&len) {
         return None;
@@ -135,7 +135,7 @@ fn expand(inst: &Instruction, wide_stores: bool, fresh: &mut dyn FnMut() -> Valu
             }
             // The byte, repeated in each of eight.
             let pattern = match info.args[1] {
-                Operand::Const(c) => Operand::Const(IrConst::I64((c.to_i64()? & 0xff) * 0x0101_0101_0101_0101)),
+                Operand::Const(c) => Operand::Const(IrConst::I64((c.to_i64_exact()? & 0xff) * 0x0101_0101_0101_0101)),
                 Operand::Value(v) => {
                     let from = *info.arg_types.get(1)?;
                     if !matches!(from, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
@@ -214,7 +214,7 @@ pub(crate) fn scalarize_local_copies(func: &mut IrFunction) -> usize {
         match inst {
             Instruction::Alloca { dest, ty, volatile: false, .. } if scalar(ty) => { locals.insert(dest.0, *ty); }
             Instruction::Copy { dest, src } => { moves.insert(dest.0, *src); }
-            Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } if c.to_i64() == Some(0) => {
+            Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } if c.to_i64_exact() == Some(0) => {
                 moves.insert(dest.0, Operand::Value(*base));
             }
             // A pointer or integer passed on unchanged, or a constant.
@@ -269,7 +269,7 @@ pub(crate) fn scalarize_local_copies(func: &mut IrFunction) -> usize {
                 // A plain call, before mem_inline makes it a Memcpy.
                 Instruction::Call { func: name, info } if name == "memcpy" && info.args.len() == 3
                     && info.dest.is_none_or(|r| !used.contains(&r.0)) => {
-                    let len = match resolve(info.args[2], &mut via) { Operand::Const(c) => c.to_i64(), _ => None };
+                    let len = match resolve(info.args[2], &mut via) { Operand::Const(c) => c.to_i64_exact(), _ => None };
                     match len {
                         Some(n @ 1..=8) => (info.args[0], info.args[1], n as usize),
                         _ => continue,
@@ -417,7 +417,7 @@ mod tests {
             vec![IrType::Ptr, IrType::I32, IrType::U64]));
         assert_eq!(inline_function(&mut f, true), 1);
         let stores: Vec<(IrType, i64)> = f.blocks[0].instructions.iter().filter_map(|i| match i {
-            Instruction::Store { ty, val: Operand::Const(c), .. } => Some((*ty, c.to_i64().unwrap())),
+            Instruction::Store { ty, val: Operand::Const(c), .. } => Some((*ty, c.to_i64_exact().unwrap())),
             _ => None,
         }).collect();
         assert_eq!(stores, [(IrType::I64, 0xabababababababab_u64 as i64), (IrType::I32, 0xabababab_u32 as i32 as i64),

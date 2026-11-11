@@ -328,7 +328,7 @@ pub(crate) fn reads_low_bits(func: &IrFunction, uses: &[Vec<Option<(usize, usize
                 // A right shift by k reads bits k.. of v: its uses may read
                 // only its low (bits - k).
                 let shift = match (op, lhs, rhs) {
-                    (IrBinOp::LShr | IrBinOp::AShr, Operand::Value(l), Operand::Const(k)) if l.0 == v => k.to_i64(),
+                    (IrBinOp::LShr | IrBinOp::AShr, Operand::Value(l), Operand::Const(k)) if l.0 == v => k.to_i64_exact(),
                     _ => None,
                 };
                 if let Some(k) = shift {
@@ -469,7 +469,7 @@ fn narrow_binops_with_cast(
                 if matches!(binop_info.op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr) {
                     let bits = (to_ty.size() * 8) as i64;
                     let in_range = matches!(&binop_info.rhs, Operand::Const(c)
-                        if c.to_i64().is_some_and(|k| (0..bits).contains(&k)));
+                        if c.to_i64_exact().is_some_and(|k| (0..bits).contains(&k)));
                     if !in_range {
                         continue;
                     }
@@ -743,7 +743,7 @@ fn narrow_binops_without_cast(
                 // need not have its high half zero ((uint32_t)b of a signed
                 // char is its `sxtb` register, so (uint32_t)b | 0 was
                 // sign-extended).
-                let is_zero = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64() == Some(0));
+                let is_zero = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64_exact() == Some(0));
                 if (matches!(op, IrBinOp::Or | IrBinOp::Xor) && (is_zero(lhs) || is_zero(rhs)))
                     || (matches!(op, IrBinOp::Or | IrBinOp::And)
                         && matches!((&*lhs, &*rhs), (Operand::Value(a), Operand::Value(b)) if a.0 == b.0))

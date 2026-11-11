@@ -115,7 +115,7 @@ fn promote_loop(func: &mut IrFunction, cfg: &CfgAnalysis, l: &NaturalLoop, model
                     alloca_size.insert(dest.0, *size);
                 }
                 Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => {
-                    if let Some(off) = c.to_i64() {
+                    if let Some(off) = c.to_i64_exact() {
                         const_gep.insert(dest.0, (base.0, off));
                     }
                 }

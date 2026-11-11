@@ -76,7 +76,7 @@ pub(crate) fn widen_function(func: &mut IrFunction) -> usize {
 /// The constant of `op` as an i64, if it is an integer constant.
 fn const_i64(op: &Operand) -> Option<i64> {
     match op {
-        Operand::Const(c) => c.to_i64(),
+        Operand::Const(c) => c.to_i64_exact(),
         _ => None,
     }
 }
@@ -138,7 +138,7 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
         }
     };
     if let Operand::Const(c) = init {
-        if c.to_i64().is_none() {
+        if c.to_i64_exact().is_none() {
             return false;
         }
     }
@@ -150,7 +150,7 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
     // in the loop and after it.
     if unsigned {
         let Operand::Const(c) = init else { return false };
-        if !c.to_i64().is_some_and(|k| (0..0xffff_fffe).contains(&k)) {
+        if !c.to_i64_exact().is_some_and(|k| (0..0xffff_fffe).contains(&k)) {
             return false;
         }
         let header_label = func.blocks[header].label;
@@ -212,7 +212,7 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
                     // signed order; it is placed after the value's definition.
                     let signed_cmp = matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
                     let ok = !(unsigned && signed_cmp) && match other {
-                        Operand::Const(c) => c.to_i64().is_some(),
+                        Operand::Const(c) => c.to_i64_exact().is_some(),
                         Operand::Value(v) => !is_iv(v.0) && (unsigned || available_before(func, v.0)),
                     };
                     if ok {
@@ -247,7 +247,7 @@ fn widen_iv(func: &mut IrFunction, body: &crate::common::fx_hash::FxHashSet<usiz
     let mut after_def: Vec<(Value, Instruction)> = Vec::new();
     let mut extended: FxHashMap<u32, Value> = FxHashMap::default();
     let mut sext = |op: Operand, narrow: &mut FxHashMap<u32, Value>| match op {
-        Operand::Const(c) => Operand::Const(IrConst::I64(ext_op(c.to_i64().unwrap_or(0)))),
+        Operand::Const(c) => Operand::Const(IrConst::I64(ext_op(c.to_i64_exact().unwrap_or(0)))),
         Operand::Value(v) => {
             if let Some(&w) = narrow.get(&v.0).or(extended.get(&v.0)) {
                 return Operand::Value(w);

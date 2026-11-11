@@ -61,7 +61,7 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
                 inst.for_each_used_value(|v| uses.entry(v).or_default().push((b, Some(k))));
             }
             if let Instruction::BinOp { dest, op: IrBinOp::Shl, lhs, rhs: Operand::Const(c), ty: IrType::I64 | IrType::U64 } = inst {
-                if let Some(k) = c.to_i64() {
+                if let Some(k) = c.to_i64_exact() {
                     shl.insert(dest.0, (*lhs, k));
                 }
             }

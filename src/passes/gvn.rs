@@ -720,7 +720,7 @@ pub(crate) fn pointer_locations(func: &IrFunction) -> FxHashMap<u32, (Value, i64
     let mut step: FxHashMap<u32, (Value, i64)> = FxHashMap::default();
     for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
         if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
-            if let Some(k) = c.to_i64().filter(|k| k.unsigned_abs() < 1 << 31) {
+            if let Some(k) = c.to_i64_exact().filter(|k| k.unsigned_abs() < 1 << 31) {
                 step.insert(dest.0, (*base, k));
             }
         }

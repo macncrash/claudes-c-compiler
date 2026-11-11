@@ -177,13 +177,13 @@ fn int_like(ty: IrType) -> bool {
 /// of those times at most 256 (a shift or multiply: a byte offset).
 fn bounded(func: &IrFunction, op: &Operand) -> bool {
     match op {
-        Operand::Const(c) => c.to_i64().is_some_and(|k| k.abs() < 1 << 40),
+        Operand::Const(c) => c.to_i64_exact().is_some_and(|k| k.abs() < 1 << 40),
         Operand::Value(v) => func.blocks.iter().flat_map(|b| &b.instructions).any(|i| match i {
             Instruction::Cast { dest, from_ty: IrType::I32, to_ty: IrType::I64, .. } => dest == v,
             Instruction::BinOp { dest, op: IrBinOp::Shl, lhs, rhs: Operand::Const(k), ty: IrType::I64 } if dest == v =>
-                k.to_i64().is_some_and(|k| (0..=8).contains(&k)) && sext32(func, lhs),
+                k.to_i64_exact().is_some_and(|k| (0..=8).contains(&k)) && sext32(func, lhs),
             Instruction::BinOp { dest, op: IrBinOp::Mul, lhs, rhs: Operand::Const(k), ty: IrType::I64 } if dest == v =>
-                k.to_i64().is_some_and(|k| k.abs() <= 256) && sext32(func, lhs),
+                k.to_i64_exact().is_some_and(|k| k.abs() <= 256) && sext32(func, lhs),
             _ => false,
         }),
     }
@@ -249,15 +249,15 @@ fn analyze(func: &IrFunction, header: usize, body: usize, pre: usize) -> Option<
     }
     let is_inc = |inst: &Instruction, of: Value| match inst {
         Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(x), rhs: Operand::Const(c), ty: IrType::I64, .. }
-            if *x == of => c.to_i64(),
-        Instruction::GetElementPtr { base, offset: Operand::Const(c), .. } if *base == of => c.to_i64(),
+            if *x == of => c.to_i64_exact(),
+        Instruction::GetElementPtr { base, offset: Operand::Const(c), .. } if *base == of => c.to_i64_exact(),
         _ => None,
     };
     let counter_step = is_inc(&b.instructions[cn_at], *counter).filter(|&k| (1..=1 << 16).contains(&k))?;
     // Every value of the counter is a 32-bit int (it counts by one from a
     // 32-bit start to a 32-bit bound): truncating it loses nothing.
     let fits32 = |op: &Operand| match op {
-        Operand::Const(c) => c.to_i64().is_some_and(|k| i32::try_from(k).is_ok()),
+        Operand::Const(c) => c.to_i64_exact().is_some_and(|k| i32::try_from(k).is_ok()),
         Operand::Value(_) => sext32(func, op),
     };
     let counter32 = int_ok && counter_step == 1 && fits32(&counter_init) && fits32(bound);
@@ -326,7 +326,7 @@ fn analyze(func: &IrFunction, header: usize, body: usize, pre: usize) -> Option<
     fn lin_of(op: &Operand, b: &BasicBlock, defined: &FxHashSet<u32>, counter: Value, int_counter: bool, stepped: &FxHashSet<u32>,
               memo: &mut FxHashMap<u32, Option<Lin>>, addr: &mut FxHashSet<usize>, depth: u32) -> Option<Lin> {
         let v = match op {
-            Operand::Const(c) => return Some(Lin::konst(c.to_i64()?)),
+            Operand::Const(c) => return Some(Lin::konst(c.to_i64_exact()?)),
             Operand::Value(v) => *v,
         };
         if v == counter || stepped.contains(&v.0) || !defined.contains(&v.0) {
@@ -347,11 +347,11 @@ fn analyze(func: &IrFunction, header: usize, body: usize, pre: usize) -> Option<
                 l.add(&r, if *op == IrBinOp::Add { 1 } else { -1 })
             }
             Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs: Operand::Const(c), ty: IrType::I32 | IrType::I64, .. } =>
-                rec(lhs, addr)?.scale(c.to_i64()?),
+                rec(lhs, addr)?.scale(c.to_i64_exact()?),
             Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Const(c), rhs, ty: IrType::I32 | IrType::I64, .. } =>
-                rec(rhs, addr)?.scale(c.to_i64()?),
+                rec(rhs, addr)?.scale(c.to_i64_exact()?),
             Instruction::BinOp { op: IrBinOp::Shl, lhs, rhs: Operand::Const(c), ty: IrType::I32 | IrType::I64, .. } => {
-                let k = c.to_i64().filter(|k| (0..32).contains(k))?;
+                let k = c.to_i64_exact().filter(|k| (0..32).contains(k))?;
                 rec(lhs, addr)?.scale(1 << k)
             }
             // Signed 32-bit arithmetic does not overflow (C), and the
@@ -385,7 +385,7 @@ fn analyze(func: &IrFunction, header: usize, body: usize, pre: usize) -> Option<
         .filter(|(i, _)| *i != header && *i != body)
         .flat_map(|(_, blk)| &blk.instructions)
         .filter_map(|i| match i {
-            Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => Some((dest.0, (base.0, c.to_i64()?))),
+            Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => Some((dest.0, (base.0, c.to_i64_exact()?))),
             _ => None,
         })
         .collect();

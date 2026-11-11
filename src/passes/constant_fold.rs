@@ -358,7 +358,7 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
                 // Compare constants across potentially different widths (e.g.,
                 // I32(0) from a cmp result vs I64(0) from a short-circuit default).
                 let same = tv.to_hash_key() == fv.to_hash_key()
-                    || matches!((tv.to_i64(), fv.to_i64()), (Some(a), Some(b)) if a == b);
+                    || matches!((tv.to_i64_exact(), fv.to_i64_exact()), (Some(a), Some(b)) if a == b);
                 if same {
                     return Some(Instruction::Copy {
                         dest: *dest,
@@ -399,7 +399,7 @@ fn resolve_const(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<Ir
 
 /// Extract a constant integer value from an operand, resolving through const map.
 fn as_i64_const_mapped(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<i64> {
-    resolve_const(op, const_map)?.to_i64()
+    resolve_const(op, const_map)?.to_i64_exact()
 }
 
 /// Extract a constant integer with proper extension for sub-int types (I8/I16),
@@ -446,7 +446,7 @@ fn as_i64_promoted_mapped(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> 
             // Default: zero-extend (unsigned short or literal)
             Some(*v as u16 as i64)
         }
-        _ => c.to_i64(),
+        _ => c.to_i64_exact(),
     }
 }
 
@@ -608,7 +608,7 @@ fn try_fold_float_cast_mapped(dest: Value, src: &Operand, from_ty: IrType, to_ty
         (false, true) => {
             // int-to-float conversion
             // Normalize to source type width first (sign-extend or zero-extend)
-            let raw_val = src_const.to_i64()?;
+            let raw_val = src_const.to_i64_exact()?;
             let val = match from_ty {
                 IrType::I8 => raw_val as i8 as i64,
                 IrType::U8 => raw_val as u8 as i64,

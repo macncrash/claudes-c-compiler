@@ -46,9 +46,9 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
             // bits or fewer, is zero above them (zbench's xorshift
             // `(unsigned)(rng >> 32)`, widened again for `% nw`).
             Instruction::BinOp { dest, op, rhs: Operand::Const(k), ty: IrType::I64 | IrType::U64, .. }
-                if matches!((op, k.to_i64()), (IrBinOp::LShr, Some(32..=63)) | (IrBinOp::And, Some(0..=0xffff_ffff))) =>
+                if matches!((op, k.to_i64_exact()), (IrBinOp::LShr, Some(32..=63)) | (IrBinOp::And, Some(0..=0xffff_ffff))) =>
             {
-                let k = k.to_i64().unwrap_or(0);
+                let k = k.to_i64_exact().unwrap_or(0);
                 ext[dest.0 as usize] = Some(match op {
                     IrBinOp::And if k <= 0xff => IrType::U8,
                     IrBinOp::And if k <= 0xffff => IrType::U16,
@@ -68,7 +68,7 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
         }
     }
     let fits = |c: &crate::ir::reexports::IrConst, ty: IrType| {
-        let Some(k) = c.to_i64() else { return false };
+        let Some(k) = c.to_i64_exact() else { return false };
         let bits = ty.size() * 8;
         if ty.is_unsigned() { k >= 0 && k < 1 << bits } else { k >= -(1 << (bits - 1)) && k < 1 << (bits - 1) }
     };
@@ -126,7 +126,7 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
                 Ext::As(e) if e.is_unsigned() => Ext::As(e),
                 _ => Ext::No,
             },
-            Operand::Const(c) => match c.to_i64() {
+            Operand::Const(c) => match c.to_i64_exact() {
                 Some(0..=0xff) => Ext::As(IrType::U8),
                 Some(0x100..=0xffff) => Ext::As(IrType::U16),
                 Some(0x1_0000..=0xffff_ffff) => Ext::As(IrType::U32),
@@ -285,9 +285,9 @@ pub(crate) fn elide_extensions(func: &mut IrFunction) -> usize {
             // A mask of the bits a zero extension already kept (division by
             // a constant masks its 32-bit dividend).
             Instruction::BinOp { dest, op: IrBinOp::And, lhs: Operand::Value(v), rhs: Operand::Const(k), ty: IrType::I64 | IrType::U64 }
-                if matches!(k.to_i64(), Some(0xff | 0xffff | 0xffff_ffff))
+                if matches!(k.to_i64_exact(), Some(0xff | 0xffff | 0xffff_ffff))
                     && ext.get(v.0 as usize).copied().flatten().is_some_and(|e| {
-                        e.is_unsigned() && (e.size() as i64) * 8 <= 64 - k.to_i64().unwrap_or(0).leading_zeros() as i64
+                        e.is_unsigned() && (e.size() as i64) * 8 <= 64 - k.to_i64_exact().unwrap_or(0).leading_zeros() as i64
                     }) =>
             {
                 *inst = Instruction::Copy { dest, src: Operand::Value(v) };
@@ -409,7 +409,7 @@ fn low_bits_only(func: &IrFunction, uses: &[Vec<Option<(usize, usize)>>], v: u32
             Instruction::BinOp { dest, op, lhs, rhs, ty } if ty.is_integer() && ty.size() <= 8 => {
                 let low = match (op, lhs, rhs) {
                     (IrBinOp::LShr | IrBinOp::AShr, Operand::Value(l), Operand::Const(k)) if l.0 == v => {
-                        return matches!(k.to_i64(), Some(k) if (0..bits as i64).contains(&k)
+                        return matches!(k.to_i64_exact(), Some(k) if (0..bits as i64).contains(&k)
                             && low_bits_only(func, uses, dest.0, bits - k as usize, seen));
                     }
                     (IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor, _, _) => true,

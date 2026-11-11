@@ -360,6 +360,16 @@ impl IrConst {
         }
     }
 
+    /// Like to_i64(), but None for an I128 outside i64's range instead of its
+    /// low 64 bits: what passes reasoning about the value need (1 << 64 is
+    /// not zero).
+    pub fn to_i64_exact(self) -> Option<i64> {
+        match self {
+            IrConst::I128(v) => i64::try_from(v).ok(),
+            _ => self.to_i64(),
+        }
+    }
+
     /// Extract as i128 (integer constants only; floats return None).
     /// Unlike to_i64(), this preserves the full 128-bit value.
     pub fn to_i128(self) -> Option<i128> {

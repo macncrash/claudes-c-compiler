@@ -128,7 +128,7 @@ pub(crate) fn mul_high_chains(func: &IrFunction) -> Vec<MulHighChain> {
             };
             let Instruction::BinOp { dest: h, op: IrBinOp::AShr | IrBinOp::LShr, lhs: Operand::Value(pv), rhs: Operand::Const(k), ty } = &w[2] else { continue };
             let Instruction::Cast { dest: t, src: Operand::Value(hv), from_ty, to_ty: IrType::I64 | IrType::U64 } = &w[3] else { continue };
-            if pv != p || hv != h || !wide(ty) || !wide(from_ty) || k.to_i64() != Some(64) || !once(e) || !once(p) || !once(h) {
+            if pv != p || hv != h || !wide(ty) || !wide(from_ty) || k.to_i64_exact() != Some(64) || !once(e) || !once(p) || !once(h) {
                 continue;
             }
             chains.push(MulHighChain { block: b, mul: i + 1, x: *x, m, signed, parts: [*e, *p, *h], dest: *t });
@@ -195,7 +195,7 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                     }
                 }
                 Instruction::BinOp { dest, op: IrBinOp::And, rhs: Operand::Const(c), .. } if dest.0 as usize <= max_id => {
-                    if let Some(k) = c.to_i64().filter(|&k| (0..=u16::MAX as i64).contains(&k)) {
+                    if let Some(k) = c.to_i64_exact().filter(|&k| (0..=u16::MAX as i64).contains(&k)) {
                         small_range[dest.0 as usize] = Some((0, k));
                     }
                 }
@@ -297,7 +297,7 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                 id <= max_id && is_known_u32[id]
             }
             Operand::Const(c) => {
-                if let Some(v) = c.to_i64() {
+                if let Some(v) = c.to_i64_exact() {
                     v >= 0 && v <= u32::MAX as i64
                 } else {
                     false
@@ -319,7 +319,7 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                 id <= max_id && is_known_i32[id]
             }
             Operand::Const(c) => {
-                if let Some(v) = c.to_i64() {
+                if let Some(v) = c.to_i64_exact() {
                     v >= i32::MIN as i64 && v <= i32::MAX as i64
                 } else {
                     false
@@ -342,7 +342,7 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
             match &inst {
                 Instruction::BinOp { dest, op, lhs, rhs, ty } => {
                     let const_val = match rhs {
-                        Operand::Const(c) => c.to_i64(),
+                        Operand::Const(c) => c.to_i64_exact(),
                         _ => None,
                     };
                     if let Some(divisor) = const_val {
@@ -557,7 +557,7 @@ fn unsigned_when_never_negative(func: &mut IrFunction) -> usize {
             if let Instruction::BinOp { op: IrBinOp::SDiv | IrBinOp::SRem, lhs, rhs: Operand::Const(c), ty: ty @ (IrType::I32 | IrType::I64), .. } = inst {
                 // (Powers of two only: other divisors have cheaper signed
                 // expansions for small ranges than unsigned 64-bit magic.)
-                if c.to_i64().is_some_and(|d| d > 1 && (d as u64).is_power_of_two()) {
+                if c.to_i64_exact().is_some_and(|d| d > 1 && (d as u64).is_power_of_two()) {
                     at.push((*lhs, b, *ty));
                     sites.push((b, i));
                 }

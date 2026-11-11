@@ -296,7 +296,7 @@ fn thread_phi_cond_branches(func: &mut IrFunction, label_to_idx: &FxHashMap<Bloc
         let extras: Vec<u32> = block.instructions.iter().filter_map(|i| i.dest()).filter(|d| d != p).map(|d| d.0).collect();
         for (op, pred) in incoming {
             let Operand::Const(k) = op else { continue };
-            let Some(v) = k.to_i64() else { continue };
+            let Some(v) = k.to_i64_exact() else { continue };
             let target = if v != 0 { *true_label } else { *false_label };
             if incoming.iter().filter(|(_, l)| l == pred).count() != 1 || touched.contains(pred) {
                 continue;
@@ -539,7 +539,7 @@ fn thread_phi_cond_branches_merging(func: &mut IrFunction, label_to_idx: &FxHash
         }
         let mut sends = Vec::with_capacity(incoming.len());
         for (op, pred) in incoming {
-            let Some(v) = (match op { Operand::Const(k) => k.to_i64(), _ => None }) else { break };
+            let Some(v) = (match op { Operand::Const(k) => k.to_i64_exact(), _ => None }) else { break };
             let target = if v != 0 { t } else { f };
             let Some(&pi) = label_to_idx.get(pred) else { break };
             let pb = &func.blocks[pi];
@@ -789,8 +789,8 @@ fn fuse_range_tests(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usi
             return None;
         }
         match (lhs, rhs) {
-            (Operand::Value(x), Operand::Const(k)) => Some((*x, *op, k.to_i64()?, true, *ty, c)),
-            (Operand::Const(k), Operand::Value(x)) => Some((*x, *op, k.to_i64()?, false, *ty, c)),
+            (Operand::Value(x), Operand::Const(k)) => Some((*x, *op, k.to_i64_exact()?, true, *ty, c)),
+            (Operand::Const(k), Operand::Value(x)) => Some((*x, *op, k.to_i64_exact()?, false, *ty, c)),
             _ => None,
         }
     };
@@ -1091,7 +1091,7 @@ fn fold_constant_switches(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockI
                 Operand::Value(v) => resolve_value_to_const_in_block(block, *v),
             };
             if let Some(c) = resolved_const {
-                if let Some(switch_int) = c.to_i64() {
+                if let Some(switch_int) = c.to_i64_exact() {
                     let taken = cases.iter()
                         .find(|(cv, _)| *cv == switch_int)
                         .map(|(_, label)| *label)
@@ -1720,7 +1720,7 @@ fn resolve_value_globally(func: &IrFunction, v: Value, val_map: &FxHashMap<Value
                 };
                 match c {
                     Some(c) => {
-                        let ci = c.to_i64()?;
+                        let ci = c.to_i64_exact()?;
                         if let Some(prev) = common_val {
                             if prev != ci { return None; }
                         } else {
@@ -1758,8 +1758,8 @@ fn resolve_value_globally(func: &IrFunction, v: Value, val_map: &FxHashMap<Value
 /// Resolve an operand to an i64 constant using global cross-block resolution.
 fn resolve_operand_globally(func: &IrFunction, op: &Operand, val_map: &FxHashMap<Value, (usize, usize)>, depth: usize) -> Option<i64> {
     match op {
-        Operand::Const(c) => c.to_i64(),
-        Operand::Value(v) => resolve_value_globally(func, *v, val_map, depth)?.to_i64(),
+        Operand::Const(c) => c.to_i64_exact(),
+        Operand::Value(v) => resolve_value_globally(func, *v, val_map, depth)?.to_i64_exact(),
     }
 }
 
@@ -1780,7 +1780,7 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
                 for (op, _) in incoming {
                     match op {
                         Operand::Const(c) => {
-                            let ci = c.to_i64()?;
+                            let ci = c.to_i64_exact()?;
                             if let Some(prev) = common_val {
                                 if prev != ci { return None; }
                             } else {
@@ -1816,8 +1816,8 @@ fn resolve_value_to_const_in_block(block: &BasicBlock, v: Value) -> Option<IrCon
 /// Resolve an operand to an i64 constant within a single block.
 fn resolve_operand_to_i64_in_block(block: &BasicBlock, op: &Operand) -> Option<i64> {
     match op {
-        Operand::Const(c) => c.to_i64(),
-        Operand::Value(v) => resolve_value_to_const_in_block(block, *v)?.to_i64(),
+        Operand::Const(c) => c.to_i64_exact(),
+        Operand::Value(v) => resolve_value_to_const_in_block(block, *v)?.to_i64_exact(),
     }
 }
 
@@ -1837,7 +1837,7 @@ fn consts_equal_for_phi(a: &IrConst, b: &IrConst) -> bool {
     if a.to_hash_key() == b.to_hash_key() {
         return true;
     }
-    match (a.to_i64(), b.to_i64()) {
+    match (a.to_i64_exact(), b.to_i64_exact()) {
         (Some(va), Some(vb)) => va == vb,
         _ => false,
     }
@@ -1936,7 +1936,7 @@ mod tests {
         let mut b = &func.blocks[0];
         for _ in 0..8 {
             match &b.terminator {
-                Terminator::Return(Some(Operand::Const(c))) => return c.to_i64(),
+                Terminator::Return(Some(Operand::Const(c))) => return c.to_i64_exact(),
                 Terminator::Branch(t) => b = &func.blocks[idx(*t)],
                 Terminator::CondBranch { cond: Operand::Value(Value(0)), true_label, false_label } => {
                     b = &func.blocks[idx(if first_true { *true_label } else { *false_label })];
@@ -2461,7 +2461,7 @@ mod tests {
             Instruction::Cmp { dest: Value(10), op: IrCmpOp::Ule, ty: IrType::U32, .. },
         ]));
         let Instruction::Cmp { rhs: Operand::Const(k), .. } = func.blocks[0].instructions[1] else { unreachable!() };
-        assert_eq!(k.to_i64(), Some(25));
+        assert_eq!(k.to_i64_exact(), Some(25));
         assert!(matches!(func.blocks[0].terminator,
             Terminator::CondBranch { true_label: BlockId(2), false_label: BlockId(3), .. }));
         // The second test's block is left unreachable.

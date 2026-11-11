@@ -116,7 +116,7 @@ impl Finder<'_> {
     fn widened(&mut self, val: &Operand, wide: IrType) -> Option<Operand> {
         match val {
             Operand::Const(c) => {
-                let k = c.to_i64()?;
+                let k = c.to_i64_exact()?;
                 Some(Operand::Const(if wide.size() == 8 { IrConst::I64(k) } else { IrConst::I32(k as i32) }))
             }
             Operand::Value(v) => {

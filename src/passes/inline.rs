@@ -906,7 +906,7 @@ fn trace_value_to_global(
                 // GEP: accumulate offset (constant or resolvable Value)
                 Instruction::GetElementPtr { base, offset, .. } => {
                     let off = match offset {
-                        Operand::Const(c) => c.to_i64(),
+                        Operand::Const(c) => c.to_i64_exact(),
                         Operand::Value(_) => {
                             trace_operand_to_const(offset, value_defs, alloca_stores, 0)
                         }
@@ -964,14 +964,14 @@ fn trace_operand_to_const(
         return None;
     }
     match op {
-        Operand::Const(c) => c.to_i64(),
+        Operand::Const(c) => c.to_i64_exact(),
         Operand::Value(v) => {
             let mut current = v.0;
             for _ in 0..MAX_TRACE_CHAIN_LENGTH {
                 if let Some(inst) = value_defs.get(&current) {
                     match inst {
                         Instruction::Copy { src: Operand::Const(c), .. } => {
-                            return c.to_i64();
+                            return c.to_i64_exact();
                         }
                         Instruction::Copy { src: Operand::Value(v2), .. } => {
                             current = v2.0;
@@ -980,7 +980,7 @@ fn trace_operand_to_const(
                         Instruction::Load { ptr, .. } => {
                             if let Some(stored_val) = alloca_stores.get(&ptr.0) {
                                 match stored_val {
-                                    Operand::Const(c) => return c.to_i64(),
+                                    Operand::Const(c) => return c.to_i64_exact(),
                                     Operand::Value(v2) => {
                                         current = v2.0;
                                         continue;
@@ -991,7 +991,7 @@ fn trace_operand_to_const(
                         }
                         Instruction::Cast { src, .. } => {
                             match src {
-                                Operand::Const(c) => return c.to_i64(),
+                                Operand::Const(c) => return c.to_i64_exact(),
                                 Operand::Value(v2) => {
                                     current = v2.0;
                                     continue;

@@ -65,7 +65,7 @@ fn wrap(v: i64, ty: IrType) -> i64 {
 
 fn konst(op: &Operand) -> Option<i64> {
     match op {
-        Operand::Const(c) => c.to_i64(),
+        Operand::Const(c) => c.to_i64_exact(),
         Operand::Value(_) => None,
     }
 }
@@ -102,7 +102,7 @@ fn used_outside(func: &IrFunction, h: usize, b: usize, v: Value) -> bool {
 fn evaluate(insts: &[Instruction], known: &mut FxHashMap<u32, i64>) {
     for inst in insts {
         let val = |o: &Operand, known: &FxHashMap<u32, i64>| match o {
-            Operand::Const(c) => c.to_i64(),
+            Operand::Const(c) => c.to_i64_exact(),
             Operand::Value(v) => known.get(&v.0).copied(),
         };
         let r = match inst {
@@ -243,7 +243,7 @@ fn unroll_one(func: &mut IrFunction) -> bool {
             evaluate(binsts, &mut known);
             let next: FxHashMap<u32, i64> = carried.iter().filter_map(|(d, _, n)| {
                 let k = match n {
-                    Operand::Const(c) => c.to_i64(),
+                    Operand::Const(c) => c.to_i64_exact(),
                     Operand::Value(v) => known.get(&v.0).copied(),
                 }?;
                 Some((d.0, wrap(k, phi_ty[&d.0])))
@@ -406,7 +406,7 @@ mod tests {
         let mut vals = vec![0i64; func.next_value_id as usize + 1];
         let get = |vals: &[i64], o: &Operand| match o {
             Operand::Value(v) => vals[v.0 as usize],
-            Operand::Const(c) => c.to_i64().unwrap(),
+            Operand::Const(c) => c.to_i64_exact().unwrap(),
         };
         let mut b = 0;
         loop {

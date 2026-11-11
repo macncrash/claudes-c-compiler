@@ -85,7 +85,7 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
             let (dest, base, off) = match inst {
                 Instruction::GetElementPtr { dest, base, offset, .. } => match offset {
-                    Operand::Const(c) => match c.to_i64() {
+                    Operand::Const(c) => match c.to_i64_exact() {
                         Some(k) => (*dest, *base, k),
                         None => continue,
                     },
@@ -140,14 +140,14 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
                             || !within(a, k, n) {
                             bad.insert(a);
                         } else {
-                            let konst = matches!(val, Operand::Const(c) if c.to_i64().is_some()) && ty.is_integer();
+                            let konst = matches!(val, Operand::Const(c) if c.to_i64_exact().is_some()) && ty.is_integer();
                             accesses.entry(a).or_default().push(Access { off: k as usize, size: n, ty: *ty, konst });
                         }
                     }
                 }
                 Instruction::GetElementPtr { base, offset, .. } => {
                     if let Some(&(a, _)) = addr.get(&base.0) {
-                        if !matches!(offset, Operand::Const(c) if c.to_i64().is_some()) {
+                        if !matches!(offset, Operand::Const(c) if c.to_i64_exact().is_some()) {
                             bad.insert(a);
                         }
                     }
@@ -270,7 +270,7 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
                                 None => {
                                     // A constant over several fields.
                                     let Operand::Const(c) = val else { unreachable!("split store of a constant") };
-                                    let bits = c.to_i64().expect("integer constant") as u64;
+                                    let bits = c.to_i64_exact().expect("integer constant") as u64;
                                     for s in plans[&a].iter().filter(|s| s.off >= off && s.off + s.size <= off + n) {
                                         let shift = 8 * (s.off - off);
                                         let part = if s.size == 8 { bits >> shift } else { (bits >> shift) & ((1u64 << (8 * s.size)) - 1) };
@@ -478,7 +478,7 @@ mod tests {
         let memcpys = insts.iter().filter(|i| matches!(i, Instruction::Memcpy { .. })).count();
         assert_eq!(memcpys, 0);
         let zeros = insts.iter().filter(|i| matches!(i,
-            Instruction::Store { val: Operand::Const(c), .. } if c.to_i64() == Some(0))).count();
+            Instruction::Store { val: Operand::Const(c), .. } if c.to_i64_exact() == Some(0))).count();
         assert_eq!(zeros, 3);
     }
 

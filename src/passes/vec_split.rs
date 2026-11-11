@@ -67,7 +67,7 @@ pub(crate) fn split_function(func: &mut IrFunction) -> usize {
         let mut changed = false;
         for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
             let (dest, base, off) = match inst {
-                Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => match c.to_i64() {
+                Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } => match c.to_i64_exact() {
                     Some(k) => (*dest, *base, k),
                     None => continue,
                 },
@@ -390,7 +390,7 @@ mod tests {
         let tail = &out[out.len() - 3..];
         assert!(matches!(&tail[0], Instruction::Memcpy { dest, src, size: 16 } if dest.0 == 9 && *src == field(0)));
         let Instruction::GetElementPtr { dest: next, base, offset: Operand::Const(c), .. } = &tail[1] else { panic!() };
-        assert_eq!((base.0, c.to_i64()), (9, Some(16)));
+        assert_eq!((base.0, c.to_i64_exact()), (9, Some(16)));
         assert!(matches!(&tail[2], Instruction::Memcpy { dest, src, size: 16 } if dest == next && *src == field(1)));
         // Both sides split, part way into one.
         let (n, out) = run(vec![alloca(1, 48), alloca(2, 32), alloca(3, 16), vec_add(1, 1, 3, 16, 0),
@@ -416,7 +416,7 @@ mod tests {
         // The second vector's: 8 bytes into it for the store, its start for the load.
         let second = field(1);
         let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = &out[4] else { panic!() };
-        assert_eq!((*base, c.to_i64()), (second, Some(8)));
+        assert_eq!((*base, c.to_i64_exact()), (second, Some(8)));
         assert!(matches!(&out[5], Instruction::Store { ptr, .. } if ptr == dest));
         assert!(matches!(&out[6], Instruction::Load { ptr, .. } if *ptr == second));
     }

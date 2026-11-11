@@ -106,7 +106,7 @@ fn try_resolve_global_with_offset(val: &Value, defs: &FxHashMap<u32, DefInfo>, a
         DefInfo::GlobalAddr(name) => Some((name.clone(), accum_offset)),
         DefInfo::Gep(base, offset) => {
             let off = match offset {
-                Operand::Const(c) => c.to_i64()?,
+                Operand::Const(c) => c.to_i64_exact()?,
                 Operand::Value(_) => {
                     // Non-constant GEP offset - can't resolve to symbol+offset
                     return None;
@@ -118,11 +118,11 @@ fn try_resolve_global_with_offset(val: &Value, defs: &FxHashMap<u32, DefInfo>, a
             // Pattern: base + const_offset or const_offset + base
             match (lhs, rhs) {
                 (Operand::Value(base), Operand::Const(c)) => {
-                    let off = c.to_i64()?;
+                    let off = c.to_i64_exact()?;
                     try_resolve_global_with_offset(base, defs, accum_offset + off)
                 }
                 (Operand::Const(c), Operand::Value(base)) => {
-                    let off = c.to_i64()?;
+                    let off = c.to_i64_exact()?;
                     try_resolve_global_with_offset(base, defs, accum_offset + off)
                 }
                 _ => None,

@@ -133,7 +133,7 @@ pub(crate) fn cancel_function(func: &mut IrFunction) -> usize {
 /// multiplies and left shifts by constants; None past MAX_TERMS values.
 fn linear(def: &FxHashMap<u32, Instruction>, op: &Operand, depth: usize) -> Option<Lin> {
     let v = match op {
-        Operand::Const(c) => return Some(Lin { terms: Vec::new(), konst: c.to_i64()? }),
+        Operand::Const(c) => return Some(Lin { terms: Vec::new(), konst: c.to_i64_exact()? }),
         Operand::Value(v) => *v,
     };
     let leaf = Some(Lin { terms: vec![(v.0, 1)], konst: 0 });
@@ -141,7 +141,7 @@ fn linear(def: &FxHashMap<u32, Instruction>, op: &Operand, depth: usize) -> Opti
         return leaf;
     }
     let Some(Instruction::BinOp { op, lhs, rhs, ty: IrType::I64 | IrType::U64, .. }) = def.get(&v.0) else { return leaf };
-    let konst = |o: &Operand| match o { Operand::Const(c) => c.to_i64(), Operand::Value(_) => None };
+    let konst = |o: &Operand| match o { Operand::Const(c) => c.to_i64_exact(), Operand::Value(_) => None };
     let l = match op {
         IrBinOp::Add | IrBinOp::Sub => {
             let mut l = linear(def, lhs, depth + 1)?;

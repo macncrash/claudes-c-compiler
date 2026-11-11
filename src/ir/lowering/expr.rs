@@ -93,6 +93,14 @@ impl Lowerer {
             return Operand::Value(result);
         }
 
+        // __int128 conditions: a branch on the value tests one register, the
+        // low half, so `if (a)` with a == 1 << 64 was false. Compare the
+        // whole value against zero, as `!a` does.
+        if matches!(expr_ty, IrType::I128 | IrType::U128) {
+            let result = self.emit_cmp_val(IrCmpOp::Ne, val, Operand::Const(IrConst::I64(0)), expr_ty);
+            return Operand::Value(result);
+        }
+
         // Sub-int types (U8/I8/U16/I16): the narrow optimization pass may convert
         // widen-op-narrow patterns into narrow-type BinOps. The codegen only handles
         // I32/U32 and I64/U64 operand widths, so after a narrow BinOp the upper

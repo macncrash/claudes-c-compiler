@@ -49,7 +49,7 @@ pub(crate) fn chain_large_offsets(func: &mut IrFunction) -> usize {
         let mut seen: Vec<(Value, i64, Value)> = Vec::new();
         for inst in &mut block.instructions {
             let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), ty } = *inst else { continue };
-            let Some(k) = c.to_i64() else { continue };
+            let Some(k) = c.to_i64_exact() else { continue };
             if !add_imm(k) && !add_imm(-k) {
                 if let Some(&(_, o, from)) = seen.iter()
                     .filter(|&&(b, o, _)| b == base && o < k && add_imm(k - o))
@@ -223,7 +223,7 @@ fn split_index_constants(func: &mut IrFunction) -> usize {
     let split = |o: &Value| -> Option<(Value, i64, u32)> {
         let add = |v: &Value| -> Option<(Value, i64)> {
             match binops.get(&v.0)? {
-                (IrBinOp::Add, Operand::Value(x), Operand::Const(c)) | (IrBinOp::Add, Operand::Const(c), Operand::Value(x)) => Some((*x, c.to_i64()?)),
+                (IrBinOp::Add, Operand::Value(x), Operand::Const(c)) | (IrBinOp::Add, Operand::Const(c), Operand::Value(x)) => Some((*x, c.to_i64_exact()?)),
                 _ => None,
             }
         };
@@ -234,7 +234,7 @@ fn split_index_constants(func: &mut IrFunction) -> usize {
             return Some((x, c, 0));
         }
         let (IrBinOp::Shl, Operand::Value(a), Operand::Const(k)) = binops.get(&o.0)? else { return None };
-        let k = k.to_i64().filter(|k| (0..8).contains(k))? as u32;
+        let k = k.to_i64_exact().filter(|k| (0..8).contains(k))? as u32;
         let (x, c) = add(a).filter(|_| single(a))?;
         Some((x, c, k))
     };
@@ -283,7 +283,7 @@ fn split_index_constants(func: &mut IrFunction) -> usize {
     for inst in func.blocks.iter_mut().flat_map(|b| &mut b.instructions) {
         if let Instruction::GetElementPtr { base, offset, .. } = inst {
             let Operand::Const(c2) = offset else { continue };
-            if let (Some(&(inner, constant)), Some(c2v)) = (rebased.get(&base.0), c2.to_i64()) {
+            if let (Some(&(inner, constant)), Some(c2v)) = (rebased.get(&base.0), c2.to_i64_exact()) {
                 *base = inner;
                 *offset = Operand::Const(IrConst::I64(constant + c2v));
             }

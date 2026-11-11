@@ -56,7 +56,7 @@ fn fold_function(func: &mut IrFunction) -> usize {
         let mut changed = false;
         for inst in insts() {
             if let Instruction::GetElementPtr { dest, base, offset: Operand::Const(c), .. } = inst {
-                if let (Some(&(local, at)), Some(k), false) = (place.get(&base.0), c.to_i64(), place.contains_key(&dest.0)) {
+                if let (Some(&(local, at)), Some(k), false) = (place.get(&base.0), c.to_i64_exact(), place.contains_key(&dest.0)) {
                     place.insert(dest.0, (local, at + k));
                     changed = true;
                 }
@@ -101,9 +101,9 @@ fn fold_function(func: &mut IrFunction) -> usize {
     }
     let constants: FxHashMap<u32, i64> = insts()
         .filter_map(|inst| match inst {
-            Instruction::Copy { dest, src: Operand::Const(c) } => Some((dest.0, c.to_i64()?)),
+            Instruction::Copy { dest, src: Operand::Const(c) } => Some((dest.0, c.to_i64_exact()?)),
             Instruction::Cast { dest, src: Operand::Const(c), from_ty, to_ty }
-                if int_size(*to_ty).is_some() && int_size(*from_ty) >= int_size(*to_ty) => Some((dest.0, c.to_i64()?)),
+                if int_size(*to_ty).is_some() && int_size(*from_ty) >= int_size(*to_ty) => Some((dest.0, c.to_i64_exact()?)),
             _ => None,
         })
         .filter(|(id, _)| defs.get(id) == Some(&1))
@@ -126,7 +126,7 @@ fn fold_function(func: &mut IrFunction) -> usize {
                         continue;
                     }
                     let known = match val {
-                        Operand::Const(c) if int_size(*ty).is_some() => c.to_i64(),
+                        Operand::Const(c) if int_size(*ty).is_some() => c.to_i64_exact(),
                         Operand::Value(v) if int_size(*ty).is_some() => constants.get(&v.0).copied(),
                         _ => None,
                     };
@@ -195,7 +195,7 @@ mod tests {
 
     fn constant(inst: &Instruction) -> Option<i64> {
         match inst {
-            Instruction::Copy { src: Operand::Const(c), .. } => c.to_i64(),
+            Instruction::Copy { src: Operand::Const(c), .. } => c.to_i64_exact(),
             _ => None,
         }
     }
