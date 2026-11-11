@@ -254,6 +254,20 @@ impl Lowerer {
             }
             (lhs_val, rhs_val)
         };
+        // A 32-bit shift by a variable count is a 32-bit shift in the IR:
+        // its count is below 32 (else C leaves it undefined), but a 64-bit
+        // shift of the widened value is defined up to 63, so no later pass
+        // could narrow it (lsl w takes the count mod 32). AArch64 only.
+        if is_shift && common_ty.size() == 4 && !matches!(rhs_val, Operand::Const(_))
+            && self.target == crate::backend::Target::Aarch64 && !crate::common::types::target_is_32bit()
+        {
+            let l = self.emit_cast_val(lhs_val, op_ty, common_ty);
+            let r = self.emit_cast_val(rhs_val, op_ty, IrType::I32);
+            let dest = self.fresh_value();
+            let ir_op = Self::binop_to_ir(*op, is_unsigned);
+            self.emit(Instruction::BinOp { dest, op: ir_op, lhs: Operand::Value(l), rhs: Operand::Value(r), ty: common_ty });
+            return Operand::Value(dest);
+        }
         if let Some(fused) = self.try_contract_fma(op, Some(lhs), Some(rhs), lhs_val, rhs_val, op_ty) {
             return fused;
         }
