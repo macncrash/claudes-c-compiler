@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-12",
-  "ccc_rev": "5844ebe9",
+  "ccc_rev": "ca3e36d8",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -1331,6 +1331,9 @@
    "status": "pass"
   },
   "cases/vector_shuffles_and_structs": {
+   "status": "pass"
+  },
+  "cases/vla_typedef_objects_and_subscript_sizeof": {
    "status": "pass"
   },
   "cases/volatile_access": {
@@ -5685,7 +5688,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16f23ed0f 0x16f23ed0f 0x16f23ed0f 0x16f23ed0f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16d0d2d0f 0x16d0d2d0f 0x16d0d2d0f 0x16d0d2d0f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
