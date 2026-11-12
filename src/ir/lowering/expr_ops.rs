@@ -727,7 +727,10 @@ impl Lowerer {
             );
         }
 
-        let common_ty = Self::common_type(cond_ty, else_ty);
+        // Integer operands take the usual arithmetic conversions, as in
+        // a ? a : b: (-1) ?: u is unsigned.
+        let common_ty = self.conditional_int_type(cond, else_expr)
+            .unwrap_or_else(|| Self::common_type(cond_ty, else_ty));
 
         // Convert condition to boolean for branching
         let int_ty = crate::common::types::target_int_ir_type();

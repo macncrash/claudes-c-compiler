@@ -899,6 +899,9 @@ impl Lowerer {
                 Self::common_type(then_ty, else_ty)
             }
             Expr::GnuConditional(cond, else_expr, _) => {
+                if let Some(ty) = self.conditional_int_type(cond, else_expr) {
+                    return ty;
+                }
                 let cond_ty = self.get_expr_type(cond);
                 let else_ty = self.get_expr_type(else_expr);
                 Self::common_type(cond_ty, else_ty)

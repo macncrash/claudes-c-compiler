@@ -368,8 +368,14 @@ impl<'a> SemaConstEval<'a> {
                 Some(IrConst::I64(align as i64))
             }
 
-            // Ternary conditional
-            Expr::Conditional(cond, then_e, else_e, _) => {
+            // Ternary conditional, and GNU a ?: b as a ? a : b (its value too
+            // has the common type: (-1) ?: u is 4294967295 for unsigned u).
+            Expr::Conditional(..) | Expr::GnuConditional(..) => {
+                let (cond, then_e, else_e) = match expr {
+                    Expr::Conditional(c, t, e, _) => (c, t, e),
+                    Expr::GnuConditional(c, e, _) => (c, c, e),
+                    _ => unreachable!(),
+                };
                 let cond_val = self.eval_const_expr(cond)?;
                 let chosen = if cond_val.is_nonzero() { then_e } else { else_e };
                 let value = self.eval_const_expr(chosen)?;
@@ -401,16 +407,6 @@ impl<'a> SemaConstEval<'a> {
                         other => Some(other),
                     },
                     _ => Some(value),
-                }
-            }
-
-            // GNU conditional (a ?: b)
-            Expr::GnuConditional(cond, else_e, _) => {
-                let cond_val = self.eval_const_expr(cond)?;
-                if cond_val.is_nonzero() {
-                    Some(cond_val)
-                } else {
-                    self.eval_const_expr(else_e)
                 }
             }
 

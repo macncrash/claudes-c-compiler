@@ -650,11 +650,13 @@ fn fold_cast_i128(src: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCon
         // For unsigned sources, we need to zero-extend: e.g., u64 0xCAFEBABE12345678
         // should become u128 0x00000000_00000000_CAFEBABE12345678, not
         // 0xFFFFFFFF_FFFFFFFF_CAFEBABE12345678.
-        if from_ty.is_unsigned() && !from_ty.is_128bit() {
-            // Zero-extend: reinterpret the i128 (which was sign-extended from i64)
-            // as just the low 64 bits zero-extended.
-            let zero_extended = (val as u64 as u128) as i128;
-            Some(IrConst::I128(zero_extended))
+        if !from_ty.is_128bit() {
+            // First reduce to the source type's own width (a U32 constant
+            // may be held as I32(-1): it is 0xffffffff, not 2^64 - 1), then
+            // zero- or sign-extend by the source's signedness.
+            let v = from_ty.truncate_i64(val as i64);
+            let extended = if from_ty.is_unsigned() { (v as u64 as u128) as i128 } else { v as i128 };
+            Some(IrConst::I128(extended))
         } else {
             Some(IrConst::I128(val))
         }

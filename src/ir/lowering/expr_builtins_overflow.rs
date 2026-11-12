@@ -80,6 +80,22 @@ impl Lowerer {
                 8 => IrType::I64,
                 _ => IrType::I128,
             };
+            // An unsigned result as wide as the signed compute type: compute
+            // one size wider, so the exact result is known. Judging by the
+            // signed operation's overflow called LONG_MAX + 1 into unsigned
+            // long long an overflow, though 2^63 fits.
+            // And a 64-bit operand with a narrower result: i64 is no exact
+            // compute type for it (LLONG_MAX * 2 into short wrapped in i64 and
+            // could round-trip as no overflow). A signed 64-bit result keeps
+            // the same-type path below.
+            let wide_operand = lhs_src_ir.size() >= 8 || rhs_src_ir.size() >= 8;
+            let compute_ty = if compute_ty == IrType::I64 && wide_operand && result_ir_ty.size() < 8 {
+                IrType::I128
+            } else if !is_signed && compute_ty.size() == result_ir_ty.size() && compute_ty != IrType::I128 {
+                if compute_ty == IrType::I64 { IrType::I128 } else { IrType::I64 }
+            } else {
+                compute_ty
+            };
 
             // Check if all operands can be represented exactly in compute_ty.
             // If an unsigned operand is the same size as compute_ty, it can't be

@@ -1600,8 +1600,13 @@ impl SemanticAnalyzer {
             | Expr::CharLiteral(_, _) => {}
             // Label address (&&label) - just a compile-time address
             Expr::LabelAddr(_, _) => {}
-            // __builtin_types_compatible_p(type1, type2) - compile-time constant
-            Expr::BuiltinTypesCompatibleP(..) => {}
+            // __builtin_types_compatible_p(type1, type2) - compile-time constant.
+            // A statement expression in a typeof operand is walked in its own
+            // scopes first, so its type is known: typeof(({ long v; v + 1; })).
+            Expr::BuiltinTypesCompatibleP(type1, type2, _, _) => {
+                self.collect_enum_constants_from_type_spec(type1);
+                self.collect_enum_constants_from_type_spec(type2);
+            }
         }
 
         // After analyzing sub-expressions, infer this expression's CType using

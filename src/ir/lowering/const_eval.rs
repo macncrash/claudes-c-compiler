@@ -272,21 +272,27 @@ impl Lowerer {
                 let align = self.preferred_alignof_expr(inner_expr);
                 Some(IrConst::I64(align as i64))
             }
-            Expr::Conditional(cond, then_e, else_e, _) => {
-                // Ternary in constant expr: evaluate condition and pick branch
-                let cond_val = self.eval_const_condition(cond)?;
-                if cond_val.is_nonzero() {
-                    self.eval_const_expr(then_e)
+            Expr::Conditional(..) | Expr::GnuConditional(..) => {
+                // Ternary in constant expr: evaluate condition and pick
+                // branch; a ?: b is a ? a : b. The value has the common
+                // type of both branches ((-1) ?: u is 4294967295).
+                let (chosen, other) = match expr {
+                    Expr::Conditional(cond, then_e, else_e, _) => {
+                        let cond_val = self.eval_const_condition(cond)?;
+                        if cond_val.is_nonzero() { (then_e, else_e) } else { (else_e, then_e) }
+                    }
+                    Expr::GnuConditional(cond, else_e, _) => {
+                        let cond_val = self.eval_const_expr(cond)?;
+                        if cond_val.is_nonzero() { (cond, else_e) } else { (else_e, cond) }
+                    }
+                    _ => unreachable!(),
+                };
+                let value = self.eval_const_expr(chosen)?;
+                let (src, dst) = (self.get_expr_type(chosen), self.get_expr_type(expr));
+                if src.is_integer() && dst.is_integer() && self.get_expr_type(other).is_integer() && src != dst {
+                    Some(value.coerce_to_with_src(dst, Some(src)))
                 } else {
-                    self.eval_const_expr(else_e)
-                }
-            }
-            Expr::GnuConditional(cond, else_e, _) => {
-                let cond_val = self.eval_const_expr(cond)?;
-                if cond_val.is_nonzero() {
-                    Some(cond_val) // condition value is used as result
-                } else {
-                    self.eval_const_expr(else_e)
+                    Some(value)
                 }
             }
             // __real__/__imag__ of a complex constant: its part, in the
