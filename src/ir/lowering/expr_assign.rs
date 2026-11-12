@@ -105,7 +105,7 @@ impl Lowerer {
             let rhs_val = self.lower_expr(rhs);
             if let Some(lv) = self.lower_lvalue(lhs) {
                 let dest_addr = self.lvalue_addr(&lv);
-                self.emit(Instruction::Store { val: rhs_val, ptr: dest_addr, ty: Self::packed_store_type(struct_size) , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+                self.emit_packed_struct_store(rhs_val, dest_addr, struct_size);
                 return Operand::Value(dest_addr);
             }
             return rhs_val;
@@ -883,7 +883,7 @@ impl Lowerer {
             let alloca = self.fresh_value();
             let store_ty = Self::packed_store_type(total_size);
             self.emit(Instruction::Alloca { dest: alloca, size: total_size, ty: store_ty, align: 0, volatile: false });
-            self.emit(Instruction::Store { val: rhs_val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+            self.emit_packed_struct_store(rhs_val, alloca, total_size);
             alloca
         } else {
             self.operand_to_value(rhs_val)

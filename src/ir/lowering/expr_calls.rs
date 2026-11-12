@@ -338,7 +338,9 @@ impl Lowerer {
         self.emit(Instruction::Cast { dest: hi, src: Operand::Value(shifted), from_ty: IrType::I128, to_ty: IrType::I64 });
         let hi_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr { dest: hi_ptr, base: alloca, offset: Operand::Const(IrConst::I64(8)), ty: IrType::I64 });
-        self.emit(Instruction::Store { val: Operand::Value(hi), ptr: hi_ptr, ty: IrType::I64 , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+        // Only the struct's remaining size - 8 bytes: a full 8-byte store
+        // would run past the end of the temporary.
+        self.emit_packed_struct_store(Operand::Value(hi), hi_ptr, size.saturating_sub(8).clamp(1, 8));
         Operand::Value(alloca)
     }
 
@@ -543,7 +545,7 @@ impl Lowerer {
                     let alloca = self.fresh_value();
                     let store_ty = Self::packed_store_type(alloc_size);
                     self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false });
-                    self.emit(Instruction::Store { val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+                    self.emit_packed_struct_store(val, alloca, alloc_size);
                     val = Operand::Value(alloca);
                 }
             }

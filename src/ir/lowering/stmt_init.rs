@@ -394,7 +394,7 @@ impl Lowerer {
                     let tmp_alloca = self.fresh_value();
                     let store_ty = Self::packed_store_type(total_size);
                     self.emit(Instruction::Alloca { dest: tmp_alloca, size: total_size, ty: store_ty, align: 0, volatile: false });
-                    self.emit(Instruction::Store { val: Operand::Value(src_val), ptr: tmp_alloca, ty: store_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+                    self.emit_packed_struct_store(Operand::Value(src_val), tmp_alloca, total_size);
                     self.emit(Instruction::Memcpy { dest: alloca, src: tmp_alloca, size: total_size });
                 } else {
                     self.emit(Instruction::Memcpy { dest: alloca, src: src_val, size: total_size });
@@ -473,7 +473,7 @@ impl Lowerer {
         // IS the struct data, not an address. Store directly.
         if self.expr_produces_packed_struct_data(expr) && da.actual_alloc_size <= 8 {
             let val = self.lower_expr(expr);
-            self.emit(Instruction::Store { val, ptr: alloca, ty: Self::packed_store_type(da.actual_alloc_size) , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+            self.emit_packed_struct_store(val, alloca, da.actual_alloc_size);
         } else {
             let src_addr = self.get_struct_base_addr(expr);
             self.emit(Instruction::Memcpy {

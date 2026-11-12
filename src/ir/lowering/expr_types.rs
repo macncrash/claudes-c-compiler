@@ -94,6 +94,44 @@ impl Lowerer {
     /// 64-bit register. We must store with the correct width to avoid overwriting memory
     /// adjacent to the struct allocation (e.g. globals placed contiguously).
     /// Sizes 5-7 use I64 since SysV ABI alignment ensures at least 8 bytes are allocated.
+    /// Store a struct of `size` (<= 8) bytes held packed in an I64 register
+    /// value (a small struct call result) to `ptr`, writing exactly `size`
+    /// bytes: a 3-, 5-, 6- or 7-byte struct is stored in pieces, as a single
+    /// 4- or 8-byte store would overwrite whatever follows the object (the
+    /// next array element, a neighbouring member or variable).
+    pub(super) fn emit_packed_struct_store(&mut self, val: crate::ir::reexports::Operand, ptr: crate::ir::reexports::Value, size: usize) {
+        use crate::ir::reexports::{Instruction, IrBinOp, Operand};
+        use crate::common::types::{AddressSpace, AliasClass};
+        let pieces: &[(usize, IrType)] = match size {
+            3 => &[(0, IrType::I16), (2, IrType::I8)],
+            5 => &[(0, IrType::I32), (4, IrType::I8)],
+            6 => &[(0, IrType::I32), (4, IrType::I16)],
+            7 => &[(0, IrType::I32), (4, IrType::I16), (6, IrType::I8)],
+            _ => {
+                let ty = Self::packed_store_type(size);
+                self.emit(Instruction::Store { val, ptr, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+                return;
+            }
+        };
+        for &(off, ty) in pieces {
+            let part = if off == 0 {
+                val
+            } else {
+                let k = Operand::Const(IrConst::I64((off * 8) as i64));
+                Operand::Value(self.emit_binop_val(IrBinOp::LShr, val, k, IrType::I64))
+            };
+            let part = self.emit_implicit_cast(part, IrType::I64, ty);
+            let dest = if off == 0 {
+                ptr
+            } else {
+                let d = self.fresh_value();
+                self.emit(Instruction::GetElementPtr { dest: d, base: ptr, offset: Operand::Const(IrConst::ptr_int(off as i64)), ty });
+                d
+            };
+            self.emit(Instruction::Store { val: part, ptr: dest, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+        }
+    }
+
     pub(super) fn packed_store_type(size: usize) -> IrType {
         match size {
             1 => IrType::I8,
