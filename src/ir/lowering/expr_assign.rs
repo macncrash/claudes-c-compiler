@@ -575,7 +575,8 @@ impl Lowerer {
             // Scale RHS for pointer += and -=
             let actual_rhs = if ty == IrType::Ptr && matches!(op, BinOp::Add | BinOp::Sub) {
                 let elem_size = self.get_pointer_elem_size_from_expr(lhs);
-                self.scale_index(rhs_val, elem_size)
+                let vla_stride = self.vla_pointee_stride(lhs);
+                self.scale_index_or_vla(rhs_val, elem_size, vla_stride)
             } else {
                 rhs_val
             };

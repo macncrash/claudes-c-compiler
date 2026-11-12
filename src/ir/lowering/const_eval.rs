@@ -43,6 +43,7 @@ impl Lowerer {
             SizeofArg::Expr(Expr::ArraySubscript(base, _, _)) => {
                 self.get_vla_stride_for_subscript(base).is_some()
             }
+            SizeofArg::Expr(Expr::Deref(inner, _)) => self.vla_pointee_stride(inner).is_some(),
             SizeofArg::Expr(_) => false,
             SizeofArg::Type(ts) => {
                 if let TypeSpecifier::TypedefName(name) = ts {

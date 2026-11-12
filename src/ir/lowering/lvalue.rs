@@ -1,4 +1,4 @@
-use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
+use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier, UnaryOp};
 use crate::ir::reexports::{
     Instruction,
     IrBinOp,
@@ -330,15 +330,74 @@ impl Lowerer {
     /// For `m[i]` where m has VLA strides, returns the runtime stride at depth 0.
     /// For `m[i][j]` where the outer subscript `m[i]` already used VLA, returns stride at depth 1.
     pub(super) fn get_vla_stride_for_subscript(&self, base: &Expr) -> Option<Value> {
-        let root_name = self.get_array_root_name_from_base(base)?;
-        let depth = self.count_subscript_depth(base);
+        self.vla_strides_of_expr(base)?.first().copied().flatten()
+    }
 
-        if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(&root_name)) {
-            if !info.vla_strides.is_empty() && depth < info.vla_strides.len() {
-                return info.vla_strides[depth];
+    /// The runtime subscript strides of an array or pointer expression whose
+    /// type has VLA dimensions, laid out as `LocalInfo::vla_strides`: entry k
+    /// is the size of what k + 1 subscripts (or derefs) of the expression
+    /// reach, `None` where that size is a compile-time constant. For a
+    /// pointer to a VLA (`int (*p)[m]`) entry 0 is the pointee size, the step
+    /// of `p + 1`, `p++` and `p[i]`. Derived expressions keep (`p + i`, `p++`,
+    /// `p = q`) or peel (`p[i]`, `*p`) the strides of the variable they use.
+    pub(super) fn vla_strides_of_expr(&self, expr: &Expr) -> Option<Vec<Option<Value>>> {
+        let peel = |s: Vec<Option<Value>>| -> Option<Vec<Option<Value>>> {
+            if s.len() > 1 { Some(s[1..].to_vec()) } else { None }
+        };
+        match expr {
+            Expr::Identifier(name, _) => {
+                let info = self.func_state.as_ref()?.locals.get(name)?;
+                if info.vla_strides.is_empty() { None } else { Some(info.vla_strides.clone()) }
             }
+            Expr::ArraySubscript(base, index, _) => {
+                // i[p] is p[i]: take the strides of whichever side is the pointer.
+                let side = if self.expr_is_pointer(index) && !self.expr_is_pointer(base) { index } else { base };
+                peel(self.vla_strides_of_expr(side)?)
+            }
+            Expr::Deref(inner, _) => peel(self.vla_strides_of_expr(inner)?),
+            Expr::BinaryOp(BinOp::Add, ..) => {
+                // Walk left-skewed chains (p + 1 + 2) iteratively.
+                let mut cur = expr;
+                while let Expr::BinaryOp(BinOp::Add, l, r, _) = cur {
+                    if let Some(s) = self.vla_strides_of_expr(r) {
+                        return Some(s);
+                    }
+                    cur = l;
+                }
+                self.vla_strides_of_expr(cur)
+            }
+            Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) if !self.expr_is_pointer(rhs) => {
+                self.vla_strides_of_expr(lhs)
+            }
+            Expr::UnaryOp(UnaryOp::PreInc | UnaryOp::PreDec, inner, _)
+            | Expr::PostfixOp(_, inner, _)
+            | Expr::Assign(inner, _, _)
+            | Expr::CompoundAssign(_, inner, _, _)
+            | Expr::Comma(_, inner, _) => self.vla_strides_of_expr(inner),
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                self.vla_strides_of_expr(then_expr).or_else(|| self.vla_strides_of_expr(else_expr))
+            }
+            Expr::AddressOf(inner, _) => {
+                // &a of a VLA a: steps over the whole of a.
+                let size = match inner.as_ref() {
+                    Expr::Identifier(name, _) => self.func_state.as_ref()?.locals.get(name)?.vla_size?,
+                    other => self.vla_strides_of_expr(match other {
+                        Expr::ArraySubscript(b, _, _) | Expr::Deref(b, _) => b,
+                        _ => return None,
+                    })?.first().copied().flatten()?,
+                };
+                let mut s = vec![Some(size)];
+                s.extend(self.vla_strides_of_expr(inner).unwrap_or_else(|| vec![None]));
+                Some(s)
+            }
+            _ => None,
         }
-        None
+    }
+
+    /// The runtime size of what a pointer (or array) expression points to,
+    /// when it is a VLA type: the step of pointer arithmetic on it.
+    pub(super) fn vla_pointee_stride(&self, expr: &Expr) -> Option<Value> {
+        self.vla_strides_of_expr(expr)?.first().copied().flatten()
     }
 
     /// Get the base address for an array expression.

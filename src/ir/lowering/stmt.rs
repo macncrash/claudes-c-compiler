@@ -393,6 +393,8 @@ impl Lowerer {
             if !strides.is_empty() {
                 local_info.vla_strides = strides;
             }
+        } else if let Some(strides) = self.vla_pointer_strides(type_spec, &declarator.derived) {
+            local_info.vla_strides = strides;
         }
         local_info.asm_register = declarator.attrs.asm_register.clone();
         local_info.asm_register_has_init = declarator.attrs.asm_register.is_some() && declarator.init.is_some();
@@ -1010,6 +1012,39 @@ impl Lowerer {
         }
 
         None
+    }
+
+    /// Subscript strides for a pointer to a VLA type: `int (*p)[m]` (derived
+    /// `[Array(m), Pointer]`) or `T *p` with `T` a VLA typedef. Entry 0 is
+    /// the runtime pointee size, the step of `p + 1` and `p[i]`; the
+    /// pointee's own strides follow. None when the pointee has a constant size.
+    fn vla_pointer_strides(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> Option<Vec<Option<Value>>> {
+        let Some((DerivedDeclarator::Pointer(_), pointee)) = derived.split_last() else {
+            return None;
+        };
+        if !pointee.iter().all(|d| matches!(d, DerivedDeclarator::Array(_))) {
+            return None;
+        }
+        let is_vla_typedef = matches!(type_spec, TypeSpecifier::TypedefName(name)
+            if self.func().vla_typedef_sizes.contains_key(name));
+        let has_vla_dim = pointee.iter().any(|d| matches!(d,
+            DerivedDeclarator::Array(Some(e)) if self.expr_as_array_size(e).is_none()));
+        if !is_vla_typedef && !has_vla_dim {
+            return None;
+        }
+        let size = self.compute_vla_runtime_size(type_spec, pointee)?;
+        let mut strides = vec![Some(size)];
+        let inner = self.vla_strides_for_decl(type_spec, pointee);
+        if inner.is_empty() {
+            strides.push(None);
+        } else {
+            strides.extend(inner);
+        }
+        Some(strides)
     }
 
     /// Subscript strides for a declaration whose type is a VLA typedef name,

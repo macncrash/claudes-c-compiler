@@ -159,31 +159,39 @@ impl Lowerer {
 
         if lhs_is_ptr && !rhs_is_ptr {
             let elem_size = self.get_pointer_elem_size_from_expr(lhs);
+            let vla_stride = self.vla_pointee_stride(lhs);
             let rhs_ty = self.get_expr_type(rhs);
             let lhs_val = self.lower_expr(lhs);
             let rhs_val = self.lower_expr(rhs);
             // Widen the integer index to pointer width (sign-extend for signed types,
             // zero-extend for unsigned) before scaling and adding to the pointer.
             let rhs_val = self.emit_implicit_cast(rhs_val, rhs_ty, ptr_int_ty);
-            let scaled_rhs = self.scale_index(rhs_val, elem_size);
+            let scaled_rhs = self.scale_index_or_vla(rhs_val, elem_size, vla_stride);
             let ir_op = if *op == BinOp::Add { IrBinOp::Add } else { IrBinOp::Sub };
             let dest = self.emit_binop_val(ir_op, lhs_val, scaled_rhs, ptr_int_ty);
             Some(Operand::Value(dest))
         } else if rhs_is_ptr && !lhs_is_ptr && *op == BinOp::Add {
             let elem_size = self.get_pointer_elem_size_from_expr(rhs);
+            let vla_stride = self.vla_pointee_stride(rhs);
             let lhs_ty = self.get_expr_type(lhs);
             let lhs_val = self.lower_expr(lhs);
             // Widen the integer index to pointer width before scaling and adding to the pointer.
             let lhs_val = self.emit_implicit_cast(lhs_val, lhs_ty, ptr_int_ty);
             let rhs_val = self.lower_expr(rhs);
-            let scaled_lhs = self.scale_index(lhs_val, elem_size);
+            let scaled_lhs = self.scale_index_or_vla(lhs_val, elem_size, vla_stride);
             let dest = self.emit_binop_val(IrBinOp::Add, scaled_lhs, rhs_val, ptr_int_ty);
             Some(Operand::Value(dest))
         } else if lhs_is_ptr && rhs_is_ptr && *op == BinOp::Sub {
             let elem_size = self.get_pointer_elem_size_from_expr(lhs);
+            let vla_stride = self.vla_pointee_stride(lhs);
             let lhs_val = self.lower_expr(lhs);
             let rhs_val = self.lower_expr(rhs);
             let diff = self.emit_binop_val(IrBinOp::Sub, lhs_val, rhs_val, ptr_int_ty);
+            if let Some(stride) = vla_stride {
+                // Pointers to a VLA type: divide by the runtime pointee size.
+                let q = self.emit_binop_val(IrBinOp::SDiv, Operand::Value(diff), Operand::Value(stride), ptr_int_ty);
+                return Some(Operand::Value(q));
+            }
             // Both pointers point into one array, so the byte difference is a
             // multiple of the element size 2^k * m: shift out 2^k, then
             // multiply by the inverse of the odd m modulo 2^64 (as clang and
@@ -201,6 +209,18 @@ impl Lowerer {
             Some(result)
         } else {
             None
+        }
+    }
+
+    /// Scale an index by the pointee size: the runtime size of a VLA pointee
+    /// when there is one, else the constant `scale`.
+    pub(super) fn scale_index_or_vla(&mut self, index: Operand, scale: usize, vla_stride: Option<Value>) -> Operand {
+        match vla_stride {
+            Some(stride) => {
+                let ptr_int_ty = crate::common::types::target_int_ir_type();
+                Operand::Value(self.emit_binop_val(IrBinOp::Mul, index, Operand::Value(stride), ptr_int_ty))
+            }
+            None => self.scale_index(index, scale),
         }
     }
 
@@ -934,6 +954,9 @@ impl Lowerer {
     fn inc_dec_step_and_type(&self, ty: IrType, expr: &Expr) -> (Operand, IrType) {
         if ty == IrType::Ptr {
             let ptr_int_ty = crate::common::types::target_int_ir_type();
+            if let Some(stride) = self.vla_pointee_stride(expr) {
+                return (Operand::Value(stride), ptr_int_ty);
+            }
             let elem_size = self.get_pointer_elem_size_from_expr(expr);
             (Operand::Const(IrConst::ptr_int(elem_size as i64)), ptr_int_ty)
         } else if ty == IrType::F64 {

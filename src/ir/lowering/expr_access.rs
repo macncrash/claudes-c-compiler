@@ -440,6 +440,10 @@ impl Lowerer {
                 return Some(stride);
             }
         }
+        // sizeof *p of a pointer to a VLA type.
+        if let SizeofArg::Expr(Expr::Deref(inner, _)) = arg {
+            return self.vla_pointee_stride(inner);
+        }
         None
     }
 
