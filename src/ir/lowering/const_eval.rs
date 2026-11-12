@@ -163,8 +163,11 @@ impl Lowerer {
                 self.wrap_unsigned_int(inner, is_unsigned, const_arith::negate_const(promoted)?)
             }
             Expr::BinaryOp(op, lhs, rhs, _) => {
-                let l = self.eval_const_expr(lhs);
-                let r = self.eval_const_expr(rhs);
+                let (l, r) = if matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
+                    (self.eval_const_condition(lhs), self.eval_const_condition(rhs))
+                } else {
+                    (self.eval_const_expr(lhs), self.eval_const_expr(rhs))
+                };
                 if let (Some(l), Some(r)) = (l, r) {
                     // Use infer_expr_type (C semantic types) for proper usual arithmetic
                     // conversions. get_expr_type returns IR storage types (IntLiteral → I64)
@@ -267,7 +270,7 @@ impl Lowerer {
             }
             Expr::Conditional(cond, then_e, else_e, _) => {
                 // Ternary in constant expr: evaluate condition and pick branch
-                let cond_val = self.eval_const_expr(cond)?;
+                let cond_val = self.eval_const_condition(cond)?;
                 if cond_val.is_nonzero() {
                     self.eval_const_expr(then_e)
                 } else {
@@ -282,8 +285,16 @@ impl Lowerer {
                     self.eval_const_expr(else_e)
                 }
             }
+            // __real__/__imag__ of a complex constant: its part, in the
+            // component type (static double r = __real__ (1.0 + 2.0i) was 0).
+            Expr::UnaryOp(op @ (UnaryOp::RealPart | UnaryOp::ImagPart), inner, _) if self.expr_ctype(inner).is_complex() => {
+                let inner_ct = self.expr_ctype(inner);
+                let (re, im) = self.eval_complex_const_public(inner)?;
+                let part = if *op == UnaryOp::RealPart { re } else { im };
+                IrConst::cast_float_to_target(part, Self::complex_component_ir_type(&inner_ct))
+            }
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
-                if let Some(val) = self.eval_const_expr(inner) {
+                if let Some(val) = self.eval_const_condition(inner) {
                     Some(IrConst::I64(if val.is_nonzero() { 0 } else { 1 }))
                 } else if Self::expr_is_always_nonzero(inner) {
                     // !("string_literal") is always 0
@@ -322,8 +333,32 @@ impl Lowerer {
     }
 
     /// Evaluate a cast expression at compile time.
+    /// A constant used as a condition: its value, or for a complex constant
+    /// (no one IrConst) 1 or 0 by whether either part is nonzero.
+    fn eval_const_condition(&self, expr: &Expr) -> Option<IrConst> {
+        if self.expr_ctype(expr).is_complex() {
+            let (re, im) = self.eval_complex_const_public(expr)?;
+            return Some(IrConst::I64((re != 0.0 || im != 0.0) as i64));
+        }
+        self.eval_const_expr(expr)
+    }
+
     fn eval_const_cast(&self, target_type: &TypeSpecifier, inner: &Expr) -> Option<IrConst> {
+        // A complex value is no one IrConst: (float _Complex)0.25f, cast as to
+        // its IR type (Ptr), came out 0, and `?:`/`&&` on it took the wrong arm.
+        if self.type_spec_to_ctype(target_type).is_complex() {
+            return None;
+        }
         let target_ir_ty = self.type_spec_to_ir(target_type);
+        // From a complex constant: _Bool tests both parts, a real type
+        // takes the real part ((int)(double _Complex)3.5 is 3).
+        if self.expr_ctype(inner).is_complex() {
+            let (re, im) = self.eval_complex_const_public(inner)?;
+            if matches!(self.type_spec_to_ctype(target_type), CType::Bool) {
+                return Some(IrConst::I64((re != 0.0 || im != 0.0) as i64));
+            }
+            return IrConst::cast_float_to_target(re, target_ir_ty);
+        }
         let src_val = self.eval_const_expr(inner)?;
         // To _Bool is a test against zero, not a truncation to a byte.
         if matches!(self.type_spec_to_ctype(target_type), CType::Bool) {

@@ -484,15 +484,25 @@ impl Lowerer {
         };
 
         let rhs_val = self.lower_expr(rhs);
-        let rhs_complex = self.convert_to_complex(rhs_val, &rhs_ct, &result_ct);
-        let rhs_ptr = self.operand_to_value(rhs_complex);
-
-        let result = match op {
-            BinOp::Add => self.lower_complex_add(op_lhs_ptr, rhs_ptr, &result_ct),
-            BinOp::Sub => self.lower_complex_sub(op_lhs_ptr, rhs_ptr, &result_ct),
-            BinOp::Mul => self.lower_complex_mul(op_lhs_ptr, rhs_ptr, &result_ct),
-            BinOp::Div => self.lower_complex_div(op_lhs_ptr, rhs_ptr, &result_ct),
-            _ => unreachable!("unsupported complex compound assignment op: {:?}", op),
+        // A real right operand is not made complex (signed zeros): z += x
+        // leaves z's imaginary part alone, z *= x scales both parts.
+        let real_result = if rhs_ct.is_complex() {
+            None
+        } else {
+            self.lower_complex_real_op(op, op_lhs_ptr, rhs_val, &rhs_ct, &result_ct, false)
+        };
+        let result = if let Some(r) = real_result {
+            r
+        } else {
+            let rhs_complex = self.convert_to_complex(rhs_val, &rhs_ct, &result_ct);
+            let rhs_ptr = self.operand_to_value(rhs_complex);
+            match op {
+                BinOp::Add => self.lower_complex_add(op_lhs_ptr, rhs_ptr, &result_ct),
+                BinOp::Sub => self.lower_complex_sub(op_lhs_ptr, rhs_ptr, &result_ct),
+                BinOp::Mul => self.lower_complex_mul(op_lhs_ptr, rhs_ptr, &result_ct),
+                BinOp::Div => self.lower_complex_div(op_lhs_ptr, rhs_ptr, &result_ct),
+                _ => unreachable!("unsupported complex compound assignment op: {:?}", op),
+            }
         };
 
         let store_ptr = if result_ct != *lhs_ct {

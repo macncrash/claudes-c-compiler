@@ -218,6 +218,11 @@ impl<'a> SemaConstEval<'a> {
             // Cast expressions with proper bit-width tracking
             Expr::Cast(ref target_type, inner, _) => {
                 let target_ctype = self.type_spec_to_ctype(target_type);
+                // A complex value is no one IrConst ((float _Complex)0.25f
+                // came out 0, so `x && 1` on it folded to 0).
+                if target_ctype.is_complex() {
+                    return None;
+                }
                 let src_val = self.eval_const_expr(inner)?;
                 // To _Bool is a test against zero, not a truncation: (_Bool)6
                 // is 1, (_Bool)0.5 is 1, (_Bool)-0.0 is 0.
@@ -1172,6 +1177,11 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         TypeSpecifier::Float => CType::Float,
         TypeSpecifier::Double => CType::Double,
         TypeSpecifier::LongDouble => CType::LongDouble,
+        // Without these, (float _Complex)0.25f fell to the Int fallback and
+        // folded to 0.
+        TypeSpecifier::ComplexFloat => CType::ComplexFloat,
+        TypeSpecifier::ComplexDouble => CType::ComplexDouble,
+        TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
         TypeSpecifier::Pointer(inner, addr_space) => CType::Pointer(Box::new(ctype_from_type_spec(inner, types)), *addr_space),
         TypeSpecifier::Array(elem, size) => {
             let elem_ty = ctype_from_type_spec(elem, types);

@@ -268,6 +268,44 @@ impl Lowerer {
         Operand::Value(result)
     }
 
+    /// One complex operand and one real (C11 Annex G.5.1, as clang and GCC
+    /// do): the real is not made x+0i, which would change signed zeros
+    /// (-0.0 + 0.0 is +0.0, and a product's terms add -0.0 and +0.0):
+    /// x + (a+bi) = (x+a) + bi, (a+bi) - x = (a-x) + bi, x * (a+bi) =
+    /// xa + xbi, (a+bi) / x = a/x + (b/x)i. Real - complex has its own
+    /// lowering; real / complex stays a complex division. None for those.
+    pub(super) fn lower_complex_real_op(&mut self, op: &BinOp, cptr: Value, real_val: Operand, real_type: &CType,
+                                        ctype: &CType, real_on_left: bool) -> Option<Operand> {
+        let ir_op = match (op, real_on_left) {
+            (BinOp::Add, _) => IrBinOp::Add,
+            (BinOp::Sub, false) => IrBinOp::Sub,
+            (BinOp::Mul, _) => IrBinOp::Mul,
+            (BinOp::Div, false) => IrBinOp::SDiv,
+            _ => return None,
+        };
+        let comp_ty = Self::complex_component_ir_type(ctype);
+        let real_ir = IrType::from_ctype(real_type);
+        let x = if real_ir != comp_ty {
+            Operand::Value(self.emit_cast_val(real_val, real_ir, comp_ty))
+        } else {
+            real_val
+        };
+        let a = self.load_complex_real(cptr, ctype);
+        let b = self.load_complex_imag(cptr, ctype);
+        let pair = |l: Operand, r: Operand| if real_on_left { (r, l) } else { (l, r) };
+        let (l, r) = pair(a, x);
+        let re = Operand::Value(self.emit_binop_val(ir_op, l, r, comp_ty));
+        let im = if matches!(ir_op, IrBinOp::Mul | IrBinOp::SDiv) {
+            let (l, r) = pair(b, x);
+            Operand::Value(self.emit_binop_val(ir_op, l, r, comp_ty))
+        } else {
+            b
+        };
+        let result = self.alloca_complex(ctype);
+        self.store_complex_parts(result, re, im, ctype);
+        Some(Operand::Value(result))
+    }
+
     /// Lower complex multiplication: (a+bi)(c+di) = (ac-bd) + (ad+bc)i
     pub(super) fn lower_complex_mul(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);

@@ -303,6 +303,16 @@ impl<'a> ExprTypeChecker<'a> {
                             self.infer_expr_ctype(&args[2])
                         };
                     }
+                    // __builtin_complex(re, im) is complex of its parts' type
+                    // (its registered return type is double, so
+                    // -(__builtin_complex(1.0, 2.0)) was taken for a double).
+                    if name == "__builtin_complex" {
+                        return Some(match args.first().and_then(|a| self.infer_expr_ctype(a)) {
+                            Some(CType::Float) => CType::ComplexFloat,
+                            Some(CType::LongDouble) => CType::complex_long_double(),
+                            _ => CType::ComplexDouble,
+                        });
+                    }
                 }
                 self.infer_call_return_ctype(func)
             }

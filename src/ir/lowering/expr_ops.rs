@@ -123,6 +123,20 @@ impl Lowerer {
 
         let lhs_val = self.lower_expr(lhs);
         let rhs_val = self.lower_expr(rhs);
+
+        // One real operand: it is not made complex (signed zeros).
+        let real_side = !lhs_ct.is_complex() || !rhs_ct.is_complex();
+        if real_side && !matches!((op, lhs_ct.is_complex()), (BinOp::Sub | BinOp::Div, false)) {
+            let real_on_left = !lhs_ct.is_complex();
+            let (cval, cct, rval, rct) = if real_on_left { (rhs_val, rhs_ct, lhs_val, lhs_ct) } else { (lhs_val, lhs_ct, rhs_val, rhs_ct) };
+            let c = self.convert_to_complex(cval, cct, &result_ct);
+            let cptr = self.operand_to_value(c);
+            if let Some(r) = self.lower_complex_real_op(op, cptr, rval, rct, &result_ct, real_on_left) {
+                return r;
+            }
+            unreachable!("real/complex op not handled: {:?}", op);
+        }
+
         let lhs_complex = self.convert_to_complex(lhs_val, lhs_ct, &result_ct);
         let rhs_complex = self.convert_to_complex(rhs_val, rhs_ct, &result_ct);
         let lhs_ptr = self.operand_to_value(lhs_complex);
@@ -543,7 +557,10 @@ impl Lowerer {
         // and sizeof checks gate large macro expansions — without folding, the
         // dead branches bloat the IR beyond inlining limits and cause linker
         // errors when always_inline functions can't be inlined.
-        if let Some(const_val) = self.eval_const_expr(cond) {
+        // Not a complex condition: the evaluator gives no complex constant
+        // ((float _Complex)0.25f came out zero, taking the else branch).
+        let folded = if self.expr_ctype(cond).is_complex() { None } else { self.eval_const_expr(cond) };
+        if let Some(const_val) = folded {
             let is_true = const_val.is_nonzero();
             if is_true {
                 let then_val = self.lower_expr(then_expr);

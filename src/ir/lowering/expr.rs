@@ -482,6 +482,10 @@ impl Lowerer {
                 let inner_ty = self.infer_expr_type(inner);
                 if inner_ty.is_float() { inner_ty } else { Self::integer_promote(inner_ty) }
             }
+            // __real__/__imag__ of a complex value is its component type, not
+            // the complex's (Ptr): as a condition, -0.0 from __imag__ was
+            // tested by its bits and taken as true.
+            Expr::UnaryOp(UnaryOp::RealPart | UnaryOp::ImagPart, _, _) => self.get_expr_type(expr),
             // Recursive cases that must use infer_expr_type (not get_expr_type)
             // to propagate narrow literal types through the expression tree
             Expr::UnaryOp(_, inner, _) => self.infer_expr_type(inner),
