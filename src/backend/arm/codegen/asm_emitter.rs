@@ -321,7 +321,12 @@ impl InlineAsmEmitter for ArmCodegen {
         }).collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
         let op_imm_values: Vec<Option<i64>> = operands.iter().map(|o| o.imm_value).collect();
-        let op_imm_symbols: Vec<Option<String>> = operands.iter().map(|o| o.imm_symbol.clone()).collect();
+        // A memory operand naming a global ("m"(g)) is its address in a
+        // register ([x9]), not the bare symbol: `ldr x9, g` does not assemble
+        // on arm64 (no literal fixup for a data symbol).
+        let op_imm_symbols: Vec<Option<String>> = operands.iter()
+            .map(|o| if matches!(o.kind, AsmOperandKind::Memory) { None } else { o.imm_symbol.clone() })
+            .collect();
         let mut result = Self::substitute_asm_operands_static(line, &op_regs, &op_names, gcc_to_internal, &op_imm_values, &op_imm_symbols);
         // Substitute %l[name] goto label references
         result = crate::backend::inline_asm::substitute_goto_labels(&result, goto_labels, operands.len());
