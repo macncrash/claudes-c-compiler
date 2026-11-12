@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-12",
-  "ccc_rev": "10f11f49",
+  "ccc_rev": "a0104427",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -1109,6 +1109,9 @@
    "status": "pass"
   },
   "cases/pp_literal_prefix_params": {
+   "status": "pass"
+  },
+  "cases/pragma_pack_bitfield_layout": {
    "status": "pass"
   },
   "cases/quotient_remainder_pairs": {
@@ -5703,7 +5706,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b7ded0f 0x16b7ded0f 0x16b7ded0f 0x16b7ded0f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16f4aed0f 0x16f4aed0f 0x16f4aed0f 0x16f4aed0f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
