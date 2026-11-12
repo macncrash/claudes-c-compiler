@@ -591,6 +591,11 @@ impl Lowerer {
                         self.compute_init_list_array_size(items)
                     } else if let Some(ref layout) = da.struct_layout {
                         self.compute_struct_array_init_count(items, layout)
+                    } else if da.array_dim_strides.len() > 1 {
+                        // An array of char arrays: char a[][6] = { "ab" } has
+                        // one row per string, so the string's length must not
+                        // count (that is the 1-D case, char c[] = { "ab" }).
+                        self.compute_init_list_array_size(items)
                     } else {
                         self.compute_init_list_array_size_for_char_array(items, da.base_ty)
                     };

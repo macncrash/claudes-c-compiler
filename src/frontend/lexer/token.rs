@@ -27,6 +27,8 @@ pub enum TokenKind {
     /// char16_t string literal (u"..."), stores content as Rust chars (each becomes char16_t = u16)
     Char16StringLiteral(String),
     CharLiteral(char),
+    /// u'x': a char16_t (unsigned short) character constant.
+    Char16Literal(u32),
 
     // Identifiers and keywords
     Identifier(String),
@@ -207,7 +209,7 @@ impl std::fmt::Display for TokenKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // Literals - described generically like GCC
-            TokenKind::IntLiteral(_) | TokenKind::UIntLiteral(_) |
+            TokenKind::IntLiteral(_) | TokenKind::UIntLiteral(_) | TokenKind::Char16Literal(_) |
             TokenKind::LongLiteral(_) | TokenKind::ULongLiteral(_) |
             TokenKind::LongLongLiteral(_) | TokenKind::ULongLongLiteral(_) =>
                 write!(f, "integer constant"),

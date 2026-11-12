@@ -481,6 +481,12 @@ impl Parser {
                 self.advance();
                 Expr::UIntLiteral(val, span)
             }
+            TokenKind::Char16Literal(val) => {
+                let val = *val;
+                let span = self.peek_span();
+                self.advance();
+                Expr::Cast(TypeSpecifier::UnsignedShort, Box::new(Expr::IntLiteral(val as i64, span)), span)
+            }
             TokenKind::LongLiteral(val) => {
                 let val = *val;
                 let span = self.peek_span();

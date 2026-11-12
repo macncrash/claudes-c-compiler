@@ -433,7 +433,7 @@ impl Lowerer {
         match expr {
             Expr::WideStringLiteral(s, _) | Expr::StringLiteral(s, _)
             | Expr::Char16StringLiteral(s, _) => {
-                self.emit_wide_string_to_alloca(alloca, s, 0);
+                self.emit_wide_string_to_alloca(alloca, s, 0, da.alloc_size);
             }
             _ => {
                 let val = self.lower_expr(expr);
@@ -447,17 +447,7 @@ impl Lowerer {
         match expr {
             Expr::Char16StringLiteral(s, _) | Expr::StringLiteral(s, _)
             | Expr::WideStringLiteral(s, _) => {
-                self.emit_char16_string_to_alloca(alloca, s, 0);
-                // Zero-fill remaining bytes if string is shorter than array
-                let str_len = (s.chars().count() + 1) * 2; // +1 for null, *2 for u16
-                let arr_size = da.alloc_size;
-                if arr_size > str_len {
-                    // Zero remaining bytes
-                    for i in (str_len..arr_size).step_by(2) {
-                        let val = Operand::Const(IrConst::I16(0));
-                        self.emit_store_at_offset(alloca, i, val, IrType::U16);
-                    }
-                }
+                self.emit_char16_string_to_alloca(alloca, s, 0, da.alloc_size);
             }
             _ => {
                 let val = self.lower_expr(expr);
@@ -1027,7 +1017,7 @@ impl Lowerer {
                 // wchar_t array with braced wide string: wchar_t w[] = {L"hello"};
                 if !da.is_array_of_pointers && (da.elem_ir_ty == IrType::I32 || da.elem_ir_ty == IrType::U32) {
                     if let Expr::WideStringLiteral(s, _) = e {
-                        self.emit_wide_string_to_alloca(alloca, s, current_idx * da.elem_size);
+                        self.emit_wide_string_to_alloca(alloca, s, current_idx * da.elem_size, da.elem_size);
                         current_idx += 1;
                         continue;
                     }
@@ -1035,7 +1025,7 @@ impl Lowerer {
                 // char16_t array with braced char16 string: char16_t w[] = {u"hello"};
                 if !da.is_array_of_pointers && (da.elem_ir_ty == IrType::I16 || da.elem_ir_ty == IrType::U16) {
                     if let Expr::Char16StringLiteral(s, _) = e {
-                        self.emit_char16_string_to_alloca(alloca, s, current_idx * da.elem_size);
+                        self.emit_char16_string_to_alloca(alloca, s, current_idx * da.elem_size, da.elem_size);
                         current_idx += 1;
                         continue;
                     }

@@ -1404,49 +1404,33 @@ impl Lowerer {
     }
 
     /// Emit a wide string (L"...") to a local alloca. Each character is stored as I32 (wchar_t).
-    pub(super) fn emit_wide_string_to_alloca(&mut self, alloca: Value, s: &str, base_offset: usize) {
-        for (j, ch) in s.chars().enumerate() {
-            let val = Operand::Const(IrConst::I32(ch as i32));
-            let byte_offset = base_offset + j * 4;
-            let offset = Operand::Const(IrConst::ptr_int(byte_offset as i64));
-            let addr = self.fresh_value();
-            self.emit(Instruction::GetElementPtr {
-                dest: addr, base: alloca, offset, ty: IrType::I8,
-            });
-            self.emit(Instruction::Store { val, ptr: addr, ty: IrType::I32 , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
-        }
-        // Null terminator
-        let null_byte_offset = base_offset + s.chars().count() * 4;
-        let null_offset = Operand::Const(IrConst::ptr_int(null_byte_offset as i64));
-        let null_addr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: null_addr, base: alloca, offset: null_offset, ty: IrType::I8,
-        });
-        self.emit(Instruction::Store { val: Operand::Const(IrConst::I32(0)), ptr: null_addr, ty: IrType::I32,
-         seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+    pub(super) fn emit_wide_string_to_alloca(&mut self, alloca: Value, s: &str, base_offset: usize, max_bytes: usize) {
+        let units: Vec<i64> = s.chars().map(|c| c as i64).collect();
+        self.emit_units_to_alloca(alloca, &units, 4, base_offset, max_bytes);
     }
 
-    /// Emit a char16_t string (u"...") to a local alloca. Each character is stored as U16.
-    pub(super) fn emit_char16_string_to_alloca(&mut self, alloca: Value, s: &str, base_offset: usize) {
-        for (j, ch) in s.chars().enumerate() {
-            let val = Operand::Const(IrConst::I16(ch as u16 as i16));
-            let byte_offset = base_offset + j * 2;
-            let offset = Operand::Const(IrConst::ptr_int(byte_offset as i64));
+    /// Emit a char16_t string (u"...") to a local alloca, as UTF-16 code
+    /// units (a character above U+FFFF is a surrogate pair).
+    pub(super) fn emit_char16_string_to_alloca(&mut self, alloca: Value, s: &str, base_offset: usize, max_bytes: usize) {
+        let units: Vec<i64> = s.encode_utf16().map(|u| u as i64).collect();
+        self.emit_units_to_alloca(alloca, &units, 2, base_offset, max_bytes);
+    }
+
+    /// Store a string's code units of `unit` bytes, then its terminating
+    /// zero and zero fill, writing at most `max_bytes` (the array's size):
+    /// an exact-fit array (wchar_t w[2] = L"ab") gets no terminator, a
+    /// longer one zeros after it (C11 6.7.9p14, p21).
+    fn emit_units_to_alloca(&mut self, alloca: Value, units: &[i64], unit: usize, base_offset: usize, max_bytes: usize) {
+        let ty = if unit == 4 { IrType::I32 } else { IrType::U16 };
+        let n = max_bytes / unit;
+        for j in 0..n {
+            let v = units.get(j).copied().unwrap_or(0);
+            let val = Operand::Const(if unit == 4 { IrConst::I32(v as i32) } else { IrConst::I16(v as u16 as i16) });
+            let offset = Operand::Const(IrConst::ptr_int((base_offset + j * unit) as i64));
             let addr = self.fresh_value();
-            self.emit(Instruction::GetElementPtr {
-                dest: addr, base: alloca, offset, ty: IrType::I8,
-            });
-            self.emit(Instruction::Store { val, ptr: addr, ty: IrType::U16, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+            self.emit(Instruction::GetElementPtr { dest: addr, base: alloca, offset, ty: IrType::I8 });
+            self.emit(Instruction::Store { val, ptr: addr, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
         }
-        // Null terminator
-        let null_byte_offset = base_offset + s.chars().count() * 2;
-        let null_offset = Operand::Const(IrConst::ptr_int(null_byte_offset as i64));
-        let null_addr = self.fresh_value();
-        self.emit(Instruction::GetElementPtr {
-            dest: null_addr, base: alloca, offset: null_offset, ty: IrType::I8,
-        });
-        self.emit(Instruction::Store { val: Operand::Const(IrConst::I16(0)), ptr: null_addr, ty: IrType::U16,
-         seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
     }
 
     /// Emit a single element store at a given byte offset in an alloca.

@@ -35,7 +35,47 @@ impl Lexer {
                 break;
             }
         }
+        self.widen_concatenated_narrow_strings(&mut tokens);
         tokens
+    }
+
+    /// In a run of adjacent string literals where one has an L, U or u
+    /// prefix, the whole literal has that prefix (C11 6.4.5p5), so an
+    /// unprefixed piece's escapes keep their full value and its non-ASCII
+    /// characters are code points, not UTF-8 bytes (L"" "\x123" is one
+    /// wchar_t 0x123, L"" "é" one 0xe9). Re-lex such pieces as wide.
+    fn widen_concatenated_narrow_strings(&mut self, tokens: &mut [Token]) {
+        let is_str = |k: &TokenKind| matches!(k, TokenKind::StringLiteral(_)
+            | TokenKind::WideStringLiteral(_) | TokenKind::Char16StringLiteral(_));
+        let saved = self.pos;
+        let mut i = 0;
+        while i < tokens.len() {
+            if !is_str(&tokens[i].kind) {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j < tokens.len() && is_str(&tokens[j].kind) {
+                j += 1;
+            }
+            let wide32 = tokens[i..j].iter().any(|t| matches!(t.kind, TokenKind::WideStringLiteral(_)));
+            let wide16 = tokens[i..j].iter().any(|t| matches!(t.kind, TokenKind::Char16StringLiteral(_)));
+            if wide32 || wide16 {
+                for t in &mut tokens[i..j] {
+                    let start = t.span.start as usize;
+                    // Only plain "..." pieces (not u8"...", whose span starts at the prefix).
+                    if matches!(t.kind, TokenKind::StringLiteral(_)) && self.input.get(start) == Some(&b'"') {
+                        self.pos = start;
+                        let relexed = if wide32 { self.lex_wide_string(start) } else { self.lex_char16_string(start) };
+                        if let TokenKind::WideStringLiteral(s) | TokenKind::Char16StringLiteral(s) = relexed.kind {
+                            t.kind = TokenKind::StringLiteral(s);
+                        }
+                    }
+                }
+            }
+            i = j;
+        }
+        self.pos = saved;
     }
 
     fn next_token(&mut self) -> Token {
@@ -580,7 +620,7 @@ impl Lexer {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 if self.pos < self.input.len() {
-                    let ch = self.lex_escape_char();
+                    let ch = self.lex_escape_char(false);
                     // C narrow strings store raw bytes, so Unicode escapes (\u, \U)
                     // must be UTF-8 encoded to match GCC/Clang behavior.
                     if (ch as u32) > 0xFF {
@@ -615,7 +655,7 @@ impl Lexer {
                 self.pos += 1;
                 if self.pos < self.input.len() {
                     // Wide strings store code points directly (no UTF-8 encoding needed)
-                    s.push(self.lex_escape_char());
+                    s.push(self.lex_escape_char(true));
                 }
             } else {
                 // Check for PUA-encoded bytes first (from non-UTF-8 source files)
@@ -674,7 +714,7 @@ impl Lexer {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 if self.pos < self.input.len() {
-                    s.push(self.lex_escape_char());
+                    s.push(self.lex_escape_char(true));
                 }
             } else {
                 // Check for PUA-encoded bytes first
@@ -726,8 +766,8 @@ impl Lexer {
         if self.pos < self.input.len() && self.input[self.pos] != b'\'' {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
-                let ch = self.lex_escape_char();
-                value = ch as u32; // Unicode escapes return code point directly
+                let v = self.lex_escape_value(true);
+                value = v; // the code point or code unit, untruncated
             } else {
                 // Check for PUA-encoded bytes first
                 let (byte, consumed) = decode_pua_byte(&self.input, self.pos);
@@ -769,8 +809,13 @@ impl Lexer {
             self.pos += 1; // skip closing '
         }
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
-        // Wide char literals have type int (wchar_t)
-        Token::new(TokenKind::IntLiteral(value as i64), span)
+        // L'x' is a wchar_t (int), U'x' a char32_t (unsigned int), u'x' a
+        // char16_t (unsigned short: sizeof u'x' is 2).
+        match self.input[start] {
+            b'U' => Token::new(TokenKind::UIntLiteral(value as u64), span),
+            b'u' => Token::new(TokenKind::Char16Literal(value & 0xffff), span),
+            _ => Token::new(TokenKind::IntLiteral(value as i64), span),
+        }
     }
 
     fn lex_char(&mut self, start: usize) -> Token {
@@ -780,7 +825,7 @@ impl Lexer {
         while self.pos < self.input.len() && self.input[self.pos] != b'\'' {
             let ch = if self.input[self.pos] == b'\\' {
                 self.pos += 1;
-                self.lex_escape_char()
+                self.lex_escape_char(false)
             } else {
                 // Decode PUA-encoded bytes for non-UTF-8 source files
                 let (byte, consumed) = decode_pua_byte(&self.input, self.pos);
@@ -816,42 +861,48 @@ impl Lexer {
         }
     }
 
-    fn lex_escape_char(&mut self) -> char {
+    /// An escape sequence as a character: in a narrow literal hex and octal
+    /// escapes are bytes; in a wide (L, u, U) one they keep their full value
+    /// (L"\x123" is 0x123), and a value that is no Unicode scalar becomes
+    /// U+FFFD.
+    fn lex_escape_char(&mut self, wide: bool) -> char {
+        let v = self.lex_escape_value(wide);
+        char::from_u32(v).unwrap_or('\u{FFFD}')
+    }
+
+    fn lex_escape_value(&mut self, wide: bool) -> u32 {
         if self.pos >= self.input.len() {
-            return '\0';
+            return 0;
         }
         let ch = self.input[self.pos];
         self.pos += 1;
         match ch {
-            b'n' => '\n',
-            b't' => '\t',
-            b'r' => '\r',
-            b'\\' => '\\',
-            b'\'' => '\'',
-            b'"' => '"',
-            b'a' => '\x07',
-            b'b' => '\x08',
-            b'e' | b'E' => '\x1b', // GNU extension: ESC
-            b'f' => '\x0c',
-            b'v' => '\x0b',
+            b'n' => 0x0a,
+            b't' => 0x09,
+            b'r' => 0x0d,
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'e' | b'E' => 0x1b, // GNU extension: ESC
+            b'f' => 0x0c,
+            b'v' => 0x0b,
             b'x' => {
-                // Hex escape: \xNN - consumes all hex digits, value truncated to byte
+                // Hex escape: \xNN - consumes all hex digits
                 let mut val = 0u32;
                 while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
                     val = val * 16 + hex_digit_val(self.input[self.pos]) as u32;
                     self.pos += 1;
                 }
-                // Truncate to byte value and use direct char mapping to avoid
-                // multi-byte UTF-8 encoding issues with values > 127
-                (val as u8) as char
+                // A narrow literal keeps the low byte (mapped to the char
+                // of that value, not UTF-8 encoded); a wide one the value.
+                if wide { val } else { val & 0xff }
             }
             b'u' => {
                 // Universal character name: \uNNNN (exactly 4 hex digits)
-                self.lex_unicode_escape(4)
+                self.lex_unicode_escape(4) as u32
             }
             b'U' => {
                 // Universal character name: \UNNNNNNNN (exactly 8 hex digits)
-                self.lex_unicode_escape(8)
+                self.lex_unicode_escape(8) as u32
             }
             b'0'..=b'7' => {
                 // Octal escape: \0 through \377 (1-3 octal digits)
@@ -865,10 +916,9 @@ impl Lexer {
                         break;
                     }
                 }
-                // Truncate to byte value to match C semantics
-                (val as u8) as char
+                if wide { val } else { val & 0xff }
             }
-            _ => ch as char,
+            _ => ch as u32,
         }
     }
 

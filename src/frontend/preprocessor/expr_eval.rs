@@ -81,7 +81,10 @@ impl Preprocessor {
                     i += 1;
                 }
                 let ident = bytes_to_str(bytes, start, i);
-                if ident == "defined" || ident == "true" || ident == "false" {
+                // An encoding prefix of a character constant (L'x', u'x',
+                // U'x', u8'x') is no identifier: keep it for the evaluator.
+                let is_prefix = matches!(ident, "L" | "u" | "U" | "u8") && bytes.get(i) == Some(&b'\'');
+                if ident == "defined" || ident == "true" || ident == "false" || is_prefix {
                     result.push_str(ident);
                 } else {
                     result.push('0');

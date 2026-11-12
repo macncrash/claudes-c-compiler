@@ -274,6 +274,86 @@ enum ExprToken {
 
 /// Tokenize a preprocessor expression, operating on byte slices for performance.
 /// Avoids allocating Vec<char>; numbers are parsed directly from byte spans.
+/// The value of a character constant in `#if`, as the compiler proper gives
+/// it (lexer::scan): `i` is just past the opening quote and is left past the
+/// closing one. `prefix` is b'L', b'u' or b'U' for a wide constant, else 0.
+/// A plain constant is a (signed) char, or for several characters their
+/// bytes combined as an int; L'x' is a wchar_t (int), u'x' a char16_t and
+/// U'x' a char32_t (unsigned), with escapes keeping their full value.
+fn pp_char_constant(bytes: &[u8], i: &mut usize, prefix: u8) -> (i64, bool) {
+    let len = bytes.len();
+    let wide = prefix != 0;
+    let mut units: Vec<u32> = Vec::new();
+    while *i < len && bytes[*i] != b'\'' {
+        if bytes[*i] == b'\\' && *i + 1 < len {
+            *i += 1;
+            let c = bytes[*i];
+            *i += 1;
+            let v = match c {
+                b'n' => 0x0a,
+                b't' => 0x09,
+                b'r' => 0x0d,
+                b'a' => 0x07,
+                b'b' => 0x08,
+                b'e' | b'E' => 0x1b,
+                b'f' => 0x0c,
+                b'v' => 0x0b,
+                b'x' | b'u' | b'U' => {
+                    let max = match c { b'u' => 4, b'U' => 8, _ => usize::MAX };
+                    let mut v: u32 = 0;
+                    let mut n = 0;
+                    while *i < len && n < max && bytes[*i].is_ascii_hexdigit() {
+                        v = v.wrapping_mul(16) + (bytes[*i] as char).to_digit(16).unwrap_or(0);
+                        *i += 1;
+                        n += 1;
+                    }
+                    if c == b'x' && !wide { v & 0xff } else { v }
+                }
+                b'0'..=b'7' => {
+                    let mut v = (c - b'0') as u32;
+                    let mut n = 1;
+                    while *i < len && n < 3 && (b'0'..=b'7').contains(&bytes[*i]) {
+                        v = v * 8 + (bytes[*i] - b'0') as u32;
+                        *i += 1;
+                        n += 1;
+                    }
+                    if wide { v } else { v & 0xff }
+                }
+                other => other as u32,
+            };
+            if !wide && v > 0xff {
+                // \u in a narrow constant: its UTF-8 bytes.
+                let mut buf = [0u8; 4];
+                let s = char::from_u32(v).unwrap_or('\u{FFFD}').encode_utf8(&mut buf);
+                units.extend(s.bytes().map(|b| b as u32));
+            } else {
+                units.push(v);
+            }
+        } else if wide {
+            // A source character: one code point.
+            let rest = &bytes[*i..];
+            let n = match rest[0] { 0..=0x7f => 1, 0xc0..=0xdf => 2, 0xe0..=0xef => 3, _ => 4 }.min(rest.len());
+            let ch = std::str::from_utf8(&rest[..n]).ok().and_then(|s| s.chars().next());
+            units.push(ch.map_or(rest[0] as u32, |c| c as u32));
+            *i += n;
+        } else {
+            units.push(bytes[*i] as u32);
+            *i += 1;
+        }
+    }
+    if *i < len {
+        *i += 1; // closing quote
+    }
+    let first = units.first().copied().unwrap_or(0);
+    match prefix {
+        b'L' => (first as i32 as i64, false),
+        b'u' => ((first & 0xffff) as i64, false),
+        b'U' => (first as i64, true),
+        _ if units.len() <= 1 => (first as u8 as i8 as i64, false),
+        _ => (units.iter().fold(0i32, |a, &u| (a << 8) | (u as u8 as i32)) as i64, false),
+    }
+}
+
 fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
     let mut tokens = Vec::new();
     let bytes = expr.as_bytes();
@@ -342,43 +422,20 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
             continue;
         }
 
-        // Character literal
-        if b == b'\'' {
-            i += 1;
-            let val = if i < len && bytes[i] == b'\\' {
-                i += 1;
-                let c = if i < len {
-                    let c = match bytes[i] {
-                        b'n' => b'\n',
-                        b't' => b'\t',
-                        b'r' => b'\r',
-                        b'0' => b'\0',
-                        b'\\' => b'\\',
-                        b'\'' => b'\'',
-                        b'a' => 0x07,
-                        b'b' => 0x08,
-                        b'f' => 0x0C,
-                        b'v' => 0x0B,
-                        other => other,
-                    };
-                    i += 1;
-                    c
-                } else {
-                    0
-                };
-                c as i64
-            } else if i < len {
-                let c = bytes[i] as i64;
-                i += 1;
-                c
-            } else {
-                0
-            };
-            // Skip closing quote
-            if i < len && bytes[i] == b'\'' {
-                i += 1;
-            }
-            tokens.push(ExprToken::Num(val, false));
+        // Character constant, plain or with an L, u, U or u8 prefix (L'\400' is 0x100).
+        let prefix_len = if (b == b'L' || b == b'U' || b == b'u') && bytes.get(i + 1) == Some(&b'\'') {
+            1
+        } else if b == b'u' && bytes.get(i + 1) == Some(&b'8') && bytes.get(i + 2) == Some(&b'\'') {
+            2
+        } else {
+            0
+        };
+        if prefix_len > 0 || b == b'\'' {
+            let prefix = b;
+            let wide = prefix_len == 1;
+            i += prefix_len + 1;
+            let (val, unsigned) = pp_char_constant(bytes, &mut i, if wide { prefix } else { 0 });
+            tokens.push(ExprToken::Num(val, unsigned));
             continue;
         }
 
