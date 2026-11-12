@@ -108,7 +108,11 @@ impl Lowerer {
             6 => &[(0, IrType::I32), (4, IrType::I16)],
             7 => &[(0, IrType::I32), (4, IrType::I16), (6, IrType::I8)],
             _ => {
+                // Truncate explicitly: the value is an I64, and a load that
+                // store-to-load forwarding answers from this store must see
+                // only the stored bytes, not the register's upper bits.
                 let ty = Self::packed_store_type(size);
+                let val = if ty == IrType::I64 { val } else { self.emit_implicit_cast(val, IrType::I64, ty) };
                 self.emit(Instruction::Store { val, ptr, ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                 return;
             }

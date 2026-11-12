@@ -1147,7 +1147,15 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
                     LineKind::LoadSp { reg: load_reg, offset: load_off, is_word: load_word }
                         if store_off == load_off && store_word == load_word =>
                     {
-                        if store_reg == load_reg {
+                        if store_reg == load_reg && store_word {
+                            // Same w register: `ldr wN` also zeroes xN's upper
+                            // half, which the store left as it was and a later
+                            // 64-bit use may read (a small struct returned in
+                            // x0 and reread as its 4-byte member): keep that.
+                            lines[j] = format!("    mov {}, {}", wreg_name(load_reg), wreg_name(load_reg));
+                            kinds[j] = LineKind::Move { dst: load_reg, src: load_reg, is_32bit: true };
+                            changed = true;
+                        } else if store_reg == load_reg {
                             // Same register: eliminate the load entirely
                             kinds[j] = LineKind::Nop;
                             changed = true;
@@ -1233,14 +1241,23 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
 fn forward_held_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
     // (offset, is_word) -> register holding it.
-    let mut held: Vec<(i32, bool, u8)> = Vec::new();
+    let mut held: Vec<(i32, bool, u8, bool)> = Vec::new();
     let size = |w: bool| if w { 4 } else { 8 };
     for i in 0..n {
         match kinds[i] {
             LineKind::Nop => continue,
             LineKind::LoadSp { reg, offset, is_word } => {
-                if let Some(&(_, _, s)) = held.iter().find(|&&(o, w, _)| o == offset && w == is_word) {
-                    if s == reg {
+                if let Some(&(_, _, s, ext)) = held.iter().find(|&&(o, w, _, _)| o == offset && w == is_word) {
+                    if s == reg && is_word && !ext {
+                        // The register holds what was stored from its w half;
+                        // the reload also zeroed its upper half, which a
+                        // later 64-bit use may read: keep that as mov wN, wN.
+                        lines[i] = format!("    mov {}, {}", wreg_name(reg), wreg_name(reg));
+                        kinds[i] = LineKind::Move { dst: reg, src: reg, is_32bit: true };
+                        if let Some(e) = held.iter_mut().find(|e| e.0 == offset && e.1 && e.2 == reg) {
+                            e.3 = true;
+                        }
+                    } else if s == reg {
                         kinds[i] = LineKind::Nop;
                     } else {
                         let name = if is_word { wreg_name } else { xreg_name };
@@ -1248,12 +1265,12 @@ fn forward_held_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
                         kinds[i] = LineKind::Move { dst: reg, src: s, is_32bit: is_word };
                     }
                     changed = true;
-                    held.retain(|&(_, _, r)| r != reg || r == s);
+                    held.retain(|&(_, _, r, _)| r != reg || r == s);
                     continue;
                 }
-                held.retain(|&(_, _, r)| r != reg);
+                held.retain(|&(_, _, r, _)| r != reg);
                 if reg < 31 {
-                    held.push((offset, is_word, reg));
+                    held.push((offset, is_word, reg, true));
                 }
                 continue;
             }
@@ -1262,15 +1279,15 @@ fn forward_held_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
                 // copies through a temporary, its source and destination
                 // sharing a slot: sqlite3VdbeExec's values carried around
                 // its dispatch loop, reloaded and stored at every latch).
-                if reg < 31 && held.contains(&(offset, is_word, reg)) {
+                if reg < 31 && held.iter().any(|&(o, w, r, _)| (o, w, r) == (offset, is_word, reg)) {
                     kinds[i] = LineKind::Nop;
                     changed = true;
                     continue;
                 }
                 let end = offset + size(is_word);
-                held.retain(|&(o, w, _)| o + size(w) <= offset || end <= o);
+                held.retain(|&(o, w, _, _)| o + size(w) <= offset || end <= o);
                 if reg < 31 {
-                    held.push((offset, is_word, reg));
+                    held.push((offset, is_word, reg, !is_word));
                 }
                 continue;
             }
@@ -1300,7 +1317,7 @@ fn forward_held_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
         if writeback {
             defs |= regs_in(ops);
         }
-        held.retain(|&(_, _, r)| r >= 31 || defs & (1 << r) == 0);
+        held.retain(|&(_, _, r, _)| r >= 31 || defs & (1 << r) == 0);
     }
     changed
 }
