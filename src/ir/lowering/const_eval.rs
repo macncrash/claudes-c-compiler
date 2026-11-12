@@ -40,6 +40,9 @@ impl Lowerer {
                 func.locals.get(name).is_some_and(|info| info.vla_size.is_some())
                     || func.vla_typedef_sizes.contains_key(name)
             }
+            SizeofArg::Expr(Expr::ArraySubscript(base, _, _)) => {
+                self.get_vla_stride_for_subscript(base).is_some()
+            }
             SizeofArg::Expr(_) => false,
             SizeofArg::Type(ts) => {
                 if let TypeSpecifier::TypedefName(name) = ts {

@@ -433,6 +433,13 @@ impl Lowerer {
                 return Some(vla_size);
             }
         }
+        // sizeof m[i] (or m[i][j]...) of a local multi-dimensional VLA: the
+        // element size is the runtime stride of that subscript level.
+        if let SizeofArg::Expr(Expr::ArraySubscript(base, _, _)) = arg {
+            if let Some(stride) = self.get_vla_stride_for_subscript(base) {
+                return Some(stride);
+            }
+        }
         None
     }
 

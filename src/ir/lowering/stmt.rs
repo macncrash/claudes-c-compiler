@@ -263,7 +263,8 @@ impl Lowerer {
             }
             if self.func_state.is_some() {
                 if let Some(vla_size) = self.compute_vla_runtime_size(type_spec, &declarator.derived) {
-                    self.func_mut().insert_vla_typedef_size_scoped(declarator.name.clone(), vla_size);
+                    let strides = self.vla_strides_for_decl(type_spec, &declarator.derived);
+                    self.func_mut().insert_vla_typedef_size_scoped(declarator.name.clone(), vla_size, strides);
                 }
             }
         }
@@ -388,7 +389,7 @@ impl Lowerer {
         }
         local_info.vla_size = vla_size;
         if vla_size.is_some() {
-            let strides = self.compute_vla_local_strides(type_spec, &declarator.derived);
+            let strides = self.vla_strides_for_decl(type_spec, &declarator.derived);
             if !strides.is_empty() {
                 local_info.vla_strides = strides;
             }
@@ -919,6 +920,30 @@ impl Lowerer {
             }
         }).collect();
 
+        // A VLA typedef has its size evaluated once, at the typedef (C11
+        // 6.7.8p3); an object declared with it, or an array of them, takes
+        // that size, whatever the size expressions' variables hold now.
+        if let TypeSpecifier::TypedefName(name) = type_spec {
+            let only_arrays = derived.iter().all(|d| matches!(d, DerivedDeclarator::Array(_)));
+            if only_arrays {
+                if let Some(&td_size) = self.func().vla_typedef_sizes.get(name) {
+                    let ptr_int_ty = target_int_ir_type();
+                    let mut total = td_size;
+                    for expr in array_dims.iter().copied().flatten() {
+                        let dim = match self.expr_as_array_size(expr) {
+                            Some(c) => Operand::Const(IrConst::ptr_int(c)),
+                            None => {
+                                let v = self.lower_expr(expr);
+                                Operand::Value(self.operand_to_value(v))
+                            }
+                        };
+                        total = self.emit_binop_val(IrBinOp::Mul, Operand::Value(total), dim, ptr_int_ty);
+                    }
+                    return Some(total);
+                }
+            }
+        }
+
         if array_dims.is_empty() {
             // Check if the type_spec itself is an Array (typedef'd VLA)
             return self.compute_vla_size_from_type_spec(type_spec);
@@ -985,6 +1010,59 @@ impl Lowerer {
         }
 
         None
+    }
+
+    /// Subscript strides for a declaration whose type is a VLA typedef name,
+    /// possibly with more array dimensions in front (`Row a[n]`): the outer
+    /// levels step by (inner outer dims) * sizeof(typedef), then the typedef's
+    /// own strides follow. Any other declaration uses compute_vla_local_strides.
+    pub(super) fn vla_strides_for_decl(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> Vec<Option<Value>> {
+        if let TypeSpecifier::TypedefName(name) = type_spec {
+            let only_arrays = derived.iter().all(|d| matches!(d, DerivedDeclarator::Array(_)));
+            let td = self.func().vla_typedef_sizes.get(name).copied();
+            if let (true, Some(td_size)) = (only_arrays, td) {
+                let td_strides = self.func().vla_typedef_strides.get(name).cloned().unwrap_or_default();
+                let outer: Vec<Option<Box<Expr>>> = derived.iter().filter_map(|d| match d {
+                    DerivedDeclarator::Array(e) => Some(e.clone()),
+                    _ => None,
+                }).collect();
+                if outer.is_empty() {
+                    return td_strides;
+                }
+                let k = outer.len();
+                let ptr_int_ty = target_int_ir_type();
+                let mut outer_strides: Vec<Option<Value>> = vec![None; k];
+                let mut cur = td_size;
+                outer_strides[k - 1] = Some(cur);
+                for i in (0..k - 1).rev() {
+                    let dim = match outer[i + 1].as_deref() {
+                        Some(e) => match self.expr_as_array_size(e) {
+                            Some(c) => Operand::Const(IrConst::ptr_int(c)),
+                            None => {
+                                let v = self.lower_expr(e);
+                                Operand::Value(self.operand_to_value(v))
+                            }
+                        },
+                        None => Operand::Const(IrConst::ptr_int(0)),
+                    };
+                    cur = self.emit_binop_val(IrBinOp::Mul, Operand::Value(cur), dim, ptr_int_ty);
+                    outer_strides[i] = Some(cur);
+                }
+                // The typedef's own levels: its saved strides, or (1-D typedef)
+                // a constant element size and the terminating entry.
+                if td_strides.is_empty() {
+                    outer_strides.extend([None, None]);
+                } else {
+                    outer_strides.extend(td_strides);
+                }
+                return outer_strides;
+            }
+        }
+        self.compute_vla_local_strides(type_spec, derived)
     }
 
     /// Compute VLA strides for a local VLA variable declaration.

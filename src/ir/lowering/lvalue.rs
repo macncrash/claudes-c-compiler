@@ -329,7 +329,7 @@ impl Lowerer {
     /// Get the VLA runtime stride value for a subscript expression, if available.
     /// For `m[i]` where m has VLA strides, returns the runtime stride at depth 0.
     /// For `m[i][j]` where the outer subscript `m[i]` already used VLA, returns stride at depth 1.
-    fn get_vla_stride_for_subscript(&self, base: &Expr) -> Option<Value> {
+    pub(super) fn get_vla_stride_for_subscript(&self, base: &Expr) -> Option<Value> {
         let root_name = self.get_array_root_name_from_base(base)?;
         let depth = self.count_subscript_depth(base);
 

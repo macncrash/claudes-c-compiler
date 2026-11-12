@@ -47,6 +47,8 @@ pub(super) struct FuncScopeFrame {
     pub vla_typedef_sizes_added: Vec<String>,
     /// Keys that were overwritten in `vla_typedef_sizes`: (key, previous_value).
     pub vla_typedef_sizes_shadowed: Vec<(String, Value)>,
+    /// Strides that were overwritten in `vla_typedef_strides` by an inner typedef.
+    pub vla_typedef_strides_shadowed: Vec<(String, Vec<Option<Value>>)>,
     /// Saved stack pointer before the first VLA in this scope.
     /// When set, StackRestore is emitted at scope exit to reclaim VLA stack space.
     pub scope_stack_save: Option<Value>,
@@ -70,6 +72,7 @@ impl FuncScopeFrame {
             var_ctypes_shadowed: Vec::new(),
             vla_typedef_sizes_added: Vec::new(),
             vla_typedef_sizes_shadowed: Vec::new(),
+            vla_typedef_strides_shadowed: Vec::new(),
             scope_stack_save: None,
             cleanup_vars: Vec::new(),
         }
@@ -130,6 +133,9 @@ pub(super) struct FunctionBuildState {
     /// Runtime sizeof Values for VLA typedef types (e.g., `typedef char buf[n][m]`).
     /// Keyed by typedef name, value is the IR Value holding the runtime byte size.
     pub vla_typedef_sizes: FxHashMap<String, Value>,
+    /// Runtime subscript strides of multi-dimensional VLA typedefs (same
+    /// layout as `LocalInfo::vla_strides`), saved with the typedef's size.
+    pub vla_typedef_strides: FxHashMap<String, Vec<Option<Value>>>,
     /// Per-function value counter (reset for each function)
     pub next_value: u32,
     /// Saved stack pointer Value for VLA deallocation.
@@ -189,6 +195,7 @@ impl FunctionBuildState {
             const_local_values: FxHashMap::default(),
             var_ctypes: FxHashMap::default(),
             vla_typedef_sizes: FxHashMap::default(),
+            vla_typedef_strides: FxHashMap::default(),
             next_value: 0,
             vla_stack_save: None,
             has_vla: false,
@@ -239,6 +246,10 @@ impl FunctionBuildState {
             }
             for key in frame.vla_typedef_sizes_added {
                 self.vla_typedef_sizes.remove(&key);
+                self.vla_typedef_strides.remove(&key);
+            }
+            for (key, val) in frame.vla_typedef_strides_shadowed {
+                self.vla_typedef_strides.insert(key, val);
             }
             for (key, val) in frame.vla_typedef_sizes_shadowed {
                 self.vla_typedef_sizes.insert(key, val);
@@ -250,14 +261,17 @@ impl FunctionBuildState {
     }
 
     /// Insert a VLA typedef runtime size, tracking for scope management.
-    pub fn insert_vla_typedef_size_scoped(&mut self, name: String, size: Value) {
+    pub fn insert_vla_typedef_size_scoped(&mut self, name: String, size: Value, strides: Vec<Option<Value>>) {
         if let Some(frame) = self.scope_stack.last_mut() {
             if let Some(prev) = self.vla_typedef_sizes.remove(&name) {
                 frame.vla_typedef_sizes_shadowed.push((name.clone(), prev));
+                let prev_strides = self.vla_typedef_strides.remove(&name).unwrap_or_default();
+                frame.vla_typedef_strides_shadowed.push((name.clone(), prev_strides));
             } else {
                 frame.vla_typedef_sizes_added.push(name.clone());
             }
         }
+        self.vla_typedef_strides.insert(name.clone(), strides);
         self.vla_typedef_sizes.insert(name, size);
     }
 
