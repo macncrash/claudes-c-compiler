@@ -629,7 +629,11 @@ impl Lowerer {
         if val_ty != op_ty && op_ty.is_float() && !val_ty.is_float() {
             // Int to float: cast from the widened int type
             let wt = widened_op_type(ir_ty);
-            let cast_from = if ir_ty.is_unsigned() {
+            // A 128-bit type converts as itself: unsigned __int128 through
+            // U64 lost its value (y *= 0.75 gave 0).
+            let cast_from = if ir_ty == IrType::U128 || ir_ty == IrType::I128 {
+                ir_ty
+            } else if ir_ty.is_unsigned() {
                 if wt == IrType::I32 { IrType::U32 } else { IrType::U64 }
             } else {
                 wt
@@ -680,7 +684,9 @@ impl Lowerer {
         if op_ty.is_float() && !target_ty.is_float() {
             // Float to int: cast to widened int type first, then narrow if needed
             let wt = widened_op_type(target_ir_ty);
-            let cast_to = if target_ir_ty.is_unsigned() {
+            let cast_to = if target_ir_ty == IrType::U128 || target_ir_ty == IrType::I128 {
+                target_ir_ty
+            } else if target_ir_ty.is_unsigned() {
                 if wt == IrType::I32 { IrType::U32 } else { IrType::U64 }
             } else {
                 wt
