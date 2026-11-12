@@ -280,8 +280,7 @@ impl Lowerer {
                         return Some(layout.clone());
                     }
                 }
-                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(Rc::new(self.compute_struct_union_layout_packed(fields, false, max_field_align)))
+                Some(Rc::new(self.compute_struct_union_layout_packed(fields, false, *is_packed, *pragma_pack)))
             }
             TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _) => {
                 // Use cached layout for tagged unions
@@ -290,8 +289,7 @@ impl Lowerer {
                         return Some(layout.clone());
                     }
                 }
-                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(Rc::new(self.compute_struct_union_layout_packed(fields, true, max_field_align)))
+                Some(Rc::new(self.compute_struct_union_layout_packed(fields, true, *is_packed, *pragma_pack)))
             }
             TypeSpecifier::Struct(Some(tag), None, _, _, _) =>
                 self.get_struct_union_layout_by_tag("struct", tag),
@@ -301,7 +299,7 @@ impl Lowerer {
         }
     }
 
-    pub(super) fn compute_struct_union_layout_packed(&self, fields: &[StructFieldDecl], is_union: bool, max_field_align: Option<usize>) -> StructLayout {
+    pub(super) fn compute_struct_union_layout_packed(&self, fields: &[StructFieldDecl], is_union: bool, is_packed: bool, pragma_pack: Option<usize>) -> StructLayout {
         let struct_fields: Vec<StructField> = fields.iter().map(|f| {
             let bit_width = f.bit_width.as_ref().and_then(|bw| {
                 self.eval_const_expr(bw).and_then(|c| c.to_u32())
@@ -335,9 +333,10 @@ impl Lowerer {
             }
         }).collect();
         if is_union {
+            let max_field_align = if is_packed { Some(1) } else { pragma_pack };
             StructLayout::for_union_with_packing(&struct_fields, max_field_align, &*self.types.borrow_struct_layouts())
         } else {
-            StructLayout::for_struct_with_packing(&struct_fields, max_field_align, &*self.types.borrow_struct_layouts())
+            StructLayout::for_struct(&struct_fields, is_packed, pragma_pack, &*self.types.borrow_struct_layouts())
         }
     }
 

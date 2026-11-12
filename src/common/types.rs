@@ -539,11 +539,16 @@ struct StructLayoutBuilder {
     bf_bit_pos: u32,
     bf_unit_size: usize,
     in_bitfield: bool,
-    is_packed_1: bool,
+    /// Bit-fields are laid out back to back, with no padding to a storage
+    /// unit boundary: in a packed struct and under any #pragma pack (as
+    /// clang, whose padding needs no maximum field alignment, and GCC do).
+    contiguous_bf: bool,
+    struct_packed: bool,
+    pragma: Option<usize>,
 }
 
 impl StructLayoutBuilder {
-    fn new(field_count: usize, max_field_align: Option<usize>) -> Self {
+    fn new(field_count: usize, struct_packed: bool, pragma: Option<usize>) -> Self {
         Self {
             offset: 0,
             max_align: 1,
@@ -552,28 +557,34 @@ impl StructLayoutBuilder {
             bf_bit_pos: 0,
             bf_unit_size: 0,
             in_bitfield: false,
-            is_packed_1: max_field_align == Some(1),
+            contiguous_bf: struct_packed || pragma.is_some(),
+            struct_packed,
+            pragma,
         }
     }
 
-    /// Compute the effective alignment and size for a field.
-    fn compute_field_alignment(&mut self, field: &StructField, max_field_align: Option<usize>,
-                               ctx: &dyn StructLayoutProvider) -> (usize, usize) {
+    /// Compute the effective alignment and size for a field, as clang and
+    /// GCC do: a packed field (by its own attribute or the struct's) starts
+    /// from alignment 1, otherwise from its type's; an aligned attribute
+    /// raises that (so `long x __attribute__((aligned(2)))` in a packed
+    /// struct is 2-aligned); `#pragma pack(N)` then caps the result, even
+    /// an explicit alignment. Under a pragma a named bit-field raises the
+    /// struct's alignment to min(its type's, N), packed or not.
+    fn compute_field_alignment(&mut self, field: &StructField, ctx: &dyn StructLayoutProvider) -> (usize, usize) {
         let natural_align = field.ty.align_ctx(ctx);
-        let field_align = if field.is_packed {
-            // Per-field __attribute__((packed)) forces alignment to 1
-            1
-        } else if let Some(explicit) = field.alignment {
-            // Explicit _Alignas/aligned raises alignment, overrides struct-level packing
-            natural_align.max(explicit)
-        } else if let Some(max_a) = max_field_align {
-            // Struct-level packed or #pragma pack caps alignment
-            natural_align.min(max_a)
-        } else {
-            natural_align
-        };
+        let base = if field.is_packed || self.struct_packed { 1 } else { natural_align };
+        let mut field_align = field.alignment.map_or(base, |explicit| base.max(explicit));
+        if let Some(n) = self.pragma {
+            field_align = field_align.min(n);
+        }
         let field_size = field.ty.size_ctx(ctx);
-        self.max_align = self.max_align.max(field_align);
+        let mut struct_align = field_align;
+        if let (Some(n), Some(w)) = (self.pragma, field.bit_width) {
+            if w > 0 {
+                struct_align = struct_align.max(natural_align.min(n));
+            }
+        }
+        self.max_align = self.max_align.max(struct_align);
         (field_align, field_size)
     }
 
@@ -822,14 +833,12 @@ impl StructLayout {
 
     /// Compute the layout for a struct (fields laid out sequentially with alignment padding).
     /// Supports bitfield packing: adjacent bitfields share storage units.
-    /// `max_field_align`: if Some(N), cap each field's alignment to min(natural, N).
-    ///   For __attribute__((packed)), pass Some(1).
-    ///   For #pragma pack(N), pass Some(N).
-    ///   For normal structs, pass None.
+    /// `struct_packed`: the struct has __attribute__((packed)) (each member is packed).
+    /// `pragma`: the #pragma pack(N) in effect at its definition, capping every
+    ///   member's alignment (an explicit aligned attribute too).
     /// `ctx`: provides struct/union layout lookup for nested struct/union field types.
-    pub fn for_struct_with_packing(fields: &[StructField], max_field_align: Option<usize>, ctx: &dyn StructLayoutProvider) -> Self {
-        let mut b = StructLayoutBuilder::new(fields.len(), max_field_align);
-
+    pub fn for_struct(fields: &[StructField], struct_packed: bool, pragma: Option<usize>, ctx: &dyn StructLayoutProvider) -> Self {
+        let mut b = StructLayoutBuilder::new(fields.len(), struct_packed, pragma);
         for field in fields {
             // On Darwin a zero-width bit-field aligns what follows to its
             // type's natural alignment, even in a packed struct, and does not
@@ -841,7 +850,7 @@ impl StructLayout {
             // An unnamed bit-field's type places it but does not align the
             // struct (SysV psABI): { unsigned a : 10; long long : 10; } is 4.
             let struct_align = b.max_align;
-            let (field_align, field_size) = b.compute_field_alignment(field, max_field_align, ctx);
+            let (field_align, field_size) = b.compute_field_alignment(field, ctx);
             if field.name.is_empty() && field.bit_width.is_some_and(|w| w > 0) {
                 b.max_align = struct_align;
             }
@@ -849,7 +858,7 @@ impl StructLayout {
             if let Some(bw) = field.bit_width {
                 if bw == 0 {
                     b.layout_zero_width_bitfield(field_align);
-                } else if b.is_packed_1 {
+                } else if b.contiguous_bf || field.is_packed {
                     b.layout_packed_bitfield(field, bw, field_size);
                 } else {
                     b.layout_standard_bitfield(field, bw, field_size, field_align);

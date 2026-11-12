@@ -26,8 +26,7 @@ impl Lowerer {
             TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
-                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                let mut layout = self.compute_struct_union_layout_packed(fields, false, max_field_align);
+                let mut layout = self.compute_struct_union_layout_packed(fields, false, *is_packed, *pragma_pack);
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
                 if let Some(a) = struct_aligned {
                     if *a > layout.align {
@@ -47,8 +46,7 @@ impl Lowerer {
             TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
-                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                let mut layout = self.compute_struct_union_layout_packed(fields, true, max_field_align);
+                let mut layout = self.compute_struct_union_layout_packed(fields, true, *is_packed, *pragma_pack);
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
                 if let Some(a) = struct_aligned {
                     if *a > layout.align {
@@ -196,8 +194,7 @@ impl Lowerer {
                         return Some(layout.clone());
                     }
                 }
-                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(Rc::new(self.compute_struct_union_layout_packed(fields, false, max_field_align)))
+                Some(Rc::new(self.compute_struct_union_layout_packed(fields, false, *is_packed, *pragma_pack)))
             }
             TypeSpecifier::Struct(Some(tag), None, _, _, _) => {
                 let layouts = self.types.borrow_struct_layouts();
@@ -217,8 +214,7 @@ impl Lowerer {
                         return Some(layout.clone());
                     }
                 }
-                let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(Rc::new(self.compute_struct_union_layout_packed(fields, true, max_field_align)))
+                Some(Rc::new(self.compute_struct_union_layout_packed(fields, true, *is_packed, *pragma_pack)))
             }
             TypeSpecifier::Union(Some(tag), None, _, _, _) => {
                 let layouts = self.types.borrow_struct_layouts();

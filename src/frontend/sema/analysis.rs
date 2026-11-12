@@ -2086,9 +2086,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             let mut layout = if is_union {
                 StructLayout::for_union_with_packing(&struct_fields, max_field_align, &*self.result.type_context.borrow_struct_layouts())
             } else {
-                StructLayout::for_struct_with_packing(
-                    &struct_fields, max_field_align, &*self.result.type_context.borrow_struct_layouts()
-                )
+                StructLayout::for_struct(&struct_fields, is_packed, pragma_pack, &*self.result.type_context.borrow_struct_layouts())
             };
             if let Some(a) = struct_aligned {
                 if a > layout.align {

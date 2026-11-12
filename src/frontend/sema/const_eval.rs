@@ -875,10 +875,7 @@ impl<'a> SemaConstEval<'a> {
                 if let Some(fields) = fields {
                     let struct_fields = self.convert_struct_fields(fields);
                     if !struct_fields.is_empty() {
-                        let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                        let mut layout = crate::common::types::StructLayout::for_struct_with_packing(
-                            &struct_fields, max_field_align, &*self.types.borrow_struct_layouts()
-                        );
+                        let mut layout = crate::common::types::StructLayout::for_struct(&struct_fields, *is_packed, *pragma_pack, &*self.types.borrow_struct_layouts());
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
                                 layout.align = *a;
@@ -1003,10 +1000,7 @@ impl<'a> SemaConstEval<'a> {
                 if let Some(fields) = fields {
                     let struct_fields = self.convert_struct_fields(fields);
                     if !struct_fields.is_empty() {
-                        let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                        let mut layout = crate::common::types::StructLayout::for_struct_with_packing(
-                            &struct_fields, max_field_align, &*self.types.borrow_struct_layouts()
-                        );
+                        let mut layout = crate::common::types::StructLayout::for_struct(&struct_fields, *is_packed, *pragma_pack, &*self.types.borrow_struct_layouts());
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
                                 layout.align = *a;
