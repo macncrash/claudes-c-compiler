@@ -44,7 +44,19 @@ impl ArmCodegen {
                 self.state.emit_fmt(format_args!("    cbnz w4, {}", loop_label));
             }
         }
+        Self::extend_atomic_result(&mut self.state, ty);
         self.store_x0_to(dest);
+    }
+
+    /// The exclusive loads zero-extend a byte, halfword or word into x0; a signed
+    /// result is sign-extended, as emit_atomic_load_impl does.
+    fn extend_atomic_result(state: &mut crate::backend::state::CodegenState, ty: IrType) {
+        match ty {
+            IrType::I8 => state.emit("    sxtb x0, w0"),
+            IrType::I16 => state.emit("    sxth x0, w0"),
+            IrType::I32 => state.emit("    sxtw x0, w0"),
+            _ => {}
+        }
     }
 
     pub(super) fn emit_atomic_cmpxchg_impl(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, _failure_ordering: AtomicOrdering, returns_bool: bool) {
@@ -67,7 +79,14 @@ impl ArmCodegen {
 
         self.state.emit_fmt(format_args!("{}:", loop_label));
         self.state.emit_fmt(format_args!("    {} {}, [x1]", ldxr, old_reg));
-        self.state.emit_fmt(format_args!("    cmp {}, {}", old_reg, expected_reg));
+        // Only the low byte or halfword of the expected value counts: the loaded
+        // value is zero-extended, the expected one may be sign-extended.
+        let cmp_ext = match ty {
+            IrType::I8 | IrType::U8 => ", uxtb",
+            IrType::I16 | IrType::U16 => ", uxth",
+            _ => "",
+        };
+        self.state.emit_fmt(format_args!("    cmp {}, {}{}", old_reg, expected_reg, cmp_ext));
         self.state.emit_fmt(format_args!("    b.ne {}", fail_label));
         self.state.emit_fmt(format_args!("    {} w4, {}, [x1]", stxr, desired_reg));
         self.state.emit_fmt(format_args!("    cbnz w4, {}", loop_label));
@@ -83,6 +102,9 @@ impl ArmCodegen {
             self.state.emit("    clrex");
         }
         self.state.emit_fmt(format_args!("{}:", done_label));
+        if !returns_bool {
+            Self::extend_atomic_result(&mut self.state, ty);
+        }
         self.store_x0_to(dest);
     }
 
