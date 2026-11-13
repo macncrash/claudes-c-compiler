@@ -159,9 +159,11 @@ impl Lowerer {
 
         if lhs_is_ptr && !rhs_is_ptr {
             let elem_size = self.get_pointer_elem_size_from_expr(lhs);
-            let vla_stride = self.vla_pointee_stride(lhs);
             let rhs_ty = self.get_expr_type(rhs);
             let lhs_val = self.lower_expr(lhs);
+            // After lowering: a cast to a pointer to a VLA type records its
+            // strides when lowered (FunctionState::cast_vla_strides).
+            let vla_stride = self.vla_pointee_stride(lhs);
             let rhs_val = self.lower_expr(rhs);
             // Widen the integer index to pointer width (sign-extend for signed types,
             // zero-extend for unsigned) before scaling and adding to the pointer.
@@ -172,20 +174,20 @@ impl Lowerer {
             Some(Operand::Value(dest))
         } else if rhs_is_ptr && !lhs_is_ptr && *op == BinOp::Add {
             let elem_size = self.get_pointer_elem_size_from_expr(rhs);
-            let vla_stride = self.vla_pointee_stride(rhs);
             let lhs_ty = self.get_expr_type(lhs);
             let lhs_val = self.lower_expr(lhs);
             // Widen the integer index to pointer width before scaling and adding to the pointer.
             let lhs_val = self.emit_implicit_cast(lhs_val, lhs_ty, ptr_int_ty);
             let rhs_val = self.lower_expr(rhs);
+            let vla_stride = self.vla_pointee_stride(rhs);
             let scaled_lhs = self.scale_index_or_vla(lhs_val, elem_size, vla_stride);
             let dest = self.emit_binop_val(IrBinOp::Add, scaled_lhs, rhs_val, ptr_int_ty);
             Some(Operand::Value(dest))
         } else if lhs_is_ptr && rhs_is_ptr && *op == BinOp::Sub {
             let elem_size = self.get_pointer_elem_size_from_expr(lhs);
-            let vla_stride = self.vla_pointee_stride(lhs);
             let lhs_val = self.lower_expr(lhs);
             let rhs_val = self.lower_expr(rhs);
+            let vla_stride = self.vla_pointee_stride(lhs);
             let diff = self.emit_binop_val(IrBinOp::Sub, lhs_val, rhs_val, ptr_int_ty);
             if let Some(stride) = vla_stride {
                 // Pointers to a VLA type: divide by the runtime pointee size.

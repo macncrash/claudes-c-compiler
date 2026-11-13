@@ -1507,8 +1507,11 @@ impl Lowerer {
                 // looks names up in the enclosing scope first, so in
                 // `float n = ({ double n = x; n; })` it typed the inner n as
                 // the outer float.
+                // Its value is an rvalue: an array result decays
+                // (`typeof(({ a; }))` is a pointer, as is the value).
                 self.lookup_sema_expr_type(expr)
                     .or_else(|| self.get_stmt_expr_ctype(compound, None))
+                    .map(|ct| ct.rvalue_converted())
             }
             // sizeof and alignof always produce size_t (unsigned long on 64-bit,
             // unsigned int on 32-bit). This is needed so typeof(sizeof(...)) resolves

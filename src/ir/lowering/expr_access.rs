@@ -53,8 +53,131 @@ impl Lowerer {
         }
     }
 
+    /// The runtime size and subscript strides (as `LocalInfo::vla_strides`)
+    /// of an array type name with VLA dimensions (`int [n][m]`, a VLA
+    /// typedef, `typeof` a VLA expression), evaluating its runtime
+    /// dimensions. None for a type of constant size, with nothing evaluated.
+    fn type_name_vla_layout(&mut self, ts: &TypeSpecifier) -> Option<(Value, Vec<Option<Value>>)> {
+        match ts {
+            TypeSpecifier::Array(elem, Some(dim)) => {
+                let inner = self.type_name_vla_layout(elem);
+                let const_dim = self.expr_as_array_size(dim);
+                if inner.is_none() && const_dim.is_some() {
+                    return None;
+                }
+                // Probing (operand_has_vla_type): placeholders, nothing emitted.
+                let probe = self.func_state.as_ref().is_some_and(|fs| fs.vla_probe);
+                let ptr_int_ty = crate::common::types::target_int_ir_type();
+                let (elem_size, mut strides) = match inner {
+                    Some((size, strides)) => (Operand::Value(size), strides),
+                    None => (Operand::Const(IrConst::ptr_int(self.sizeof_type(elem) as i64)), vec![None]),
+                };
+                let dim = match const_dim {
+                    Some(c) => Operand::Const(IrConst::ptr_int(c)),
+                    None if probe => Operand::Value(Value(u32::MAX)),
+                    None => {
+                        let d = self.lower_expr(dim);
+                        Operand::Value(self.operand_to_value(d))
+                    }
+                };
+                let size = if probe { Value(u32::MAX) } else { self.emit_binop_val(IrBinOp::Mul, dim, elem_size, ptr_int_ty) };
+                let elem_stride = match elem_size {
+                    Operand::Value(v) => Some(v),
+                    _ => None,
+                };
+                strides.insert(0, elem_stride);
+                Some((size, strides))
+            }
+            TypeSpecifier::TypedefName(name) => {
+                let fs = self.func_state.as_ref()?;
+                let size = *fs.vla_typedef_sizes.get(name)?;
+                Some((size, fs.vla_typedef_strides.get(name).cloned().unwrap_or_default()))
+            }
+            TypeSpecifier::Typeof(e) => self.vla_array_layout(e),
+            TypeSpecifier::TypeofType(inner) => self.type_name_vla_layout(inner),
+            _ => None,
+        }
+    }
+
+    /// For a cast to a pointer to a VLA type (`(int (*)[n])p`): evaluate its
+    /// sizes and record its strides, for the subscripts, derefs and pointer
+    /// arithmetic on the cast (see FunctionState::cast_vla_strides).
+    fn record_cast_vla_strides(&mut self, ts: &TypeSpecifier) -> bool {
+        let Some(strides) = self.pointer_type_name_vla_strides(ts) else { return false };
+        self.func_mut().cast_vla_strides.push((ts as *const TypeSpecifier, strides));
+        true
+    }
+
+    /// Record the strides of the pointer-to-VLA casts that the type of an
+    /// unevaluated operand (sizeof, typeof) depends on, through the
+    /// expressions vla_strides_of_expr follows: `sizeof *(1, (int (*)[n])p)`.
+    /// Evaluates those casts' sizes, as the operand has a VLA type. Whether
+    /// any was recorded.
+    pub(super) fn record_operand_cast_vla_strides(&mut self, expr: &Expr) -> bool {
+        if self.func_state.is_none() {
+            return false;
+        }
+        match expr {
+            Expr::Cast(ts, _, _) => self.record_cast_vla_strides(ts),
+            Expr::ArraySubscript(a, b, _) | Expr::BinaryOp(BinOp::Add | BinOp::Sub, a, b, _) => {
+                let ra = self.record_operand_cast_vla_strides(a);
+                self.record_operand_cast_vla_strides(b) || ra
+            }
+            // One arm: c ? x : y evaluates one, and both have its type.
+            Expr::Conditional(_, a, b, _) => {
+                self.record_operand_cast_vla_strides(a) || self.record_operand_cast_vla_strides(b)
+            }
+            Expr::Deref(inner, _) | Expr::AddressOf(inner, _) | Expr::Comma(_, inner, _)
+            | Expr::UnaryOp(UnaryOp::PreInc | UnaryOp::PreDec, inner, _) | Expr::PostfixOp(_, inner, _)
+            | Expr::Assign(inner, _, _) | Expr::CompoundAssign(_, inner, _, _) => {
+                self.record_operand_cast_vla_strides(inner)
+            }
+            Expr::StmtExpr(compound, _) => match Self::stmt_expr_result(compound) {
+                Some(e) => self.record_operand_cast_vla_strides(e),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether an unevaluated operand (sizeof, typeof) has a variably
+    /// modified type through the pointer-to-VLA casts in it, by `check` (for
+    /// example: its sizeof has a runtime value), with placeholder strides
+    /// recorded for those casts and nothing evaluated. Only then are the
+    /// casts' sizes evaluated (record_operand_cast_vla_strides):
+    /// `typeof((0, (char (*)[g(k)])p)[1] + 0)` is char *, which calls no g.
+    pub(super) fn operand_has_vla_type(&mut self, expr: &Expr, check: impl Fn(&Self) -> bool) -> bool {
+        if self.func_state.is_none() {
+            return false;
+        }
+        let mark = self.func().cast_vla_strides.len();
+        self.func_mut().vla_probe = true;
+        let any = self.record_operand_cast_vla_strides(expr);
+        self.func_mut().vla_probe = false;
+        let vm = any && check(self);
+        self.func_mut().cast_vla_strides.truncate(mark);
+        vm
+    }
+
+    /// The subscript strides of a pointer to VLA type name (`int (*)[n]`),
+    /// evaluating its sizes: entry 0 is the pointee size (see
+    /// LocalInfo::vla_strides). None for any other type, with nothing evaluated.
+    pub(super) fn pointer_type_name_vla_strides(&mut self, ts: &TypeSpecifier) -> Option<Vec<Option<Value>>> {
+        let TypeSpecifier::Pointer(pointee, _) = ts else { return None };
+        let (size, inner) = self.type_name_vla_layout(pointee)?;
+        let mut strides = vec![Some(size)];
+        if inner.is_empty() {
+            strides.push(None);
+        } else {
+            strides.extend(inner);
+        }
+        Some(strides)
+    }
+
     pub(super) fn lower_cast(&mut self, target_type: &TypeSpecifier, inner: &Expr) -> Operand {
-        self.evaluate_vla_type_sizes(target_type);
+        if self.func_state.is_none() || !self.record_cast_vla_strides(target_type) {
+            self.evaluate_vla_type_sizes(target_type);
+        }
         let target_ctype = self.type_spec_to_ctype(target_type);
         let inner_ctype = self.expr_ctype(inner);
 
@@ -494,6 +617,17 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     pub(super) fn lower_sizeof(&mut self, arg: &SizeofArg) -> Operand {
+        // sizeof *(int (*)[n])p or sizeof ((int (*)[n])p)[i]: the operand has
+        // a VLA type, which is evaluated: here, the cast's sizes.
+        // Lowering the operand again would evaluate those sizes twice.
+        if let SizeofArg::Expr(e @ (Expr::ArraySubscript(..) | Expr::Deref(..))) = arg {
+            if self.operand_has_vla_type(e, |s| s.get_vla_sizeof(arg).is_some()) {
+                self.record_operand_cast_vla_strides(e);
+                if let Some(vla_val) = self.get_vla_sizeof(arg) {
+                    return Operand::Value(vla_val);
+                }
+            }
+        }
         if let Some(vla_val) = self.get_vla_sizeof(arg) {
             // An operand of variable length array type is evaluated (C11
             // 6.5.3.4p2): sizeof p[k++] increments k. A named VLA has
@@ -548,6 +682,13 @@ impl Lowerer {
     /// Handles both typedef names that are VLA types and direct Array types
     /// with non-constant size expressions.
     fn compute_vla_sizeof_for_type(&mut self, ts: &TypeSpecifier) -> Option<Value> {
+        // sizeof(typeof(b)) of a VLA b.
+        if let TypeSpecifier::Typeof(e) = ts {
+            if self.operand_has_vla_type(e, |s| s.vla_array_layout(e).is_some()) {
+                self.record_operand_cast_vla_strides(e);
+            }
+            return self.vla_array_layout(e).map(|(size, _)| size);
+        }
         // Check if it's a VLA typedef name with a pre-computed runtime size
         if let TypeSpecifier::TypedefName(name) = ts {
             if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {

@@ -326,7 +326,7 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::StmtExpr(compound, _) => {
                 if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.items.last() {
                     if let Some(ctype) = self.infer_expr_ctype(expr) {
-                        return Some(ctype);
+                        return Some(ctype.rvalue_converted());
                     }
                     // If the last expr is an identifier not in the symbol table
                     // (e.g., inside typeof where the stmt expr was never executed),

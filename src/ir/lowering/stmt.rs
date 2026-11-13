@@ -78,10 +78,58 @@ impl Lowerer {
         }
     }
 
+    /// A declaration's type taken from an expression of variably modified
+    /// type (`typeof(a)`, `typeof(b[0])`, `typeof(p)` for VLAs a, b and a
+    /// pointer p to one; for `__auto_type` see lower_local_decl), which
+    /// resolve_typeof's CType gives without its runtime sizes. An array type
+    /// becomes a hidden VLA typedef with the expression's size and strides,
+    /// so `T x`, `T x[2]`, `T *p` and `typedef T U` work as for a VLA
+    /// typedef; a pointer type gives the strides of the declared pointer (see
+    /// vla_strides_of_expr).
+    fn typeof_vla(&mut self, decl: &Declaration) -> Option<TypeofVla> {
+        let e = match &decl.type_spec {
+            TypeSpecifier::Typeof(e) => e.as_ref(),
+            // typeof(int (*)[n]) p, typeof(typeof(a) *) p.
+            TypeSpecifier::TypeofType(inner) if matches!(**inner, TypeSpecifier::Pointer(..)) => {
+                self.func_state.as_ref()?;
+                return self.pointer_type_name_vla_strides(inner).map(TypeofVla::Pointer);
+            }
+            _ => return None,
+        };
+        self.func_state.as_ref()?;
+        let vm = |s: &Self| s.vla_array_layout(e).is_some() || s.vla_pointee_stride(e).is_some();
+        if self.operand_has_vla_type(e, vm) {
+            self.record_operand_cast_vla_strides(e);
+        }
+        match self.qualified_expr_ctype(e)? {
+            ctype @ CType::Array(..) => {
+                let (size, strides) = self.vla_array_layout(e)?;
+                let n = self.func().next_typeof_vla;
+                self.func_mut().next_typeof_vla += 1;
+                let name = format!("__typeof_vla.{n}");
+                let is_const = self.expr_is_const_qualified(e);
+                self.types.insert_typedef_scoped(name.clone(), ctype);
+                self.types.set_typedef_const_scoped(&name, is_const);
+                self.func_mut().insert_vla_typedef_size_scoped(name.clone(), size, strides);
+                Some(TypeofVla::Array(TypeSpecifier::TypedefName(name)))
+            }
+            CType::Pointer(..) => self.vla_strides_of_expr(e).map(TypeofVla::Pointer),
+            _ => None,
+        }
+    }
+
     pub(super) fn lower_local_decl(&mut self, decl: &Declaration) {
         self.forget_statement_memos();
+        let typeof_vla = self.typeof_vla(decl);
         let mut resolved_type_spec = None;
-        let type_spec = self.resolve_local_type_spec(decl, &mut resolved_type_spec);
+        let type_spec = match &typeof_vla {
+            Some(TypeofVla::Array(ts)) => ts,
+            _ => self.resolve_local_type_spec(decl, &mut resolved_type_spec),
+        };
+        let typeof_ptr_strides = match &typeof_vla {
+            Some(TypeofVla::Pointer(s)) => Some(s.clone()),
+            _ => None,
+        };
 
         self.register_struct_type(type_spec);
 
@@ -149,10 +197,25 @@ impl Lowerer {
             };
 
             self.register_local_var(decl, declarator, type_spec, &da, alloca, alloca_align, vla_size);
+            if let (Some(strides), true) = (&typeof_ptr_strides, declarator.derived.is_empty()) {
+                if let Some(local) = self.func_mut().locals.get_mut(&declarator.name) {
+                    local.vla_strides = strides.clone();
+                }
+            }
             self.track_fptr_sig(declarator, type_spec);
 
             if let Some(ref init) = declarator.init {
                 self.lower_local_var_init(init, decl, declarator, &da, alloca, is_complex, &complex_elem_ctype);
+                // __auto_type p = a + 1 for a VLA a: p takes the strides of
+                // its initializer, read after lowering it (a cast to a pointer
+                // to a VLA type records them then).
+                if let (TypeSpecifier::AutoType, Initializer::Expr(e)) = (&decl.type_spec, init) {
+                    if let Some(strides) = self.vla_strides_of_expr(e) {
+                        if let Some(local) = self.func_mut().locals.get_mut(&declarator.name) {
+                            local.vla_strides = strides;
+                        }
+                    }
+                }
             } else if !self.func().continue_labels.is_empty() && vla_size.is_none() && !da.is_array && !da.is_struct
                 && !is_complex && !decl.object_quals(declarator).volatile
                 && matches!(da.var_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
@@ -1324,4 +1387,13 @@ impl Lowerer {
             _ => None,
         }
     }
+}
+
+/// A declaration type taken from an expression of variably modified type
+/// (see Lowerer::typeof_vla).
+enum TypeofVla {
+    /// The hidden VLA typedef standing for the array type.
+    Array(TypeSpecifier),
+    /// The subscript strides of a pointer to a VLA type.
+    Pointer(Vec<Option<Value>>),
 }

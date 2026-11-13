@@ -141,6 +141,16 @@ pub(super) struct FunctionBuildState {
     /// dimensions, which are evaluated once (`int a[g()][h()]` calls h once).
     /// Cleared at each declarator, while those expressions are alive.
     pub vla_dim_memo: Vec<(*const crate::frontend::parser::ast::Expr, Value)>,
+    /// Runtime subscript strides of the pointer-to-VLA casts lowered so far
+    /// (`(int (*)[n])p`), by the address of the cast's type name, latest
+    /// last: lower_cast evaluates the sizes, and the subscripts, derefs and
+    /// arithmetic on the cast that follow read them (see vla_strides_of_expr).
+    pub cast_vla_strides: Vec<(*const crate::frontend::parser::ast::TypeSpecifier, Vec<Option<Value>>)>,
+    /// Counter for the hidden typedef names that carry typeof(e) of a VLA type.
+    pub next_typeof_vla: u32,
+    /// Set while operand_has_vla_type probes an operand: the cast strides
+    /// recorded then are placeholders, and no size is evaluated.
+    pub vla_probe: bool,
     /// Per-function value counter (reset for each function)
     pub next_value: u32,
     /// Saved stack pointer Value for VLA deallocation.
@@ -202,6 +212,9 @@ impl FunctionBuildState {
             vla_typedef_sizes: FxHashMap::default(),
             vla_typedef_strides: FxHashMap::default(),
             vla_dim_memo: Vec::new(),
+            cast_vla_strides: Vec::new(),
+            next_typeof_vla: 0,
+            vla_probe: false,
             next_value: 0,
             vla_stack_save: None,
             has_vla: false,

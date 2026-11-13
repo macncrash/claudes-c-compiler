@@ -1,4 +1,4 @@
-use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier, UnaryOp};
+use crate::frontend::parser::ast::{BinOp, BlockItem, CompoundStmt, Expr, Stmt, TypeSpecifier, UnaryOp};
 use crate::ir::reexports::{
     Instruction,
     IrBinOp,
@@ -286,14 +286,15 @@ impl Lowerer {
         // before use in pointer arithmetic.
         let index_val = self.emit_implicit_cast(index_val, index_ty, ptr_int_ty);
 
-        // Check for VLA runtime stride first
-        let vla_stride = self.get_vla_stride_for_subscript(actual_base);
-
         // Determine the element size based on subscript depth for multi-dim arrays
         let elem_size = self.get_array_elem_size_for_subscript(actual_base);
 
         // Get the base address - for nested subscripts (a[i][j]), don't load
         let base_addr = self.get_array_base_addr(actual_base);
+
+        // The VLA runtime stride, if any: read after lowering the base, as a
+        // cast to a pointer to a VLA type records its strides when lowered.
+        let vla_stride = self.get_vla_stride_for_subscript(actual_base);
 
         // Compute offset = index * stride (runtime VLA stride or compile-time elem_size)
         let offset = if let Some(stride_val) = vla_stride {
@@ -377,6 +378,12 @@ impl Lowerer {
             Expr::Conditional(_, then_expr, else_expr, _) => {
                 self.vla_strides_of_expr(then_expr).or_else(|| self.vla_strides_of_expr(else_expr))
             }
+            Expr::StmtExpr(compound, _) => self.vla_strides_of_expr(Self::stmt_expr_result(compound)?),
+            Expr::Cast(ts, _, _) => {
+                let key = ts as *const TypeSpecifier;
+                self.func_state.as_ref()?.cast_vla_strides.iter().rev()
+                    .find(|(k, _)| *k == key).map(|(_, s)| s.clone())
+            }
             Expr::AddressOf(inner, _) => {
                 // &a of a VLA a: steps over the whole of a.
                 let size = match inner.as_ref() {
@@ -390,6 +397,39 @@ impl Lowerer {
                 s.extend(self.vla_strides_of_expr(inner).unwrap_or_else(|| vec![None]));
                 Some(s)
             }
+            _ => None,
+        }
+    }
+
+    /// The runtime size and subscript strides (as `LocalInfo::vla_strides`)
+    /// of an expression of VLA array type: a VLA local, or a subscript or
+    /// dereference that reaches a VLA level (`b[i]` of `double b[n][m]`,
+    /// `*p` of `int (*p)[n]`). For `typeof` and `sizeof(typeof(e))`. Not a
+    /// statement expression: its array value decays (`({ a; })` is a pointer).
+    pub(super) fn vla_array_layout(&self, expr: &Expr) -> Option<(Value, Vec<Option<Value>>)> {
+        match expr {
+            Expr::Identifier(name, _) => {
+                let info = self.func_state.as_ref()?.locals.get(name)?;
+                Some((info.vla_size?, info.vla_strides.clone()))
+            }
+            Expr::ArraySubscript(base, index, _) => {
+                let side = if self.expr_is_pointer(index) && !self.expr_is_pointer(base) { index } else { base };
+                let s = self.vla_strides_of_expr(side)?;
+                Some((s.first().copied().flatten()?, s[1..].to_vec()))
+            }
+            Expr::Deref(inner, _) => {
+                let s = self.vla_strides_of_expr(inner)?;
+                Some((s.first().copied().flatten()?, s[1..].to_vec()))
+            }
+            _ => None,
+        }
+    }
+
+    /// The expression whose value a statement expression yields: its last
+    /// item, when that is an expression statement.
+    pub(super) fn stmt_expr_result(compound: &CompoundStmt) -> Option<&Expr> {
+        match compound.items.last()? {
+            BlockItem::Statement(Stmt::Expr(Some(e))) => Some(e),
             _ => None,
         }
     }
