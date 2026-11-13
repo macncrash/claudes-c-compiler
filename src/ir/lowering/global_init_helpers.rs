@@ -54,6 +54,17 @@ pub(super) fn has_array_field_designators(items: &[InitializerItem]) -> bool {
     })
 }
 
+/// The expression of a scalar initializer, braced or not: e or { e }.
+pub(super) fn scalar_init_expr(init: &Initializer) -> Option<&Expr> {
+    match init {
+        Initializer::Expr(expr) => Some(expr),
+        Initializer::List(items) => match items.first().map(|item| &item.init) {
+            Some(Initializer::Expr(expr)) => Some(expr),
+            _ => None,
+        },
+    }
+}
+
 /// Check if an expression contains a string literal anywhere,
 /// including through binary operations and casts (e.g., `"str" + N`).
 pub(super) fn expr_contains_string_literal(expr: &Expr) -> bool {
@@ -63,7 +74,13 @@ pub(super) fn expr_contains_string_literal(expr: &Expr) -> bool {
         Expr::BinaryOp(_, lhs, rhs, _) => {
             expr_contains_string_literal(lhs) || expr_contains_string_literal(rhs)
         }
+        // &"str"[n] and &*"str" are addresses into the literal.
         Expr::Cast(_, inner, _) => expr_contains_string_literal(inner),
+        Expr::AddressOf(inner, _) => match inner.as_ref() {
+            Expr::ArraySubscript(base, index, _) => expr_contains_string_literal(base) || expr_contains_string_literal(index),
+            Expr::Deref(ptr, _) => expr_contains_string_literal(ptr),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -123,7 +140,8 @@ fn expr_might_be_addr(expr: &Expr, enum_constants: &FxHashMap<String, i64>) -> b
         // Member access might be array-to-pointer decay (e.g., s.arr where arr is an array field)
         Expr::MemberAccess(_, _, _) => true,
         // Cast of an address expression
-        Expr::Cast(_, inner, _) => expr_might_be_addr(inner, enum_constants),
+        // *f of a function designator is the function
+        Expr::Cast(_, inner, _) | Expr::Deref(inner, _) => expr_might_be_addr(inner, enum_constants),
         // Binary ops on addresses (e.g., &x + offset, arr + n)
         Expr::BinaryOp(_, lhs, rhs, _) => expr_might_be_addr(lhs, enum_constants) || expr_might_be_addr(rhs, enum_constants),
         // Compound literals may contain addresses
@@ -132,10 +150,12 @@ fn expr_might_be_addr(expr: &Expr, enum_constants: &FxHashMap<String, i64>) -> b
     }
 }
 
-/// Check if a CType contains pointer elements (directly or through arrays/structs).
+/// Check if a CType contains pointer elements (directly or through arrays/structs),
+/// counting pointer-sized integers, which can hold an address constant.
 pub(super) fn type_has_pointer_elements(ty: &CType, ctx: &dyn StructLayoutProvider) -> bool {
     match ty {
         CType::Pointer(_, _) | CType::Function(_) => true,
+        t if t.is_address_sized_integer() => true,
         CType::Array(inner, _) => type_has_pointer_elements(inner, ctx),
         CType::Struct(key) | CType::Union(key) => {
             if let Some(layout) = ctx.get_struct_layout(key) {

@@ -135,6 +135,11 @@ pub struct Lowerer {
     /// TODO: Once ExprId is backed by a counter-based scheme instead of pointer
     /// addresses, the ABA discriminant check can be removed entirely.
     pub(super) expr_ctype_cache: RefCell<FxHashMap<ExprId, (Discriminant<Expr>, Option<CType>)>>,
+    /// Depth of static initializer lowering. Those paths clone initializer
+    /// items into temporaries whose freed addresses the next clone reuses, so
+    /// the address-keyed caches above are not consulted while it is nonzero:
+    /// a later global's &SA[2] took the cached type of an earlier &SA[0].in[1].
+    pub(super) static_init_depth: u32,
     /// Binary operators of the statement being lowered that are not constant
     /// (see eval_const_expr), and the IR types of those asked (get_expr_type).
     /// Cleared at each statement and declaration (forget_statement_memos).
@@ -230,6 +235,7 @@ impl Lowerer {
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),
             expr_ctype_cache: RefCell::new(FxHashMap::default()),
+            static_init_depth: 0,
             not_const_binops: RefCell::new(FxHashSet::default()),
             binop_ir_types: RefCell::new(FxHashMap::default()),
             diagnostics: RefCell::new(diagnostics),

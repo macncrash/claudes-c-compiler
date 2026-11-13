@@ -66,12 +66,31 @@ impl Lowerer {
     /// - `(type *)&x` (cast of address expression)
     /// - `&x + n` or `&x - n` (pointer arithmetic on global address)
     pub(super) fn eval_global_addr_expr(&self, expr: &Expr) -> Option<GlobalInit> {
+        // *f of a function is f (int (*p)(int) = *f was null), and &*e is e.
+        match expr {
+            Expr::Deref(inner, _) if self.is_function_designator(inner) => return self.eval_global_addr_expr(inner),
+            Expr::AddressOf(inner, _) => {
+                if let Expr::Deref(ptr, _) = inner.as_ref() {
+                    return self.eval_global_addr_expr(ptr);
+                }
+            }
+            _ => {}
+        }
         // The general walk catches chains the patterns below miss, which
         // were emitted as null: &so.in[1].s[1], so.m[1], &sarr[2].in[1].i.
         self.eval_global_addr_pattern(expr).or_else(|| {
             let (name, off, _) = self.const_pointer_value(expr)?;
             Some(if off == 0 { GlobalInit::GlobalAddr(name) } else { GlobalInit::GlobalAddrOffset(name, off) })
         })
+    }
+
+    /// A function name, or any number of dereferences of one.
+    fn is_function_designator(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(name, _) => self.known_functions.contains(name) && self.resolve_to_global_name(name).is_none(),
+            Expr::Deref(inner, _) => self.is_function_designator(inner),
+            _ => false,
+        }
     }
 
     /// The address of an lvalue built from a global by members, constant

@@ -103,10 +103,12 @@ impl Lowerer {
         &mut self,
         elements: &mut Vec<GlobalInit>,
         items: &[InitializerItem],
-        _elem_ty: &CType,
+        elem_ty: &CType,
         arr_size: usize,
     ) {
         let ptr_size = crate::common::types::target_ptr_size();
+        // An address-sized integer element keeps its type for constants.
+        let coerce = elem_ty.is_integer().then_some(elem_ty);
 
         // Build a sparse map: for each array index, store the initializer (if any).
         // This correctly handles out-of-order designators like [3]=x, [1]=y.
@@ -134,10 +136,10 @@ impl Lowerer {
         // Emit each element in order
         for slot in &index_inits {
             if let Some(init) = slot {
-                if let Initializer::Expr(ref expr) = init {
-                    self.emit_expr_to_compound(elements, expr, ptr_size, None);
+                // A braced scalar, { e }, is e.
+                if let Some(expr) = h::scalar_init_expr(init) {
+                    self.emit_expr_to_compound(elements, expr, ptr_size, coerce);
                 } else {
-                    // Nested list - zero fill this element
                     push_zero_bytes(elements, ptr_size);
                 }
             } else {
@@ -255,7 +257,9 @@ impl Lowerer {
             if ai >= arr_size { break; }
 
             if let Initializer::Expr(ref expr) = item.init {
-                if elem_is_pointer {
+                if elem_is_pointer && elem_ty.is_integer() {
+                    self.emit_expr_to_compound(elements, expr, elem_size, Some(elem_ty));
+                } else if elem_is_pointer {
                     self.emit_expr_to_compound(elements, expr, ptr_size, None);
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     let elem_ir_ty = IrType::from_ctype(elem_ty);

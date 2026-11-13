@@ -404,7 +404,7 @@ impl Lowerer {
                     }
                     if ai >= arr_size { ai += 1; continue; }
                     let elem_offset = field_offset + ai * ptr_size;
-                    if let Initializer::Expr(ref expr) = inner_item.init {
+                    if let Some(expr) = h::scalar_init_expr(&inner_item.init) {
                         self.write_expr_to_bytes_or_ptrs(
                             expr, &ptr_ty, elem_offset, None, None, bytes, ptr_ranges,
                         );
@@ -777,6 +777,11 @@ impl Lowerer {
         } else if let Some(val) = self.eval_const_expr(expr) {
             let ir_ty = IrType::from_ctype(ty);
             self.write_const_to_bytes(bytes, offset, &val, ir_ty);
+        } else if ty.is_integer() && self.ctype_size(ty) == crate::common::types::target_ptr_size() {
+            // An address cast to a pointer-sized integer: long f = (long)&x.
+            if let Some(addr_init) = self.resolve_ptr_field_init(expr) {
+                ptr_ranges.push((offset, addr_init));
+            }
         }
     }
 

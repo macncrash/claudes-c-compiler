@@ -932,7 +932,9 @@ impl StructLayout {
         }
     }
 
-    /// Check if any field in this layout is or contains a pointer/function type.
+    /// Check if any field in this layout is or contains a pointer/function type,
+    /// or a pointer-sized integer, which a static initializer can fill with an
+    /// address (unsigned long start = (unsigned long)&x).
     /// Recursively checks array element types and nested struct/union fields.
     pub fn has_pointer_fields(&self, ctx: &dyn StructLayoutProvider) -> bool {
         self.fields.iter().any(|f| Self::field_type_has_pointers(&f.ty, ctx))
@@ -942,6 +944,7 @@ impl StructLayout {
     fn field_type_has_pointers(ty: &CType, ctx: &dyn StructLayoutProvider) -> bool {
         match ty {
             CType::Pointer(_, _) | CType::Function(_) => true,
+            t if t.is_address_sized_integer() => true,
             CType::Array(inner, _) => Self::field_type_has_pointers(inner, ctx),
             CType::Struct(key) | CType::Union(key) => {
                 if let Some(layout) = ctx.get_struct_layout(key) {
@@ -1730,6 +1733,13 @@ impl CType {
         }
     }
 
+
+    /// An integer as wide as a pointer: a static initializer may give it an
+    /// address constant.
+    pub fn is_address_sized_integer(&self) -> bool {
+        matches!(self, CType::Long | CType::ULong | CType::LongLong | CType::ULongLong)
+            && self.size() == target_ptr_size()
+    }
 
     pub fn is_integer(&self) -> bool {
         matches!(self, CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort |

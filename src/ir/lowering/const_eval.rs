@@ -117,7 +117,7 @@ impl Lowerer {
         // function no declaration comes between the questions, so the answer
         // for a node that is not constant is kept until the next statement or
         // declaration (forget_statement_memos).
-        if matches!(expr, Expr::BinaryOp(..)) && self.func_state.is_some() {
+        if matches!(expr, Expr::BinaryOp(..)) && self.func_state.is_some() && self.static_init_depth == 0 {
             if self.not_const_binops.borrow().contains(&expr.id()) {
                 return None;
             }

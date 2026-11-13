@@ -52,6 +52,24 @@ impl Lowerer {
         struct_layout: &Option<RcLayout>,
         array_dim_strides: &[usize],
     ) -> GlobalInit {
+        self.static_init_depth += 1;
+        let init = self.lower_global_init_uncached(init, type_spec, base_ty, is_array, elem_size, total_size, struct_layout, array_dim_strides);
+        self.static_init_depth -= 1;
+        init
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_global_init_uncached(
+        &mut self,
+        init: &Initializer,
+        type_spec: &TypeSpecifier,
+        base_ty: IrType,
+        is_array: bool,
+        elem_size: usize,
+        total_size: usize,
+        struct_layout: &Option<RcLayout>,
+        array_dim_strides: &[usize],
+    ) -> GlobalInit {
         let is_long_double_target = self.is_type_spec_long_double(type_spec);
         let is_bool_target = self.is_type_bool(type_spec);
 
@@ -1152,10 +1170,11 @@ impl Lowerer {
             // This is equivalent to "string" + index, but expressed as
             // address-of array subscript on a string literal.
             Expr::AddressOf(inner, _) => {
-                if let Expr::ArraySubscript(base, index, _) = inner.as_ref() {
-                    self.eval_string_literal_with_offset(base, index, false)
-                } else {
-                    None
+                match inner.as_ref() {
+                    Expr::ArraySubscript(base, index, _) => self.eval_string_literal_with_offset(base, index, false)
+                        .or_else(|| self.eval_string_literal_with_offset(index, base, false)),
+                    Expr::Deref(ptr, _) => self.eval_string_literal_addr_expr(ptr),
+                    _ => None,
                 }
             }
             Expr::Cast(_, inner, _) => self.eval_string_literal_addr_expr(inner),
@@ -1182,7 +1201,13 @@ impl Lowerer {
         let (s, kind) = self.extract_string_literal(str_expr)?;
         let offset_val = self.eval_const_expr(offset_expr)?;
         let offset = self.const_to_i64(&offset_val)?;
-        let byte_offset = if negate { -offset } else { offset };
+        // The offset counts elements: L"abc" + 1 is 4 bytes in.
+        let elem = match kind {
+            StringLitKind::Narrow => 1,
+            StringLitKind::Wide => 4,
+            StringLitKind::Char16 => 2,
+        };
+        let byte_offset = if negate { -offset } else { offset } * elem;
         let label = match kind {
             StringLitKind::Narrow => self.intern_string_literal(&s),
             StringLitKind::Wide => self.intern_wide_string_literal(&s),

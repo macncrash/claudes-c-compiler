@@ -1201,7 +1201,8 @@ impl Lowerer {
         // typeof(*(type *)0) patterns (e.g., LIST_ELEM macro) reuse
         // Deref(Cast(...)) addresses.  Cast is also bypassed since
         // type_spec_to_ctype is cheap and always correct.
-        let bypass_cache = matches!(expr, Expr::Identifier(..) | Expr::Deref(..) | Expr::Cast(..));
+        let bypass_cache = matches!(expr, Expr::Identifier(..) | Expr::Deref(..) | Expr::Cast(..))
+            || self.static_init_depth > 0;
         if bypass_cache {
             let result = self.get_expr_ctype_lowerer(expr);
             if result.is_some() {

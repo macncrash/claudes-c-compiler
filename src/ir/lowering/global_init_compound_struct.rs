@@ -579,8 +579,9 @@ impl Lowerer {
                 if let CType::Array(elem_ty, Some(arr_size)) = field_ty {
                     if h::type_has_pointer_elements(elem_ty, &*self.types.borrow_struct_layouts()) {
                         // Distinguish: direct pointer array vs struct-with-pointer-fields array
-                        if matches!(elem_ty.as_ref(), CType::Pointer(_, _) | CType::Function(_)) {
-                            // Array of direct pointers: emit each element as a GlobalAddr or zero
+                        if matches!(elem_ty.as_ref(), CType::Pointer(_, _) | CType::Function(_)) || elem_ty.is_address_sized_integer() {
+                            // Array of direct pointers (or of integers that may hold
+                            // addresses): emit each element as a GlobalAddr or value
                             self.emit_compound_ptr_array_init(elements, nested_items, elem_ty, *arr_size);
                             return;
                         }
