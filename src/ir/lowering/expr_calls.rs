@@ -218,6 +218,14 @@ impl Lowerer {
         } else {
             None
         };
+        // A variadic call through a pointer with no signature recorded
+        // (`int (*volatile vp)(float _Complex, ...)`): the pointer's function
+        // type gives the named parameters, so a named _Complex float is not
+        // taken for a variadic one (packed on Apple arm64).
+        let param_ctypes_for_decompose = param_ctypes_for_decompose.or_else(|| {
+            func_ptr_variadic?;
+            self.func_ptr_param_ctypes(stripped_func).filter(|v| !v.is_empty())
+        });
         self.decompose_complex_call_args(&mut arg_vals, &mut arg_types, &mut struct_arg_sizes, &mut struct_arg_aligns, &mut struct_arg_classes, &mut struct_arg_riscv_float_classes, &param_ctypes_for_decompose, args, call_is_variadic);
 
         let dest = self.fresh_value();
@@ -1012,6 +1020,27 @@ impl Lowerer {
                 // decompose_complex_call_args does to the arguments.
                 return match ctype {
                     CType::Function(ft) if ft.variadic => Some(self.ir_param_count(ft.params.iter().map(|(t, _)| t))),
+                    _ => None,
+                };
+            }
+            if let Expr::Deref(inner, _) = expr {
+                expr = inner;
+            } else {
+                return None;
+            }
+        }
+    }
+
+    /// The named parameter types of a function (pointer) expression's type.
+    fn func_ptr_param_ctypes(&self, func_expr: &Expr) -> Option<Vec<CType>> {
+        let mut expr = func_expr;
+        loop {
+            if let Some(mut ctype) = self.get_expr_ctype(expr) {
+                while let CType::Pointer(inner, _) = ctype {
+                    ctype = *inner;
+                }
+                return match ctype {
+                    CType::Function(ft) => Some(ft.params.iter().map(|(t, _)| t.clone()).collect()),
                     _ => None,
                 };
             }

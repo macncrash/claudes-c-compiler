@@ -1676,7 +1676,8 @@ impl Lowerer {
         // The two F32 components (real, imag) are packed into a single 8-byte value:
         // - x86-64: packed in one XMM register, read as F64
         // - RISC-V: packed in one integer register, read as I64
-        if *ctype == CType::ComplexFloat && (self.target == Target::X86_64 || self.target == Target::Riscv64) {
+        // - Apple arm64: one 8-byte stack slot, read as I64 (packs_complex_float_variadic)
+        if *ctype == CType::ComplexFloat && (self.target == Target::X86_64 || self.packs_complex_float_variadic()) {
             let read_ty = if self.target == Target::X86_64 { IrType::F64 } else { IrType::I64 };
             let packed = self.fresh_value();
             self.emit(Instruction::VaArg {

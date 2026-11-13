@@ -317,8 +317,10 @@ impl Lowerer {
     /// Returns true if the target packs _Complex float into a single 8-byte value
     /// for variadic function calls. On RISC-V, variadic float args go through GP
     /// registers, so _Complex float (2xF32) must be packed into one I64 GP register.
+    /// On Apple arm64 every variadic argument takes 8-byte stack slots, and a
+    /// _Complex float takes one, holding both parts (as clang passes it).
     pub(super) fn packs_complex_float_variadic(&self) -> bool {
-        self.target == Target::Riscv64
+        self.target == Target::Riscv64 || self.target.is_darwin()
     }
 
     /// The FP-register classification of a struct passed or returned by value:
