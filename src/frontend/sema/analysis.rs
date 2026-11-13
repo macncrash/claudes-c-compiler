@@ -583,7 +583,7 @@ impl SemanticAnalyzer {
         match init {
             Initializer::List(items) => {
                 // Check for brace-wrapped string literal: char c[] = {"hello"}
-                let is_char_elem = matches!(elem_ty, CType::Char | CType::UChar);
+                let is_char_elem = matches!(elem_ty, CType::Char | CType::SChar | CType::UChar);
                 let is_int_elem = matches!(elem_ty, CType::Int | CType::UInt);
                 if items.len() == 1 && items[0].designators.is_empty() {
                     if is_char_elem {
@@ -683,7 +683,7 @@ impl SemanticAnalyzer {
             Initializer::Expr(expr) => {
                 // String literal initializer for char arrays: char s[] = "hello"
                 match (elem_ty, expr) {
-                    (CType::Char | CType::UChar, Expr::StringLiteral(s, _)) => {
+                    (CType::Char | CType::SChar | CType::UChar, Expr::StringLiteral(s, _)) => {
                         Some(s.chars().count() + 1) // +1 for null terminator
                     }
                     (CType::Int | CType::UInt, Expr::WideStringLiteral(s, _)) => {

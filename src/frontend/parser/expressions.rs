@@ -55,7 +55,7 @@ impl Parser {
     /// this currently hardcodes 64-bit sizes. Only affects ext_vector_type (not vector_size).
     fn estimate_type_size(&self, ts: &TypeSpecifier) -> usize {
         match ts {
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar | TypeSpecifier::Bool => 1,
+            TypeSpecifier::Char | TypeSpecifier::SignedChar | TypeSpecifier::UnsignedChar | TypeSpecifier::Bool => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
             TypeSpecifier::Int | TypeSpecifier::UnsignedInt
             | TypeSpecifier::Signed | TypeSpecifier::Unsigned => 4,
@@ -198,8 +198,13 @@ impl Parser {
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
+                self.attrs.set_const(false);
                 if let Some(type_spec) = self.parse_type_specifier() {
+                    let base_const = self.attrs.parsing_const();
                     let mut result_type = self.parse_abstract_declarator_suffix(type_spec);
+                    if base_const {
+                        result_type.mark_const_base();
+                    }
                     if self.attrs.parsing_volatile() {
                         result_type.mark_volatile_pointers();
                     }

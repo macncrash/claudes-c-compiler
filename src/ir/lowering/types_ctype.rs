@@ -23,6 +23,7 @@ impl Lowerer {
             CType::Void => TypeSpecifier::Void,
             CType::Bool => TypeSpecifier::Bool,
             CType::Char => TypeSpecifier::Char,
+            CType::SChar => TypeSpecifier::SignedChar,
             CType::UChar => TypeSpecifier::UnsignedChar,
             CType::Short => TypeSpecifier::Short,
             CType::UShort => TypeSpecifier::UnsignedShort,
@@ -544,7 +545,7 @@ impl type_builder::TypeConvertContext for Lowerer {
                 return ctype;
             }
         }
-        self.get_expr_ctype(expr).unwrap_or(CType::Int)
+        self.qualified_expr_ctype(expr).unwrap_or(CType::Int)
     }
 
     fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize> {

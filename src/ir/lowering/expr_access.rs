@@ -5,6 +5,7 @@
 //! Extracted from expr.rs to keep expression lowering manageable.
 
 use crate::frontend::parser::ast::{
+    BinOp,
     BlockItem,
     CompoundStmt,
     Designator,
@@ -15,6 +16,7 @@ use crate::frontend::parser::ast::{
     SizeofArg,
     Stmt,
     TypeSpecifier,
+    UnaryOp,
 };
 use crate::ir::reexports::{
     Instruction,
@@ -619,8 +621,11 @@ impl Lowerer {
                 (CType::Pointer(a, qa), CType::Pointer(b, qb)) => {
                     return qa.pointer_const == qb.pointer_const && self.ctype_matches_generic(a, b);
                 }
-                (CType::Array(a, _), CType::Array(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
+                // Below the top level (decayed by the caller) an array is
+                // compatible only with an array of the same length, or of
+                // unknown length: int (*)[3] is not int (*)[4] or int **.
+                (CType::Array(a, na), CType::Array(b, nb)) => {
+                    return (na.is_none() || nb.is_none() || na == nb) && self.ctype_matches_generic(a, b);
                 }
                 // Parameter names are not part of a function type.
                 (CType::Function(a), CType::Function(b)) => {
@@ -633,12 +638,6 @@ impl Lowerer {
                 // Vector), we must compare the full type, not just the discriminant.
                 // Primitive types (Int, Float, etc.) have no data so PartialEq works too.
                 _ => return controlling == assoc,
-            }
-        }
-        // Array decays to pointer for _Generic matching
-        if let CType::Array(elem, _) = controlling {
-            if let CType::Pointer(pointee, _) = assoc {
-                return self.ctype_matches_generic(elem, pointee);
             }
         }
         // An enum matches its underlying integer type (unsigned int unless
@@ -658,6 +657,7 @@ impl Lowerer {
     /// subscript, member access and comma expressions.
     pub(super) fn expr_is_const_qualified(&self, expr: &Expr) -> bool {
         match expr {
+            Expr::Identifier(name, _) if self.func_name_ctype(name).is_some() => true,
             Expr::Identifier(name, _) => {
                 if let Some(ref fs) = self.func_state {
                     if let Some(info) = fs.locals.get(name) {
@@ -685,9 +685,38 @@ impl Lowerer {
                 };
                 field_const || (reaches && self.expr_is_const_qualified(base))
             }
-            // Comma: const-ness comes from the right-hand operand.
+            // Comma: a pointer's (or decayed array's) const-ness comes from
+            // the right-hand operand; any other result is an rvalue, whose
+            // own const is gone.
             Expr::Comma(_, rhs, _) => {
-                self.expr_is_const_qualified(rhs)
+                matches!(self.get_expr_ctype(rhs), Some(CType::Pointer(..) | CType::Array(..)))
+                    && self.expr_is_const_qualified(rhs)
+            }
+            // A cast or compound literal of pointer type: its base type was
+            // written const (`(const int *)p`) or is a const typedef's
+            // (`(CI *)p`). Other casts are rvalues, whose const lvalue
+            // conversion drops anyway.
+            Expr::Cast(ts, _, _) | Expr::CompoundLiteral(ts, _, _) => {
+                let mut leaf = ts;
+                while let TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) = leaf {
+                    leaf = inner;
+                }
+                matches!(self.type_spec_to_ctype(ts), CType::Pointer(..))
+                    && (ts.has_const_base() || self.base_is_const(leaf, false))
+            }
+            // Pointer arithmetic, assignment and increments keep the
+            // pointer operand's type: `cip + 1` is still `const int *`.
+            Expr::BinaryOp(BinOp::Add | BinOp::Sub, lhs, rhs, _) => {
+                match (self.get_expr_ctype(lhs), self.get_expr_ctype(rhs)) {
+                    (Some(CType::Pointer(..) | CType::Array(..)), Some(r)) if r.is_integer() => self.expr_is_const_qualified(lhs),
+                    (Some(l), Some(CType::Pointer(..) | CType::Array(..))) if l.is_integer() => self.expr_is_const_qualified(rhs),
+                    _ => false,
+                }
+            }
+            Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _)
+            | Expr::PostfixOp(_, lhs, _) | Expr::UnaryOp(UnaryOp::PreInc | UnaryOp::PreDec, lhs, _) => {
+                matches!(self.get_expr_ctype(lhs), Some(CType::Pointer(..)))
+                    && self.expr_is_const_qualified(lhs)
             }
             // c ? p : q of pointers points to a type with the qualifiers of
             // both pointees (C11 6.5.15p6); other results are not lvalues.
@@ -704,6 +733,17 @@ impl Lowerer {
     /// a pointer member takes from a const struct (`cs.p` is `int *const`
     /// when `cs` is const), also through `&`.
     pub(super) fn qualified_expr_ctype(&self, expr: &Expr) -> Option<CType> {
+        // A string literal is an array (`typeof("ab")` is char[3]), which
+        // get_expr_ctype gives already decayed.
+        let literal = match expr {
+            Expr::StringLiteral(s, _) => Some((CType::Char, s.chars().count())),
+            Expr::WideStringLiteral(s, _) => Some((CType::Int, s.chars().count())),
+            Expr::Char16StringLiteral(s, _) => Some((CType::UShort, s.chars().count())),
+            _ => None,
+        };
+        if let Some((elem, len)) = literal {
+            return Some(CType::Array(Box::new(elem), Some(len + 1)));
+        }
         self.get_expr_ctype(expr).map(|ctype| self.with_member_const(expr, ctype))
     }
 

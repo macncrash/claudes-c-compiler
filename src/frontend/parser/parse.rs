@@ -37,7 +37,7 @@ impl ModeKind {
             | TypeSpecifier::UnsignedChar | TypeSpecifier::UnsignedShort
         );
         match self {
-            ModeKind::QI => if is_unsigned { TypeSpecifier::UnsignedChar } else { TypeSpecifier::Char },
+            ModeKind::QI => if is_unsigned { TypeSpecifier::UnsignedChar } else { TypeSpecifier::SignedChar },
             ModeKind::HI => if is_unsigned { TypeSpecifier::UnsignedShort } else { TypeSpecifier::Short },
             ModeKind::SI => if is_unsigned { TypeSpecifier::UnsignedInt } else { TypeSpecifier::Int },
             ModeKind::DI => if is_unsigned { TypeSpecifier::UnsignedLongLong } else { TypeSpecifier::LongLong },
@@ -1274,7 +1274,7 @@ impl Parser {
         let ptr_sz = target_ptr_size();
         match ts {
             TypeSpecifier::Void | TypeSpecifier::Bool
-            | TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some(1),
+            | TypeSpecifier::Char | TypeSpecifier::SignedChar | TypeSpecifier::UnsignedChar => Some(1),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some(2),
             TypeSpecifier::Int | TypeSpecifier::UnsignedInt
             | TypeSpecifier::Signed | TypeSpecifier::Unsigned
@@ -1330,7 +1330,7 @@ impl Parser {
         let ptr_sz = target_ptr_size();
         match ts {
             TypeSpecifier::Void | TypeSpecifier::Bool
-            | TypeSpecifier::Char | TypeSpecifier::UnsignedChar => 1,
+            | TypeSpecifier::Char | TypeSpecifier::SignedChar | TypeSpecifier::UnsignedChar => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
             TypeSpecifier::Int | TypeSpecifier::UnsignedInt
             | TypeSpecifier::Signed | TypeSpecifier::Unsigned

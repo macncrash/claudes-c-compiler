@@ -521,7 +521,13 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// Resolve a _Generic selection based on the controlling expression's type.
     fn infer_generic_selection_ctype(&self, controlling: &Expr, associations: &[GenericAssociation]) -> Option<CType> {
-        let controlling_ct = self.infer_expr_ctype(controlling);
+        // Lvalue conversion: arrays and functions decay to pointers (only at
+        // the top level: a pointer to an array stays one).
+        let controlling_ct = self.infer_expr_ctype(controlling).map(|ct| match ct {
+            CType::Array(elem, _) => CType::Pointer(elem, AccessQuals::NONE),
+            CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), AccessQuals::NONE),
+            other => other,
+        });
         let mut default_expr: Option<&Expr> = None;
 
         for assoc in associations {
@@ -545,7 +551,9 @@ impl<'a> ExprTypeChecker<'a> {
     }
 
     /// Check if two CTypes match for _Generic selection purposes.
-    /// Uses compatible-type rules: ignores qualifiers, matches arrays with pointers.
+    /// Uses compatible-type rules and ignores qualifiers. The controlling
+    /// type is already decayed; an array beneath a pointer is compatible
+    /// only with an array of the same length (or of unknown length).
     fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
         // Exact match
         if std::mem::discriminant(controlling) == std::mem::discriminant(assoc) {
@@ -553,19 +561,13 @@ impl<'a> ExprTypeChecker<'a> {
                 (CType::Pointer(a, _), CType::Pointer(b, _)) => {
                     return self.ctype_matches_generic(a, b);
                 }
-                (CType::Array(a, _), CType::Array(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
+                (CType::Array(a, na), CType::Array(b, nb)) => {
+                    return (na.is_none() || nb.is_none() || na == nb) && self.ctype_matches_generic(a, b);
                 }
                 // For types that carry identity data (Struct, Union, Enum, Function,
                 // Vector), we must compare the full type, not just the discriminant.
                 // Primitive types (Int, Float, etc.) have no data so PartialEq works too.
                 _ => return controlling == assoc,
-            }
-        }
-        // Array decays to pointer for _Generic matching
-        if let CType::Array(elem, _) = controlling {
-            if let CType::Pointer(pointee, _) = assoc {
-                return self.ctype_matches_generic(elem, pointee);
             }
         }
         // An enum matches its underlying integer type (unsigned int unless
@@ -587,6 +589,7 @@ impl<'a> ExprTypeChecker<'a> {
             TypeSpecifier::Void => CType::Void,
             TypeSpecifier::Bool => CType::Bool,
             TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::SignedChar => CType::SChar,
             TypeSpecifier::UnsignedChar => CType::UChar,
             TypeSpecifier::Short => CType::Short,
             TypeSpecifier::UnsignedShort => CType::UShort,

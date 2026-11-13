@@ -17,6 +17,9 @@ impl Lowerer {
 
     /// Get the sizeof for an identifier expression.
     fn sizeof_identifier(&self, name: &str) -> usize {
+        if let Some(ct) = self.func_name_ctype(name) {
+            return self.ctype_size(&ct);
+        }
         if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
             if info.is_array || info.is_struct {
                 return info.alloc_size;
@@ -196,8 +199,13 @@ impl Lowerer {
             BinOp::Shl | BinOp::Shr => {
                 self.sizeof_arith_operand(lhs).max(4) // integer promotion of left operand only
             }
-            // Arithmetic/bitwise: usual arithmetic conversions
+            // Arithmetic/bitwise: usual arithmetic conversions, which are
+            // not simply the larger operand: unsigned long long * float is
+            // a float.
             _ => {
+                if let Some(ct) = self.get_binop_ctype(op, lhs, rhs).filter(|ct| ct.is_arithmetic()) {
+                    return self.ctype_size(&ct);
+                }
                 let ls = self.sizeof_arith_operand(lhs);
                 let rs = self.sizeof_arith_operand(rhs);
                 ls.max(rs).max(4) // integer promotion
@@ -222,7 +230,7 @@ impl Lowerer {
             return true;
         }
         if let Some(ctype) = self.get_expr_ctype(expr) {
-            return matches!(ctype, CType::Pointer(_, _) | CType::Array(_, _));
+            return matches!(ctype, CType::Pointer(_, _) | CType::Array(_, _) | CType::Function(_));
         }
         false
     }
@@ -362,9 +370,13 @@ impl Lowerer {
                 self.sizeof_expr(lhs)
             }
 
-            // Comma: type of the right expression
+            // Comma: type of the right expression, which is not an lvalue,
+            // so an array or function there decays: sizeof (0, a) is a
+            // pointer's size.
             Expr::Comma(_, rhs, _) => {
-                self.sizeof_expr(rhs)
+                let decays = matches!(**rhs, Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..))
+                    || matches!(self.get_expr_ctype(rhs), Some(CType::Array(..) | CType::Function(..)));
+                if decays { crate::common::types::target_ptr_size() } else { self.sizeof_expr(rhs) }
             }
 
             // Function call: use the actual return type

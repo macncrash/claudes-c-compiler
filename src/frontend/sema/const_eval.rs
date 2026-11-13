@@ -622,7 +622,7 @@ impl<'a> SemaConstEval<'a> {
             CType::Float => IrConst::F32(fv as f32),
             CType::Double => IrConst::F64(fv),
             CType::LongDouble => IrConst::long_double_with_bytes(fv, *bytes),
-            CType::Char => IrConst::I8(f128_bytes_to_i64(bytes)? as i8),
+            CType::Char | CType::SChar => IrConst::I8(f128_bytes_to_i64(bytes)? as i8),
             CType::UChar => IrConst::I32(f128_bytes_to_u64(bytes)? as u8 as i32),
             CType::Short => IrConst::I16(f128_bytes_to_i64(bytes)? as i16),
             CType::UShort => IrConst::I32(f128_bytes_to_u64(bytes)? as u16 as i32),
@@ -643,7 +643,7 @@ impl<'a> SemaConstEval<'a> {
             CType::Float => IrConst::F32(fv as f32),
             CType::Double => IrConst::F64(fv),
             CType::LongDouble => IrConst::long_double(fv),
-            CType::Char => IrConst::I8(fv as i8),
+            CType::Char | CType::SChar => IrConst::I8(fv as i8),
             CType::UChar => IrConst::I32(fv as u8 as i32),
             CType::Short => IrConst::I16(fv as i16),
             CType::UShort => IrConst::I32(fv as u16 as i32),
@@ -842,7 +842,7 @@ impl<'a> SemaConstEval<'a> {
         let ptr_sz = target_ptr_size();
         match spec {
             TypeSpecifier::Void => Some(0),
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some(1),
+            TypeSpecifier::Char | TypeSpecifier::SignedChar | TypeSpecifier::UnsignedChar => Some(1),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some(2),
             TypeSpecifier::Int | TypeSpecifier::UnsignedInt
             | TypeSpecifier::Signed | TypeSpecifier::Unsigned => Some(4),
@@ -973,7 +973,7 @@ impl<'a> SemaConstEval<'a> {
         let ptr_sz = target_ptr_size();
         match spec {
             TypeSpecifier::Void | TypeSpecifier::Bool => 1,
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => 1,
+            TypeSpecifier::Char | TypeSpecifier::SignedChar | TypeSpecifier::UnsignedChar => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
             TypeSpecifier::Int | TypeSpecifier::UnsignedInt
             | TypeSpecifier::Signed | TypeSpecifier::Unsigned => 4,
@@ -1153,6 +1153,7 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
         TypeSpecifier::Void => CType::Void,
         TypeSpecifier::Bool => CType::Bool,
         TypeSpecifier::Char => CType::Char,
+        TypeSpecifier::SignedChar => CType::SChar,
         TypeSpecifier::UnsignedChar => CType::UChar,
         TypeSpecifier::Short => CType::Short,
         TypeSpecifier::UnsignedShort => CType::UShort,

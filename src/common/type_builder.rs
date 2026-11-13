@@ -62,6 +62,7 @@ pub trait TypeConvertContext {
             // === 22 primitive types (identical in sema and lowering) ===
             TypeSpecifier::Void => CType::Void,
             TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::SignedChar => CType::SChar,
             TypeSpecifier::UnsignedChar => CType::UChar,
             TypeSpecifier::Short => CType::Short,
             TypeSpecifier::UnsignedShort => CType::UShort,

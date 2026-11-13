@@ -1369,7 +1369,7 @@ impl Lowerer {
                 let num_elems = match &item.init {
                     Initializer::List(sub_items) => sub_items.len(),
                     Initializer::Expr(Expr::StringLiteral(s, _)) => {
-                        if matches!(elem_ty.as_ref(), CType::Char | CType::UChar) {
+                        if matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar) {
                             s.len() + 1
                         } else {
                             items.len() - item_idx
@@ -1449,7 +1449,7 @@ impl Lowerer {
                     && item.designators.is_empty()
                 {
                     let is_string_literal = matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
-                    let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::UChar);
+                    let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar);
                     if !(is_string_literal && is_char_array) {
                         let scalars_per_elem = h::count_flat_init_scalars(elem_ty, &*self.types.borrow_struct_layouts());
                         let total_scalars = arr_size * scalars_per_elem;

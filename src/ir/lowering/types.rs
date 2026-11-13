@@ -157,7 +157,7 @@ impl Lowerer {
         match ts {
             TypeSpecifier::Void => IrType::Void,
             TypeSpecifier::Bool => IrType::U8,
-            TypeSpecifier::Char => IrType::I8,
+            TypeSpecifier::Char | TypeSpecifier::SignedChar => IrType::I8,
             TypeSpecifier::UnsignedChar => IrType::U8,
             TypeSpecifier::Short => IrType::I16,
             TypeSpecifier::UnsignedShort => IrType::U16,
@@ -223,7 +223,7 @@ impl Lowerer {
         // On i686 (ILP32): long=4, pointer=4, double aligned to 4, long double=12 aligned to 4
         match ts {
             TypeSpecifier::Void | TypeSpecifier::Bool => Some((1, 1)),
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some((1, 1)),
+            TypeSpecifier::Char | TypeSpecifier::SignedChar | TypeSpecifier::UnsignedChar => Some((1, 1)),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some((2, 2)),
             TypeSpecifier::Int | TypeSpecifier::UnsignedInt
             | TypeSpecifier::Signed | TypeSpecifier::Unsigned => Some((4, 4)),

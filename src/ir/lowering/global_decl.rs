@@ -126,7 +126,10 @@ impl Lowerer {
                     resolved_ctype = existing.clone();
                 }
             }
-            self.types.typedefs.insert(declarator.name.clone(), resolved_ctype);
+            // `typedef const IP CIP;` of a pointer typedef makes the pointer const.
+            let mut resolved_ctype = Some(resolved_ctype);
+            self.mark_written_pointer_const(&mut resolved_ctype, &decl.type_spec, decl.is_const());
+            self.types.typedefs.insert(declarator.name.clone(), resolved_ctype.expect("typedef type"));
             let is_const = self.base_is_const(&decl.type_spec, decl.is_const());
             self.types.set_typedef_const_scoped(&declarator.name, is_const);
             if is_enum_type && declarator.derived.is_empty() {

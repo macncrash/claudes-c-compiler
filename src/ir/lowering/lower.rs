@@ -257,6 +257,17 @@ impl Lowerer {
         self.func_state.as_ref().expect("not inside a function")
     }
 
+    /// The type of `__func__` (and `__FUNCTION__`, `__PRETTY_FUNCTION__`)
+    /// inside a function: `static const char __func__[]` holding its name
+    /// (C11 6.4.2.2), so `sizeof __func__` counts the terminating NUL.
+    pub(super) fn func_name_ctype(&self, name: &str) -> Option<CType> {
+        if !matches!(name, "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__") {
+            return None;
+        }
+        let fs = self.func_state.as_ref()?;
+        Some(CType::Array(Box::new(CType::Char), Some(fs.name.len() + 1)))
+    }
+
     /// Mutably access the current function build state (panics if not inside a function).
     #[inline]
     pub(super) fn func_mut(&mut self) -> &mut FunctionBuildState {

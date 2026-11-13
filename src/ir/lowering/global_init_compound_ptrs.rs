@@ -288,7 +288,7 @@ impl Lowerer {
             if matches!(&sub_item.init, Initializer::Expr(_)) {
                 if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
                     // Don't apply flat consumption for string literals initializing char arrays
-                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::UChar)
+                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar)
                         && matches!(&sub_item.init, Initializer::Expr(Expr::StringLiteral(..)));
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(
@@ -379,7 +379,7 @@ impl Lowerer {
             // { "yz" } for a char array member: the string's bytes.
             if let (CType::Array(ref elem, Some(n)), [only]) = (&field.ty, inner_items.as_slice()) {
                 if let (true, Initializer::Expr(Expr::StringLiteral(s, _))) =
-                    (matches!(elem.as_ref(), CType::Char | CType::UChar) && only.designators.is_empty(), &only.init)
+                    (matches!(elem.as_ref(), CType::Char | CType::SChar | CType::UChar) && only.designators.is_empty(), &only.init)
                 {
                     Self::write_string_to_bytes(bytes, field_offset, s, *n);
                     return;
@@ -709,7 +709,7 @@ impl Lowerer {
             // an array field, consume consecutive items to fill the array elements.
             if matches!(&inner_item.init, Initializer::Expr(_)) {
                 if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
-                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::UChar)
+                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar)
                         && matches!(&inner_item.init, Initializer::Expr(Expr::StringLiteral(..)));
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(
@@ -770,7 +770,7 @@ impl Lowerer {
             // String literal initializing a char array field (e.g., {"hello", &ptr} in a struct
             // with pointer members). write_string_to_bytes handles copying the string bytes.
             if let CType::Array(ref elem, Some(arr_size)) = ty {
-                if matches!(elem.as_ref(), CType::Char | CType::UChar) {
+                if matches!(elem.as_ref(), CType::Char | CType::SChar | CType::UChar) {
                     Self::write_string_to_bytes(bytes, offset, s, *arr_size);
                 }
             }
@@ -1040,7 +1040,7 @@ impl Lowerer {
             // Brace elision for array fields within the sub-struct
             if matches!(&inner_item.init, Initializer::Expr(_)) {
                 if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
-                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::UChar)
+                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar)
                         && matches!(&inner_item.init, Initializer::Expr(Expr::StringLiteral(..)));
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(

@@ -267,6 +267,12 @@ impl AliasClass {
 /// itself is const (`int *const p`). Only `_Generic` and `__typeof__` look
 /// at it, so equality and hashing ignore it and types compare as before.
 ///
+/// `pointee_const` says what the pointer points to is const. Only a type
+/// name in a cast or compound literal sets it, on its innermost pointer
+/// (`(const int **)p`), where no declaration records that const; like
+/// `pointer_const` it is for `_Generic` and `__typeof__`, and equality and
+/// hashing ignore it.
+///
 /// `alias` is set only on an lvalue's qualifiers, to the class of the
 /// scalar it designates (see AliasClass); types carry ANY, and equality
 /// and hashing ignore it too.
@@ -275,6 +281,7 @@ pub struct AccessQuals {
     pub space: AddressSpace,
     pub volatile: bool,
     pub pointer_const: bool,
+    pub pointee_const: bool,
     pub alias: AliasClass,
 }
 
@@ -294,8 +301,8 @@ impl std::hash::Hash for AccessQuals {
 }
 
 impl AccessQuals {
-    pub const NONE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: false, pointer_const: false, alias: AliasClass::ANY };
-    pub const VOLATILE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: true, pointer_const: false, alias: AliasClass::ANY };
+    pub const NONE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: false, pointer_const: false, pointee_const: false, alias: AliasClass::ANY };
+    pub const VOLATILE: AccessQuals = AccessQuals { space: AddressSpace::Default, volatile: true, pointer_const: false, pointee_const: false, alias: AliasClass::ANY };
 
     pub fn in_space(space: AddressSpace) -> Self {
         AccessQuals { space, ..AccessQuals::NONE }
@@ -308,6 +315,7 @@ impl AccessQuals {
             space: if self.space == AddressSpace::Default { other.space } else { self.space },
             volatile: self.volatile || other.volatile,
             pointer_const: self.pointer_const || other.pointer_const,
+            pointee_const: self.pointee_const || other.pointee_const,
             alias: AliasClass::ANY,
         }
     }
@@ -319,6 +327,9 @@ pub enum CType {
     Void,
     Bool,
     Char,
+    /// `signed char`: represented as `char` but a distinct type (see
+    /// TypeSpecifier::SignedChar).
+    SChar,
     UChar,
     Short,
     UShort,
@@ -1527,6 +1538,7 @@ impl std::fmt::Display for CType {
             CType::Void => write!(f, "void"),
             CType::Bool => write!(f, "_Bool"),
             CType::Char => write!(f, "char"),
+            CType::SChar => write!(f, "signed char"),
             CType::UChar => write!(f, "unsigned char"),
             CType::Short => write!(f, "short"),
             CType::UShort => write!(f, "unsigned short"),
@@ -1637,7 +1649,7 @@ impl CType {
         let ptr_sz = target_ptr_size();
         match self {
             CType::Void => 0,
-            CType::Bool | CType::Char | CType::UChar => 1,
+            CType::Bool | CType::Char | CType::SChar | CType::UChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 4,
             // ILP32: long = 4 bytes; LP64: long = 8 bytes
@@ -1673,7 +1685,7 @@ impl CType {
         let ptr_sz = target_ptr_size();
         match self {
             CType::Void => 1,
-            CType::Bool | CType::Char | CType::UChar => 1,
+            CType::Bool | CType::Char | CType::SChar | CType::UChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 4,
             // ILP32: long aligned to 4; LP64: long aligned to 8
@@ -1742,14 +1754,14 @@ impl CType {
     }
 
     pub fn is_integer(&self) -> bool {
-        matches!(self, CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort |
+        matches!(self, CType::Bool | CType::Char | CType::SChar | CType::UChar | CType::Short | CType::UShort |
                        CType::Int | CType::UInt | CType::Long | CType::ULong |
                        CType::LongLong | CType::ULongLong |
                        CType::Int128 | CType::UInt128 | CType::Enum(_))
     }
 
     pub fn is_signed(&self) -> bool {
-        matches!(self, CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128)
+        matches!(self, CType::Char | CType::SChar | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128)
     }
 
     /// Whether this is an enum type, or a pointer to or array of one.
@@ -1819,7 +1831,7 @@ impl CType {
     /// Short/UShort all fit in int).
     pub fn integer_promoted(&self) -> CType {
         match self {
-            CType::Bool | CType::Char | CType::UChar
+            CType::Bool | CType::Char | CType::SChar | CType::UChar
             | CType::Short | CType::UShort => CType::Int,
             // An enum promotes as its underlying type.
             CType::Enum(e) => e.underlying_type().integer_promoted(),
@@ -1857,7 +1869,7 @@ impl CType {
     pub fn integer_rank(&self) -> u32 {
         match self {
             CType::Bool => 0,
-            CType::Char | CType::UChar => 1,
+            CType::Char | CType::SChar | CType::UChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 3,
             CType::Enum(e) => {
@@ -1983,12 +1995,27 @@ impl CType {
     /// `__is_constexpr` macro which relies on `sizeof` of a conditional where
     /// one branch is `(void*)runtime_zero` (NOT an NPC → type is void*, sizeof 1)
     /// vs `(void*)constant_zero` (IS an NPC → type is int*, sizeof 4).
+    /// The type of an operand's value once it is no longer an lvalue (C11
+    /// 6.3.2.1): an array decays to a pointer to its element, a function
+    /// to a pointer to it, and a pointer loses its own const.
+    pub fn rvalue_converted(self) -> CType {
+        match self {
+            CType::Array(elem, _) => CType::Pointer(elem, AccessQuals::NONE),
+            CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), AccessQuals::NONE),
+            CType::Pointer(inner, quals) => CType::Pointer(inner, AccessQuals { pointer_const: false, ..quals }),
+            other => other,
+        }
+    }
+
     pub fn conditional_composite_type(
         then_ct: Option<CType>,
         else_ct: Option<CType>,
         then_is_npc: bool,
         else_is_npc: bool,
     ) -> Option<CType> {
+        // The operands are rvalues: `c ? a : 0` of an array is a pointer.
+        let then_ct = then_ct.map(CType::rvalue_converted);
+        let else_ct = else_ct.map(CType::rvalue_converted);
         match (then_ct, else_ct) {
             (Some(t), Some(e)) => {
                 // Both void
@@ -2231,7 +2258,7 @@ impl IrType {
         match ct {
             CType::Void => IrType::Void,
             CType::Bool => IrType::U8,
-            CType::Char => IrType::I8,
+            CType::Char | CType::SChar => IrType::I8,
             CType::UChar => IrType::U8,
             CType::Short => IrType::I16,
             CType::UShort => IrType::U16,

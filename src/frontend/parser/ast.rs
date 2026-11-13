@@ -489,6 +489,9 @@ pub enum Designator {
 pub enum TypeSpecifier {
     Void,
     Char,
+    /// `signed char`: the same representation as `char` (signed here) but a
+    /// distinct type (C11 6.2.5p15), which _Generic tells apart.
+    SignedChar,
     Short,
     Int,
     Long,
@@ -572,6 +575,40 @@ impl ParamDecl {
 }
 
 impl TypeSpecifier {
+    /// The innermost pointer level reachable through pointers and arrays:
+    /// the one whose pointee is the base type.
+    fn innermost_pointer_quals(&mut self) -> Option<&mut AccessQuals> {
+        match self {
+            TypeSpecifier::Pointer(inner, quals) => {
+                if matches!(**inner, TypeSpecifier::Pointer(..) | TypeSpecifier::Array(..)) {
+                    if let Some(q) = inner.innermost_pointer_quals() {
+                        return Some(q);
+                    }
+                }
+                Some(quals)
+            }
+            TypeSpecifier::Array(inner, _) => inner.innermost_pointer_quals(),
+            _ => None,
+        }
+    }
+
+    /// Record that the base type of a type name's pointer was written const
+    /// (`(const int **)p`): see AccessQuals::pointee_const.
+    pub fn mark_const_base(&mut self) {
+        if let Some(q) = self.innermost_pointer_quals() {
+            q.pointee_const = true;
+        }
+    }
+
+    /// Whether mark_const_base marked this type.
+    pub fn has_const_base(&self) -> bool {
+        match self {
+            TypeSpecifier::Pointer(inner, quals) => quals.pointee_const || inner.has_const_base(),
+            TypeSpecifier::Array(inner, _) => inner.has_const_base(),
+            _ => false,
+        }
+    }
+
     /// Mark every pointer level reachable through pointers and arrays as
     /// pointing to volatile: the conservative reading of a `volatile`
     /// written anywhere in a type name or declaration.

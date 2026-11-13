@@ -1195,7 +1195,7 @@ fn classify_ctype(ty: &CType) -> i64 {
     match ty {
         CType::Void => 0,            // no_type_class
         CType::Bool
-        | CType::Char | CType::UChar
+        | CType::Char | CType::SChar | CType::UChar
         | CType::Short | CType::UShort
         | CType::Int | CType::UInt
         | CType::Long | CType::ULong

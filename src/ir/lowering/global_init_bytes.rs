@@ -443,7 +443,7 @@ impl Lowerer {
                     } else if let Initializer::Expr(ref expr) = item.init {
                         if let Expr::StringLiteral(s, _) = expr {
                             if let CType::Array(deep_inner, Some(deep_size)) = inner_elem_ty.as_ref() {
-                                if matches!(deep_inner.as_ref(), CType::Char | CType::UChar) {
+                                if matches!(deep_inner.as_ref(), CType::Char | CType::SChar | CType::UChar) {
                                     Self::write_string_to_bytes(bytes, inner_offset, s, *deep_size);
                                 } else {
                                     let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
@@ -466,13 +466,13 @@ impl Lowerer {
             // (e.g., .a[1] = "abc" where a is char a[3][10])
             if let Expr::StringLiteral(s, _) = expr {
                 if let CType::Array(inner, Some(inner_size)) = elem_ty {
-                    if matches!(inner.as_ref(), CType::Char | CType::UChar) {
+                    if matches!(inner.as_ref(), CType::Char | CType::SChar | CType::UChar) {
                         Self::write_string_to_bytes(bytes, elem_offset, s, *inner_size);
                     } else {
                         let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
                         self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                     }
-                } else if matches!(elem_ty, CType::Char | CType::UChar) {
+                } else if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
                     let val = s.chars().next().map(|c| IrConst::I8(c as u8 as i8)).unwrap_or(IrConst::I8(0));
                     self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                 } else {
@@ -620,7 +620,7 @@ impl Lowerer {
             Initializer::Expr(expr) => {
                 // String literal for char array
                 if let Expr::StringLiteral(s, _) = expr {
-                    if matches!(elem_ty, CType::Char | CType::UChar) {
+                    if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
                         Self::write_string_to_bytes(bytes, field_offset, s, arr_size);
                         return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
                     }
@@ -731,7 +731,7 @@ impl Lowerer {
         let total = strides[0] * extents[0];
         let leaf_size = self.resolve_ctype_size(leaf);
         let leaf_ir_ty = IrType::from_ctype(leaf);
-        let leaf_is_char = matches!(leaf, CType::Char | CType::UChar);
+        let leaf_is_char = matches!(leaf, CType::Char | CType::SChar | CType::UChar);
         let row = extents[extents.len() - 1];
         let continuing = start.is_some();
         let mut pos = start.map_or(0, |(p, _)| p);
@@ -832,7 +832,7 @@ impl Lowerer {
                 Initializer::Expr(expr) => {
                     // String literal initializing a char array element (e.g., char arr[3][8] = { "hello", "world", "foo" })
                     // Each string literal initializes one inner char array (e.g., char[8]).
-                    if matches!(inner_elem_ty, CType::Char | CType::UChar) {
+                    if matches!(inner_elem_ty, CType::Char | CType::SChar | CType::UChar) {
                         if let Expr::StringLiteral(s, _) = expr {
                             Self::write_string_to_bytes(bytes, elem_offset, s, inner_arr_size);
                             sub_idx += 1;
@@ -900,7 +900,7 @@ impl Lowerer {
             );
         } else if matches!(elem_ty, CType::Struct(_) | CType::Union(_)) {
             self.fill_array_of_composites(items, elem_ty, arr_size, elem_size, bytes, field_offset);
-        } else if matches!(elem_ty, CType::Char | CType::UChar) {
+        } else if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
             // Char array: check for string literal initializer (e.g., char[8] init from "hello")
             if items.len() == 1 {
                 if let Initializer::Expr(Expr::StringLiteral(s, _)) = &items[0].init {
@@ -983,7 +983,7 @@ impl Lowerer {
             Initializer::Expr(expr) => {
                 // String literal initializing a char FAM: write bytes directly
                 if let Expr::StringLiteral(s, _) = expr {
-                    if matches!(elem_ty, CType::Char | CType::UChar) {
+                    if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
                         let max_len = bytes.len().saturating_sub(field_offset);
                         Self::write_string_to_bytes(bytes, field_offset, s, max_len);
                         return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
@@ -1025,7 +1025,7 @@ impl Lowerer {
     ) -> bool {
         if sub_items.len() == 1 && sub_items[0].designators.is_empty() {
             if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
-                if matches!(elem_ty, CType::Char | CType::UChar) {
+                if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
                     Self::write_string_to_bytes(bytes, field_offset, s, arr_size);
                     return true;
                 }

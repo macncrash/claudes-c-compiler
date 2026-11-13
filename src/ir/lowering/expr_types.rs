@@ -1003,7 +1003,7 @@ impl Lowerer {
     }
 
     /// Get the CType of a binary operation expression.
-    fn get_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
+    pub(super) fn get_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
         // Comparison and logical operators produce int, except that comparing
         // vectors gives a vector of lane masks.
         match op {
@@ -1037,7 +1037,12 @@ impl Lowerer {
                                 }
                             }
                         }
-                        return Some(lct);
+                        return Some(lct.rvalue_converted());
+                    }
+                    // GNU: arithmetic on a function designator is on its
+                    // address (`fi + 1`).
+                    CType::Function(_) if self.get_expr_ctype(rhs).is_some_and(|r| r.is_integer()) => {
+                        return Some(lct.rvalue_converted());
                     }
                     CType::Array(elem, _) => {
                         if *op == BinOp::Sub {
@@ -1057,7 +1062,8 @@ impl Lowerer {
                 // int + ptr case
                 if let Some(rct) = self.get_expr_ctype(rhs) {
                     match rct {
-                        CType::Pointer(_, _) => return Some(rct),
+                        CType::Pointer(_, _) => return Some(rct.rvalue_converted()),
+                        CType::Function(_) => return Some(rct.rvalue_converted()),
                         CType::Array(elem, _) => return Some(CType::Pointer(elem, AccessQuals::NONE)),
                         _ => {}
                     }
@@ -1256,6 +1262,7 @@ impl Lowerer {
     /// get_expr_ctype can add a sema fallback after it.
     fn get_expr_ctype_lowerer(&self, expr: &Expr) -> Option<CType> {
         match expr {
+            Expr::Identifier(name, _) if self.func_name_ctype(name).is_some() => self.func_name_ctype(name),
             Expr::Identifier(name, _) => {
                 if let Some(vi) = self.lookup_var_info(name) {
                     return vi.c_type.clone();
@@ -1281,6 +1288,8 @@ impl Lowerer {
                     match inner_ct {
                         CType::Pointer(pointee, _) => return Some(*pointee),
                         CType::Array(elem, _) => return Some(*elem),
+                        // `*f` of a function designator is the function again.
+                        CType::Function(ft) => return Some(CType::Function(ft)),
                         _ => {}
                     }
                 }
@@ -1314,8 +1323,10 @@ impl Lowerer {
                 }
                 None
             }
+            // A cast gives an rvalue: `(CIP)p` of a const pointer typedef is
+            // not itself const.
             Expr::Cast(ref type_spec, _, _) => {
-                Some(self.type_spec_to_ctype(type_spec))
+                Some(self.type_spec_to_ctype(type_spec).rvalue_converted())
             }
             Expr::MemberAccess(base_expr, field_name, _) => {
                 self.get_field_ctype(base_expr, field_name, false)
@@ -1331,6 +1342,12 @@ impl Lowerer {
                 let ct = self.arith_operand_ctype(inner);
                 ct.map(|c| if c.is_integer() { Self::integer_promote_ctype(&c) } else { c })
             }
+            Expr::UnaryOp(UnaryOp::LogicalNot, _, _) => Some(CType::Int),
+            // __real__ and __imag__ of a complex value are its component type;
+            // of a real value, the value itself.
+            Expr::UnaryOp(UnaryOp::RealPart | UnaryOp::ImagPart, inner, _) => {
+                self.get_expr_ctype(inner).map(|c| c.complex_component_type())
+            }
             Expr::UnaryOp(UnaryOp::PreInc, inner, _)
             | Expr::UnaryOp(UnaryOp::PreDec, inner, _) => {
                 // PreInc/PreDec return the operand's own type (no promotion).
@@ -1342,8 +1359,8 @@ impl Lowerer {
             }
             Expr::Conditional(_, then_expr, else_expr, _) => {
                 use crate::common::const_arith::is_null_pointer_constant;
-                let then_ct = self.get_expr_ctype(then_expr);
-                let else_ct = self.get_expr_ctype(else_expr);
+                let then_ct = self.arith_operand_ctype(then_expr);
+                let else_ct = self.arith_operand_ctype(else_expr);
                 CType::conditional_composite_type(
                     then_ct, else_ct,
                     is_null_pointer_constant(then_expr),
@@ -1352,15 +1369,17 @@ impl Lowerer {
             }
             Expr::GnuConditional(cond, else_expr, _) => {
                 use crate::common::const_arith::is_null_pointer_constant;
-                let cond_ct = self.get_expr_ctype(cond);
-                let else_ct = self.get_expr_ctype(else_expr);
+                let cond_ct = self.arith_operand_ctype(cond);
+                let else_ct = self.arith_operand_ctype(else_expr);
                 CType::conditional_composite_type(
                     cond_ct, else_ct,
                     is_null_pointer_constant(cond),
                     is_null_pointer_constant(else_expr),
                 )
             }
-            Expr::Comma(_, last, _) => self.get_expr_ctype(last),
+            // Not an lvalue: an array or function operand decays, and the
+            // pointer's own const goes (C11 6.5.17p2).
+            Expr::Comma(_, last, _) => self.get_expr_ctype(last).map(CType::rvalue_converted),
             Expr::StringLiteral(_, _) => {
                 // String literals have type char[] which decays to char*
                 Some(CType::Pointer(Box::new(CType::Char), AccessQuals::NONE))

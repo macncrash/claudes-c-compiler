@@ -393,7 +393,7 @@ impl Parser {
     ) -> TypeSpecifier {
         let TypeSpecFlags {
             has_void, has_bool, has_float, has_double, has_complex,
-            has_char, has_short, has_int: _, has_unsigned, has_signed: _,
+            has_char, has_short, has_int: _, has_unsigned, has_signed,
             has_struct, has_union, has_enum, has_typeof, long_count,
             ref typedef_name,
         } = *flags;
@@ -436,7 +436,7 @@ impl Parser {
             }
             TypeSpecifier::TypedefName(name.clone())
         } else if has_char {
-            if has_unsigned { TypeSpecifier::UnsignedChar } else { TypeSpecifier::Char }
+            if has_unsigned { TypeSpecifier::UnsignedChar } else if has_signed { TypeSpecifier::SignedChar } else { TypeSpecifier::Char }
         } else if has_short {
             if has_unsigned { TypeSpecifier::UnsignedShort } else { TypeSpecifier::Short }
         } else if long_count >= 2 {
