@@ -669,7 +669,7 @@ impl Lowerer {
             for (i, dim_info) in dim_infos.iter().enumerate().rev() {
                 if dim_info.is_vla {
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
-                    let dim_val = self.load_vla_dim_value(&dim_info.dim_expr_name);
+                    let dim_val = self.lower_vla_param_dim(dim_info.dim_expr.as_ref());
                     let stride_val = if let Some(prev) = current_stride {
                         self.emit_binop_val(IrBinOp::Mul, Operand::Value(dim_val), Operand::Value(prev), ptr_int_ty)
                     } else {
@@ -697,22 +697,20 @@ impl Lowerer {
         }
     }
 
-    /// Load the value of a VLA dimension variable (a function parameter).
-    fn load_vla_dim_value(&mut self, dim_name: &str) -> Value {
-        if let Some(info) = self.func_mut().locals.get(dim_name).cloned() {
-            let loaded = self.fresh_value();
-            self.emit(Instruction::Load { dest: loaded, ptr: info.alloca, ty: info.ty,
-             seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
-            loaded
-        } else {
-            // Fallback: use constant 1
-            let val = self.fresh_value();
-            self.emit(Instruction::Copy {
-                dest: val,
-                src: Operand::Const(IrConst::ptr_int(1)),
-            });
-            val
-        }
+    /// The value of a VLA parameter's runtime dimension, widened to pointer
+    /// width: its size expression, evaluated on entry (`c[][n + 1]` and
+    /// `q[][g(k)]` as well as `m[][cols]`; any other was taken as 1).
+    fn lower_vla_param_dim(&mut self, expr: Option<&Expr>) -> Value {
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        let op = match expr {
+            Some(e) => {
+                let ty = self.get_expr_type(e);
+                let v = self.lower_expr(e);
+                self.emit_implicit_cast(v, ty, ptr_int_ty)
+            }
+            None => Operand::Const(IrConst::ptr_int(1)),
+        };
+        self.operand_to_value(op)
     }
 
     /// Collect VLA dimension information from a pointer-to-array type.
@@ -722,22 +720,21 @@ impl Lowerer {
         loop {
             let resolved = self.resolve_type_spec(current);
             if let TypeSpecifier::Array(elem, size_expr) = resolved {
-                let (is_vla, dim_name, const_size) = if let Some(expr) = size_expr {
+                let (is_vla, dim_expr, const_size) = if let Some(expr) = size_expr {
                     if let Some(val) = self.expr_as_array_size(expr) {
-                        (false, String::new(), Some(val))
+                        (false, None, Some(val))
                     } else {
-                        let name = Self::extract_dim_expr_name(expr);
-                        (true, name, None)
+                        (true, Some((**expr).clone()), None)
                     }
                 } else {
-                    (false, String::new(), None)
+                    (false, None, None)
                 };
 
                 let base_elem_size = self.sizeof_type(elem);
 
                 dims.push(VlaDimInfo {
                     is_vla,
-                    dim_expr_name: dim_name,
+                    dim_expr,
                     const_size,
                     base_elem_size,
                 });
@@ -747,14 +744,6 @@ impl Lowerer {
             }
         }
         dims
-    }
-
-    /// Extract variable name from a VLA dimension expression.
-    fn extract_dim_expr_name(expr: &Expr) -> String {
-        match expr {
-            Expr::Identifier(name, _) => name.clone(),
-            _ => String::new(),
-        }
     }
 
     /// Pre-scan a function body to find all label definitions and their scope depths.

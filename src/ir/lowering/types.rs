@@ -747,12 +747,11 @@ impl Lowerer {
             let is_ts_array = matches!(ts, TypeSpecifier::Array(_, _));
             let is_ctype_array = matches!(resolved_ctype, CType::Array(_, _));
             if is_ts_array {
+                // all_dims follows an array typedef element into its own
+                // dims (`typeof(T[2])` for `typedef char T[3]` is [2, 3]),
+                // so the base element is the innermost one, not the typedef.
                 let all_dims = self.collect_type_array_dims(ts);
-                let mut inner = ts;
-                while let TypeSpecifier::Array(elem, _) = inner {
-                    inner = elem.as_ref();
-                }
-                let base_elem_size = self.sizeof_type(inner).max(1);
+                let base_elem_size = Self::ctype_innermost_elem_size(&resolved_ctype, &self.types.borrow_struct_layouts()).max(1);
                 let total: usize = all_dims.iter().product::<usize>() * base_elem_size;
                 let strides = Self::compute_strides_from_dims(&all_dims, base_elem_size);
                 let elem_size = if strides.len() > 1 { strides[0] } else { base_elem_size };

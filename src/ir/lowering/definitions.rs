@@ -201,8 +201,8 @@ impl DeclAnalysis {
 pub(super) struct VlaDimInfo {
     /// Whether this dimension is a VLA (runtime variable).
     pub is_vla: bool,
-    /// The name of the variable providing the dimension (e.g., "cols").
-    pub dim_expr_name: String,
+    /// The runtime dimension's size expression (`cols`, `n + 1`, `g(k)`).
+    pub dim_expr: Option<crate::frontend::parser::ast::Expr>,
     /// If not VLA, the constant size value.
     pub const_size: Option<i64>,
     /// The sizeof the element type at this level (for computing strides).

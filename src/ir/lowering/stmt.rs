@@ -94,6 +94,14 @@ impl Lowerer {
                 self.func_state.as_ref()?;
                 return self.pointer_type_name_vla_strides(inner).map(TypeofVla::Pointer);
             }
+            // typeof(Row), typeof(int[n][m]), typeof(Row[2]) of a VLA type name.
+            TypeSpecifier::TypeofType(inner) => {
+                self.func_state.as_ref()?;
+                let (size, strides) = self.type_name_vla_layout(inner)?;
+                let ctype = self.type_spec_to_ctype(inner);
+                let is_const = self.base_is_const(inner, false);
+                return Some(self.hidden_vla_typedef(ctype, is_const, size, strides));
+            }
             _ => return None,
         };
         self.func_state.as_ref()?;
@@ -104,18 +112,24 @@ impl Lowerer {
         match self.qualified_expr_ctype(e)? {
             ctype @ CType::Array(..) => {
                 let (size, strides) = self.vla_array_layout(e)?;
-                let n = self.func().next_typeof_vla;
-                self.func_mut().next_typeof_vla += 1;
-                let name = format!("__typeof_vla.{n}");
                 let is_const = self.expr_is_const_qualified(e);
-                self.types.insert_typedef_scoped(name.clone(), ctype);
-                self.types.set_typedef_const_scoped(&name, is_const);
-                self.func_mut().insert_vla_typedef_size_scoped(name.clone(), size, strides);
-                Some(TypeofVla::Array(TypeSpecifier::TypedefName(name)))
+                Some(self.hidden_vla_typedef(ctype, is_const, size, strides))
             }
             CType::Pointer(..) => self.vla_strides_of_expr(e).map(TypeofVla::Pointer),
             _ => None,
         }
+    }
+
+    /// A hidden scoped VLA typedef (`__typeof_vla.N`) of a type with these
+    /// runtime size and strides (see typeof_vla).
+    fn hidden_vla_typedef(&mut self, ctype: CType, is_const: bool, size: Value, strides: Vec<Option<Value>>) -> TypeofVla {
+        let n = self.func().next_typeof_vla;
+        self.func_mut().next_typeof_vla += 1;
+        let name = format!("__typeof_vla.{n}");
+        self.types.insert_typedef_scoped(name.clone(), ctype);
+        self.types.set_typedef_const_scoped(&name, is_const);
+        self.func_mut().insert_vla_typedef_size_scoped(name.clone(), size, strides);
+        TypeofVla::Array(TypeSpecifier::TypedefName(name))
     }
 
     pub(super) fn lower_local_decl(&mut self, decl: &Declaration) {

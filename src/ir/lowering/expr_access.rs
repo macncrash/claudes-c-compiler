@@ -57,7 +57,7 @@ impl Lowerer {
     /// of an array type name with VLA dimensions (`int [n][m]`, a VLA
     /// typedef, `typeof` a VLA expression), evaluating its runtime
     /// dimensions. None for a type of constant size, with nothing evaluated.
-    fn type_name_vla_layout(&mut self, ts: &TypeSpecifier) -> Option<(Value, Vec<Option<Value>>)> {
+    pub(super) fn type_name_vla_layout(&mut self, ts: &TypeSpecifier) -> Option<(Value, Vec<Option<Value>>)> {
         match ts {
             TypeSpecifier::Array(elem, Some(dim)) => {
                 let inner = self.type_name_vla_layout(elem);
