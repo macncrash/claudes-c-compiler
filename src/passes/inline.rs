@@ -1730,6 +1730,16 @@ fn build_callee_map_for(module: &IrModule, large: bool) -> HashMap<String, Calle
                 match inst {
                     // Inline asm is allowed for all inlined functions
                     Instruction::InlineAsm { .. } => {}
+                    // A setjmp's jmp_buf holds the frame and callee-saved
+                    // registers of the function that calls it. Inlined, the
+                    // caller's locals the callee changes through pointers
+                    // between its setjmp and longjmp (`*p += k`) could live
+                    // in those registers, and the longjmp would put back
+                    // their old values. Clang and GCC never inline these.
+                    i if i.is_returns_twice_call() => {
+                        has_problematic = true;
+                        break;
+                    }
                     Instruction::VaStart { .. }
                     | Instruction::VaEnd { .. }
                     | Instruction::VaArg { .. }

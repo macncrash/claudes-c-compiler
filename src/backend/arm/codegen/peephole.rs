@@ -5498,8 +5498,7 @@ fn eliminate_redundant_sxtw(lines: &mut [String], kinds: &mut [LineKind], n: usi
 // tail calls is then a leaf whose frame Phase 4 may drop, as clang emits
 // SQLite's btreeParseCellPtr: no frame, `b btreeParseCellAdjustSizeForOverflow`.
 
-/// Callees that return twice: their caller's frame must still be there.
-const RETURNS_TWICE: &[&str] = &["setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp", "savectx", "vfork", "getcontext"];
+use crate::ir::reexports::RETURNS_TWICE;
 
 fn convert_tail_calls(lines: Vec<String>, kinds: Vec<LineKind>) -> (Vec<String>, Vec<LineKind>) {
     let n = lines.len();

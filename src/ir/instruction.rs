@@ -381,9 +381,19 @@ pub enum Terminator {
     Unreachable,
 }
 
+/// Callees that return twice (once normally, again when a longjmp or
+/// setcontext comes back to them): their caller's frame and the values in
+/// it must be there when they do.
+pub const RETURNS_TWICE: &[&str] = &["setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp", "savectx", "vfork", "getcontext"];
+
 // === Instruction impl: dest, result_type, value visitors ===
 
 impl Instruction {
+    /// A direct call to a function that returns twice (`RETURNS_TWICE`).
+    pub fn is_returns_twice_call(&self) -> bool {
+        matches!(self, Instruction::Call { func, .. } if RETURNS_TWICE.contains(&func.as_str()))
+    }
+
     /// Get the destination value defined by this instruction, if any.
     /// Instructions like Store, Memcpy, VaStart, VaEnd, VaCopy, AtomicStore,
     /// Fence, and InlineAsm produce no value.

@@ -51,9 +51,6 @@ const MAX_FAST: usize = 64;
 /// block, and the backend a copy of the prologue).
 const MAX_ENTRIES: usize = 4;
 
-/// Callees that return twice: their caller's frame must exist from the start.
-const RETURNS_TWICE: &[&str] = &["setjmp", "_setjmp", "sigsetjmp", "__sigsetjmp", "savectx", "vfork", "getcontext"];
-
 pub(crate) fn split_module(module: &mut IrModule) -> usize {
     // Block labels are unique across the module.
     let mut next_label = module.functions.iter().flat_map(|f| &f.blocks).map(|b| b.label.0 + 1).max().unwrap_or(0);
@@ -131,7 +128,7 @@ pub(crate) fn split_function(func: &mut IrFunction, next_label: &mut u32) -> usi
         let tail = if escapes { None } else { ends_in_tail_call(block, &func.blocks, &index) };
         for (k, inst) in block.instructions.iter().enumerate() {
             let needs = match inst {
-                Instruction::Call { func: name, .. } if RETURNS_TWICE.contains(&name.as_str()) => return 0,
+                i if i.is_returns_twice_call() => return 0,
                 Instruction::InlineAsm { .. } | Instruction::DynAlloca { .. } | Instruction::StackSave { .. }
                 | Instruction::StackRestore { .. } | Instruction::VaStart { .. } => return 0,
                 Instruction::Alloca { .. } => false,
