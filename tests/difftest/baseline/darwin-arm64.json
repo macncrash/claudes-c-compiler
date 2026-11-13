@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-12",
-  "ccc_rev": "4474741f",
+  "ccc_rev": "a1488382",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -802,6 +802,9 @@
   "cases/complex_truth_constants_and_real_operands": {
    "status": "pass"
   },
+  "cases/compound_literal_and_elided_array_init": {
+   "status": "pass"
+  },
   "cases/computed_goto_interpreter": {
    "status": "pass"
   },
@@ -884,6 +887,9 @@
    "status": "pass"
   },
   "cases/function_address_compared_on_a_path": {
+   "status": "pass"
+  },
+  "cases/generic_and_sizeof_expression_types": {
    "status": "pass"
   },
   "cases/generic_enum_types": {
@@ -5712,7 +5718,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16f956d0f 0x16f956d0f 0x16f956d0f 0x16f956d0f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16ce02d0f 0x16ce02d0f 0x16ce02d0f 0x16ce02d0f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
