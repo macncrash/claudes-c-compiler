@@ -555,7 +555,7 @@ impl Lowerer {
                         push_string_as_elements(elements, s, field_size);
                     }
                 } else if let Expr::AddressOf(inner, _) = expr {
-                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref() {
+                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _, _) = inner.as_ref() {
                         // &(compound_literal) at file scope: create anonymous global
                         let addr_init = self.create_compound_literal_global(cl_type_spec, cl_init);
                         elements.push(addr_init);
@@ -566,7 +566,7 @@ impl Lowerer {
                     } else {
                         push_zero_bytes(elements, field_size);
                     }
-                } else if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = expr {
+                } else if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _, _) = expr {
                     if field_is_pointer {
                         // Compound literal initializing a pointer field (array-to-pointer decay):
                         // create anonymous global storage and emit its address

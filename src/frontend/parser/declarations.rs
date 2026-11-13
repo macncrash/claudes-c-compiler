@@ -251,6 +251,7 @@ impl Parser {
         let is_gnu_inline = self.attrs.parsing_gnu_inline();
         let is_always_inline = self.attrs.parsing_always_inline();
         let is_noinline = self.attrs.parsing_noinline();
+        let returns_const = self.attrs.parsing_const();
 
         // Build return type from derived declarators
         let return_type = self.build_return_type(type_spec, &derived);
@@ -292,6 +293,7 @@ impl Parser {
                 attrs.set_fastcall(decl_attrs.is_fastcall());
                 attrs.set_naked(decl_attrs.is_naked());
                 attrs.set_noreturn(decl_attrs.is_noreturn());
+                attrs.set_returns_const(returns_const);
                 attrs.section = decl_attrs.section;
                 attrs.visibility = decl_attrs.visibility;
                 attrs.symver = decl_attrs.symver;

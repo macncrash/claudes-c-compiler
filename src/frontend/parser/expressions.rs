@@ -216,7 +216,7 @@ impl Parser {
                         // Check for compound literal: (type){...}
                         if matches!(self.peek(), TokenKind::LBrace) {
                             let init = self.parse_initializer();
-                            let lit = Expr::CompoundLiteral(result_type, Box::new(init), span);
+                            let lit = Expr::CompoundLiteral(result_type, Box::new(init), span, base_const);
                             self.attrs.set_const(save_const);
                             self.attrs.restore_volatile(save_volatile);
                             // Restore outer vector attrs so the enclosing declaration can use them

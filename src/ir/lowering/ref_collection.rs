@@ -331,7 +331,7 @@ impl Lowerer {
             Expr::Deref(inner, _) | Expr::AddressOf(inner, _) => {
                 self.collect_refs_from_expr(inner, refs);
             }
-            Expr::CompoundLiteral(ts, init, _) => {
+            Expr::CompoundLiteral(ts, init, _, _) => {
                 self.collect_refs_from_type(ts, refs);
                 self.collect_refs_from_initializer(init, refs);
             }

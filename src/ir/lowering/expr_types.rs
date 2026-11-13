@@ -194,7 +194,7 @@ impl Lowerer {
                     Some(self.ctype_size(&ctype))
                 } else { None }
             }
-            Expr::CompoundLiteral(type_spec, _, _) => {
+            Expr::CompoundLiteral(type_spec, _, _, _) => {
                 let ctype = self.type_spec_to_ctype(type_spec);
                 if ctype.is_struct_or_union() || ctype.is_vector() {
                     Some(self.sizeof_type(type_spec))
@@ -995,7 +995,7 @@ impl Lowerer {
                 }
                 target_int_ir_type()
             }
-            Expr::CompoundLiteral(type_name, _, _) => {
+            Expr::CompoundLiteral(type_name, _, _, _) => {
                 self.type_spec_to_ir(type_name)
             }
             _ => target_int_ir_type(),
@@ -1480,7 +1480,10 @@ impl Lowerer {
                         if let Some(vi) = self.lookup_var_info(name) {
                             vi.c_type.clone()
                         } else {
-                            None
+                            // (*f)(x) for a function f: its return type, as
+                            // for f(x) (typeof((*f)(x)) was an unresolved int).
+                            return self.func_meta.sigs.get(name.as_str()).and_then(|s| s.return_ctype.clone())
+                                .or_else(|| self.sema_functions.get(name.as_str()).map(|fi| fi.return_type.clone()));
                         }
                     }
                     _ => self.get_expr_ctype(stripped_func),
@@ -1492,7 +1495,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::VaArg(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _) => {
+            Expr::VaArg(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _, _) => {
                 Some(self.type_spec_to_ctype(type_spec))
             }
             Expr::GenericSelection(controlling, associations, _) => {

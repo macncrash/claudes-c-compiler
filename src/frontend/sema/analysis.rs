@@ -1558,7 +1558,7 @@ impl SemanticAnalyzer {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
             }
-            Expr::CompoundLiteral(ts, init, _) => {
+            Expr::CompoundLiteral(ts, init, _, _) => {
                 self.collect_enum_constants_from_type_spec(ts);
                 self.analyze_initializer(init);
             }

@@ -391,7 +391,7 @@ impl Lowerer {
             }
 
             // Compound literal: size of the type (handle incomplete array types)
-            Expr::CompoundLiteral(ts, ref init, _) => self.compound_literal_size(ts, init),
+            Expr::CompoundLiteral(ts, ref init, _, _) => self.compound_literal_size(ts, init),
 
             // _Generic selection: resolve the matching association and compute its size
             Expr::GenericSelection(controlling, associations, _) => {

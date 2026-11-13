@@ -477,7 +477,7 @@ impl Lowerer {
                 Initializer::Expr(ref expr) => {
                     // Compound literal, e.g., ((struct Wrap) {inc_global}):
                     // unwrap it and process the inner initializer list as struct fields.
-                    if let Expr::CompoundLiteral(_, ref inner_init, _) = expr {
+                    if let Expr::CompoundLiteral(_, ref inner_init, _, _) = expr {
                         if let Initializer::List(ref sub_items) = **inner_init {
                             self.fill_struct_fields_from_items(
                                 sub_items, layout, base_offset, bytes, ptr_ranges,
@@ -976,7 +976,7 @@ impl Lowerer {
             }
             Initializer::Expr(expr) => {
                 // Unwrap compound literal: (type){ init_list } -> use inner init_list
-                if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
+                if let Expr::CompoundLiteral(_, ref cl_init, _, _) = expr {
                     if let Initializer::List(sub_items) = cl_init.as_ref() {
                         self.fill_nested_struct_with_ptrs(
                             sub_items, sub_layout, base_offset, bytes, ptr_ranges,

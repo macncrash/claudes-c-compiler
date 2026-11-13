@@ -5,7 +5,7 @@
 //! (DeclAnalysis), lvalue representation, switch context, function signature
 //! metadata, and typedef helpers.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{
     BlockId,
     GlobalInit,
@@ -369,6 +369,9 @@ pub(super) struct FunctionMeta {
     pub sigs: FxHashMap<String, FuncSig>,
     /// Function pointer variable name -> signature (return type + param types).
     pub ptr_sigs: FxHashMap<String, FuncSig>,
+    /// Functions whose return type's base type is const (`const char *f(void)`),
+    /// for _Generic and typeof.
+    pub const_returns: FxHashSet<String>,
 }
 
 /// Tracks how each original C parameter maps to IR parameters after ABI decomposition.

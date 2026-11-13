@@ -141,7 +141,7 @@ impl Lowerer {
 
         // &(compound_literal) at file scope
         if let Expr::AddressOf(inner, _) = expr {
-            if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref() {
+            if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _, _) = inner.as_ref() {
                 return self.create_compound_literal_global(cl_type_spec, cl_init);
             }
         }
@@ -151,12 +151,12 @@ impl Lowerer {
         {
             let stripped = Self::strip_casts(expr);
             if !std::ptr::eq(expr as *const _, stripped as *const _) {
-                if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = stripped {
+                if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _, _) = stripped {
                     return self.create_compound_literal_global(cl_type_spec, cl_init);
                 }
                 // (void*) &(CompoundLiteral) – cast wrapping address-of compound literal
                 if let Expr::AddressOf(inner, _) = stripped {
-                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref() {
+                    if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _, _) = inner.as_ref() {
                         return self.create_compound_literal_global(cl_type_spec, cl_init);
                     }
                 }
@@ -164,7 +164,7 @@ impl Lowerer {
         }
 
         // Compound literal used directly as initializer value
-        if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = expr {
+        if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _, _) = expr {
             return self.lower_compound_literal_init(
                 cl_type_spec, cl_init, base_ty, is_array,
             );
@@ -209,7 +209,7 @@ impl Lowerer {
     /// anonymous global before the pointer arithmetic can be resolved.
     fn materialize_compound_literals_in_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::CompoundLiteral(ref type_spec, ref init, _) => {
+            Expr::CompoundLiteral(ref type_spec, ref init, _, _) => {
                 let key = expr as *const Expr as usize;
                 if !self.materialized_compound_literals.contains_key(&key) {
                     // Materialize this compound literal as an anonymous global
@@ -253,7 +253,7 @@ impl Lowerer {
     fn try_address_of_compound_literal(&mut self, expr: &Expr) -> Option<GlobalInit> {
         let stripped = Self::strip_casts(expr);
         if let Expr::AddressOf(inner, _) = stripped {
-            if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _) = inner.as_ref() {
+            if let Expr::CompoundLiteral(ref cl_type_spec, ref cl_init, _, _) = inner.as_ref() {
                 return Some(self.create_compound_literal_global(cl_type_spec, cl_init));
             }
         }
@@ -1017,7 +1017,7 @@ impl Lowerer {
     ) {
         // Unwrap casts to find the inner compound literal
         let inner = Self::strip_casts(expr);
-        if let Expr::CompoundLiteral(_ts, ref cl_init, _) = inner {
+        if let Expr::CompoundLiteral(_ts, ref cl_init, _, _) = inner {
             if let Initializer::List(sub_items) = cl_init.as_ref() {
                 self.collect_vector_scalars_from_items(
                     sub_items, elem_ir_ty, vec_num_elems, values, base_offset,
@@ -1596,7 +1596,7 @@ impl Lowerer {
                         return true;
                     }
                 }
-                if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
+                if let Expr::CompoundLiteral(_, ref cl_init, _, _) = expr {
                     return self.init_has_addr_exprs(cl_init);
                 }
                 self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some()

@@ -803,7 +803,7 @@ impl Lowerer {
                 // Also try: base is a pointer to struct/union (for ptr[i] patterns)
                 self.get_pointed_struct_layout(base)
             }
-            Expr::CompoundLiteral(type_spec, _, _) => {
+            Expr::CompoundLiteral(type_spec, _, _, _) => {
                 // Compound literal: (struct tag){...} - get layout from the type specifier
                 self.get_struct_layout_for_type(type_spec)
             }

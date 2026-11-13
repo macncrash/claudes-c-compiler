@@ -82,6 +82,7 @@ impl Lowerer {
         let (ptr_count, func_info) = Self::declared_function(&declarator.derived);
         if let Some((params, variadic)) = func_info {
             self.register_block_func_meta(&declarator.name, &decl.type_spec, ptr_count, &params, variadic);
+            self.note_const_return(&declarator.name, &decl.type_spec, decl.is_const());
             self.shadow_local_for_scope(&declarator.name);
             // Propagate __attribute__((error("..."))) and __attribute__((noreturn)) / _Noreturn
             // from block-scope function declarations. Without this, the kernel's BUILD_BUG_ON
@@ -114,6 +115,7 @@ impl Lowerer {
             if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
                 if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
                     self.register_block_func_meta(&declarator.name, &fti.return_type, 0, &fti.params, fti.variadic);
+                    self.note_const_return(&declarator.name, &fti.return_type, false);
                     self.shadow_local_for_scope(&declarator.name);
                     if declarator.attrs.is_error_attr() && !declarator.name.is_empty() {
                         self.error_functions.insert(declarator.name.clone());

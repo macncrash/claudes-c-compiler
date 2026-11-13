@@ -65,6 +65,8 @@ pub mod func_attr_flag {
     pub const NAKED: u16         = 1 << 11;
     /// `__attribute__((noreturn))` or `_Noreturn` — function never returns.
     pub const NORETURN: u16      = 1 << 12;
+    /// The return type's base type is written `const` (`const char *f(void)`).
+    pub const RETURNS_CONST: u16 = 1 << 13;
 }
 
 impl FunctionAttributes {
@@ -88,6 +90,7 @@ impl FunctionAttributes {
     #[inline] pub fn is_fastcall(&self) -> bool       { self.flags & func_attr_flag::FASTCALL != 0 }
     #[inline] pub fn is_naked(&self) -> bool          { self.flags & func_attr_flag::NAKED != 0 }
     #[inline] pub fn is_noreturn(&self) -> bool       { self.flags & func_attr_flag::NORETURN != 0 }
+    #[inline] pub fn returns_const(&self) -> bool     { self.flags & func_attr_flag::RETURNS_CONST != 0 }
 
     // --- flag setters ---
 
@@ -104,6 +107,7 @@ impl FunctionAttributes {
     #[inline] pub fn set_fastcall(&mut self, v: bool)      { self.set_flag(func_attr_flag::FASTCALL, v) }
     #[inline] pub fn set_naked(&mut self, v: bool)        { self.set_flag(func_attr_flag::NAKED, v) }
     #[inline] pub fn set_noreturn(&mut self, v: bool)     { self.set_flag(func_attr_flag::NORETURN, v) }
+    #[inline] pub fn set_returns_const(&mut self, v: bool) { self.set_flag(func_attr_flag::RETURNS_CONST, v) }
 
     #[inline]
     fn set_flag(&mut self, mask: u16, v: bool) {
@@ -810,7 +814,9 @@ pub enum Expr {
     MemberAccess(Box<Expr>, String, Span),
     PointerMemberAccess(Box<Expr>, String, Span),
     Cast(TypeSpecifier, Box<Expr>, Span),
-    CompoundLiteral(TypeSpecifier, Box<Initializer>, Span),
+    /// The bool: the element type of an array compound literal was written
+    /// const (`(const int[]){1}`), which no pointer level can record.
+    CompoundLiteral(TypeSpecifier, Box<Initializer>, Span, bool),
     StmtExpr(CompoundStmt, Span),
     Sizeof(Box<SizeofArg>, Span),
     /// __builtin_va_arg(ap, type): extract next variadic argument of given type
@@ -932,7 +938,7 @@ impl Expr {
             | Expr::GnuConditional(_, _, s)
             | Expr::FunctionCall(_, _, s) | Expr::ArraySubscript(_, _, s)
             | Expr::MemberAccess(_, _, s) | Expr::PointerMemberAccess(_, _, s)
-            | Expr::Cast(_, _, s) | Expr::CompoundLiteral(_, _, s) | Expr::StmtExpr(_, s)
+            | Expr::Cast(_, _, s) | Expr::CompoundLiteral(_, _, s, _) | Expr::StmtExpr(_, s)
             | Expr::Sizeof(_, s) | Expr::VaArg(_, _, s) | Expr::Alignof(_, s)
             | Expr::AlignofExpr(_, s) | Expr::GnuAlignof(_, s)
             | Expr::GnuAlignofExpr(_, s) | Expr::Comma(_, _, s)

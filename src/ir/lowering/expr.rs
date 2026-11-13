@@ -158,7 +158,7 @@ impl Lowerer {
                 self.lower_gnu_conditional(cond, else_expr)
             }
             Expr::Cast(ref target_type, inner, _) => self.lower_cast(target_type, inner),
-            Expr::CompoundLiteral(ref type_spec, ref init, _) => {
+            Expr::CompoundLiteral(ref type_spec, ref init, _, _) => {
                 self.lower_compound_literal(type_spec, init)
             }
             Expr::Sizeof(arg, _) => self.lower_sizeof(arg),

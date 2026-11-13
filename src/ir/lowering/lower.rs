@@ -589,6 +589,7 @@ impl Lowerer {
                     &func.name, &func.return_type, 0,
                     &func.params, func.variadic, func.attrs.is_static(), func.is_kr,
                 );
+                self.note_const_return(&func.name, &func.return_type, func.attrs.returns_const());
             }
             if let ExternalDecl::Declaration(decl) = decl {
                 for declarator in &decl.declarators {
@@ -621,6 +622,7 @@ impl Lowerer {
                             &declarator.name, &decl.type_spec, ptr_count,
                             &params, variadic, decl.is_static(), false,
                         );
+                        self.note_const_return(&declarator.name, &decl.type_spec, decl.is_const());
                         // C99 6.7.4p7: Track function declarations that would make
                         // an inline definition provide an external definition.
                         // An inline definition is "inline only" (no external def) ONLY
@@ -642,6 +644,7 @@ impl Lowerer {
                                     &declarator.name, &fti.return_type, 0,
                                     &fti.params, fti.variadic, false, false,
                                 );
+                                self.note_const_return(&declarator.name, &fti.return_type, false);
                             }
                         }
                     }

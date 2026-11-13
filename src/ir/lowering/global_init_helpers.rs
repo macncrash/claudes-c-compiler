@@ -145,7 +145,7 @@ fn expr_might_be_addr(expr: &Expr, enum_constants: &FxHashMap<String, i64>) -> b
         // Binary ops on addresses (e.g., &x + offset, arr + n)
         Expr::BinaryOp(_, lhs, rhs, _) => expr_might_be_addr(lhs, enum_constants) || expr_might_be_addr(rhs, enum_constants),
         // Compound literals may contain addresses
-        Expr::CompoundLiteral(_, _, _) => true,
+        Expr::CompoundLiteral(_, _, _, _) => true,
         _ => false,
     }
 }

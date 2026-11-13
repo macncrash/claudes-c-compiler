@@ -331,7 +331,7 @@ impl Lowerer {
                     None
                 }
             }
-            Expr::CompoundLiteral(ref type_spec, ref init, _) => {
+            Expr::CompoundLiteral(ref type_spec, ref init, _, _) => {
                 self.eval_const_compound_literal(type_spec, init)
             }
             Expr::GenericSelection(ref controlling, ref associations, _) => {

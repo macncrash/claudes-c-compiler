@@ -696,13 +696,29 @@ impl Lowerer {
             // written const (`(const int *)p`) or is a const typedef's
             // (`(CI *)p`). Other casts are rvalues, whose const lvalue
             // conversion drops anyway.
-            Expr::Cast(ts, _, _) | Expr::CompoundLiteral(ts, _, _) => {
-                let mut leaf = ts;
-                while let TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) = leaf {
-                    leaf = inner;
+            Expr::Cast(ts, _, _) => {
+                matches!(self.type_spec_to_ctype(ts), CType::Pointer(..)) && self.type_name_base_const(ts)
+            }
+            // A compound literal is an lvalue, const like a declared object:
+            // `(const int[]){1}` decays to `const int *`, and `&(const int){1}`
+            // is `const int *`.
+            Expr::CompoundLiteral(ts, _, _, written_const) => *written_const || self.type_name_base_const(ts),
+            // A call to a function returning a pointer to const
+            // (`const char *f(void)`), directly or through a function pointer,
+            // whose base type is the return type's (`const char *(*fp)(void)`).
+            // A non-pointer result is an rvalue.
+            Expr::FunctionCall(callee, _, _) => {
+                let mut callee = callee.as_ref();
+                while let Expr::Deref(inner, _) = callee {
+                    callee = inner;
                 }
-                matches!(self.type_spec_to_ctype(ts), CType::Pointer(..))
-                    && (ts.has_const_base() || self.base_is_const(leaf, false))
+                let is_function = |name: &str| self.lookup_var_info(name).is_none()
+                    && (self.func_meta.sigs.contains_key(name) || self.sema_functions.contains_key(name));
+                let const_base = match callee {
+                    Expr::Identifier(name, _) if is_function(name) => self.func_meta.const_returns.contains(name),
+                    _ => self.expr_is_const_qualified(callee),
+                };
+                const_base && matches!(self.get_expr_ctype(expr), Some(CType::Pointer(..)))
             }
             // Pointer arithmetic, assignment and increments keep the
             // pointer operand's type: `cip + 1` is still `const int *`.
@@ -725,6 +741,24 @@ impl Lowerer {
                     && (self.expr_is_const_qualified(then_e) || self.expr_is_const_qualified(else_e))
             }
             _ => false,
+        }
+    }
+
+    /// Whether a type name's base type is const: written so (see
+    /// TypeSpecifier::mark_const_base) or a const typedef's (`(CI *)p`).
+    fn type_name_base_const(&self, ts: &TypeSpecifier) -> bool {
+        let mut leaf = ts;
+        while let TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) = leaf {
+            leaf = inner;
+        }
+        ts.has_const_base() || self.base_is_const(leaf, false)
+    }
+
+    /// Record that a function's return type has a const base type (see
+    /// FunctionMeta::const_returns).
+    pub(super) fn note_const_return(&mut self, name: &str, ret_type_spec: &TypeSpecifier, written_const: bool) {
+        if self.base_is_const(ret_type_spec, written_const) {
+            self.func_meta.const_returns.insert(name.to_string());
         }
     }
 
@@ -832,7 +866,7 @@ impl Lowerer {
             return Operand::Const(constant);
         }
 
-        if let Expr::CompoundLiteral(type_spec, init, _) = inner {
+        if let Expr::CompoundLiteral(type_spec, init, _, _) = inner {
             let ty = self.type_spec_to_ir(type_spec);
             let size = self.compound_literal_size(type_spec, init);
             let alloca = self.alloc_and_init_compound_literal(type_spec, init, ty, size);
