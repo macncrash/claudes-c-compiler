@@ -288,8 +288,7 @@ impl Lowerer {
             if matches!(&sub_item.init, Initializer::Expr(_)) {
                 if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
                     // Don't apply flat consumption for string literals initializing char arrays
-                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar)
-                        && matches!(&sub_item.init, Initializer::Expr(Expr::StringLiteral(..)));
+                    let is_char_array_str = matches!(&sub_item.init, Initializer::Expr(e) if Self::string_init_units(e, elem_ty).is_some());
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(
                             &sub_items[item_idx..], elem_ty, arr_size,
@@ -376,13 +375,13 @@ impl Lowerer {
                 bytes, ptr_ranges,
             );
         } else if let Initializer::List(ref inner_items) = item.init {
-            // { "yz" } for a char array member: the string's bytes.
+            // { "yz" } for a char (or wide character) array member: the
+            // string's units.
             if let (CType::Array(ref elem, Some(n)), [only]) = (&field.ty, inner_items.as_slice()) {
-                if let (true, Initializer::Expr(Expr::StringLiteral(s, _))) =
-                    (matches!(elem.as_ref(), CType::Char | CType::SChar | CType::UChar) && only.designators.is_empty(), &only.init)
-                {
-                    Self::write_string_to_bytes(bytes, field_offset, s, *n);
-                    return;
+                if let (true, Initializer::Expr(e)) = (only.designators.is_empty(), &only.init) {
+                    if Self::write_string_init(bytes, field_offset, e, elem, *n) {
+                        return;
+                    }
                 }
             }
             if is_ptr_array {
@@ -709,8 +708,7 @@ impl Lowerer {
             // an array field, consume consecutive items to fill the array elements.
             if matches!(&inner_item.init, Initializer::Expr(_)) {
                 if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
-                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar)
-                        && matches!(&inner_item.init, Initializer::Expr(Expr::StringLiteral(..)));
+                    let is_char_array_str = matches!(&inner_item.init, Initializer::Expr(e) if Self::string_init_units(e, elem_ty).is_some());
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(
                             &inner_items[item_idx..], elem_ty, arr_size,
@@ -766,13 +764,13 @@ impl Lowerer {
             let ir_ty = IrType::from_ctype(ty);
             let val = h::bool_normalized(ty, self.eval_init_scalar(&Initializer::Expr(expr.clone())));
             self.write_bitfield_to_bytes(bytes, offset, &val, ir_ty, bo, bw);
-        } else if let Expr::StringLiteral(s, _) = expr {
-            // String literal initializing a char array field (e.g., {"hello", &ptr} in a struct
-            // with pointer members). write_string_to_bytes handles copying the string bytes.
+        } else if matches!(expr, Expr::StringLiteral(..))
+            || matches!(ty, CType::Array(elem, Some(_)) if Self::string_init_units(expr, elem).is_some())
+        {
+            // String literal initializing a char (or wide character) array field (e.g.,
+            // {"hello", &ptr} in a struct with pointer members).
             if let CType::Array(ref elem, Some(arr_size)) = ty {
-                if matches!(elem.as_ref(), CType::Char | CType::SChar | CType::UChar) {
-                    Self::write_string_to_bytes(bytes, offset, s, *arr_size);
-                }
+                Self::write_string_init(bytes, offset, expr, elem, *arr_size);
             }
         } else if let Some(val) = self.eval_const_expr(expr) {
             let ir_ty = IrType::from_ctype(ty);
@@ -1040,8 +1038,7 @@ impl Lowerer {
             // Brace elision for array fields within the sub-struct
             if matches!(&inner_item.init, Initializer::Expr(_)) {
                 if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
-                    let is_char_array_str = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar)
-                        && matches!(&inner_item.init, Initializer::Expr(Expr::StringLiteral(..)));
+                    let is_char_array_str = matches!(&inner_item.init, Initializer::Expr(e) if Self::string_init_units(e, elem_ty).is_some());
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(
                             &items[item_idx..], elem_ty, arr_size,

@@ -334,7 +334,7 @@ impl Lowerer {
                     GlobalInit::WideString(s.chars().map(|c| c as u32).collect())
                 }
                 IrType::I16 | IrType::U16 => {
-                    GlobalInit::Char16String(s.chars().map(|c| c as u16).collect())
+                    GlobalInit::Char16String(s.chars().map(crate::common::encoding::char16_unit).collect())
                 }
                 _ => {
                     // Unexpected element type for string init - treat as pointer
@@ -487,7 +487,7 @@ impl Lowerer {
                 GlobalInit::WideString(s.chars().map(|c| c as u32).collect())
             }
             IrType::I16 | IrType::U16 => {
-                GlobalInit::Char16String(s.chars().map(|c| c as u16).collect())
+                GlobalInit::Char16String(s.chars().map(crate::common::encoding::char16_unit).collect())
             }
             _ => return None,
         })
@@ -634,7 +634,9 @@ impl Lowerer {
         elem_size: usize,
         array_dim_strides: &[usize],
     ) -> bool {
-        let is_multidim_char_array = matches!(base_ty, IrType::I8 | IrType::U8)
+        // A string literal in a multi-dimensional array of characters (char,
+        // char16_t, wchar_t, char32_t) is a row's contents, not an address.
+        let is_multidim_char_array = matches!(base_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32)
             && array_dim_strides.len() > 1;
         let is_ptr_array = elem_size > base_ty.size().max(1);
 
@@ -650,7 +652,7 @@ impl Lowerer {
                 } else {
                     expr
                 };
-                if matches!(expr, Expr::StringLiteral(_, _)) {
+                if matches!(expr, Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..)) {
                     return !is_multidim_char_array;
                 }
                 if matches!(Self::strip_casts(expr), Expr::LabelAddr(_, _)) || Self::expr_contains_label_addr(expr) {
@@ -1366,16 +1368,22 @@ impl Lowerer {
         for (item_idx, item) in items.iter().enumerate() {
             let field_idx = self.resolve_struct_init_field_idx(item, layout, current_field_idx);
             if field_idx == last_field_idx {
-                let num_elems = match &item.init {
-                    Initializer::List(sub_items) => sub_items.len(),
-                    Initializer::Expr(Expr::StringLiteral(s, _)) => {
-                        if matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar) {
-                            s.len() + 1
-                        } else {
-                            items.len() - item_idx
-                        }
-                    }
-                    Initializer::Expr(_) => items.len() - item_idx,
+                // A string literal (braced or not) for a char or wide
+                // character array fills its units and the terminator.
+                let string = match &item.init {
+                    Initializer::Expr(e) => Self::string_init_units(e, elem_ty),
+                    Initializer::List(sub) => match sub.as_slice() {
+                        [only] if only.designators.is_empty() => match &only.init {
+                            Initializer::Expr(e) => Self::string_init_units(e, elem_ty),
+                            Initializer::List(_) => None,
+                        },
+                        _ => None,
+                    },
+                };
+                let num_elems = match (&item.init, string) {
+                    (_, Some((units, _))) => units.len() + 1,
+                    (Initializer::List(sub_items), None) => sub_items.len(),
+                    (Initializer::Expr(_), None) => items.len() - item_idx,
                 };
                 return num_elems * elem_size;
             }
@@ -1448,9 +1456,10 @@ impl Lowerer {
                 if matches!(&item.init, Initializer::Expr(_))
                     && item.designators.is_empty()
                 {
-                    let is_string_literal = matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
-                    let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar);
-                    if !(is_string_literal && is_char_array) {
+                    // A string literal for a char (or wide character) array is
+                    // its contents, no flat run of scalars.
+                    let is_string_init = matches!(&item.init, Initializer::Expr(e) if Self::string_init_units(e, elem_ty).is_some());
+                    if !is_string_init {
                         let scalars_per_elem = h::count_flat_init_scalars(elem_ty, &*self.types.borrow_struct_layouts());
                         let total_scalars = arr_size * scalars_per_elem;
                         // Check all consumed items for address expressions
@@ -1625,13 +1634,31 @@ impl Lowerer {
         }
     }
 
-    /// Inline a string literal into a values array for a sub-array element.
+    /// The code units a string literal puts in an array whose elements have
+    /// IR type `base_ty`: a narrow literal's bytes, an L"" or U"" literal's
+    /// for 4-byte elements, a u"" literal's for 2-byte ones. None for any
+    /// other expression or element type.
+    pub(super) fn string_units_for(expr: &Expr, base_ty: IrType) -> Option<Vec<u32>> {
+        match (expr, base_ty) {
+            (Expr::StringLiteral(s, _), _) => Some(s.chars().map(|c| c as u8 as u32).collect()),
+            (Expr::WideStringLiteral(s, _), IrType::I32 | IrType::U32) => Some(s.chars().map(|c| c as u32).collect()),
+            (Expr::Char16StringLiteral(s, _), IrType::I16 | IrType::U16) => {
+                Some(s.chars().map(|c| crate::common::encoding::char16_unit(c) as u32).collect())
+            }
+            _ => None,
+        }
+    }
+
+    /// Inline a string literal into a values array for a sub-array element
+    /// (see string_units_for); false, adding nothing, if `expr` is no
+    /// literal for such elements.
     fn inline_string_to_values(
-        &self, s: &str, sub_elem_count: usize, base_ty: IrType, values: &mut Vec<IrConst>,
-    ) {
+        &self, expr: &Expr, sub_elem_count: usize, base_ty: IrType, values: &mut Vec<IrConst>,
+    ) -> bool {
+        let Some(units) = Self::string_units_for(expr, base_ty) else { return false };
         let start_len = values.len();
-        for c in s.chars() {
-            values.push(IrConst::I64(c as u8 as i64));
+        for u in units {
+            values.push(IrConst::I64(u as i64));
         }
         if values.len() < start_len + sub_elem_count {
             values.push(IrConst::I64(0));
@@ -1642,6 +1669,7 @@ impl Lowerer {
         if values.len() > start_len + sub_elem_count {
             values.truncate(start_len + sub_elem_count);
         }
+        true
     }
 
     fn flatten_global_array_init_bool(
@@ -1761,7 +1789,7 @@ impl Lowerer {
                 Self::overwrite_or_extend_values(values, flat_idx, tmp, &zero_fn);
             }
             Initializer::Expr(expr) => {
-                if let Expr::StringLiteral(s, _) = expr {
+                if Self::string_units_for(expr, base_ty).is_some() {
                     // For designated string literal in a multi-dim char array:
                     // e.g., char arr[2][5] = { [0] = "ABCD" }
                     // index_designators = [0], array_dim_strides = [5, 1]
@@ -1779,7 +1807,7 @@ impl Lowerer {
                         1
                     };
                     let mut tmp = Vec::new();
-                    self.inline_string_to_values(s, string_sub_count, base_ty, &mut tmp);
+                    self.inline_string_to_values(expr, string_sub_count, base_ty, &mut tmp);
                     Self::overwrite_or_extend_values(values, flat_idx, tmp, &zero_fn);
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     values[flat_idx] = if is_bool_target {
@@ -1820,10 +1848,10 @@ impl Lowerer {
                 match sub_items.as_slice() {
                     // {"cd"} for a char row inside an elided element.
                     [only] if level + 2 == array_dim_strides.len() && only.designators.is_empty()
-                        && matches!(only.init, Initializer::Expr(Expr::StringLiteral(..))) =>
+                        && matches!(only.init, Initializer::Expr(ref e) if Self::string_units_for(e, base_ty).is_some()) =>
                     {
-                        if let Initializer::Expr(Expr::StringLiteral(ref s, _)) = only.init {
-                            self.inline_string_to_values(s, count, base_ty, &mut sub_values);
+                        if let Initializer::Expr(ref e) = only.init {
+                            self.inline_string_to_values(e, count, base_ty, &mut sub_values);
                         }
                     }
                     _ => self.flatten_global_array_init_bool(sub_items, sub_strides, base_ty, &mut sub_values, is_bool_target),
@@ -1844,10 +1872,13 @@ impl Lowerer {
                 }
                 // Check for braced string literal initializing a char sub-array
                 if sub_items.len() == 1 {
-                    if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
-                        self.inline_string_to_values(s, sub_elem_count, base_ty, values);
-                        *current_outer_idx += 1;
-                        return;
+                    if let Initializer::Expr(e) = &sub_items[0].init {
+                        let mut row = Vec::with_capacity(sub_elem_count);
+                        if self.inline_string_to_values(e, sub_elem_count, base_ty, &mut row) {
+                            Self::overwrite_or_extend_values(values, target_start, row, &|| self.zero_const(base_ty));
+                            *current_outer_idx += 1;
+                            return;
+                        }
                     }
                 }
                 let mut sub_values = Vec::with_capacity(sub_elem_count);
@@ -1857,11 +1888,14 @@ impl Lowerer {
                 while sub_values.len() < sub_elem_count {
                     sub_values.push(self.zero_const(base_ty));
                 }
-                values.extend(sub_values.into_iter().take(sub_elem_count));
+                // At the row's position, which a designator before may have
+                // moved back: { [3] = "x", [0] = "ab", { "cd" } } fills row 1.
+                sub_values.truncate(sub_elem_count);
+                Self::overwrite_or_extend_values(values, target_start, sub_values, &|| self.zero_const(base_ty));
                 *current_outer_idx += 1;
             }
             Initializer::Expr(expr) => {
-                if let Expr::StringLiteral(s, _) = expr {
+                if Self::string_units_for(expr, base_ty).is_some() {
                     // A string initializes one row, the innermost char array
                     // (char a[][2][4] = {"ab", "cd"} fills a[0][0], a[0][1]).
                     let leaf = base_ty.size().max(1);
@@ -1871,7 +1905,7 @@ impl Lowerer {
                     while values.len() < target_start {
                         values.push(self.zero_const(base_ty));
                     }
-                    self.inline_string_to_values(s, row, base_ty, values);
+                    self.inline_string_to_values(expr, row, base_ty, values);
                     if sub_elem_count > 0 {
                         *current_outer_idx = (values.len() - start_len).div_ceil(sub_elem_count);
                     }
@@ -2070,10 +2104,8 @@ impl Lowerer {
     ) {
         match init {
             Initializer::Expr(expr) => {
-                if let Expr::StringLiteral(s, _) = expr {
-                    for c in s.chars() {
-                        values.push(IrConst::I64(c as u8 as i64));
-                    }
+                if let Some(units) = Self::string_units_for(expr, base_ty) {
+                    values.extend(units.into_iter().map(|u| IrConst::I64(u as i64)));
                     values.push(IrConst::I64(0));
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     values.push(if is_bool_target {

@@ -440,13 +440,11 @@ impl Lowerer {
     ) {
         match &item.init {
             Initializer::Expr(e) => {
-                // Check for string literal targeting a char sub-array
-                if let Expr::StringLiteral(s, _) = e {
-                    if let CType::Array(inner, Some(arr_size)) = elem_ty {
-                        if matches!(inner.as_ref(), CType::Char | CType::SChar | CType::UChar) {
-                            self.emit_string_to_alloca(base_alloca, s, elem_offset, *arr_size);
-                            return;
-                        }
+                // Check for string literal targeting a char (or wide character) sub-array
+                if let CType::Array(inner, Some(arr_size)) = elem_ty {
+                    let max_bytes = *arr_size * self.resolve_ctype_size(inner);
+                    if self.emit_string_init_to_alloca(base_alloca, e, inner, elem_offset, max_bytes) {
+                        return;
                     }
                 }
                 self.emit_init_expr_to_offset_bool(e, base_alloca, elem_offset, elem_ir_ty, *elem_ty == CType::Bool);
@@ -574,11 +572,10 @@ impl Lowerer {
         field_offset: usize,
         elem_size: usize,
     ) {
-        // Check for brace-wrapped string literal: {"hello"} for char[]
+        // Check for brace-wrapped string literal: {"hello"} for char[] (or {L"hi"} for wchar_t[])
         if sub_items.len() == 1 && sub_items[0].designators.is_empty() {
-            if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
-                if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
-                    self.emit_string_to_alloca(base_alloca, s, field_offset, arr_size * elem_size);
+            if let Initializer::Expr(e) = &sub_items[0].init {
+                if self.emit_string_init_to_alloca(base_alloca, e, elem_ty, field_offset, arr_size * elem_size) {
                     return;
                 }
             }
@@ -724,13 +721,11 @@ impl Lowerer {
                 Initializer::Expr(e) => {
                     // String literal targeting a char sub-array: copy the string
                     // into the array memory instead of storing a pointer.
-                    if let Expr::StringLiteral(s, _) = e {
-                        if let CType::Array(inner, Some(sub_arr_size)) = elem_ty {
-                            if matches!(inner.as_ref(), CType::Char | CType::SChar | CType::UChar) {
-                                self.emit_string_to_alloca(base_alloca, s, elem_offset, *sub_arr_size);
-                                ai += 1;
-                                continue;
-                            }
+                    if let CType::Array(inner, Some(sub_arr_size)) = elem_ty {
+                        let max_bytes = *sub_arr_size * self.resolve_ctype_size(inner);
+                        if self.emit_string_init_to_alloca(base_alloca, e, inner, elem_offset, max_bytes) {
+                            ai += 1;
+                            continue;
                         }
                     }
                     let elem_ir_ty = IrType::from_ctype(elem_ty);
@@ -747,12 +742,10 @@ impl Lowerer {
                             if let Initializer::Expr(e) = &inner_item.init {
                                 let inner_offset = elem_offset + ii * inner_elem_size;
                                 // String literal targeting a char sub-array: copy string contents
-                                if let Expr::StringLiteral(s, _) = e {
-                                    if let CType::Array(inner_inner, Some(sub_arr_size)) = inner_elem_ty.as_ref() {
-                                        if matches!(inner_inner.as_ref(), CType::Char | CType::SChar | CType::UChar) {
-                                            self.emit_string_to_alloca(base_alloca, s, inner_offset, *sub_arr_size);
-                                            continue;
-                                        }
+                                if let CType::Array(inner_inner, Some(sub_arr_size)) = inner_elem_ty.as_ref() {
+                                    let max_bytes = *sub_arr_size * self.resolve_ctype_size(inner_inner);
+                                    if self.emit_string_init_to_alloca(base_alloca, e, inner_inner, inner_offset, max_bytes) {
+                                        continue;
                                     }
                                 }
                                 self.emit_init_expr_to_offset_bool(e, base_alloca, inner_offset, inner_elem_ir_ty, inner_is_bool);
@@ -802,7 +795,6 @@ impl Lowerer {
         let leaf_size = self.resolve_ctype_size(leaf);
         let leaf_ir_ty = IrType::from_ctype(leaf);
         let leaf_is_bool = *leaf == CType::Bool;
-        let leaf_is_char = matches!(leaf, CType::Char | CType::SChar | CType::UChar);
         let row = extents[extents.len() - 1];
         let continuing = start.is_some();
         let mut pos = start.map_or(0, |(p, _)| p);
@@ -828,9 +820,9 @@ impl Lowerer {
                 break;
             }
             match &item.init {
-                Initializer::Expr(Expr::StringLiteral(s, _)) if leaf_is_char => {
+                Initializer::Expr(e) if Self::string_init_units(e, leaf).is_some() => {
                     let row_start = pos - pos % row;
-                    self.emit_string_to_alloca(base_alloca, s, offset + row_start * leaf_size, row);
+                    self.emit_string_init_to_alloca(base_alloca, e, leaf, offset + row_start * leaf_size, row * leaf_size);
                     pos = row_start + row;
                 }
                 Initializer::Expr(e) => {
@@ -847,8 +839,7 @@ impl Lowerer {
                     if strides[k] == 1 && k == extents.len() - 1 {
                         // Braces around a scalar, or a string for a char row.
                         if let Some(e) = Self::unwrap_nested_init_expr(sub) {
-                            if let (Expr::StringLiteral(s, _), true) = (e, leaf_is_char) {
-                                self.emit_string_to_alloca(base_alloca, s, offset + pos * leaf_size, row);
+                            if self.emit_string_init_to_alloca(base_alloca, e, leaf, offset + pos * leaf_size, row * leaf_size) {
                                 pos += row;
                             } else {
                                 self.emit_init_expr_to_offset_bool(e, base_alloca, offset + pos * leaf_size, leaf_ir_ty, leaf_is_bool);
@@ -891,13 +882,10 @@ impl Lowerer {
         elem_size: usize,
         array_start_idx: Option<usize>,
     ) {
-        // String literal for char array field
-        if let Expr::StringLiteral(s, _) = e {
-            if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
-                self.emit_string_to_alloca(base_alloca, s, field_offset, arr_size * elem_size);
-                *item_idx += 1;
-                return;
-            }
+        // String literal for a char (or wide character) array field
+        if self.emit_string_init_to_alloca(base_alloca, e, elem_ty, field_offset, arr_size * elem_size) {
+            *item_idx += 1;
+            return;
         }
 
         if let CType::Struct(ref key) | CType::Union(ref key) = elem_ty {

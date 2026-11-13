@@ -806,12 +806,9 @@ impl Lowerer {
                         }
                     }
                     Initializer::Expr(e) => {
-                        if base_ty == IrType::I8 || base_ty == IrType::U8 {
-                            if let Expr::StringLiteral(s, _) = e {
-                                self.emit_string_to_alloca(alloca, s, target_flat * elem_size, sub_elem_count * elem_size);
-                                *flat_index = target_flat + sub_elem_count;
-                                continue;
-                            }
+                        if self.emit_string_row_to_alloca(alloca, e, base_ty, target_flat * elem_size, sub_elem_count * elem_size) {
+                            *flat_index = target_flat + sub_elem_count;
+                            continue;
                         }
                         let val = self.lower_and_cast_init_expr(e, base_ty);
                         self.emit_array_element_store(alloca, val, target_flat * elem_size, base_ty);
@@ -831,15 +828,16 @@ impl Lowerer {
                     let level = Self::brace_level(array_dim_strides, elem_size, *flat_index);
                     let braced_string = match sub_items.as_slice() {
                         [only] if only.designators.is_empty() => match &only.init {
-                            Initializer::Expr(Expr::StringLiteral(s, _)) if matches!(base_ty, IrType::I8 | IrType::U8) => Some(s),
+                            Initializer::Expr(e) if Self::is_string_row(e, base_ty) => Some(e),
                             _ => None,
                         },
                         _ => None,
                     };
-                    if let (true, Some(s)) = (level > 0 && level + 2 == array_dim_strides.len(), braced_string) {
-                        // {"cd"} for a char row inside an elided element.
+                    if let (true, Some(e)) = (level + 2 == array_dim_strides.len(), braced_string) {
+                        // {"cd"} for a char (or wide character) row: a whole row, or one
+                        // inside an elided element.
                         let level_count = array_dim_strides[level] / elem_size;
-                        self.emit_string_to_alloca(alloca, s, *flat_index * elem_size, level_count * elem_size);
+                        self.emit_string_row_to_alloca(alloca, e, base_ty, *flat_index * elem_size, level_count * elem_size);
                         *flat_index = start_index + level_count;
                     } else if level > 0 && level + 1 < array_dim_strides.len() {
                         let level_count = array_dim_strides[level] / elem_size;
@@ -878,19 +876,16 @@ impl Lowerer {
                     }
                 }
                 Initializer::Expr(e) => {
-                    // String literal fills a sub-array in char arrays
-                    if base_ty == IrType::I8 || base_ty == IrType::U8 {
-                        if let Expr::StringLiteral(s, _) = e {
-                            let max_str_bytes = sub_elem_count * elem_size;
-                            self.emit_string_to_alloca(alloca, s, *flat_index * elem_size, max_str_bytes);
-                            let string_stride = if array_dim_strides.len() >= 2 {
-                                array_dim_strides[array_dim_strides.len() - 2]
-                            } else {
-                                sub_elem_count
-                            };
-                            *flat_index += string_stride;
-                            continue;
-                        }
+                    // String literal fills a sub-array (a row) in char (or wide character) arrays
+                    let max_str_bytes = sub_elem_count * elem_size;
+                    if self.emit_string_row_to_alloca(alloca, e, base_ty, *flat_index * elem_size, max_str_bytes) {
+                        let string_stride = if array_dim_strides.len() >= 2 {
+                            array_dim_strides[array_dim_strides.len() - 2] / elem_size
+                        } else {
+                            sub_elem_count
+                        };
+                        *flat_index += string_stride;
+                        continue;
                     }
                     // Bare scalar: fills one base element without sub-array padding
                     let val = self.lower_and_cast_init_expr(e, base_ty);

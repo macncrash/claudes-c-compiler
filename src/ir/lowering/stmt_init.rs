@@ -783,11 +783,10 @@ impl Lowerer {
             }
             match &item.init {
                 Initializer::List(sub_items) => {
-                    if let Some(ref fname) = field_designator_name {
-                        // Field-designated list init: [idx].field = { ... }
-                        self.lower_struct_array_field_designated_list(
-                            sub_items, alloca, base_byte_offset, fname, s_layout,
-                        );
+                    if field_designator_name.is_some() {
+                        // Field-designated init: [idx].field... = { ... }, as the
+                        // element's own initializer would take .field... = { ... }.
+                        self.emit_struct_init(&[Self::from_first_field_designator(item)], alloca, s_layout, base_byte_offset);
                     } else if is_subarray {
                         // Sub-array: recurse with next dimension level
                         let start_flat = *flat_idx;
@@ -811,10 +810,10 @@ impl Lowerer {
                     }
                 }
                 Initializer::Expr(e) => {
-                    if let Some(ref fname) = field_designator_name {
-                        self.lower_struct_array_field_designated_expr(
-                            e, alloca, base_byte_offset, fname, s_layout,
-                        );
+                    if field_designator_name.is_some() {
+                        // [idx].field... = val (a string for a char array member,
+                        // .in.x, .arr[2]): as in the element's own initializer.
+                        self.emit_struct_init(&[Self::from_first_field_designator(item)], alloca, s_layout, base_byte_offset);
                     } else if self.struct_value_size(e).is_some() {
                         let src_addr = self.get_struct_base_addr(e);
                         self.emit_memcpy_at_offset(alloca, base_byte_offset, src_addr, struct_size);
@@ -829,92 +828,6 @@ impl Lowerer {
             }
             item_idx += 1;
             *flat_idx += 1;
-        }
-    }
-
-    /// Handle field-designated list init for a struct array element:
-    /// `[idx].field = { ... }`
-    fn lower_struct_array_field_designated_list(
-        &mut self,
-        sub_items: &[InitializerItem],
-        alloca: Value,
-        base_byte_offset: usize,
-        fname: &str,
-        s_layout: &crate::common::types::StructLayout,
-    ) {
-        if let Some(field) = s_layout.fields.iter().find(|f| f.name == fname) {
-            let field_offset = base_byte_offset + field.offset;
-            if field.ty.is_complex() {
-                let dest_addr = self.emit_gep_offset(alloca, field_offset, IrType::Ptr);
-                self.lower_complex_list_init(sub_items, dest_addr, &field.ty);
-            } else if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
-                let elem_size = self.resolve_ctype_size(elem_ty);
-                if elem_ty.is_complex() {
-                    let complex_ctype = elem_ty.as_ref().clone();
-                    for (ai, sub_item) in sub_items.iter().enumerate() {
-                        if ai >= arr_size { break; }
-                        let elem_offset = field_offset + ai * elem_size;
-                        match &sub_item.init {
-                            Initializer::Expr(e) => {
-                                self.emit_complex_expr_to_offset(e, alloca, elem_offset, &complex_ctype);
-                            }
-                            Initializer::List(inner_items) => {
-                                let dest = self.emit_gep_offset(alloca, elem_offset, IrType::Ptr);
-                                self.lower_complex_list_init(inner_items, dest, &complex_ctype);
-                            }
-                        }
-                    }
-                } else {
-                    let elem_ir_ty = IrType::from_ctype(elem_ty);
-                    let elem_is_bool = **elem_ty == CType::Bool;
-                    for (ai, sub_item) in sub_items.iter().enumerate() {
-                        if ai >= arr_size { break; }
-                        if let Initializer::Expr(e) = &sub_item.init {
-                            let elem_offset = field_offset + ai * elem_size;
-                            self.emit_init_expr_to_offset_bool(e, alloca, elem_offset, elem_ir_ty, elem_is_bool);
-                        }
-                    }
-                }
-            } else if let CType::Struct(ref key) | CType::Union(ref key) = field.ty {
-                let sub_layout = self.types.borrow_struct_layouts().get(&**key).cloned();
-                if let Some(sub_layout) = sub_layout {
-                    self.emit_struct_init(sub_items, alloca, &sub_layout, field_offset);
-                }
-            } else if let Some(first) = sub_items.first() {
-                if let Initializer::Expr(e) = &first.init {
-                    let field_ir_ty = IrType::from_ctype(&field.ty);
-                    let val = self.lower_and_cast_init_expr(e, field_ir_ty);
-                    self.emit_store_at_offset(alloca, field_offset, val, field_ir_ty);
-                }
-            }
-        }
-    }
-
-    /// Handle field-designated expression init for a struct array element:
-    /// `[idx].field = expr`
-    fn lower_struct_array_field_designated_expr(
-        &mut self,
-        e: &Expr,
-        alloca: Value,
-        base_byte_offset: usize,
-        fname: &str,
-        s_layout: &crate::common::types::StructLayout,
-    ) {
-        if let Some(field) = s_layout.fields.iter().find(|f| f.name == fname) {
-            if field.ty.is_complex() {
-                let field_offset = base_byte_offset + field.offset;
-                self.emit_complex_expr_to_offset(e, alloca, field_offset, &field.ty);
-            } else {
-                let field_ty = IrType::from_ctype(&field.ty);
-                let val = if field.ty == CType::Bool {
-                    let v = self.lower_expr(e);
-                    let et = self.get_expr_type(e);
-                    self.emit_bool_normalize_typed(v, et)
-                } else {
-                    self.lower_and_cast_init_expr(e, field_ty)
-                };
-                self.emit_store_at_offset(alloca, base_byte_offset + field.offset, val, field_ty);
-            }
         }
     }
 

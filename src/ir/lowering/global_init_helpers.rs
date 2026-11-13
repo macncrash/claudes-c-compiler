@@ -108,7 +108,7 @@ pub(super) fn init_contains_addr_expr(
 ) -> bool {
     match &item.init {
         Initializer::Expr(expr) => {
-            if matches!(expr, Expr::StringLiteral(_, _)) {
+            if matches!(expr, Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..)) {
                 !is_multidim_char_array
             } else {
                 expr_might_be_addr(expr, enum_constants)

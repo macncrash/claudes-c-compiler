@@ -325,19 +325,45 @@ impl Lowerer {
         }
     }
 
-    /// Write a string literal into a byte buffer at the given offset, with null terminator.
-    /// Each char in the string is treated as a raw byte value (0-255).
-    pub(super) fn write_string_to_bytes(bytes: &mut [u8], offset: usize, s: &str, max_len: usize) {
-        let str_chars: Vec<u8> = s.chars().map(|c| c as u8).collect();
-        for (i, &b) in str_chars.iter().enumerate() {
-            if i >= max_len { break; }
-            if offset + i < bytes.len() {
-                bytes[offset + i] = b;
+    /// An array element's designated item, `[i].f.g = v`, as an item of the
+    /// element's own initializer: `.f.g = v`.
+    pub(super) fn from_first_field_designator(item: &InitializerItem) -> InitializerItem {
+        let first = item.designators.iter().position(|d| matches!(d, Designator::Field(_))).unwrap_or(0);
+        InitializerItem { designators: item.designators[first..].to_vec(), init: item.init.clone() }
+    }
+
+    /// The code units of a string literal that can initialize an array of
+    /// `elem` (C11 6.7.9p14-15), and their size: a plain or u8 literal a
+    /// char array, L"" or U"" a 4-byte (wchar_t, char32_t) one, u"" a
+    /// char16_t one. None for any other expression or element type.
+    pub(super) fn string_init_units(expr: &Expr, elem: &CType) -> Option<(Vec<u32>, usize)> {
+        match (expr, elem) {
+            (Expr::StringLiteral(s, _), CType::Char | CType::SChar | CType::UChar) => {
+                Some((s.chars().map(|c| c as u8 as u32).collect(), 1))
+            }
+            (Expr::WideStringLiteral(s, _), CType::Int | CType::UInt) => {
+                Some((s.chars().map(|c| c as u32).collect(), 4))
+            }
+            (Expr::Char16StringLiteral(s, _), CType::Short | CType::UShort) => {
+                Some((s.chars().map(|c| crate::common::encoding::char16_unit(c) as u32).collect(), 2))
+            }
+            _ => None,
+        }
+    }
+
+    /// Write a string literal that initializes `n` elements of `elem` at
+    /// `offset`: its units, then the terminator if it fits (the bytes after
+    /// are left as they are, zero). False, writing nothing, if `expr` is no
+    /// literal that can initialize such an array.
+    pub(super) fn write_string_init(bytes: &mut [u8], offset: usize, expr: &Expr, elem: &CType, n: usize) -> bool {
+        let Some((units, unit)) = Self::string_init_units(expr, elem) else { return false };
+        for (i, u) in units.into_iter().chain(std::iter::once(0)).take(n).enumerate() {
+            let at = offset + i * unit;
+            if at + unit <= bytes.len() {
+                bytes[at..at + unit].copy_from_slice(&u.to_le_bytes()[..unit]);
             }
         }
-        if str_chars.len() < max_len && offset + str_chars.len() < bytes.len() {
-            bytes[offset + str_chars.len()] = 0;
-        }
+        true
     }
 
     /// Process a nested designator into an array field (e.g., .field[idx] = val).
@@ -441,19 +467,13 @@ impl Lowerer {
                             );
                         }
                     } else if let Initializer::Expr(ref expr) = item.init {
-                        if let Expr::StringLiteral(s, _) = expr {
-                            if let CType::Array(deep_inner, Some(deep_size)) = inner_elem_ty.as_ref() {
-                                if matches!(deep_inner.as_ref(), CType::Char | CType::SChar | CType::UChar) {
-                                    Self::write_string_to_bytes(bytes, inner_offset, s, *deep_size);
-                                } else {
-                                    let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                                    self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
-                                }
-                            } else {
-                                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                                self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
+                        let wrote = match inner_elem_ty.as_ref() {
+                            CType::Array(deep_inner, Some(deep_size)) => {
+                                Self::write_string_init(bytes, inner_offset, expr, deep_inner, *deep_size)
                             }
-                        } else {
+                            _ => false,
+                        };
+                        if !wrote {
                             let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
                             self.write_const_to_bytes(bytes, inner_offset, &val, inner_ir_ty);
                         }
@@ -463,22 +483,20 @@ impl Lowerer {
         } else if let Initializer::Expr(ref expr) = item.init {
             // No further designators - store value at elem_offset
             // Handle string literal initializing a char array element
-            // (e.g., .a[1] = "abc" where a is char a[3][10])
-            if let Expr::StringLiteral(s, _) = expr {
-                if let CType::Array(inner, Some(inner_size)) = elem_ty {
-                    if matches!(inner.as_ref(), CType::Char | CType::SChar | CType::UChar) {
-                        Self::write_string_to_bytes(bytes, elem_offset, s, *inner_size);
-                    } else {
-                        let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                        self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                    }
-                } else if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
-                    let val = s.chars().next().map(|c| IrConst::I8(c as u8 as i8)).unwrap_or(IrConst::I8(0));
-                    self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                } else {
-                    let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
-                    self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
-                }
+            // (e.g., .a[1] = "abc" where a is char a[3][10]), or a wide one
+            // a wchar_t, char16_t or char32_t array element.
+            let string_row = match elem_ty {
+                CType::Array(inner, Some(inner_size)) => Self::write_string_init(bytes, elem_offset, expr, inner, *inner_size),
+                _ => false,
+            };
+            if string_row {
+                // written
+            } else if let (Expr::StringLiteral(s, _), CType::Char | CType::SChar | CType::UChar) = (expr, elem_ty) {
+                let val = s.chars().next().map(|c| IrConst::I8(c as u8 as i8)).unwrap_or(IrConst::I8(0));
+                self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+            } else if matches!(expr, Expr::StringLiteral(..)) {
+                let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
+                self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
             } else {
                 let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
                 // _Bool elements: normalize (any nonzero -> 1) per C11 6.3.1.2
@@ -618,12 +636,9 @@ impl Lowerer {
                 ArrayFillResult { new_item_idx: item_idx + 1, skip_update: false }
             }
             Initializer::Expr(expr) => {
-                // String literal for char array
-                if let Expr::StringLiteral(s, _) = expr {
-                    if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
-                        Self::write_string_to_bytes(bytes, field_offset, s, arr_size);
-                        return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
-                    }
+                // String literal for a char, wchar_t, char16_t or char32_t array
+                if Self::write_string_init(bytes, field_offset, expr, elem_ty, arr_size) {
+                    return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
                 }
                 // Flat init from consecutive items.
                 // For multi-dimensional arrays (elem_ty is Array), use leaf element
@@ -731,7 +746,6 @@ impl Lowerer {
         let total = strides[0] * extents[0];
         let leaf_size = self.resolve_ctype_size(leaf);
         let leaf_ir_ty = IrType::from_ctype(leaf);
-        let leaf_is_char = matches!(leaf, CType::Char | CType::SChar | CType::UChar);
         let row = extents[extents.len() - 1];
         let continuing = start.is_some();
         let mut pos = start.map_or(0, |(p, _)| p);
@@ -757,9 +771,9 @@ impl Lowerer {
                 break;
             }
             match &item.init {
-                Initializer::Expr(Expr::StringLiteral(s, _)) if leaf_is_char => {
+                Initializer::Expr(e) if Self::string_init_units(e, leaf).is_some() => {
                     let row_start = pos - pos % row;
-                    Self::write_string_to_bytes(bytes, offset + row_start * leaf_size, s, row);
+                    Self::write_string_init(bytes, offset + row_start * leaf_size, e, leaf, row);
                     pos = row_start + row;
                 }
                 Initializer::Expr(e) => {
@@ -777,8 +791,8 @@ impl Lowerer {
                     if strides[k] == 1 && k == extents.len() - 1 {
                         // Braces around a scalar, or a string for a char row.
                         match sub.first().map(|s| &s.init) {
-                            Some(Initializer::Expr(Expr::StringLiteral(s, _))) if leaf_is_char => {
-                                Self::write_string_to_bytes(bytes, offset + pos * leaf_size, s, row);
+                            Some(Initializer::Expr(e)) if Self::string_init_units(e, leaf).is_some() => {
+                                Self::write_string_init(bytes, offset + pos * leaf_size, e, leaf, row);
                                 pos += row;
                             }
                             Some(init) => {
@@ -831,14 +845,12 @@ impl Lowerer {
                 }
                 Initializer::Expr(expr) => {
                     // String literal initializing a char array element (e.g., char arr[3][8] = { "hello", "world", "foo" })
-                    // Each string literal initializes one inner char array (e.g., char[8]).
-                    if matches!(inner_elem_ty, CType::Char | CType::SChar | CType::UChar) {
-                        if let Expr::StringLiteral(s, _) = expr {
-                            Self::write_string_to_bytes(bytes, elem_offset, s, inner_arr_size);
-                            sub_idx += 1;
-                            ai += 1;
-                            continue;
-                        }
+                    // Each string literal initializes one inner char array (e.g., char[8]);
+                    // likewise a wide one a wchar_t, char16_t or char32_t row.
+                    if Self::write_string_init(bytes, elem_offset, expr, inner_elem_ty, inner_arr_size) {
+                        sub_idx += 1;
+                        ai += 1;
+                        continue;
                     }
                     // Flat init: fill inner array elements from consecutive Expr items.
                     // Determine the leaf type to figure out how to consume items.
@@ -900,17 +912,14 @@ impl Lowerer {
             );
         } else if matches!(elem_ty, CType::Struct(_) | CType::Union(_)) {
             self.fill_array_of_composites(items, elem_ty, arr_size, elem_size, bytes, field_offset);
-        } else if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
-            // Char array: check for string literal initializer (e.g., char[8] init from "hello")
-            if items.len() == 1 {
-                if let Initializer::Expr(Expr::StringLiteral(s, _)) = &items[0].init {
-                    Self::write_string_to_bytes(bytes, field_offset, s, arr_size);
+        } else {
+            // Char (or wide character) array: check for a string literal
+            // initializer (e.g., char[8] init from "hello")
+            if let [InitializerItem { init: Initializer::Expr(e), .. }] = items {
+                if Self::write_string_init(bytes, field_offset, e, elem_ty, arr_size) {
                     return;
                 }
             }
-            let elem_ir_ty = IrType::from_ctype(elem_ty);
-            self.fill_array_of_scalars(items, arr_size, elem_size, elem_ir_ty, bytes, field_offset);
-        } else {
             let elem_ir_ty = IrType::from_ctype(elem_ty);
             self.fill_array_of_scalars(items, arr_size, elem_size, elem_ir_ty, bytes, field_offset);
         }
@@ -981,13 +990,11 @@ impl Lowerer {
                 ArrayFillResult { new_item_idx: item_idx + 1, skip_update: false }
             }
             Initializer::Expr(expr) => {
-                // String literal initializing a char FAM: write bytes directly
-                if let Expr::StringLiteral(s, _) = expr {
-                    if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
-                        let max_len = bytes.len().saturating_sub(field_offset);
-                        Self::write_string_to_bytes(bytes, field_offset, s, max_len);
-                        return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
-                    }
+                // String literal initializing a char (or wide character) FAM:
+                // write the units directly
+                let max_len = bytes.len().saturating_sub(field_offset) / elem_size.max(1);
+                if Self::write_string_init(bytes, field_offset, expr, elem_ty, max_len) {
+                    return ArrayFillResult { new_item_idx: item_idx + 1, skip_update: true };
                 }
                 let mut ai = 0usize;
                 let val = self.eval_const_expr(expr).unwrap_or(IrConst::I64(0));
@@ -1024,11 +1031,8 @@ impl Lowerer {
         bytes: &mut [u8], field_offset: usize,
     ) -> bool {
         if sub_items.len() == 1 && sub_items[0].designators.is_empty() {
-            if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
-                if matches!(elem_ty, CType::Char | CType::SChar | CType::UChar) {
-                    Self::write_string_to_bytes(bytes, field_offset, s, arr_size);
-                    return true;
-                }
+            if let Initializer::Expr(e) = &sub_items[0].init {
+                return Self::write_string_init(bytes, field_offset, e, elem_ty, arr_size);
             }
         }
         false
@@ -1295,18 +1299,11 @@ impl Lowerer {
 
                     match &item.init {
                         Initializer::Expr(expr) => {
-                            if let Some(ref fname) = field_designator_name {
-                                if let Some(val) = self.eval_const_expr(expr) {
-                                    if let Some(field) = layout.fields.iter().find(|f| &f.name == fname) {
-                                        let field_ir_ty = IrType::from_ctype(&field.ty);
-                                        let write_offset = elem_offset + sub_byte_offset + field.offset;
-                                        if let (Some(bo), Some(bw)) = (field.bit_offset, field.bit_width) {
-                                            let val = h::bool_normalized(&field.ty, val);
-                                            self.write_bitfield_to_bytes(bytes, write_offset, &val, field_ir_ty, bo, bw);
-                                        } else if write_offset + field_ir_ty.size() <= bytes.len() {
-                                            self.write_const_to_bytes(bytes, write_offset, &val, field_ir_ty);
-                                        }
-                                    }
+                            if field_designator_name.is_some() {
+                                // [i][j].field... = val (see the one-index case below).
+                                let write_offset = elem_offset + sub_byte_offset;
+                                if write_offset + struct_size <= bytes.len() {
+                                    self.fill_struct_global_bytes(&[Self::from_first_field_designator(item)], layout, bytes, write_offset);
                                 }
                             } else {
                                 // Scalar value at the computed sub-position
@@ -1369,20 +1366,12 @@ impl Lowerer {
                     }
                     item_idx += 1;
                 }
-                Initializer::Expr(expr) => {
-                    if let Some(ref fname) = field_designator_name {
-                        // [idx].field = val: write to specific field
-                        if let Some(val) = self.eval_const_expr(expr) {
-                            if let Some(field) = layout.fields.iter().find(|f| &f.name == fname) {
-                                let field_ir_ty = IrType::from_ctype(&field.ty);
-                                if let (Some(bo), Some(bw)) = (field.bit_offset, field.bit_width) {
-                                    let val = h::bool_normalized(&field.ty, val);
-                                    self.write_bitfield_to_bytes(bytes, elem_offset + field.offset, &val, field_ir_ty, bo, bw);
-                                } else {
-                                    self.write_const_to_bytes(bytes, elem_offset + field.offset, &val, field_ir_ty);
-                                }
-                            }
-                        }
+                Initializer::Expr(_) => {
+                    if field_designator_name.is_some() {
+                        // [idx].field... = val: the struct initializer fills the
+                        // designated member, whatever it is (a string for a
+                        // char array, .in.x, .arr[2]).
+                        self.fill_struct_global_bytes(&[Self::from_first_field_designator(item)], layout, bytes, elem_offset);
                         item_idx += 1;
                     } else {
                         // Flat init: consume items for struct fields sequentially.

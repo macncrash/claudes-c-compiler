@@ -1,4 +1,4 @@
-use crate::common::encoding::decode_pua_byte;
+use crate::common::encoding::{char16_unit_char, decode_pua_byte, push_char16_code_point};
 use crate::common::source::Span;
 use super::token::{Token, TokenKind};
 
@@ -620,10 +620,11 @@ impl Lexer {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 if self.pos < self.input.len() {
+                    let is_ucn = matches!(self.input[self.pos], b'u' | b'U');
                     let ch = self.lex_escape_char(false);
                     // C narrow strings store raw bytes, so Unicode escapes (\u, \U)
                     // must be UTF-8 encoded to match GCC/Clang behavior.
-                    if (ch as u32) > 0xFF {
+                    if is_ucn || (ch as u32) > 0xFF {
                         let mut buf = [0u8; 4];
                         let utf8 = ch.encode_utf8(&mut buf);
                         for byte in utf8.bytes() {
@@ -705,8 +706,9 @@ impl Lexer {
     }
 
     /// Lex a u"..." char16_t string literal. Same parsing as wide string but produces
-    /// Char16StringLiteral token. The Rust String stores Unicode chars; the downstream
-    /// pipeline converts each to a u16 value (truncating code points > 0xFFFF).
+    /// Char16StringLiteral token, whose text holds UTF-16 code units (see
+    /// common::encoding::char16_unit): a character above U+FFFF is a surrogate
+    /// pair, and a hex or octal escape is one unit, a surrogate one included.
     fn lex_char16_string(&mut self, start: usize) -> Token {
         self.pos += 1; // skip opening "
         let mut s = String::new();
@@ -714,40 +716,42 @@ impl Lexer {
             if self.input[self.pos] == b'\\' {
                 self.pos += 1;
                 if self.pos < self.input.len() {
-                    s.push(self.lex_escape_char(true));
+                    let is_ucn = matches!(self.input[self.pos], b'u' | b'U');
+                    let v = self.lex_escape_value(true);
+                    if is_ucn { push_char16_code_point(&mut s, v) } else { s.push(char16_unit_char(v as u16)) }
                 }
             } else {
                 // Check for PUA-encoded bytes first
                 let (byte, consumed) = decode_pua_byte(&self.input, self.pos);
                 if consumed > 1 {
-                    s.push(byte as char);
+                    s.push(char16_unit_char(byte as u16));
                     self.pos += consumed;
                 } else {
                     let byte = self.input[self.pos];
                     if byte < 0x80 {
-                        s.push(byte as char);
+                        s.push(char16_unit_char(byte as u16));
                         self.pos += 1;
                     } else {
                         let remaining = &self.input[self.pos..];
                         let end = std::cmp::min(4, remaining.len());
                         if let Ok(text) = std::str::from_utf8(&remaining[..end]) {
                             if let Some(ch) = text.chars().next() {
-                                s.push(ch);
+                                push_char16_code_point(&mut s, ch as u32);
                                 self.pos += ch.len_utf8();
                             } else {
-                                s.push(byte as char);
+                                s.push(char16_unit_char(byte as u16));
                                 self.pos += 1;
                             }
                         } else if let Ok(text) = std::str::from_utf8(remaining) {
                             if let Some(ch) = text.chars().next() {
-                                s.push(ch);
+                                push_char16_code_point(&mut s, ch as u32);
                                 self.pos += ch.len_utf8();
                             } else {
-                                s.push(byte as char);
+                                s.push(char16_unit_char(byte as u16));
                                 self.pos += 1;
                             }
                         } else {
-                            s.push(byte as char);
+                            s.push(char16_unit_char(byte as u16));
                             self.pos += 1;
                         }
                     }
@@ -823,8 +827,10 @@ impl Lexer {
         let mut value: i32 = 0;
         let mut char_count = 0;
         while self.pos < self.input.len() && self.input[self.pos] != b'\'' {
+            let mut is_ucn = false;
             let ch = if self.input[self.pos] == b'\\' {
                 self.pos += 1;
+                is_ucn =matches!(self.input.get(self.pos), Some(b'u' | b'U'));
                 self.lex_escape_char(false)
             } else {
                 // Decode PUA-encoded bytes for non-UTF-8 source files
@@ -834,7 +840,7 @@ impl Lexer {
             };
             // C narrow char literals encode Unicode escapes as UTF-8 bytes
             // combined into a multi-byte int value, matching GCC behavior.
-            if (ch as u32) > 0xFF {
+            if is_ucn || (ch as u32) > 0xFF {
                 let mut buf = [0u8; 4];
                 let utf8 = ch.encode_utf8(&mut buf);
                 for byte in utf8.bytes() {

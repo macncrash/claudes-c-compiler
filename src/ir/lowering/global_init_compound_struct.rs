@@ -91,10 +91,9 @@ impl Lowerer {
             // complete initializer for the entire array (e.g., char c[10] = "hello").
             // However, for pointer arrays (e.g., char *s[2] = {"abc", "def"}), each
             // string literal IS a flat-init element (it initializes one pointer).
-            let is_string_literal = matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
             if let CType::Array(elem_ty, Some(arr_size)) = field_ty {
-                let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::SChar | CType::UChar);
-                let skip_flat = is_string_literal && is_char_array;
+                // (Likewise a wide string for a wchar_t, char16_t or char32_t array.)
+                let skip_flat = matches!(&item.init, Initializer::Expr(e) if Self::string_init_units(e, elem_ty).is_some());
                 if matches!(&item.init, Initializer::Expr(_)) && !skip_flat {
                     // Flat init: consume the right number of items for this array field.
                     // For arrays of scalars/pointers, each element is 1 item.
@@ -537,6 +536,14 @@ impl Lowerer {
 
         match init {
             Initializer::Expr(expr) => {
+                // A string literal for a char (or wide character) array field.
+                if let (false, CType::Array(elem, Some(n))) = (field_is_pointer, field_ty) {
+                    let mut bytes = vec![0u8; field_size];
+                    if Self::write_string_init(&mut bytes, 0, expr, elem, *n) {
+                        push_bytes_as_elements(elements, &bytes);
+                        return;
+                    }
+                }
                 if let Expr::StringLiteral(s, _) = expr {
                     if field_is_pointer {
                         // String literal initializing a pointer field:

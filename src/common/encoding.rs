@@ -99,6 +99,37 @@ pub fn decode_pua_byte(input: &[u8], pos: usize) -> (u8, usize) {
     (input[pos], 1)
 }
 
+/// A `u"..."` literal's text holds its UTF-16 code units, one char each, so
+/// that a character above U+FFFF counts as the two elements it fills. A
+/// surrogate unit is no Rust char, so it is held as this base plus the unit;
+/// no unit exceeds 0xFFFF, so the two never mix up.
+const CHAR16_SURROGATE_BASE: u32 = 0xF0000;
+
+/// The char that holds a UTF-16 code unit in a `u"..."` literal's text.
+pub fn char16_unit_char(unit: u16) -> char {
+    char::from_u32(unit as u32).unwrap_or_else(|| {
+        char::from_u32(CHAR16_SURROGATE_BASE + unit as u32).expect("plane 15 code point")
+    })
+}
+
+/// Append a code point to a `u"..."` literal's text: as itself, or as a
+/// surrogate pair above U+FFFF.
+pub fn push_char16_code_point(s: &mut String, cp: u32) {
+    if cp > 0xFFFF {
+        let v = cp - 0x10000;
+        s.push(char16_unit_char(0xD800 + (v >> 10) as u16));
+        s.push(char16_unit_char(0xDC00 + (v & 0x3FF) as u16));
+    } else {
+        s.push(char16_unit_char(cp as u16));
+    }
+}
+
+/// The UTF-16 code unit a char of a `u"..."` literal's text holds.
+pub fn char16_unit(c: char) -> u16 {
+    let v = c as u32;
+    if v >= CHAR16_SURROGATE_BASE { (v - CHAR16_SURROGATE_BASE) as u16 } else { v as u16 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

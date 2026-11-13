@@ -246,25 +246,17 @@ impl Lowerer {
                         return rows * elem_size;
                     }
                 }
-                // For char/unsigned char arrays with a single string literal initializer,
-                // the array size is the string length + 1 (null terminator)
-                if elem_size == 1 && items.len() == 1 {
-                    if let Initializer::Expr(ref expr) = items[0].init {
-                        if let Expr::StringLiteral(ref s, _) | Expr::WideStringLiteral(ref s, _)
-                            | Expr::Char16StringLiteral(ref s, _) = expr {
-                            if matches!(expr, Expr::StringLiteral(_, _)) {
-                                s.chars().count() + 1
-                            } else if matches!(expr, Expr::Char16StringLiteral(_, _)) {
-                                (s.chars().count() + 1) * 2
-                            } else {
-                                (s.chars().count() + 1) * 4
-                            }
-                        } else {
-                            elem_size * items.len()
-                        }
-                    } else {
-                        elem_size * items.len()
-                    }
+                // For char (or wide character) arrays with a single string literal
+                // initializer, the array holds its units and the terminator.
+                let string = match items.as_slice() {
+                    [only] if only.designators.is_empty() => match &only.init {
+                        Initializer::Expr(e) => Self::string_init_units(e, elem_ct),
+                        Initializer::List(_) => None,
+                    },
+                    _ => None,
+                };
+                if let Some((units, unit)) = string {
+                    (units.len() + 1) * unit
                 } else if let CType::Struct(ref key) = **elem_ct {
                     // (struct P[]){1, 2, 3, 4} has two elements: a struct
                     // element may take several unbraced items.
@@ -316,12 +308,20 @@ impl Lowerer {
             }
         };
 
-        // For char/unsigned char array compound literals with a single string literal,
-        // copy the string bytes directly instead of storing a pointer.
-        if elem_size == 1 && items.len() == 1 && items[0].designators.is_empty() {
-            if let Initializer::Expr(Expr::StringLiteral(ref s, _)) = items[0].init {
-                self.emit_string_to_alloca(alloca, s, 0, size);
-                return;
+        // For char (or wide character) array compound literals with a single string
+        // literal, copy the string's units directly instead of storing a pointer.
+        if items.len() == 1 && items[0].designators.is_empty() {
+            if let (Initializer::Expr(ref e), CType::Array(elem, _)) = (&items[0].init, self.type_spec_to_ctype(type_spec)) {
+                if let Some((units, unit)) = Self::string_init_units(e, &elem) {
+                    // The elements after the terminator are zero:
+                    // (char[6]){"a"} is a, then five zeros.
+                    let used = (units.len() + 1) * unit;
+                    if used < size {
+                        self.zero_init_region(alloca, used, size - used);
+                    }
+                    self.emit_string_init_to_alloca(alloca, e, &elem, 0, size);
+                    return;
+                }
             }
         }
 
@@ -789,20 +789,13 @@ impl Lowerer {
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         match init {
             Initializer::Expr(expr) => {
-                // For char array compound literals with string literal initializer,
-                // copy string bytes instead of storing pointer
-                let is_char_array = matches!(ty, IrType::I8 | IrType::U8) && {
-                    let ctype = self.type_spec_to_ctype(type_spec);
-                    matches!(ctype, CType::Array(_, _))
+                // For char (or wide character) array compound literals with a string
+                // literal initializer, copy its units instead of storing a pointer
+                let string_elem = match self.type_spec_to_ctype(type_spec) {
+                    CType::Array(elem, _) => Some(*elem),
+                    _ => None,
                 };
-                if is_char_array {
-                    if let Expr::StringLiteral(ref s, _) = expr {
-                        self.emit_string_to_alloca(alloca, s, 0, size);
-                    } else {
-                        let val = self.lower_expr(expr);
-                        self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
-                    }
-                } else {
+                if !string_elem.is_some_and(|elem| self.emit_string_init_to_alloca(alloca, expr, &elem, 0, size)) {
                     let val = self.lower_expr(expr);
                     self.emit(Instruction::Store { val, ptr: alloca, ty , seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
                 }

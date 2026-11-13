@@ -1143,7 +1143,7 @@ impl Lowerer {
     pub(super) fn intern_char16_string_literal(&mut self, s: &str) -> String {
         let label = format!(".Lc16str{}", self.next_string);
         self.next_string += 1;
-        let mut chars: Vec<u16> = s.chars().map(|c| c as u16).collect();
+        let mut chars: Vec<u16> = s.chars().map(crate::common::encoding::char16_unit).collect();
         chars.push(0); // null terminator
         self.module.char16_string_literals.push((label.clone(), chars));
         label
@@ -1426,11 +1426,49 @@ impl Lowerer {
         self.emit_units_to_alloca(alloca, &units, 4, base_offset, max_bytes);
     }
 
-    /// Emit a char16_t string (u"...") to a local alloca, as UTF-16 code
-    /// units (a character above U+FFFF is a surrogate pair).
+    /// Emit a char16_t string (u"...") to a local alloca: its text holds
+    /// UTF-16 code units (see common::encoding::char16_unit).
     pub(super) fn emit_char16_string_to_alloca(&mut self, alloca: Value, s: &str, base_offset: usize, max_bytes: usize) {
-        let units: Vec<i64> = s.encode_utf16().map(|u| u as i64).collect();
+        let units: Vec<i64> = s.chars().map(|c| crate::common::encoding::char16_unit(c) as i64).collect();
         self.emit_units_to_alloca(alloca, &units, 2, base_offset, max_bytes);
+    }
+
+    /// Emit a string literal that initializes an array of `elem`, `max_bytes`
+    /// long at `base_offset` (see string_init_units: a plain literal for a
+    /// char array, a wide one for a wchar_t, char16_t or char32_t one);
+    /// false, emitting nothing, if `expr` is no such literal.
+    pub(super) fn emit_string_init_to_alloca(&mut self, alloca: Value, expr: &Expr, elem: &CType, base_offset: usize, max_bytes: usize) -> bool {
+        let Some((units, unit)) = Self::string_init_units(expr, elem) else { return false };
+        if let Expr::StringLiteral(s, _) = expr {
+            self.emit_string_to_alloca(alloca, s, base_offset, max_bytes);
+        } else {
+            let units: Vec<i64> = units.into_iter().map(|u| u as i64).collect();
+            self.emit_units_to_alloca(alloca, &units, unit, base_offset, max_bytes);
+        }
+        true
+    }
+
+    /// Whether `expr` is a string literal for a row of elements of IR type
+    /// `base_ty`: a plain one for char, u"" for char16_t, L"" or U"" for
+    /// wchar_t and char32_t.
+    pub(super) fn is_string_row(expr: &Expr, base_ty: IrType) -> bool {
+        matches!((expr, base_ty),
+            (Expr::StringLiteral(..), IrType::I8 | IrType::U8)
+            | (Expr::Char16StringLiteral(..), IrType::I16 | IrType::U16)
+            | (Expr::WideStringLiteral(..), IrType::I32 | IrType::U32))
+    }
+
+    /// Emit a string literal filling a row of elements of IR type `base_ty`
+    /// at `base_offset`, `max_bytes` long (see is_string_row); false,
+    /// emitting nothing, if it is no literal for such a row.
+    pub(super) fn emit_string_row_to_alloca(&mut self, alloca: Value, expr: &Expr, base_ty: IrType, base_offset: usize, max_bytes: usize) -> bool {
+        match (expr, base_ty) {
+            (Expr::StringLiteral(s, _), IrType::I8 | IrType::U8) => self.emit_string_to_alloca(alloca, s, base_offset, max_bytes),
+            (Expr::Char16StringLiteral(s, _), IrType::I16 | IrType::U16) => self.emit_char16_string_to_alloca(alloca, s, base_offset, max_bytes),
+            (Expr::WideStringLiteral(s, _), IrType::I32 | IrType::U32) => self.emit_wide_string_to_alloca(alloca, s, base_offset, max_bytes),
+            _ => return false,
+        }
+        true
     }
 
     /// Store a string's code units of `unit` bytes, then its terminating
