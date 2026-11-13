@@ -72,6 +72,41 @@ impl Lowerer {
             self.fill_array_field_designator_items(
                 items, layout, struct_size, num_elems, base_offset, bytes, ptr_ranges,
             );
+        } else if !array_dim_strides.is_empty() && items.iter().all(|it| it.designators.is_empty()
+            && !matches!(it.init, Initializer::Expr(Expr::CompoundLiteral(..)))) {
+            // Undesignated items by brace elision (C11 6.7.9p20), tracking the
+            // position in leaf structs: a braced item initializes the current
+            // subobject (the coarsest level whose boundary it is on), and
+            // unbraced values fill one struct's members at a time.
+            let total = region_size / struct_size;
+            let mut fi = 0usize;
+            let mut item_idx = 0usize;
+            while item_idx < items.len() && fi < total {
+                let off = base_offset + fi * struct_size;
+                match &items[item_idx].init {
+                    Initializer::List(sub_items) => {
+                        let level = Self::brace_level(array_dim_strides, struct_size, fi);
+                        if level + 1 < array_dim_strides.len() {
+                            let span = array_dim_strides[level];
+                            self.fill_multidim_struct_array_with_ptrs(
+                                sub_items, layout, struct_size, &array_dim_strides[level + 1..],
+                                bytes, ptr_ranges, off, span,
+                            );
+                            fi += (span / struct_size).max(1);
+                        } else {
+                            self.fill_nested_struct_with_ptrs(sub_items, layout, off, bytes, ptr_ranges);
+                            fi += 1;
+                        }
+                        item_idx += 1;
+                    }
+                    Initializer::Expr(_) => {
+                        let run = Self::elided_run(&items[item_idx..]).to_vec();
+                        let consumed = self.fill_struct_fields_from_items(&run, layout, off, bytes, ptr_ranges);
+                        item_idx += consumed.max(1);
+                        fi += 1;
+                    }
+                }
+            }
         } else {
             // Sequential items: each item maps to one element at this_stride
             let mut current_idx = 0usize;

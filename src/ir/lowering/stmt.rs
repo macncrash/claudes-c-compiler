@@ -712,6 +712,22 @@ impl Lowerer {
         }
     }
 
+    /// The dimension level a braced initializer at leaf position `flat_index`
+    /// initializes: the coarsest level (0 = an element of this list) whose
+    /// element boundary the position is on. Level `strides.len() - 1` is a
+    /// leaf (a braced scalar).
+    pub(super) fn brace_level(strides: &[usize], leaf_size: usize, flat_index: usize) -> usize {
+        if leaf_size == 0 {
+            return 0;
+        }
+        (0..strides.len())
+            .find(|&l| {
+                let count = strides[l] / leaf_size;
+                count == 0 || flat_index.is_multiple_of(count)
+            })
+            .unwrap_or(strides.len().saturating_sub(1))
+    }
+
     /// Lower a multi-dimensional array initializer list.
     /// Handles nested braces like `{{1,2,3},{4,5,6}}` for `int a[2][3]`.
     pub(super) fn lower_array_init_list(
@@ -803,7 +819,38 @@ impl Lowerer {
             let start_index = *flat_index;
             match &item.init {
                 Initializer::List(sub_items) => {
-                    if array_dim_strides.len() > 1 {
+                    // After elided items, a brace initializes the current
+                    // subobject (C11 6.7.9p20): the coarsest level whose
+                    // boundary the position is on. {1, 2, {3}} for
+                    // int[][2][2] gives a[0][1] = {3}, not a[1].
+                    let level = Self::brace_level(array_dim_strides, elem_size, *flat_index);
+                    let braced_string = match sub_items.as_slice() {
+                        [only] if only.designators.is_empty() => match &only.init {
+                            Initializer::Expr(Expr::StringLiteral(s, _)) if matches!(base_ty, IrType::I8 | IrType::U8) => Some(s),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let (true, Some(s)) = (level > 0 && level + 2 == array_dim_strides.len(), braced_string) {
+                        // {"cd"} for a char row inside an elided element.
+                        let level_count = array_dim_strides[level] / elem_size;
+                        self.emit_string_to_alloca(alloca, s, *flat_index * elem_size, level_count * elem_size);
+                        *flat_index = start_index + level_count;
+                    } else if level > 0 && level + 1 < array_dim_strides.len() {
+                        let level_count = array_dim_strides[level] / elem_size;
+                        self.lower_array_init_recursive(sub_items, alloca, base_ty, &array_dim_strides[level + 1..], flat_index);
+                        let boundary = start_index + level_count;
+                        if *flat_index < boundary {
+                            *flat_index = boundary;
+                        }
+                    } else if level > 0 {
+                        // A braced scalar inside an elided row.
+                        if let Some(e) = Self::unwrap_nested_init_expr(sub_items) {
+                            let val = self.lower_and_cast_init_expr(e, base_ty);
+                            self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
+                        }
+                        *flat_index = start_index + 1;
+                    } else if array_dim_strides.len() > 1 {
                         self.lower_array_init_recursive(sub_items, alloca, base_ty, &array_dim_strides[1..], flat_index);
                     } else {
                         // Bottom level: treat as flat elements
@@ -818,7 +865,7 @@ impl Lowerer {
                     // Advance to next sub-array boundary after a braced sub-list
                     // This handles partial initialization: {{1,2},{3}} for int a[2][3]
                     // After {1,2} we advance to index 3 (next row), after {3} to index 6
-                    if array_dim_strides.len() > 1 {
+                    if array_dim_strides.len() > 1 && level == 0 {
                         let boundary = start_index + sub_elem_count;
                         if *flat_index < boundary {
                             *flat_index = boundary;

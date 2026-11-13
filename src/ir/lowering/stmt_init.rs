@@ -718,7 +718,7 @@ impl Lowerer {
     /// At each level, if stride > struct_size, the brace-delimited `List` items
     /// represent sub-arrays that must be recursed into. When stride == struct_size,
     /// we've reached leaf elements and each `List` is a single struct initializer.
-    fn lower_struct_array_init_recursive(
+    pub(super) fn lower_struct_array_init_recursive(
         &mut self,
         items: &[InitializerItem],
         alloca: Value,
@@ -759,6 +759,28 @@ impl Lowerer {
                 }
             });
 
+            // After elided items, a brace initializes the current subobject
+            // (C11 6.7.9p20): the coarsest level whose boundary flat_idx is on.
+            let brace_level = if field_designator_name.is_none() && item.designators.is_empty() {
+                Self::brace_level(dim_strides, struct_size, *flat_idx)
+            } else {
+                0
+            };
+            if let (Initializer::List(sub_items), true) = (&item.init, brace_level > 0) {
+                let start_flat = *flat_idx;
+                if brace_level + 1 < dim_strides.len() {
+                    self.lower_struct_array_init_recursive(
+                        sub_items, alloca, &dim_strides[brace_level + 1..], struct_size, s_layout, flat_idx,
+                    );
+                    let boundary = start_flat + dim_strides[brace_level] / struct_size;
+                    *flat_idx = (*flat_idx).max(boundary);
+                } else {
+                    self.emit_struct_init(sub_items, alloca, s_layout, base_byte_offset);
+                    *flat_idx = start_flat + 1;
+                }
+                item_idx += 1;
+                continue;
+            }
             match &item.init {
                 Initializer::List(sub_items) => {
                     if let Some(ref fname) = field_designator_name {

@@ -64,6 +64,68 @@ impl Lowerer {
         self.compute_init_list_array_size(items)
     }
 
+    /// The number of elements of type `elem` that an undesignated initializer
+    /// list fills when element braces may be elided (C11 6.7.9p20):
+    /// `int a[][3] = {{1, 2}, {3}, 4, 5, 6}` has three rows, `{1, 2, 3, 4}`
+    /// two. None if any item has a designator.
+    pub(super) fn count_elided_array_elements(&self, items: &[InitializerItem], elem: &CType) -> Option<usize> {
+        if items.iter().any(|item| !item.designators.is_empty()) {
+            return None;
+        }
+        let mut count = 0usize;
+        let mut idx = 0usize;
+        while idx < items.len() {
+            idx = self.elided_subobject_end(items, idx, elem);
+            count += 1;
+        }
+        Some(count)
+    }
+
+    /// The index after the items that initialize one subobject of type `ty`
+    /// starting at `items[idx]`: one item if it is braced, a string for a
+    /// character array, a struct value for a struct, or a scalar; otherwise
+    /// as many as the subobject's own members take.
+    fn elided_subobject_end(&self, items: &[InitializerItem], idx: usize, ty: &CType) -> usize {
+        let Initializer::Expr(ref expr) = items[idx].init else { return idx + 1 };
+        match ty {
+            CType::Array(sub, Some(n)) => {
+                let is_string = matches!(expr, Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..));
+                if is_string && sub.is_integer() {
+                    return idx + 1;
+                }
+                let mut i = idx;
+                for _ in 0..*n {
+                    if i >= items.len() {
+                        break;
+                    }
+                    i = self.elided_subobject_end(items, i, sub);
+                }
+                i.max(idx + 1)
+            }
+            CType::Struct(key) | CType::Union(key) => {
+                if self.struct_value_size(expr).is_some() {
+                    return idx + 1;
+                }
+                let Some(layout) = self.types.borrow_struct_layouts().get(&**key).cloned() else { return idx + 1 };
+                // Unnamed bit-fields take no initializer; a union's first member does.
+                let fields: Vec<CType> = layout.fields.iter()
+                    .filter(|f| !(f.name.is_empty() && f.bit_width.is_some()))
+                    .take(if layout.is_union { 1 } else { usize::MAX })
+                    .map(|f| f.ty.clone())
+                    .collect();
+                let mut i = idx;
+                for f in &fields {
+                    if i >= items.len() {
+                        break;
+                    }
+                    i = self.elided_subobject_end(items, i, f);
+                }
+                i.max(idx + 1)
+            }
+            _ => idx + 1,
+        }
+    }
+
     /// Compute the effective array size from an initializer list with potential designators.
     /// Returns the minimum array size needed to hold all designated (and positional) elements.
     pub(super) fn compute_init_list_array_size(&self, items: &[InitializerItem]) -> usize {

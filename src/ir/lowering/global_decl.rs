@@ -12,6 +12,7 @@ use crate::frontend::parser::ast::{
     Expr,
     InitDeclarator,
     Initializer,
+    InitializerItem,
     TypeSpecifier,
 };
 use crate::ir::reexports::{GlobalInit, IrGlobal};
@@ -526,6 +527,17 @@ impl Lowerer {
         }
     }
 
+    /// For an unsized array of arrays, the row count its initializer gives
+    /// and the row type, if the row size matches the outer stride and no
+    /// item is designated.
+    fn elided_rows(&self, da: &DeclAnalysis, items: &[InitializerItem]) -> Option<(usize, CType)> {
+        let Some(CType::Array(elem, None)) = da.c_type.as_ref() else { return None };
+        if !matches!(**elem, CType::Array(_, Some(_))) || self.resolve_ctype_size(elem) != da.array_dim_strides[0] {
+            return None;
+        }
+        Some((self.count_elided_array_elements(items, elem)?, (**elem).clone()))
+    }
+
     /// Fix up allocation size and strides for unsized arrays (int a[] = {...}).
     /// Also updates c_type from Array(elem, None) to Array(elem, Some(count))
     /// so that sizeof() returns the correct array size rather than pointer size.
@@ -577,6 +589,14 @@ impl Lowerer {
                             da.actual_alloc_size = da.alloc_size;
                         }
                     }
+                }
+                Initializer::List(items) if da.array_dim_strides.len() > 1 && self.elided_rows(da, items).is_some() => {
+                    // An array of arrays: count rows by brace elision
+                    // (int a[][3] = {1, 2, 3, 4} has two).
+                    let (rows, elem) = self.elided_rows(da, items).unwrap();
+                    da.alloc_size = rows * da.array_dim_strides[0];
+                    da.actual_alloc_size = da.alloc_size;
+                    da.c_type = Some(CType::Array(Box::new(elem), Some(rows)));
                 }
                 Initializer::List(items) => {
                     // For arrays of pointers (e.g., `const struct S *ptrs[] = {&a, &b}`),

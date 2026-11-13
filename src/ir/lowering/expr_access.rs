@@ -200,14 +200,32 @@ impl Lowerer {
     // Compound literals
     // -----------------------------------------------------------------------
 
+    /// The byte strides of an array type's dimensions, outermost first
+    /// (int[][2][3] gives [24, 12, 4]), as a declaration records them.
+    pub(super) fn array_dim_strides_of(&self, ctype: &CType) -> Vec<usize> {
+        let mut strides = Vec::new();
+        let mut t = ctype;
+        while let CType::Array(elem, _) = t {
+            strides.push(self.resolve_ctype_size(elem));
+            t = elem;
+        }
+        strides
+    }
+
     /// Compute the byte size of a compound literal, handling incomplete array types.
     /// For incomplete arrays (e.g., `(int[]){1,2,3}`), sizeof_type returns 0, so we
     /// compute the size from element_size * initializer_count instead.
-    fn compound_literal_size(&self, type_spec: &TypeSpecifier, init: &Initializer) -> usize {
+    pub(super) fn compound_literal_size(&self, type_spec: &TypeSpecifier, init: &Initializer) -> usize {
         let ctype = self.type_spec_to_ctype(type_spec);
         match (&ctype, init) {
             (CType::Array(ref elem_ct, None), Initializer::List(items)) => {
                 let elem_size = elem_ct.size_ctx(&*self.types.borrow_struct_layouts()).max(1);
+                // An array of arrays: rows by brace elision.
+                if matches!(**elem_ct, CType::Array(_, Some(_))) {
+                    if let Some(rows) = self.count_elided_array_elements(items, elem_ct) {
+                        return rows * elem_size;
+                    }
+                }
                 // For char/unsigned char arrays with a single string literal initializer,
                 // the array size is the string length + 1 (null terminator)
                 if elem_size == 1 && items.len() == 1 {
@@ -226,6 +244,14 @@ impl Lowerer {
                         }
                     } else {
                         elem_size * items.len()
+                    }
+                } else if let CType::Struct(ref key) = **elem_ct {
+                    // (struct P[]){1, 2, 3, 4} has two elements: a struct
+                    // element may take several unbraced items.
+                    let layout = self.types.borrow_struct_layouts().get(&**key).cloned();
+                    match layout {
+                        Some(layout) => elem_size * self.compute_struct_array_init_count(items, &layout),
+                        None => elem_size * self.compute_init_list_array_size(items),
                     }
                 } else {
                     // Use compute_init_list_array_size to correctly handle designated
@@ -287,6 +313,50 @@ impl Lowerer {
                 _ => None,
             }
         };
+
+        // An array of arrays is initialized as a declared one is, by brace
+        // elision over the dimension strides.
+        if let Some(CType::Array(ref inner, Some(_))) = elem_ctype {
+            let strides = self.array_dim_strides_of(&self.type_spec_to_ctype(type_spec));
+            let leaf = {
+                let mut t: &CType = inner;
+                while let CType::Array(e, _) = t { t = e; }
+                t.clone()
+            };
+            if strides.len() > 1 && strides[0] == elem_size {
+                match leaf {
+                    CType::Struct(ref key) | CType::Union(ref key) => {
+                        let layout = self.types.borrow_struct_layouts().get(&**key).cloned();
+                        if let Some(layout) = layout.filter(|l| l.size > 0) {
+                            self.zero_init_alloca(alloca, size);
+                            let mut flat_idx = 0usize;
+                            self.lower_struct_array_init_recursive(items, alloca, &strides, layout.size, &layout, &mut flat_idx);
+                            return;
+                        }
+                    }
+                    _ if (leaf.is_integer() && leaf != CType::Bool) || matches!(leaf, CType::Float | CType::Double | CType::LongDouble | CType::Pointer(..)) => {
+                        self.zero_init_alloca(alloca, size);
+                        let leaf_ty = if matches!(leaf, CType::Pointer(..)) { IrType::Ptr } else { IrType::from_ctype(&leaf) };
+                        self.lower_array_init_list(items, alloca, leaf_ty, &strides);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // An array of structs or unions is initialized as a declared one is:
+        // (struct P[]){1, 2, 3, 4} elides the element braces, and the rest of
+        // the literal is zero.
+        if let Some(CType::Struct(ref key) | CType::Union(ref key)) = elem_ctype {
+            let layout = self.types.borrow_struct_layouts().get(&**key).cloned();
+            if let Some(layout) = layout.filter(|l| l.size > 0 && l.size == elem_size) {
+                self.zero_init_alloca(alloca, size);
+                let mut flat_idx = 0usize;
+                self.lower_struct_array_init_recursive(items, alloca, &[layout.size], layout.size, &layout, &mut flat_idx);
+                return;
+            }
+        }
 
         let has_designators = items.iter().any(|item| !item.designators.is_empty());
         // Zero-init if there are designators, or if fewer initializers than total array size
@@ -527,6 +597,13 @@ impl Lowerer {
                 (CType::Array(a, _), CType::Array(b, _)) => {
                     return self.ctype_matches_generic(a, b);
                 }
+                // Parameter names are not part of a function type.
+                (CType::Function(a), CType::Function(b)) => {
+                    return a.variadic == b.variadic
+                        && a.params.len() == b.params.len()
+                        && self.ctype_matches_generic(&a.return_type, &b.return_type)
+                        && a.params.iter().zip(&b.params).all(|((pa, _), (pb, _))| self.ctype_matches_generic(pa, pb));
+                }
                 // For types that carry identity data (Struct, Union, Enum, Function,
                 // Vector), we must compare the full type, not just the discriminant.
                 // Primitive types (Int, Float, etc.) have no data so PartialEq works too.
@@ -586,6 +663,12 @@ impl Lowerer {
             // Comma: const-ness comes from the right-hand operand.
             Expr::Comma(_, rhs, _) => {
                 self.expr_is_const_qualified(rhs)
+            }
+            // c ? p : q of pointers points to a type with the qualifiers of
+            // both pointees (C11 6.5.15p6); other results are not lvalues.
+            Expr::Conditional(_, then_e, else_e, _) | Expr::GnuConditional(then_e, else_e, _) => {
+                matches!(self.get_expr_ctype(expr), Some(CType::Pointer(..)))
+                    && (self.expr_is_const_qualified(then_e) || self.expr_is_const_qualified(else_e))
             }
             _ => false,
         }

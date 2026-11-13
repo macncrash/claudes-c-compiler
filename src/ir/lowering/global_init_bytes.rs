@@ -1394,6 +1394,31 @@ impl Lowerer {
                             // A braced or designated item is the next element's,
                             // not the next struct's first field:
                             // { { 1 }, 2, 3, 4, { 7, 8, 9 } } kept only the 7.
+                            // Off an element boundary, a brace initializes the
+                            // current subobject instead (C11 6.7.9p20).
+                            if fi > flat_struct_base && items[item_idx].designators.is_empty()
+                                && !(fi * struct_size).is_multiple_of(this_stride)
+                            {
+                                if let Initializer::List(ref sub_items) = items[item_idx].init {
+                                    let level = Self::brace_level(array_dim_strides, struct_size, fi);
+                                    let byte_off = base_offset + fi * struct_size;
+                                    if level + 1 < array_dim_strides.len() {
+                                        let span = array_dim_strides[level];
+                                        if byte_off + span > bytes.len() { break; }
+                                        self.fill_multidim_struct_array_bytes(
+                                            sub_items, layout, struct_size, &array_dim_strides[level + 1..],
+                                            bytes, byte_off, span,
+                                        );
+                                        fi += (span / struct_size).max(1);
+                                    } else {
+                                        if byte_off + struct_size > bytes.len() { break; }
+                                        self.fill_struct_global_bytes(sub_items, layout, bytes, byte_off);
+                                        fi += 1;
+                                    }
+                                    item_idx += 1;
+                                    continue;
+                                }
+                            }
                             if fi > flat_struct_base
                                 && (matches!(items[item_idx].init, Initializer::List(_))
                                     || !items[item_idx].designators.is_empty())

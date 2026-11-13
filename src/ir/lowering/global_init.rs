@@ -676,6 +676,31 @@ impl Lowerer {
             matches!(&item.init, Initializer::List(_))
         });
 
+        // Undesignated items of an array of arrays, placed by brace elision.
+        if array_dim_strides.len() >= 2 && !Self::any_designators(items) {
+            let counts: Vec<usize> = array_dim_strides.iter().map(|s| (s / base_type_size).max(1)).collect();
+            let mut leaves = Vec::new();
+            Self::elided_leaf_inits(items, &counts, &mut 0, &mut leaves);
+            for (flat_idx, init) in leaves {
+                if flat_idx >= flat_num_elems {
+                    continue;
+                }
+                let mut elem_parts = Vec::new();
+                self.collect_compound_init_element(init, &mut elem_parts, elem_size);
+                if let Some(elem) = elem_parts.into_iter().next() {
+                    elements[flat_idx] = match elem {
+                        GlobalInit::Scalar(val) => GlobalInit::Scalar(val.coerce_to(base_ty)),
+                        other => other,
+                    };
+                }
+            }
+            let ptr_size = crate::common::types::target_ptr_size();
+            if base_type_size > ptr_size {
+                return self.convert_compound_to_bytes_and_ptrs(elements, base_type_size, total_size);
+            }
+            return GlobalInit::Compound(elements);
+        }
+
         let mut current_idx = 0usize;
         for item in items {
             let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
@@ -787,6 +812,55 @@ impl Lowerer {
             return self.convert_compound_to_bytes_and_ptrs(elements, base_type_size, total_size);
         }
         GlobalInit::Compound(elements)
+    }
+
+    /// Whether any item, at any brace depth, has a designator.
+    fn any_designators(items: &[InitializerItem]) -> bool {
+        items.iter().any(|item| {
+            !item.designators.is_empty()
+                || matches!(&item.init, Initializer::List(sub) if Self::any_designators(sub))
+        })
+    }
+
+    /// The leaf position of each scalar initializer in an undesignated list
+    /// for an array of arrays, by brace elision (C11 6.7.9p20). `counts[l]`
+    /// is the number of leaves in one element at level l (the last is 1).
+    /// A braced item initializes the current subobject: the coarsest level
+    /// whose boundary the position is on.
+    fn elided_leaf_inits<'a>(
+        items: &'a [InitializerItem],
+        counts: &[usize],
+        pos: &mut usize,
+        out: &mut Vec<(usize, &'a Initializer)>,
+    ) {
+        for item in items {
+            match &item.init {
+                Initializer::Expr(_) => {
+                    out.push((*pos, &item.init));
+                    *pos += 1;
+                }
+                Initializer::List(sub) => {
+                    let start = *pos;
+                    let level = (0..counts.len())
+                        .find(|&l| start.is_multiple_of(counts[l]))
+                        .unwrap_or(counts.len() - 1);
+                    if level + 1 < counts.len() {
+                        Self::elided_leaf_inits(sub, &counts[level + 1..], pos, out);
+                        *pos = start + counts[level];
+                    } else {
+                        // A braced scalar: its first value.
+                        let mut first = sub.first();
+                        while let Some(InitializerItem { init: Initializer::List(inner), .. }) = first {
+                            first = inner.first();
+                        }
+                        if let Some(f) = first {
+                            out.push((start, &f.init));
+                        }
+                        *pos = start + 1;
+                    }
+                }
+            }
+        }
     }
 
     /// Convert compound elements to byte+pointer representation for targets where
@@ -1151,12 +1225,9 @@ impl Lowerer {
         let (elem_size, base_ty, computed_alloc_size) = if let TypeSpecifier::Array(ref elem_ts, _) = type_spec {
             let elem_ir_ty = self.type_spec_to_ir(elem_ts);
             let e_size = self.sizeof_type(elem_ts);
-            let num_elems = if let Initializer::List(items) = init {
-                items.len()
-            } else {
-                1
-            };
-            (e_size, elem_ir_ty, e_size * num_elems)
+            // The declared length, or the one the initializer gives
+            // (designators, a string, elided element braces).
+            (e_size, elem_ir_ty, self.compound_literal_size(type_spec, init))
         } else {
             let ty = self.type_spec_to_ir(type_spec);
             let size = self.sizeof_type(type_spec);
@@ -1174,8 +1245,24 @@ impl Lowerer {
         let align = struct_layout.as_ref()
             .map_or(base_ty.align(), |l| l.align.max(base_ty.align()));
 
+        // An array of arrays needs its dimension strides, as a declared one has.
+        let strides = if is_array {
+            let strides = self.array_dim_strides_of(&self.type_spec_to_ctype(type_spec));
+            if strides.len() > 1 { strides } else { Vec::new() }
+        } else {
+            Vec::new()
+        };
+        // A declared array of arrays records its leaf element size and type.
+        let (elem_size, base_ty) = match strides.last() {
+            Some(&leaf_size) if struct_layout.is_none() => {
+                let mut t = self.type_spec_to_ctype(type_spec);
+                while let CType::Array(e, _) = t { t = *e; }
+                (leaf_size, if matches!(t, CType::Pointer(..)) { IrType::Ptr } else { IrType::from_ctype(&t) })
+            }
+            _ => (elem_size, base_ty),
+        };
         let global_init = self.lower_global_init(
-            init, type_spec, base_ty, is_array, elem_size, alloc_size, &struct_layout, &[],
+            init, type_spec, base_ty, is_array, elem_size, alloc_size, &struct_layout, &strides,
         );
 
         let global_ty = if matches!(&global_init, GlobalInit::Array(vals) if !vals.is_empty() && matches!(vals[0], IrConst::I8(_)))
@@ -1694,6 +1781,37 @@ impl Lowerer {
         is_bool_target: bool,
     ) {
         match &item.init {
+            Initializer::List(sub_items) if {
+                let pos = values.len().saturating_sub(start_len);
+                values.len() >= start_len && Self::brace_level(array_dim_strides, base_ty.size().max(1), pos) > 0
+            } => {
+                // After elided items, a brace initializes the current
+                // subobject (C11 6.7.9p20), not the next outer element.
+                let leaf = base_ty.size().max(1);
+                let level = Self::brace_level(array_dim_strides, leaf, values.len() - start_len);
+                let count = (array_dim_strides[level] / leaf).max(1);
+                let sub_strides = if level + 1 < array_dim_strides.len() { &array_dim_strides[level + 1..] } else { &array_dim_strides[level..] };
+                let mut sub_values = Vec::with_capacity(count);
+                match sub_items.as_slice() {
+                    // {"cd"} for a char row inside an elided element.
+                    [only] if level + 2 == array_dim_strides.len() && only.designators.is_empty()
+                        && matches!(only.init, Initializer::Expr(Expr::StringLiteral(..))) =>
+                    {
+                        if let Initializer::Expr(Expr::StringLiteral(ref s, _)) = only.init {
+                            self.inline_string_to_values(s, count, base_ty, &mut sub_values);
+                        }
+                    }
+                    _ => self.flatten_global_array_init_bool(sub_items, sub_strides, base_ty, &mut sub_values, is_bool_target),
+                }
+                while sub_values.len() < count {
+                    sub_values.push(self.zero_const(base_ty));
+                }
+                values.extend(sub_values.into_iter().take(count));
+                let relative_pos = values.len() - start_len;
+                if sub_elem_count > 0 {
+                    *current_outer_idx = relative_pos.div_ceil(sub_elem_count);
+                }
+            }
             Initializer::List(sub_items) => {
                 let target_start = start_len + *current_outer_idx * sub_elem_count;
                 while values.len() < target_start {
@@ -1719,12 +1837,19 @@ impl Lowerer {
             }
             Initializer::Expr(expr) => {
                 if let Expr::StringLiteral(s, _) = expr {
-                    let target_start = start_len + *current_outer_idx * sub_elem_count;
+                    // A string initializes one row, the innermost char array
+                    // (char a[][2][4] = {"ab", "cd"} fills a[0][0], a[0][1]).
+                    let leaf = base_ty.size().max(1);
+                    let row = (array_dim_strides[array_dim_strides.len() - 2] / leaf).max(1);
+                    let rel = values.len().saturating_sub(start_len);
+                    let target_start = start_len + rel.div_ceil(row) * row;
                     while values.len() < target_start {
                         values.push(self.zero_const(base_ty));
                     }
-                    self.inline_string_to_values(s, sub_elem_count, base_ty, values);
-                    *current_outer_idx += 1;
+                    self.inline_string_to_values(s, row, base_ty, values);
+                    if sub_elem_count > 0 {
+                        *current_outer_idx = (values.len() - start_len).div_ceil(sub_elem_count);
+                    }
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     values.push(if is_bool_target {
                         val.bool_normalize()

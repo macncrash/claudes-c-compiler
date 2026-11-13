@@ -7,7 +7,6 @@
 use crate::frontend::parser::ast::{
     BinOp,
     Expr,
-    Initializer,
     TypeSpecifier,
     UnaryOp,
 };
@@ -195,14 +194,23 @@ impl Lowerer {
                 || self.sizeof_operand_is_pointer_like(rhs) => crate::common::types::target_ptr_size(),
             // Shift operators: result type is promoted left operand
             BinOp::Shl | BinOp::Shr => {
-                self.sizeof_expr(lhs).max(4) // integer promotion of left operand only
+                self.sizeof_arith_operand(lhs).max(4) // integer promotion of left operand only
             }
             // Arithmetic/bitwise: usual arithmetic conversions
             _ => {
-                let ls = self.sizeof_expr(lhs);
-                let rs = self.sizeof_expr(rhs);
+                let ls = self.sizeof_arith_operand(lhs);
+                let rs = self.sizeof_arith_operand(rhs);
                 ls.max(rs).max(4) // integer promotion
             }
+        }
+    }
+
+    /// The size of an arithmetic operand after integer promotion of a
+    /// narrow bit-field (`unsigned long long f : 20` promotes to int).
+    fn sizeof_arith_operand(&self, expr: &Expr) -> usize {
+        match self.bitfield_operand_ctype(expr) {
+            Some(ct) => self.ctype_size(&ct),
+            None => self.sizeof_expr(expr),
         }
     }
 
@@ -312,7 +320,7 @@ impl Lowerer {
                 match op {
                     UnaryOp::LogicalNot => 4, // result is int
                     UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot => {
-                        self.sizeof_expr(inner).max(4) // integer promotion
+                        self.sizeof_arith_operand(inner).max(4) // integer promotion
                     }
                     UnaryOp::PreInc | UnaryOp::PreDec => self.sizeof_expr(inner),
                     UnaryOp::RealPart | UnaryOp::ImagPart => {
@@ -371,15 +379,7 @@ impl Lowerer {
             }
 
             // Compound literal: size of the type (handle incomplete array types)
-            Expr::CompoundLiteral(ts, ref init, _) => {
-                let ctype = self.type_spec_to_ctype(ts);
-                match (&ctype, init.as_ref()) {
-                    (CType::Array(ref elem_ct, None), Initializer::List(items)) => {
-                        self.ctype_size(elem_ct).max(1) * items.len()
-                    }
-                    _ => self.sizeof_type(ts),
-                }
-            }
+            Expr::CompoundLiteral(ts, ref init, _) => self.compound_literal_size(ts, init),
 
             // _Generic selection: resolve the matching association and compute its size
             Expr::GenericSelection(controlling, associations, _) => {

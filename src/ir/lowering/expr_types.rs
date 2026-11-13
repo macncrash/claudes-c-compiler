@@ -785,19 +785,32 @@ impl Lowerer {
     /// of up to 31 bits (32 if signed) promotes to int, whatever its declared
     /// type (`unsigned bf : 5` is int, so `c ? s.bf : -1` is -1, not 2^32 - 1).
     fn promoted_branch_ctype(&self, expr: &Expr) -> CType {
+        self.bitfield_operand_ctype(expr).unwrap_or_else(|| self.expr_ctype(expr))
+    }
+
+    /// The promoted type of a bit-field operand that promotes to int or
+    /// unsigned int (C11 6.3.1.1p2), or None if `expr` is not such a
+    /// bit-field.
+    pub(super) fn bitfield_operand_ctype(&self, expr: &Expr) -> Option<CType> {
         let bf_info = match expr {
             Expr::MemberAccess(base, field, _) => self.resolve_member_access_full(base, field),
             Expr::PointerMemberAccess(base, field, _) => self.resolve_pointer_member_access_full(base, field),
-            _ => return self.expr_ctype(expr),
+            _ => return None,
         };
         match bf_info {
             (_, field_ty, Some(bf)) => match bitfield_promoted_type(field_ty, Some(bf)) {
-                IrType::I32 => CType::Int,
-                IrType::U32 => CType::UInt,
-                _ => self.expr_ctype(expr),
+                IrType::I32 => Some(CType::Int),
+                IrType::U32 => Some(CType::UInt),
+                _ => None,
             },
-            _ => self.expr_ctype(expr),
+            _ => None,
         }
+    }
+
+    /// An operand's C type for the integer promotions and usual arithmetic
+    /// conversions: a narrow bit-field has its promoted type.
+    fn arith_operand_ctype(&self, expr: &Expr) -> Option<CType> {
+        self.bitfield_operand_ctype(expr).or_else(|| self.get_expr_ctype(expr))
     }
 
     pub(super) fn get_expr_type(&self, expr: &Expr) -> IrType {
@@ -1005,7 +1018,7 @@ impl Lowerer {
 
         // Shift operators: result type is the promoted type of the left operand
         if matches!(op, BinOp::Shl | BinOp::Shr) {
-            if let Some(lct) = self.get_expr_ctype(lhs) {
+            if let Some(lct) = self.arith_operand_ctype(lhs) {
                 return Some(Self::integer_promote_ctype(&lct));
             }
             return Some(CType::Int);
@@ -1054,8 +1067,8 @@ impl Lowerer {
 
         // For arithmetic (Add, Sub, Mul, Div, Mod) and bitwise (BitAnd, BitOr, BitXor)
         // operators on non-pointer types, apply C usual arithmetic conversions.
-        let lct = self.get_expr_ctype(lhs);
-        let rct = self.get_expr_ctype(rhs);
+        let lct = self.arith_operand_ctype(lhs);
+        let rct = self.arith_operand_ctype(rhs);
 
         // Per GCC vector extensions, if either operand is a vector type, the result
         // is a vector type. The scalar operand is broadcast to all vector lanes.
@@ -1314,7 +1327,7 @@ impl Lowerer {
             | Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 // C11 6.5.3.3: integer promotions apply to the operand of
                 // unary +, -, and ~.  The result type is the promoted type.
-                let ct = self.get_expr_ctype(inner);
+                let ct = self.arith_operand_ctype(inner);
                 ct.map(|c| if c.is_integer() { Self::integer_promote_ctype(&c) } else { c })
             }
             Expr::UnaryOp(UnaryOp::PreInc, inner, _)
