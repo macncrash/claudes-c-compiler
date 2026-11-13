@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-13",
-  "ccc_rev": "f0b1c690",
+  "ccc_rev": "c62070d7",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -1367,6 +1367,9 @@
    "status": "pass"
   },
   "cases/vla_pointer_arithmetic_and_sizeof": {
+   "status": "pass"
+  },
+  "cases/vla_sizeof_operands_and_size_calls": {
    "status": "pass"
   },
   "cases/vla_typedef_objects_and_subscript_sizeof": {
@@ -5727,7 +5730,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16d21ad0f 0x16d21ad0f 0x16d21ad0f 0x16d21ad0f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b046d0f 0x16b046d0f 0x16b046d0f 0x16b046d0f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
