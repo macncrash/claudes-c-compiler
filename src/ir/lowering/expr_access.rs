@@ -34,7 +34,25 @@ impl Lowerer {
     // Cast expressions
     // -----------------------------------------------------------------------
 
+    /// Evaluate the size expressions of the variable length array types in a
+    /// type name for their side effects: a cast to `char (*)[g(n)]` calls g.
+    fn evaluate_vla_type_sizes(&mut self, ts: &TypeSpecifier) {
+        match ts {
+            TypeSpecifier::Pointer(inner, _) => self.evaluate_vla_type_sizes(inner),
+            TypeSpecifier::Array(elem, size) => {
+                if let Some(e) = size {
+                    if self.expr_as_array_size(e).is_none() {
+                        self.lower_expr(e);
+                    }
+                }
+                self.evaluate_vla_type_sizes(elem);
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn lower_cast(&mut self, target_type: &TypeSpecifier, inner: &Expr) -> Operand {
+        self.evaluate_vla_type_sizes(target_type);
         let target_ctype = self.type_spec_to_ctype(target_type);
         let inner_ctype = self.expr_ctype(inner);
 
@@ -475,6 +493,13 @@ impl Lowerer {
 
     pub(super) fn lower_sizeof(&mut self, arg: &SizeofArg) -> Operand {
         if let Some(vla_val) = self.get_vla_sizeof(arg) {
+            // An operand of variable length array type is evaluated (C11
+            // 6.5.3.4p2): sizeof p[k++] increments k. A named VLA has
+            // nothing to evaluate; a subscript or dereference may. Its
+            // value is the array's address, so nothing is loaded.
+            if let SizeofArg::Expr(e @ (Expr::ArraySubscript(..) | Expr::Deref(..))) = arg {
+                self.lower_expr(e);
+            }
             return Operand::Value(vla_val);
         }
         // Check for sizeof(type) where type is or contains VLA dimensions

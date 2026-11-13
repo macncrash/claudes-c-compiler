@@ -120,6 +120,7 @@ impl Lowerer {
                 continue;
             }
 
+            self.func_mut().vla_dim_memo.clear();
             let vla_size = if da.is_array {
                 self.compute_vla_runtime_size(type_spec, &declarator.derived)
             } else {
@@ -262,6 +263,7 @@ impl Lowerer {
                 self.types.insert_typedef_alignment_scoped(declarator.name.clone(), align);
             }
             if self.func_state.is_some() {
+                self.func_mut().vla_dim_memo.clear();
                 if let Some(vla_size) = self.compute_vla_runtime_size(type_spec, &declarator.derived) {
                     let strides = self.vla_strides_for_decl(type_spec, &declarator.derived);
                     self.func_mut().insert_vla_typedef_size_scoped(declarator.name.clone(), vla_size, strides);
@@ -951,6 +953,19 @@ impl Lowerer {
         }
     }
 
+    /// The value of a VLA dimension of the declarator being lowered,
+    /// evaluated the first time it is asked for (`vla_dim_memo`).
+    fn lower_vla_dim(&mut self, expr: &Expr) -> Value {
+        let key = expr as *const Expr;
+        if let Some(&(_, v)) = self.func().vla_dim_memo.iter().find(|(k, _)| *k == key) {
+            return v;
+        }
+        let op = self.lower_expr(expr);
+        let v = self.operand_to_value(op);
+        self.func_mut().vla_dim_memo.push((key, v));
+        v
+    }
+
     /// Compute the runtime sizeof for a VLA local variable.
     /// Returns Some(Value) if any array dimension is a non-constant expression.
     /// The Value holds the total byte size (product of all dimensions * element_size).
@@ -981,12 +996,9 @@ impl Lowerer {
                     for expr in array_dims.iter().copied().flatten() {
                         let dim = match self.expr_as_array_size(expr) {
                             Some(c) => Operand::Const(IrConst::ptr_int(c)),
-                            None => {
-                                let v = self.lower_expr(expr);
-                                Operand::Value(self.operand_to_value(v))
-                            }
+                            None => Operand::Value(self.lower_vla_dim(expr)),
                         };
-                        total = self.emit_binop_val(IrBinOp::Mul, Operand::Value(total), dim, ptr_int_ty);
+                        total =self.emit_binop_val(IrBinOp::Mul, Operand::Value(total), dim, ptr_int_ty);
                     }
                     return Some(total);
                 }
@@ -1028,8 +1040,7 @@ impl Lowerer {
                 const_product *= const_val as usize;
             } else {
                 // Runtime dimension - emit multiplication
-                let dim_val = self.lower_expr(expr);
-                let dim_value = self.operand_to_value(dim_val);
+                let dim_value = self.lower_vla_dim(expr);
 
                 let ptr_int_ty = target_int_ir_type();
                 result = if let Some(prev) = result {
@@ -1124,10 +1135,7 @@ impl Lowerer {
                     let dim = match outer[i + 1].as_deref() {
                         Some(e) => match self.expr_as_array_size(e) {
                             Some(c) => Operand::Const(IrConst::ptr_int(c)),
-                            None => {
-                                let v = self.lower_expr(e);
-                                Operand::Value(self.operand_to_value(v))
-                            }
+                            None => Operand::Value(self.lower_vla_dim(e)),
                         },
                         None => Operand::Const(IrConst::ptr_int(0)),
                     };
@@ -1233,8 +1241,7 @@ impl Lowerer {
                     // else: purely const, fallback handles it
                 } else {
                     // Inner dimension is a runtime VLA dimension
-                    let dim_val = self.lower_expr(expr);
-                    let dim_value = self.operand_to_value(dim_val);
+                    let dim_value = self.lower_vla_dim(expr);
 
                     let stride_val = if let Some(prev) = current_stride {
                         let ptr_int_ty = target_int_ir_type();

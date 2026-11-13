@@ -12,13 +12,17 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::frontend::parser::ast::{
     BlockItem,
     CompoundStmt,
+    Declaration,
+    DerivedDeclarator,
     Expr,
     ExternalDecl,
     ForInit,
     FunctionDef,
     Initializer,
+    SizeofArg,
     Stmt,
     TranslationUnit,
+    TypeSpecifier,
 };
 use super::lower::Lowerer;
 
@@ -62,10 +66,12 @@ impl Lowerer {
                         // For skippable functions, collect their refs into a separate map
                         // so we can do transitive closure later
                         let mut func_refs = FxHashSet::default();
+                        self.collect_refs_from_params(func, &mut func_refs);
                         self.collect_refs_from_compound(&func.body, &mut func_refs);
                         skippable_refs.insert(func.name.clone(), func_refs);
                     } else {
                         // Root function: collect refs directly into the referenced set
+                        self.collect_refs_from_params(func, &mut referenced);
                         self.collect_refs_from_compound(&func.body, &mut referenced);
                     }
                 }
@@ -115,11 +121,53 @@ impl Lowerer {
         referenced
     }
 
+    /// Size expressions of variable length array parameters (`int a[g(n)]`)
+    /// are evaluated on entry.
+    fn collect_refs_from_params(&self, func: &FunctionDef, refs: &mut FxHashSet<String>) {
+        for param in &func.params {
+            for e in &param.vla_size_exprs {
+                self.collect_refs_from_expr(e, refs);
+            }
+            self.collect_refs_from_type(&param.type_spec, refs);
+        }
+    }
+
+    /// Array size expressions inside a type (a VLA's `int[g(n)]`, in a
+    /// declaration, cast, compound literal or sizeof) and typeof operands
+    /// can be evaluated, calling functions. Collected even when they are
+    /// constant or unevaluated, which only keeps a function.
+    fn collect_refs_from_type(&self, ts: &TypeSpecifier, refs: &mut FxHashSet<String>) {
+        match ts {
+            TypeSpecifier::Array(elem, size) => {
+                if let Some(e) = size {
+                    self.collect_refs_from_expr(e, refs);
+                }
+                self.collect_refs_from_type(elem, refs);
+            }
+            TypeSpecifier::Pointer(inner, _) | TypeSpecifier::TypeofType(inner) => self.collect_refs_from_type(inner, refs),
+            TypeSpecifier::Typeof(e) => self.collect_refs_from_expr(e, refs),
+            _ => {}
+        }
+    }
+
+    /// The type and declarator array sizes of a declaration.
+    fn collect_refs_from_decl_types(&self, decl: &Declaration, refs: &mut FxHashSet<String>) {
+        self.collect_refs_from_type(&decl.type_spec, refs);
+        for declarator in &decl.declarators {
+            for d in &declarator.derived {
+                if let DerivedDeclarator::Array(Some(e)) = d {
+                    self.collect_refs_from_expr(e, refs);
+                }
+            }
+        }
+    }
+
     /// Collect function name references from a compound statement.
     pub(super) fn collect_refs_from_compound(&self, compound: &CompoundStmt, refs: &mut FxHashSet<String>) {
         for item in &compound.items {
             match item {
                 BlockItem::Declaration(decl) => {
+                    self.collect_refs_from_decl_types(decl, refs);
                     for declarator in &decl.declarators {
                         if let Some(ref init) = declarator.init {
                             self.collect_refs_from_initializer(init, refs);
@@ -171,6 +219,7 @@ impl Lowerer {
                     match init.as_ref() {
                         ForInit::Expr(e) => self.collect_refs_from_expr(e, refs),
                         ForInit::Declaration(d) => {
+                            self.collect_refs_from_decl_types(d, refs);
                             for declarator in &d.declarators {
                                 if let Some(ref init) = declarator.init {
                                     self.collect_refs_from_initializer(init, refs);
@@ -206,6 +255,7 @@ impl Lowerer {
                 self.collect_refs_from_stmt(stmt, refs);
             }
             Stmt::Declaration(decl) => {
+                self.collect_refs_from_decl_types(decl, refs);
                 for declarator in &decl.declarators {
                     if let Some(ref init) = declarator.init {
                         self.collect_refs_from_initializer(init, refs);
@@ -246,10 +296,18 @@ impl Lowerer {
                 self.collect_refs_from_expr(lhs, refs);
                 self.collect_refs_from_expr(rhs, refs);
             }
-            Expr::UnaryOp(_, operand, _) | Expr::PostfixOp(_, operand, _)
-            | Expr::Cast(_, operand, _) => {
+            Expr::UnaryOp(_, operand, _) | Expr::PostfixOp(_, operand, _) => {
                 self.collect_refs_from_expr(operand, refs);
             }
+            Expr::Cast(ts, operand, _) | Expr::VaArg(operand, ts, _) => {
+                self.collect_refs_from_type(ts, refs);
+                self.collect_refs_from_expr(operand, refs);
+            }
+            // An operand of variable length array type is evaluated.
+            Expr::Sizeof(arg, _) => match arg.as_ref() {
+                SizeofArg::Expr(e) => self.collect_refs_from_expr(e, refs),
+                SizeofArg::Type(ts) => self.collect_refs_from_type(ts, refs),
+            },
             Expr::Conditional(c, t, f, _) => {
                 self.collect_refs_from_expr(c, refs);
                 self.collect_refs_from_expr(t, refs);
@@ -270,10 +328,11 @@ impl Lowerer {
                 self.collect_refs_from_expr(base, refs);
                 self.collect_refs_from_expr(idx, refs);
             }
-            Expr::Deref(inner, _) | Expr::AddressOf(inner, _) | Expr::VaArg(inner, _, _) => {
+            Expr::Deref(inner, _) | Expr::AddressOf(inner, _) => {
                 self.collect_refs_from_expr(inner, refs);
             }
-            Expr::CompoundLiteral(_, init, _) => {
+            Expr::CompoundLiteral(ts, init, _) => {
+                self.collect_refs_from_type(ts, refs);
                 self.collect_refs_from_initializer(init, refs);
             }
             Expr::StmtExpr(compound, _) => {

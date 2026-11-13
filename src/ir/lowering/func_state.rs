@@ -136,6 +136,11 @@ pub(super) struct FunctionBuildState {
     /// Runtime subscript strides of multi-dimensional VLA typedefs (same
     /// layout as `LocalInfo::vla_strides`), saved with the typedef's size.
     pub vla_typedef_strides: FxHashMap<String, Vec<Option<Value>>>,
+    /// Values of the VLA size expressions of the declarator being lowered,
+    /// by expression address: its size and its strides both read the inner
+    /// dimensions, which are evaluated once (`int a[g()][h()]` calls h once).
+    /// Cleared at each declarator, while those expressions are alive.
+    pub vla_dim_memo: Vec<(*const crate::frontend::parser::ast::Expr, Value)>,
     /// Per-function value counter (reset for each function)
     pub next_value: u32,
     /// Saved stack pointer Value for VLA deallocation.
@@ -196,6 +201,7 @@ impl FunctionBuildState {
             var_ctypes: FxHashMap::default(),
             vla_typedef_sizes: FxHashMap::default(),
             vla_typedef_strides: FxHashMap::default(),
+            vla_dim_memo: Vec::new(),
             next_value: 0,
             vla_stack_save: None,
             has_vla: false,
