@@ -7320,6 +7320,9 @@ fn line_info(line: &str, kind: LineKind, label_index: &dyn Fn(&str) -> Option<us
 /// The registers a call may change (x0-x18).
 const CALLER_SAVED: RegSet = (1 << 19) - 1;
 
+/// The registers a Mach-O TLV descriptor's thunk may change (x0, x16, x17).
+const TLV_CALL_CLOBBERS: RegSet = (1 << 0) | (1 << 16) | (1 << 17);
+
 /// `text` with every `xN`/`wN` operand naming register `from` naming `to`
 /// instead, at the same width (operands only: not part of a symbol).
 fn rename_gpr(text: &str, from: u8, to: u8) -> String {
@@ -7384,7 +7387,19 @@ fn coalesce_arg_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -
         for k in start..end {
             let info = line_info(&lines[k], kinds[k], &label_index);
             let call = kinds[k] == LineKind::Call;
-            defs.push(if call { info.defs | CALLER_SAVED } else { info.defs });
+            // A Mach-O TLV access (`ldr x16, [x0]; blr x16`) calls a thunk that
+            // changes only x0, x16 and x17, and the code generator keeps values
+            // in other temporaries across it: as a call changing x0-x18, a value
+            // of x10 read after it looked written by it, and `mov x1, x10`
+            // before a later call was renamed away.
+            let tlv = call && lines[k].trim() == "blr x16" && k > start && lines[k - 1].trim() == "ldr x16, [x0]";
+            defs.push(if tlv {
+                info.defs | TLV_CALL_CLOBBERS
+            } else if call {
+                info.defs | CALLER_SAVED
+            } else {
+                info.defs
+            });
             uses.push(info.uses);
             opaque.push(info.uses == ALL_REGS && info.defs == ALL_REGS);
         }
