@@ -47,6 +47,8 @@ fn would_paste_tokens(last: u8, first: u8) -> bool {
         (b'/', b'*') | (b'/', b'/') => true,
         // . followed by digit (e.g., prevent "1." + "5" pasting weirdly)
         (b'.', b'0'..=b'9') => true,
+        // A digit followed by . (1 . E is not the pp-number 1.E)
+        (b'0'..=b'9', b'.') => true,
         // Identifier/number continuation: letter/digit/_ followed by letter/digit/_
         (a, b) if is_ident_cont_byte(a) && is_ident_cont_byte(b) => true,
         _ => false,
@@ -86,6 +88,14 @@ const BLUE_PAINT_MARKER: u8 = 0x01;
 /// Uses 0x02/0x03 to avoid collision with BLUE_PAINT_MARKER (0x01).
 const PASTE_PROTECT_START: u8 = 0x02;
 const PASTE_PROTECT_END: u8 = 0x03;
+
+/// A token boundary between pieces of text that came from different places
+/// (an expansion and what is next to it) where nothing separated them: it
+/// keeps them from reading as one token when the text is rescanned (1 . E
+/// from x.E with x = 1 is not the pp-number 1.E), stringifies as nothing
+/// (clang's "1.5.7" for MAJOR.MINOR.RELEASE, not "1. 5. 7"), and is a space
+/// in the final output, where the lexer must still see the boundary.
+const TOKEN_SEP: u8 = 0x04;
 
 /// Strip all blue-paint markers from a string.
 /// Used when substituting arguments into ## token paste operations,
@@ -238,6 +248,12 @@ impl MacroTable {
         // - 0x01 (BLUE_PAINT_MARKER): prevents re-expansion per C11 §6.10.3.4
         // - 0x02/0x03 (PASTE_PROTECT_START/END): should already be consumed by
         //   substitute_params, but strip defensively in case any leak through.
+        // - 0x04 (TOKEN_SEP): a token boundary, a space for the lexer.
+        let result = if result.as_bytes().contains(&TOKEN_SEP) {
+            result.replace(TOKEN_SEP as char, " ")
+        } else {
+            result
+        };
         if result.as_bytes().iter().any(|&b| b == BLUE_PAINT_MARKER || b == PASTE_PROTECT_START || b == PASTE_PROTECT_END) {
             result.replace([BLUE_PAINT_MARKER as char, PASTE_PROTECT_START as char, PASTE_PROTECT_END as char], "")
         } else {
@@ -260,7 +276,7 @@ impl MacroTable {
             if would_paste_tokens(last, first)
                 || (is_ident_cont_byte(last) && is_ident_cont_byte(first))
             {
-                result.push(' ');
+                result.push(TOKEN_SEP as char);
             }
         }
         result.push_str(expanded);
@@ -268,7 +284,7 @@ impl MacroTable {
         if let Some(next) = next_byte {
             let last_expanded = expanded.as_bytes()[expanded.len() - 1];
             if would_paste_tokens(last_expanded, next) {
-                result.push(' ');
+                result.push(TOKEN_SEP as char);
             }
         }
     }
@@ -435,8 +451,11 @@ impl MacroTable {
         }
         let ident = bytes_to_str(bytes, start, i);
 
-        // Check if this identifier is part of a pp-number (e.g., 1.I, 15.IF, 0x1p2).
-        if Self::is_ppnumber_suffix(result.as_bytes(), ident) {
+        // Check if this identifier is part of a pp-number (e.g., 1.I, 15.IF,
+        // 0x1p2) in the text being scanned: tokens are formed before
+        // expansion, so X.Y with X a macro for 1 is X . Y, and Y still expands
+        // (the result so far, "1.", made zstd's version string "1.MINOR.7").
+        if Self::is_ppnumber_suffix(&bytes[..start], ident) {
             result.push_str(ident);
             return i;
         }
@@ -1066,8 +1085,9 @@ impl MacroTable {
                 // Check if this identifier is a pp-number suffix (e.g., the "L"
                 // in "10L", "ULL" in "0xFFULL"). Per C11 §6.4.8, pp-numbers are
                 // single tokens and their suffixes must not be treated as macro
-                // parameters even if they happen to share a name.
-                if Self::is_ppnumber_suffix(result.as_bytes(), ident) {
+                // parameters even if they happen to share a name. In the
+                // body, not the result: x.y with x = 1 is x . y.
+                if Self::is_ppnumber_suffix(&bytes[..start], ident) {
                     result.push_str(ident);
                     continue;
                 }
@@ -1348,8 +1368,10 @@ fn stringify_arg(arg: &str) -> String {
     let mut i = 0;
 
     while i < len {
-        // Skip blue-paint markers (they must not appear in stringified output)
-        if bytes[i] == BLUE_PAINT_MARKER {
+        // Skip blue-paint markers and token separators (they must not
+        // appear in stringified output; a separator stands where the source
+        // had no whitespace)
+        if bytes[i] == BLUE_PAINT_MARKER || bytes[i] == TOKEN_SEP {
             i += 1;
             continue;
         }
