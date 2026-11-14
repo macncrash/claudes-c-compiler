@@ -1521,14 +1521,11 @@ impl ArchCodegen for I686Codegen {
         };
 
         if !is_wide {
-            use crate::backend::traits::{MIN_JUMP_TABLE_CASES, MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_DENSITY_PERCENT};
+            use crate::backend::traits::{MIN_JUMP_TABLE_CASES, MIN_JUMP_TABLE_DENSITY_PERCENT, jump_table_span};
             let use_jump_table = if self.state.no_jump_tables {
                 false
             } else if cases.len() >= MIN_JUMP_TABLE_CASES {
-                let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
-                let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
-                let range = (max_val - min_val + 1) as usize;
-                range <= MAX_JUMP_TABLE_RANGE && cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT
+                jump_table_span(cases).is_some_and(|range| cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT)
             } else {
                 false
             };

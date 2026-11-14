@@ -1170,10 +1170,7 @@ pub trait ArchCodegen {
         let use_jump_table = if self.state_ref().no_jump_tables {
             false
         } else if cases.len() >= MIN_JUMP_TABLE_CASES {
-            let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
-            let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
-            let range = (max_val - min_val + 1) as usize;
-            range <= MAX_JUMP_TABLE_RANGE && cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT
+            jump_table_span(cases).is_some_and(|range| cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT)
         } else {
             false
         };
@@ -1408,6 +1405,17 @@ pub trait ArchCodegen {
 }
 
 // ── Shared jump table helpers ─────────────────────────────────────────────────
+
+/// The number of table entries switch cases from their least to their
+/// greatest value would need, if within MAX_JUMP_TABLE_RANGE. Computed in
+/// 128 bits: with cases at i64::MIN and i64::MAX (a long switch on both
+/// limits) max - min + 1 wrapped to 0, and the density check divided by it.
+pub fn jump_table_span(cases: &[(i64, BlockId)]) -> Option<usize> {
+    let min_val = cases.iter().map(|&(v, _)| v).min()?;
+    let max_val = cases.iter().map(|&(v, _)| v).max()?;
+    let range = max_val as i128 - min_val as i128 + 1;
+    (range <= MAX_JUMP_TABLE_RANGE as i128).then_some(range as usize)
+}
 
 /// Build a jump table from switch cases: maps each index in [min..max] to a BlockId.
 /// Returns (table, min_val, range).
