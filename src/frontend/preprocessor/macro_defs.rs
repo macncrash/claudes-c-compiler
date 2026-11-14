@@ -296,13 +296,13 @@ impl MacroTable {
                                 k += 1;
                             }
                             if k < len && bytes[k] == b'(' {
-                                let (trail_args, trail_end) = self.parse_macro_args(bytes, k);
+                                let (trail_args, trail_ws, trail_end) = self.parse_macro_args(bytes, k);
                                 i = trail_end;
                                 let trail_mac_clone = trail_mac.clone();
                                 let trimmed_len = expanded.trim_end().len();
                                 let prefix_len = trimmed_len - trail_ident.len();
                                 expanded.truncate(prefix_len);
-                                let (trail_expanded, _) = self.expand_function_macro(&trail_mac_clone, &trail_args, expanding);
+                                let (trail_expanded, _) = self.expand_function_macro(&trail_mac_clone, &trail_args, &trail_ws, expanding);
                                 expanded.push_str(&trail_expanded);
                                 continue;
                             }
@@ -349,9 +349,9 @@ impl MacroTable {
         if j >= len || bytes[j] != b'(' {
             return None;
         }
-        let (args, end_pos) = self.parse_macro_args(bytes, j);
+        let (args, ws, end_pos) = self.parse_macro_args(bytes, j);
         let target_mac_clone = target_mac.clone();
-        let (func_expanded, _) = self.expand_function_macro(&target_mac_clone, &args, expanding);
+        let (func_expanded, _) = self.expand_function_macro(&target_mac_clone, &args, &ws, expanding);
         Some((func_expanded, end_pos))
     }
 
@@ -544,9 +544,9 @@ impl MacroTable {
             let mut j = i;
             while j < len && bytes[j].is_ascii_whitespace() { j += 1; }
             if j < len && bytes[j] == b'(' {
-                let (args, end_pos) = self.parse_macro_args(bytes, j);
+                let (args, ws, end_pos) = self.parse_macro_args(bytes, j);
                 let mut i = end_pos;
-                let (expanded, body_ended_with_func_ident) = self.expand_function_macro(mac, &args, expanding);
+                let (expanded, body_ended_with_func_ident) = self.expand_function_macro(mac, &args, &ws, expanding);
                 // Per C11 §6.10.3.4, only connect trailing function-like macro
                 // identifiers with subsequent source `(` if the substituted body
                 // (before rescan) truly ended with that identifier. If the body
@@ -653,13 +653,19 @@ impl MacroTable {
     /// per-argument String allocations in the common case where arguments contain
     /// no string/char literals. When all content is plain text, arguments are
     /// extracted as trimmed `&str` slices and converted to String only once.
-    fn parse_macro_args(&self, bytes: &[u8], start: usize) -> (Vec<String>, usize) {
+    /// The arguments of a macro invocation (trimmed), with whether each had
+    /// whitespace before and after it (see join_args), and the end position.
+    fn parse_macro_args(&self, bytes: &[u8], start: usize) -> (Vec<String>, ArgSpacing, usize) {
         let len = bytes.len();
         let mut i = start + 1; // skip '('
         let mut args: Vec<String> = Vec::new();
+        let mut spacing: ArgSpacing = Vec::new();
         let mut paren_depth = 0;
         // Start position of the current argument in bytes
         let mut arg_start = i;
+        // An argument written empty has no token to carry a leading space
+        // (`M(y, )` joins as "y,"); one that expands to nothing keeps it.
+        let ws_of = |s: &str| (s.starts_with(char::is_whitespace) && !s.trim().is_empty(), s.ends_with(char::is_whitespace));
 
         while i < len {
             match bytes[i] {
@@ -675,8 +681,9 @@ impl MacroTable {
                         let trimmed = arg_slice.trim();
                         if !trimmed.is_empty() || !args.is_empty() {
                             args.push(trimmed.to_string());
+                            spacing.push(ws_of(arg_slice));
                         }
-                        return (args, i + 1);
+                        return (args, spacing, i + 1);
                     } else {
                         paren_depth -= 1;
                         i += 1;
@@ -686,6 +693,7 @@ impl MacroTable {
                     let arg_slice = std::str::from_utf8(&bytes[arg_start..i])
                         .unwrap_or("");
                     args.push(arg_slice.trim().to_string());
+                    spacing.push(ws_of(arg_slice));
                     i += 1;
                     arg_start = i;
                 }
@@ -706,8 +714,9 @@ impl MacroTable {
         let trimmed = arg_slice.trim();
         if !trimmed.is_empty() || !args.is_empty() {
             args.push(trimmed.to_string());
+            spacing.push(ws_of(arg_slice));
         }
-        (args, i)
+        (args, spacing, i)
     }
 
     /// Expand a function-like macro with given arguments.
@@ -728,6 +737,7 @@ impl MacroTable {
         &self,
         mac: &MacroDef,
         args: &[String],
+        ws: &[(bool, bool)],
         expanding: &mut FxHashSet<String>,
     ) -> (String, bool) {
         // Step 1-2: Prescan - expand ALL arguments (C11 §6.10.3.1).
@@ -747,10 +757,24 @@ impl MacroTable {
         // Step 3: Handle stringification (#param) and token pasting (##).
         // Returns Cow::Borrowed(&mac.body) when the body has no '#' (common case),
         // avoiding a String clone.
-        let body = self.handle_stringify_and_paste(&mac.body, &mac.params, args, mac.is_variadic, mac.has_named_variadic);
+        // __VA_OPT__(content) (C23, and a GNU extension before): the content
+        // when the variable arguments have tokens after expansion, else
+        // nothing.
+        let va_opt_body;
+        let mac_body = if mac.is_variadic && mac.body.contains("__VA_OPT__") {
+            let first_va = if mac.has_named_variadic { mac.params.len() - 1 } else { mac.params.len() };
+            // Two or more variable arguments have a comma token between them.
+            let present = expanded_args.len() > first_va + 1
+                || expanded_args.iter().skip(first_va).any(|a| !strip_blue_paint(a).trim().is_empty());
+            va_opt_body = replace_va_opt(&mac.body, present);
+            va_opt_body.as_str()
+        } else {
+            mac.body.as_str()
+        };
+        let body = self.handle_stringify_and_paste(mac_body, &mac.params, args, ws, mac.is_variadic, mac.has_named_variadic);
 
         // Step 4: Substitute parameters with expanded arguments
-        let body = self.substitute_params(&body, &mac.params, &expanded_args, mac.is_variadic, mac.has_named_variadic);
+        let body = self.substitute_params(&body, &mac.params, &expanded_args, ws, mac.is_variadic, mac.has_named_variadic);
 
         // Check if the substituted body (before rescan) ends with a function-like
         // macro identifier. Per C11 §6.10.3.4, the rescan processes the replacement
@@ -825,6 +849,7 @@ impl MacroTable {
         body: &'a str,
         params: &[String],
         args: &[String],
+        ws: &[(bool, bool)],
         is_variadic: bool,
         has_named_variadic: bool,
     ) -> std::borrow::Cow<'a, str> {
@@ -849,7 +874,7 @@ impl MacroTable {
                 let left_token = extract_trailing_ident(&result);
                 if let Some(ref left_ident) = left_token {
                     if left_ident == "__VA_ARGS__" && is_variadic {
-                        let va_args_raw = self.get_va_args(params, args);
+                        let va_args_raw = self.get_va_args(params, args, ws);
                         let va_args = strip_blue_paint(&va_args_raw);
                         let trim_len = result.len() - "__VA_ARGS__".len();
                         result.truncate(trim_len);
@@ -894,39 +919,15 @@ impl MacroTable {
                     let right_ident = bytes_to_str(bytes, start, i);
 
                     if right_ident == "__VA_ARGS__" && is_variadic {
-                        let va_args_raw = self.get_va_args(params, args);
+                        let va_args_raw = self.get_va_args(params, args, ws);
                         let va_args = strip_blue_paint(&va_args_raw);
-                        if va_args.is_empty() {
-                            while result.ends_with(' ') || result.ends_with('\t') {
-                                result.pop();
-                            }
-                            if result.ends_with(',') {
-                                result.pop();
-                            }
-                        } else {
-                            // Wrap in paste-protection markers to prevent
-                            // re-substitution in substitute_params (C11 §6.10.3.3)
-                            result.push(PASTE_PROTECT_START as char);
-                            result.push_str(&va_args);
-                            result.push(PASTE_PROTECT_END as char);
-                        }
+                        paste_va_args(&mut result, &va_args, params.len(), args, ws);
                     } else if let Some(idx) = params.iter().position(|p| p == right_ident) {
                         let is_named_variadic_param = is_variadic && has_named_variadic && idx == params.len() - 1;
                         if is_named_variadic_param {
-                            let va_args_raw = self.get_named_va_args(idx, args);
+                            let va_args_raw = self.get_named_va_args(idx, args, ws);
                             let va_args = strip_blue_paint(&va_args_raw);
-                            if va_args.is_empty() {
-                                while result.ends_with(' ') || result.ends_with('\t') {
-                                    result.pop();
-                                }
-                                if result.ends_with(',') {
-                                    result.pop();
-                                }
-                            } else {
-                                result.push(PASTE_PROTECT_START as char);
-                                result.push_str(&va_args);
-                                result.push(PASTE_PROTECT_END as char);
-                            }
+                            paste_va_args(&mut result, &va_args, idx, args, ws);
                         } else {
                             let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
                             // Strip blue paint: ## creates a new token that must be rescanned
@@ -974,13 +975,13 @@ impl MacroTable {
                     let param_name = bytes_to_str(bytes, start, i);
 
                     if param_name == "__VA_ARGS__" && is_variadic {
-                        let va_args = self.get_va_args(params, args);
+                        let va_args = self.get_va_args(params, args, ws);
                         result.push('"');
                         result.push_str(&stringify_arg(&va_args));
                         result.push('"');
                     } else if let Some(idx) = params.iter().position(|p| p == param_name) {
                         let arg_str = if is_variadic && has_named_variadic && idx == params.len() - 1 {
-                            self.get_named_va_args(idx, args)
+                            self.get_named_va_args(idx, args, ws)
                         } else {
                             args.get(idx).map(|s| s.to_string()).unwrap_or_default()
                         };
@@ -1021,6 +1022,7 @@ impl MacroTable {
         body: &str,
         params: &[String],
         args: &[String],
+        ws: &[(bool, bool)],
         is_variadic: bool,
         has_named_variadic: bool,
     ) -> String {
@@ -1080,12 +1082,12 @@ impl MacroTable {
                 }
 
                 if ident == "__VA_ARGS__" && is_variadic {
-                    let va_args = self.get_va_args(params, args);
+                    let va_args = self.get_va_args(params, args, ws);
                     let next = if i < len { Some(bytes[i]) } else { None };
                     Self::append_with_paste_guard(&mut result, &va_args, next);
                 } else if let Some(idx) = params.iter().position(|p| p == ident) {
                     if is_variadic && has_named_variadic && idx == params.len() - 1 {
-                        let va_args = self.get_named_va_args(idx, args);
+                        let va_args = self.get_named_va_args(idx, args, ws);
                         let next = if i < len { Some(bytes[i]) } else { None };
                         Self::append_with_paste_guard(&mut result, &va_args, next);
                     } else {
@@ -1127,23 +1129,126 @@ impl MacroTable {
     }
 
     /// Get variadic arguments (__VA_ARGS__) as a comma-separated string.
-    fn get_va_args(&self, params: &[String], args: &[String]) -> String {
-        let named_count = params.len();
-        if args.len() > named_count {
-            args[named_count..].join(", ")
-        } else {
-            String::new()
-        }
+    fn get_va_args(&self, params: &[String], args: &[String], ws: &[(bool, bool)]) -> String {
+        join_args(args, ws, params.len())
     }
 
     /// Get ALL arguments for a named variadic parameter (e.g., `extra...`).
-    fn get_named_va_args(&self, param_idx: usize, args: &[String]) -> String {
-        if args.len() > param_idx {
-            args[param_idx..].join(", ")
-        } else {
-            String::new()
+    fn get_named_va_args(&self, param_idx: usize, args: &[String], ws: &[(bool, bool)]) -> String {
+        join_args(args, ws, param_idx)
+    }
+}
+
+/// Whether each macro argument had whitespace before and after it in the
+/// invocation (see MacroTable::parse_macro_args).
+type ArgSpacing = Vec<(bool, bool)>;
+
+/// The arguments from `from` on, joined by commas with the whitespace they
+/// had around them in the invocation: `#__VA_ARGS__` of `M(a,b , c)` is
+/// "a,b , c" (it was "a, b, c"). With no spacing known, ", ".
+fn join_args(args: &[String], ws: &[(bool, bool)], from: usize) -> String {
+    let mut s = String::new();
+    for (k, arg) in args.iter().enumerate().skip(from) {
+        if k > from {
+            // A comma that starts the result (after empty arguments) takes
+            // its spacing from the macro body, not the invocation.
+            if ws.get(k - 1).is_some_and(|w| w.1) && !s.is_empty() {
+                s.push(' ');
+            }
+            s.push(',');
+            if ws.get(k).is_none_or(|w| w.0) {
+                s.push(' ');
+            }
+        }
+        s.push_str(arg);
+    }
+    s
+}
+
+/// `x ## __VA_ARGS__` (or `## args` of a named variadic `args...`) with the
+/// variable arguments va_args, which start at argument first_va. GNU `,
+/// ## __VA_ARGS__` drops the comma when no variable argument is given at
+/// all; one given but empty (`M(f, )`) keeps it, as clang and gcc do. After
+/// the comma, the arguments keep the space they had before them.
+fn paste_va_args(result: &mut String, va_args: &str, first_va: usize, args: &[String], ws: &[(bool, bool)]) {
+    if args.len() <= first_va {
+        while result.ends_with(' ') || result.ends_with('\t') {
+            result.pop();
+        }
+        if result.ends_with(',') {
+            result.pop();
+        }
+        return;
+    }
+    if va_args.is_empty() {
+        return;
+    }
+    if result.ends_with(',') && ws.get(first_va).is_some_and(|w| w.0) {
+        result.push(' ');
+    }
+    // Wrap in paste-protection markers to prevent re-substitution in
+    // substitute_params (C11 §6.10.3.3)
+    result.push(PASTE_PROTECT_START as char);
+    result.push_str(va_args);
+    result.push(PASTE_PROTECT_END as char);
+}
+
+/// A variadic macro body with each `__VA_OPT__(content)` replaced by its
+/// content when the variable arguments are present, else removed.
+fn replace_va_opt(body: &str, present: bool) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    let mut copied = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => i = skip_literal_bytes(bytes, i, bytes[i]),
+            b if is_ident_start_byte(b) => {
+                let start = i;
+                while i < bytes.len() && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                if &body[start..i] != "__VA_OPT__" {
+                    continue;
+                }
+                let mut j = i;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j >= bytes.len() || bytes[j] != b'(' {
+                    continue;
+                }
+                let open = j;
+                let mut depth = 0;
+                while j < bytes.len() {
+                    match bytes[j] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        b'"' | b'\'' => {
+                            j = skip_literal_bytes(bytes, j, bytes[j]);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                out.push_str(&body[copied..start]);
+                if present {
+                    out.push_str(&body[open + 1..j.min(bytes.len())]);
+                }
+                i = (j + 1).min(bytes.len());
+                copied = i;
+            }
+            _ => i += 1,
         }
     }
+    out.push_str(&body[copied..]);
+    out
 }
 
 impl Default for MacroTable {
