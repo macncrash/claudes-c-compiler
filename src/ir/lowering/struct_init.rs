@@ -133,6 +133,10 @@ impl Lowerer {
                 && matches!(&field.ty, CType::Struct(_) | CType::Union(_));
             let has_nested_designator = item.designators.len() > 1
                 && matches!(item.designators.first(), Some(Designator::Field(_)));
+            // Only a list with designators can come back to a member.
+            if !is_anon_member_designator && items.iter().any(|it| !it.designators.is_empty()) {
+                self.reset_local_reinitialized_target(item, &field.ty, base_alloca, field_offset);
+            }
 
             // Dispatch to per-field-type handler
             match &field.ty {
@@ -185,6 +189,16 @@ impl Lowerer {
             }
         }
         item_idx
+    }
+
+    /// For a local: a braced initializer (or a string for a char array)
+    /// initializes the whole aggregate it targets, so what an earlier
+    /// initializer in the list stored there is zeroed first (see
+    /// reset_reinitialized_target, the static-initializer counterpart).
+    pub(super) fn reset_local_reinitialized_target(&mut self, item: &InitializerItem, field_ty: &CType, base_alloca: Value, field_offset: usize) {
+        if let Some((offset, size)) = self.reinitialized_range(item, field_ty, field_offset) {
+            self.zero_init_region(base_alloca, offset, size);
+        }
     }
 
     // ========================================================================
@@ -637,6 +651,13 @@ impl Lowerer {
             let elem_offset = field_offset + ai * elem_size;
             match &sub_items[si].init {
                 Initializer::List(struct_items) => {
+                    // The braces initialize the whole element, which an
+                    // earlier [i] = ... may have filled ({ {1, 2}, [0] = { } }
+                    // zeroes element 0). Only a list with designators can
+                    // come back to an element.
+                    if sub_items.iter().any(|it| !it.designators.is_empty()) {
+                        self.zero_init_region(base_alloca, elem_offset, elem_size);
+                    }
                     self.emit_struct_init(struct_items, base_alloca, sub_layout, elem_offset);
                     si += 1;
                     ai += 1;
@@ -854,6 +875,12 @@ impl Lowerer {
                             sub_ty = CType::Array(Box::new(sub_ty), Some(n));
                         }
                         if matches!(sub_ty, CType::Array(..)) {
+                            // The braces initialize the whole sub-array, which
+                            // a designator before may have come back to:
+                            // { {18, 24, 93}, [0] = { } } zeroes row 0.
+                            if items.iter().any(|it| !it.designators.is_empty()) {
+                                self.zero_init_region(base_alloca, offset + pos * leaf_size, strides[k] * leaf_size);
+                            }
                             self.emit_scalar_multidim_items(sub, base_alloca, offset + pos * leaf_size, &sub_ty, None);
                         }
                         pos += strides[k];

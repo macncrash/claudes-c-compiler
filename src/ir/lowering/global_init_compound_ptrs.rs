@@ -183,6 +183,12 @@ impl Lowerer {
         Self::build_compound_from_bytes_and_ptrs(bytes, ptr_ranges, total_size)
     }
 
+    /// Drop the address relocations at offsets in [start, end), cleared by a
+    /// re-initialization.
+    pub(super) fn drop_ptr_ranges(ptr_ranges: &mut Vec<(usize, GlobalInit)>, start: usize, end: usize) {
+        ptr_ranges.retain(|(off, _)| *off < start || *off >= end);
+    }
+
     /// Fill struct fields from an initializer item list into the byte buffer and ptr_ranges;
     /// returns the number of items used.
     /// Used both for braced init lists `{ field1, field2, ... }` and for unwrapped compound
@@ -228,6 +234,11 @@ impl Lowerer {
             };
             let field = &layout.fields[field_idx];
             let field_offset = base_offset + field.offset;
+            // A braced (or string) re-initialization clears the aggregate it
+            // targets, relocations included (see reinitialized_range).
+            if let Some((s, e)) = self.reset_reinitialized_target(sub_item, &field.ty, bytes, field_offset) {
+                Self::drop_ptr_ranges(ptr_ranges, s, e);
+            }
 
             // A multi-dimensional array of scalars, by leaf position, as in the
             // byte path: g[2][3] = { 1, 2, 3, 4 } stored a value per row.
@@ -469,6 +480,12 @@ impl Lowerer {
 
             match &item.init {
                 Initializer::List(sub_items) => {
+                    // The braces initialize the whole element, which a
+                    // designator before may have filled in part:
+                    // { [1].a = {1, 2, 3}, [1] = { .l = 5 } } zeroes a.
+                    let end = (base_offset + struct_size).min(bytes.len());
+                    bytes[base_offset.min(end)..end].fill(0);
+                    Self::drop_ptr_ranges(ptr_ranges, base_offset, end);
                     self.fill_struct_fields_from_items(
                         sub_items, layout, base_offset, bytes, ptr_ranges,
                     );
@@ -912,32 +929,15 @@ impl Lowerer {
                     };
                     self.fill_struct_array_sequential(items, &elem_layout, arr_size, offset, bytes, ptr_ranges);
                 } else {
-                    // Array of structs without pointer fields: byte serialization.
-                    // Handles both braced sub-items (List) and flat/brace-elided
-                    // scalar items (Expr) that fill struct fields sequentially.
-                    let struct_size = elem_layout.size;
-                    let mut sub_idx = 0usize;
-                    let mut ai = 0usize;
+                    // Array of structs without pointer fields: byte
+                    // serialization, as in the byte path (braced elements,
+                    // brace elision, [i] and [i].f designators: { [1] = { .. } }
+                    // went to element 0).
                     let arr_size = match field_ty {
                         CType::Array(_, Some(s)) => *s,
                         _ => items.len(),
                     };
-                    while ai < arr_size && sub_idx < items.len() {
-                        let elem_offset = offset + ai * struct_size;
-                        match &items[sub_idx].init {
-                            Initializer::List(ref sub_items) => {
-                                self.fill_struct_global_bytes(sub_items, &elem_layout, bytes, elem_offset);
-                                sub_idx += 1;
-                            }
-                            Initializer::Expr(_) => {
-                                // Flat/brace-elided init: pass remaining items to fill
-                                // this struct element field-by-field.
-                                let consumed = self.fill_struct_global_bytes(Self::elided_run(&items[sub_idx..]), &elem_layout, bytes, elem_offset);
-                                sub_idx += consumed;
-                            }
-                        }
-                        ai += 1;
-                    }
+                    self.fill_array_of_composites(items, elem_ty, arr_size, elem_layout.size, bytes, offset);
                 }
             } else if let CType::Array(ref inner_elem, Some(inner_size)) = elem_ty.as_ref() {
                 // Multi-dimensional array of scalars (e.g., unsigned char hash[2][4]):

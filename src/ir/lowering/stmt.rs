@@ -871,6 +871,11 @@ impl Lowerer {
                         let remaining_dims = array_dim_strides.len().saturating_sub(index_designators.len());
                         let sub_strides = &array_dim_strides[array_dim_strides.len() - remaining_dims..];
                         if remaining_dims > 0 {
+                            // The braces initialize the whole sub-array: what
+                            // an earlier initializer stored in the rest of it
+                            // is zeroed ({ {1, 2, 3}, [0] = {7} } gives {7, 0, 0}).
+                            let whole = array_dim_strides[index_designators.len() - 1];
+                            self.zero_init_region(alloca, target_flat * elem_size, whole);
                             self.lower_array_init_recursive(sub_items, alloca, base_ty, sub_strides, flat_index);
                         } else {
                             for sub_item in sub_items {

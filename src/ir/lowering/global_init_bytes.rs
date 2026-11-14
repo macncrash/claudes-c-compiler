@@ -79,6 +79,9 @@ impl Lowerer {
             let is_anon = h::is_anon_member_designator(
                 designator_name, &field_layout.name, &field_layout.ty);
             let has_nested = h::has_nested_field_designator(item);
+            if !is_anon {
+                self.reset_reinitialized_target(item, &field_layout.ty, bytes, field_offset);
+            }
 
             match &field_layout.ty {
                 // Nested designator or anonymous member designator into struct/union
@@ -222,6 +225,42 @@ impl Lowerer {
             }
         }
         item_idx
+    }
+
+    /// A braced initializer (or a string literal for a char array) initializes
+    /// the whole aggregate it targets, so what an earlier initializer in the
+    /// same list put there is gone (C11 6.7.9p19): `{ .a = {1, 2, 3}, .a =
+    /// {7} }` leaves a = {7, 0, 0}, and `.name = "ab"` clears the rest of name.
+    /// The byte range (offset, size) such an item clears before it is
+    /// filled, if it re-initializes a whole aggregate. `field_ty` at
+    /// `field_offset` is what the item's first designator (or its position)
+    /// selected; any further designators are followed from there.
+    pub(super) fn reinitialized_range(&self, item: &InitializerItem, field_ty: &CType, field_offset: usize) -> Option<(usize, usize)> {
+        let rest = item.designators.get(1..).unwrap_or(&[]);
+        let (target_ty, offset) = if rest.is_empty() {
+            (field_ty.clone(), field_offset)
+        } else {
+            let d = self.drill_designators(rest, field_ty)?;
+            (d.target_ty, field_offset + d.byte_offset)
+        };
+        let reinit = match (&item.init, &target_ty) {
+            (Initializer::List(_), CType::Struct(_) | CType::Union(_) | CType::Array(_, Some(_))) => true,
+            (Initializer::Expr(e), CType::Array(_, Some(_))) => matches!(e,
+                Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..)),
+            _ => false,
+        };
+        reinit.then(|| (offset, self.resolve_ctype_size(&target_ty)))
+    }
+
+    /// Zero the range reinitialized_range gives in a static image, and drop
+    /// the address relocations an earlier initializer put there.
+    pub(super) fn reset_reinitialized_target(&self, item: &InitializerItem, field_ty: &CType, bytes: &mut [u8], field_offset: usize) -> Option<(usize, usize)> {
+        let (offset, size) = self.reinitialized_range(item, field_ty, field_offset)?;
+        let end = (offset + size).min(bytes.len());
+        if offset < end {
+            bytes[offset..end].fill(0);
+        }
+        Some((offset, end))
     }
 
     /// Drill through a slice of designators to find the target type and byte offset.
@@ -807,7 +846,13 @@ impl Lowerer {
                         for &n in extents[k + 1..].iter().rev() {
                             sub_ty = CType::Array(Box::new(sub_ty), Some(n));
                         }
-                        self.fill_scalar_multidim_bytes(sub, &sub_ty, bytes, offset + pos * leaf_size, None);
+                        // The braces initialize the whole sub-array, which
+                        // a designator before may have come back to:
+                        // { {18, 24, 93}, [0] = { } } zeroes row 0.
+                        let start = offset + pos * leaf_size;
+                        let end = (start + strides[k] * leaf_size).min(bytes.len());
+                        bytes[start.min(end)..end].fill(0);
+                        self.fill_scalar_multidim_bytes(sub, &sub_ty, bytes, start, None);
                         pos += strides[k];
                     }
                 }
@@ -1067,6 +1112,10 @@ impl Lowerer {
             }
             match &sub_items[sub_idx].init {
                 Initializer::List(inner_items) => {
+                    // The braces initialize the whole element (see
+                    // fill_multidim_struct_array_bytes).
+                    let end = (elem_offset + elem_size).min(bytes.len());
+                    bytes[elem_offset.min(end)..end].fill(0);
                     self.fill_struct_global_bytes(inner_items, &sub_layout, bytes, elem_offset);
                     sub_idx += 1;
                 }
@@ -1316,6 +1365,12 @@ impl Lowerer {
                         }
                         Initializer::List(sub_items) => {
                             let write_offset = elem_offset + sub_byte_offset;
+                            // Braces initialize the whole element or sub-array.
+                            if field_designator_name.is_none() {
+                                let span = if !sub_strides.is_empty() && sub_strides[0] > struct_size { sub_strides[0] } else { struct_size };
+                                let end = (write_offset + span).min(bytes.len());
+                                bytes[write_offset.min(end)..end].fill(0);
+                            }
                             if !sub_strides.is_empty() && sub_strides[0] > struct_size {
                                 self.fill_multidim_struct_array_bytes(
                                     sub_items, layout, struct_size, sub_strides,
@@ -1353,6 +1408,13 @@ impl Lowerer {
 
             match &item.init {
                 Initializer::List(sub_items) => {
+                    // The braces initialize the whole element (or sub-array),
+                    // which a designator before may have filled in part:
+                    // { [1].a = {1, 2, 3}, [1] = { .l = 5 } } zeroes a.
+                    if field_designator_name.is_none() {
+                        let end = (elem_offset + this_stride).min(bytes.len());
+                        bytes[elem_offset.min(end)..end].fill(0);
+                    }
                     if this_stride > struct_size && !remaining_strides.is_empty() {
                         // This brace group represents a sub-array (not a single struct).
                         // Recurse with the next dimension's strides.

@@ -1785,6 +1785,13 @@ impl Lowerer {
                     self.flatten_global_init_item_bool(&item.init, base_ty, &mut tmp, is_bool_target);
                 } else {
                     self.flatten_global_array_init_bool(sub_items, sub_strides, base_ty, &mut tmp, is_bool_target);
+                    // The braces initialize the whole sub-array: what an
+                    // earlier initializer put in the rest of it is zeroed
+                    // ({ {1, 2, 3}, [0] = {7} } gives {7, 0, 0}).
+                    let whole = array_dim_strides[index_designators.len() - 1] / base_type_size.max(1);
+                    while tmp.len() < whole {
+                        tmp.push(self.zero_const(base_ty));
+                    }
                 }
                 Self::overwrite_or_extend_values(values, flat_idx, tmp, &zero_fn);
             }

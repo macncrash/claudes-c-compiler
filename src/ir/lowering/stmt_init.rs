@@ -785,6 +785,13 @@ impl Lowerer {
             }
             match &item.init {
                 Initializer::List(sub_items) => {
+                    // The braces initialize the whole element (or sub-array),
+                    // which a designator before may have filled in part:
+                    // { [1].a = {1, 2, 3}, [1] = { .l = 5 } } zeroes a. Only a
+                    // list with designators can come back to an element.
+                    if field_designator_name.is_none() && items.iter().any(|it| !it.designators.is_empty()) {
+                        self.zero_init_region(alloca, base_byte_offset, this_stride);
+                    }
                     if field_designator_name.is_some() {
                         // Field-designated init: [idx].field... = { ... }, as the
                         // element's own initializer would take .field... = { ... }.
