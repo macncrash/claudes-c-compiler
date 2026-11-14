@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-14",
-  "ccc_rev": "1e7abe66",
+  "ccc_rev": "9d26c662",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -715,6 +715,9 @@
   "cases/address_constant_chains": {
    "status": "pass"
   },
+  "cases/always_inline_recursion": {
+   "status": "pass"
+  },
   "cases/arg_register_copies": {
    "status": "pass"
   },
@@ -943,6 +946,9 @@
   "cases/heap_sift": {
    "status": "pass"
   },
+  "cases/hex_float_literals_exact": {
+   "status": "pass"
+  },
   "cases/indexed_local_arrays": {
    "status": "pass"
   },
@@ -1001,6 +1007,9 @@
    "status": "pass"
   },
   "cases/libc_interop": {
+   "status": "pass"
+  },
+  "cases/libm_builtins_fma_lround_ilogb_frexp": {
    "status": "pass"
   },
   "cases/line_directive_filename": {
@@ -5772,7 +5781,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16f59ed8f 0x16f59ed8f 0x16f59ed8f 0x16f59ed8f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16f66ad8f 0x16f66ad8f 0x16f66ad8f 0x16f66ad8f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
