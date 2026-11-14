@@ -281,6 +281,29 @@ impl Lowerer {
                     }
                 }
             }
+            // fma, frexp and modf, and the float-to-integer functions.
+            use crate::frontend::sema::builtins::{LIBM_TERNARY, LIBM_FLOAT_PTR, LIBM_TO_INT};
+            for (sfx, t) in [("", F64), ("f", F32), ("l", ld)] {
+                for base in LIBM_TERNARY {
+                    let name = format!("{base}{sfx}");
+                    if !self.func_meta.sigs.contains_key(&name) {
+                        self.insert_builtin_sig(&name, t, vec![t, t, t], Vec::new());
+                    }
+                }
+                for base in LIBM_FLOAT_PTR {
+                    let name = format!("{base}{sfx}");
+                    if !self.func_meta.sigs.contains_key(&name) {
+                        self.insert_builtin_sig(&name, t, vec![t, Ptr], Vec::new());
+                    }
+                }
+                for (base, ret) in LIBM_TO_INT {
+                    let name = format!("{base}{sfx}");
+                    if !self.func_meta.sigs.contains_key(&name) {
+                        let r = if *ret == CType::Int { I32 } else { I64 };
+                        self.insert_builtin_sig(&name, r, vec![t], Vec::new());
+                    }
+                }
+            }
         }
         // int/long returning functions
         self.insert_builtin_sig("abs", I32, vec![I32], Vec::new());

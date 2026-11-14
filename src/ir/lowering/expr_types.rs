@@ -345,7 +345,9 @@ impl Lowerer {
             crate::frontend::sema::builtins::libm_builtin_ctype(name).map(|ct| match ct {
                 CType::Float => IrType::F32,
                 CType::LongDouble => IrType::F128,
-                _ => IrType::F64,
+                CType::Double => IrType::F64,
+                // __builtin_lround and the like
+                ref t => IrType::from_ctype(t),
             })
         })?;
         // On Apple arm64 a long double is a double.

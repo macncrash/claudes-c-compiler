@@ -23,18 +23,46 @@ pub const LIBM_UNARY_COUNT: usize = 33;
 /// libm functions taking a floating value and an int (ldexp, scalbn).
 pub const LIBM_FLOAT_INT: &[&str] = &["ldexp", "scalbn"];
 
+/// libm functions taking three floating values.
+pub const LIBM_TERNARY: &[&str] = &["fma"];
+
+/// libm functions taking a floating value and a pointer: frexp (int *) and
+/// modf (a pointer to the same floating type).
+pub const LIBM_FLOAT_PTR: &[&str] = &["frexp", "modf"];
+
+/// libm functions taking a floating value and returning an integer, with
+/// that integer type (in all three precisions: __builtin_lroundf is a long).
+pub const LIBM_TO_INT: &[(&str, crate::common::types::CType)] = &[
+    ("lround", crate::common::types::CType::Long), ("lrint", crate::common::types::CType::Long),
+    ("llround", crate::common::types::CType::LongLong), ("llrint", crate::common::types::CType::LongLong),
+    ("ilogb", crate::common::types::CType::Int),
+];
+
+/// Every libm base name known as a builtin, in all three precisions.
+pub fn libm_builtin_bases() -> impl Iterator<Item = &'static str> {
+    LIBM_BUILTINS.iter().chain(LIBM_FLOAT_INT).chain(LIBM_TERNARY).chain(LIBM_FLOAT_PTR).copied()
+        .chain(LIBM_TO_INT.iter().map(|(b, _)| *b))
+}
+
 /// The C result type of a libm builtin from the lists above:
-/// `__builtin_fminf` is a float, `__builtin_fminl` a long double.
+/// `__builtin_fminf` is a float, `__builtin_fminl` a long double, and
+/// `__builtin_lroundf` a long.
 pub fn libm_builtin_ctype(name: &str) -> Option<crate::common::types::CType> {
     use crate::common::types::CType;
     let rest = name.strip_prefix("__builtin_")?;
-    let known = |b: &str| LIBM_BUILTINS.contains(&b) || LIBM_FLOAT_INT.contains(&b);
-    if known(rest) {
+    let float_result = |b: &str| LIBM_BUILTINS.contains(&b) || LIBM_FLOAT_INT.contains(&b)
+        || LIBM_TERNARY.contains(&b) || LIBM_FLOAT_PTR.contains(&b);
+    let int_result = |b: &str| LIBM_TO_INT.iter().find(|(n, _)| *n == b).map(|(_, t)| t.clone());
+    if float_result(rest) {
         return Some(CType::Double);
     }
+    if let Some(t) = int_result(rest) {
+        return Some(t);
+    }
     match rest.split_at(rest.len().checked_sub(1)?) {
-        (b, "f") if known(b) => Some(CType::Float),
-        (b, "l") if known(b) => Some(CType::LongDouble),
+        (b, "f") if float_result(b) => Some(CType::Float),
+        (b, "l") if float_result(b) => Some(CType::LongDouble),
+        (b, "f" | "l") => int_result(b),
         _ => None,
     }
 }
@@ -104,7 +132,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     // The rest of libm, each as __builtin_NAME, NAMEf and NAMEl: clang and
     // GCC know them all, and ccc called __builtin_fminf as an undeclared
     // function, which no library defines.
-    for base in LIBM_BUILTINS.iter().chain(LIBM_FLOAT_INT) {
+    for base in libm_builtin_bases() {
         for sfx in ["", "f", "l"] {
             let lib = format!("{base}{sfx}");
             let key: &'static str = Box::leak(format!("__builtin_{lib}").into_boxed_str());
