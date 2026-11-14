@@ -53,6 +53,8 @@ objects; a ccc-only build cannot show a calling-convention mismatch.
 | `loopfuzz` | loop nests over arrays and maybe-overlapping pointers |
 | `rdfuzz` | float-sum loops (vectorized reductions and near misses) |
 | `memfz` | memory access and aliasing: union punning of every width, char and memcpy access, overlapping copies, aliasing pointers |
+| `inlfz` | inlining: always_inline, static inline and noinline functions with static locals, recursion, early returns, function-pointer calls |
+| `mathfz` | math library and builtins with exactly specified results, constant and run-time arguments, edge values |
 | `bffuzz` | bit-field layout, static initializers and access |
 | `bfrt` | bit-field runtime operations |
 | `pkfz` | bit-field layout under `#pragma pack` and attributes |
