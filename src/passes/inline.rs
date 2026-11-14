@@ -1608,10 +1608,15 @@ fn build_callee_map_for(module: &IrModule, large: bool) -> HashMap<String, Calle
         // the calls its body brings stay calls (SQLite's sqlite3_value_text,
         // on a cycle through sqlite3VdbeMemStringify, is a call per row from
         // its SQL functions).
-        let in_cycle = !func.is_always_inline && recursive.contains(func.name.as_str());
+        let in_cycle = recursive.contains(func.name.as_str());
 
-        // Determine if this is an always_inline function
-        let is_always_inline = func.is_always_inline;
+        // Determine if this is an always_inline function. One on a call
+        // cycle cannot be inlined everywhere, and clang does not try (gcc
+        // rejects it): forcing it re-inlined its own call into itself up to
+        // the 50,000-instruction budget in every caller, over a minute of
+        // compiling a few recursive always_inline functions. It is inlined,
+        // or not, as any function on a cycle.
+        let is_always_inline = func.is_always_inline && !in_cycle;
 
         // For always_inline: we inline regardless of whether the function is static,
         // because GCC/Clang semantics dictate that __attribute__((always_inline))
