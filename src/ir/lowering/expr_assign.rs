@@ -204,21 +204,50 @@ impl Lowerer {
         let (field_addr, storage_ty, bit_offset, bit_width, quals) = self.resolve_bitfield_lvalue(lhs)?;
         let is_bool = self.is_bool_lvalue(lhs);
 
+        // The field's value (held extended to the machine word) has its promoted
+        // type: int below 32 bits (unsigned ones too, all their values fit),
+        // else the declared type. With the right-hand side it goes through the
+        // usual arithmetic conversions as any compound assignment. (The right
+        // side was used unconverted, so s.bf += 2.5 added a double's bits, and
+        // the operation's signedness was the storage type's.)
+        let field_ty = if bit_width < 32 {
+            IrType::I32
+        } else if bit_width == 32 {
+            if storage_ty.is_unsigned() { IrType::U32 } else { IrType::I32 }
+        } else if storage_ty.is_unsigned() {
+            IrType::U64
+        } else {
+            IrType::I64
+        };
         let current_val = self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, quals);
 
-        let rhs_val = self.lower_expr(rhs);
-
-        let is_unsigned = storage_ty.is_unsigned();
-        let ir_op = Self::binop_to_ir(*op, is_unsigned);
-        let wt = widened_op_type(IrType::I32);
-        let result = self.emit_binop_val(ir_op, current_val, rhs_val, wt);
-
-        // C standard 6.3.1.2: when the target is _Bool, normalize the result
-        // to 0 or 1 before storing into the bitfield.
-        let store_val = if is_bool {
-            self.emit_bool_normalize_typed(Operand::Value(result), wt)
+        let rhs_ty = self.get_expr_type(rhs);
+        let rhs_ir_ty = self.infer_expr_type(rhs);
+        let (common_ty, op_ty) = Self::usual_arithmetic_conversions(field_ty, rhs_ty, field_ty, rhs_ir_ty);
+        let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        let rhs_val = self.lower_compound_rhs(rhs, common_ty, op_ty, is_shift);
+        let loaded = self.promote_for_op(current_val, field_ty, field_ty, op_ty, common_ty, is_shift);
+        let is_unsigned = if is_shift {
+            Self::integer_promote(field_ty).is_unsigned()
         } else {
-            Operand::Value(result)
+            common_ty.is_unsigned()
+        };
+        let ir_op = Self::binop_to_ir(*op, is_unsigned);
+        let result = self.emit_binop_val(ir_op, loaded, rhs_val, op_ty);
+
+        // C standard 6.3.1.2: when the target is _Bool, the result is 1 if it
+        // compares unequal to 0 (in the operation's type: 0.5 is 1), else 0.
+        let store_val = if is_bool {
+            self.emit_bool_normalize_typed(Operand::Value(result), op_ty)
+        } else {
+            let narrowed = self.narrow_from_op(Operand::Value(result), field_ty, field_ty, op_ty);
+            // The store masks the value to the field; it takes it in the machine word.
+            let wt = widened_op_type(storage_ty);
+            if op_ty.is_float() && field_ty.size() < wt.size() {
+                Operand::Value(self.emit_cast_val(narrowed, field_ty, wt))
+            } else {
+                narrowed
+            }
         };
 
         self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, store_val, quals);
@@ -559,10 +588,14 @@ impl Lowerer {
 
         let (common_ty, op_ty) = Self::usual_arithmetic_conversions(ty, rhs_ty, lhs_ir_ty, rhs_ir_ty);
 
-        let rhs_val = self.lower_expr_with_type(rhs, op_ty);
+        let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        let rhs_val = if ty == IrType::Ptr {
+            self.lower_expr_with_type(rhs, op_ty)
+        } else {
+            self.lower_compound_rhs(rhs, common_ty, op_ty, is_shift)
+        };
         if let Some(lv) = self.lower_lvalue(lhs) {
             let loaded = self.load_lvalue_typed(&lv, ty);
-            let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
             let loaded_promoted = self.promote_for_op(loaded, ty, lhs_ir_ty, op_ty, common_ty, is_shift);
 
             let is_unsigned = if is_shift {
@@ -587,11 +620,12 @@ impl Lowerer {
                 _ => self.emit_binop_val(ir_op, loaded_promoted, actual_rhs, op_ty),
             };
 
-            let store_val = self.narrow_from_op(Operand::Value(result), ty, lhs_ir_ty, op_ty);
+            // A _Bool target is 1 if the result compares unequal to 0, tested in
+            // the operation's type: narrowing first made b += 0.5 and b += 256 0.
             let store_val = if self.is_bool_lvalue(lhs) {
-                self.emit_bool_normalize_typed(store_val, op_ty)
+                self.emit_bool_normalize_typed(Operand::Value(result), op_ty)
             } else {
-                store_val
+                self.narrow_from_op(Operand::Value(result), ty, lhs_ir_ty, op_ty)
             };
             self.store_lvalue_typed(&lv, store_val, ty);
             return store_val;
@@ -624,6 +658,20 @@ impl Lowerer {
         (common_ty, op_ty)
     }
 
+    /// A compound assignment's right operand in the operation type. An integer
+    /// operation whose common type is narrower than the operation type (32-bit
+    /// unsigned held in 64 bits) takes the operand converted to the common type
+    /// first: u /= -100 divides by 2^32 - 100, where extending -100 straight to
+    /// 64 bits divided by 2^64 - 100. A shift count takes no part in it.
+    fn lower_compound_rhs(&mut self, rhs: &Expr, common_ty: IrType, op_ty: IrType, is_shift: bool) -> Operand {
+        if !is_shift && !op_ty.is_float() && common_ty.size() < op_ty.size() {
+            let in_common = self.lower_expr_with_type(rhs, common_ty);
+            Operand::Value(self.emit_cast_val(in_common, common_ty, op_ty))
+        } else {
+            self.lower_expr_with_type(rhs, op_ty)
+        }
+    }
+
     /// Promote a loaded value to the operation type for compound assignment.
     pub(super) fn promote_for_op(&mut self, loaded: Operand, val_ty: IrType, ir_ty: IrType, op_ty: IrType, common_ty: IrType, is_shift: bool) -> Operand {
         if val_ty != op_ty && op_ty.is_float() && !val_ty.is_float() {
@@ -644,35 +692,33 @@ impl Lowerer {
         } else if !op_ty.is_float() && ir_ty.size() < op_ty.size() {
             // Widen the LHS to the operation type.
             if op_ty == IrType::I128 || op_ty == IrType::U128 {
-                // Widen to 128-bit: first promote to I64/U64, then cast to 128-bit
-                let from_64 = if ir_ty.is_unsigned() || common_ty.is_unsigned() {
-                    IrType::U64
-                } else {
-                    IrType::I64
-                };
+                // Widen to 128-bit: first to I64/U64 by the value's own
+                // signedness, then to 128 bits (a negative int into unsigned
+                // __int128 is 2^128 - n: sign-extended, as C converts).
+                let from_64 = if ir_ty.is_unsigned() { IrType::U64 } else { IrType::I64 };
                 let loaded_64 = if ir_ty.size() < 8 {
                     Operand::Value(self.emit_cast_val(loaded, ir_ty, from_64))
                 } else {
                     loaded
                 };
                 Operand::Value(self.emit_cast_val(loaded_64, from_64, op_ty))
-            } else {
-                let extend_unsigned = if is_shift {
-                    ir_ty.is_unsigned()
-                } else {
-                    common_ty.is_unsigned() || ir_ty.is_unsigned()
-                };
-                let from_ty = if extend_unsigned {
-                    match ir_ty {
-                        IrType::I32 => IrType::U32,
-                        IrType::I16 => IrType::U16,
-                        IrType::I8 => IrType::U8,
-                        _ => ir_ty,
-                    }
-                } else {
-                    ir_ty
-                };
+            } else if is_shift || ir_ty.size() >= common_ty.size() {
+                // A shift's left operand is only promoted, so it extends by its
+                // own signedness; one as wide as the common type takes the
+                // common type's signedness.
+                let from_ty = if !is_shift && common_ty.is_unsigned() { ir_ty.to_unsigned() } else { ir_ty };
                 Operand::Value(self.emit_cast_val(loaded, from_ty, op_ty))
+            } else {
+                // Narrower than the common type: it converts as C does, extending
+                // by its own signedness to the common type, which then extends by
+                // its signedness into the operation type. (Zero-extending a
+                // negative char straight to 64 bits made c /= 200u divide 246.)
+                let to_common = self.emit_cast_val(loaded, ir_ty, common_ty);
+                if common_ty.size() < op_ty.size() {
+                    Operand::Value(self.emit_cast_val(Operand::Value(to_common), common_ty, op_ty))
+                } else {
+                    Operand::Value(to_common)
+                }
             }
         } else {
             loaded

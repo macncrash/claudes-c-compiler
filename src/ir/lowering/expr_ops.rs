@@ -949,6 +949,16 @@ impl Lowerer {
         let wt = widened_op_type(IrType::I32);
         let one = if wt == IrType::I32 { IrConst::I32(1) } else { IrConst::I64(1) };
         let result = self.emit_binop_val(ir_op, current_val, Operand::Const(one), wt);
+        // A _Bool bit-field takes 1 for any nonzero result: ++ leaves 1 at 1 and
+        // -- turns 0 into 1. (Masking 2 to the 1-bit field stored 0.)
+        let result = if self.is_bool_lvalue(inner) {
+            match self.emit_bool_normalize_typed(Operand::Value(result), wt) {
+                Operand::Value(v) => v,
+                Operand::Const(_) => result,
+            }
+        } else {
+            result
+        };
 
         self.store_bitfield(field_addr, storage_ty, bit_offset, bit_width, Operand::Value(result), quals);
 
