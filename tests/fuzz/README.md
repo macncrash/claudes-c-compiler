@@ -51,6 +51,7 @@ objects; a ccc-only build cannot show a calling-convention mismatch.
 | `cxfz` | `_Complex` arithmetic |
 | `cffuzz` | control flow: nested if/switch, GNU case ranges, bounded loops |
 | `swfz` | switches on every integer type: jump tables with holes, extreme and sparse values, case ranges, fallthrough; computed goto |
+| `cufz` | cleanup attribute: handler order and values on return, break, continue, goto out of and back within scopes; generated programs capped at 1 MB of output |
 | `loopfuzz` | loop nests over arrays and maybe-overlapping pointers |
 | `rdfuzz` | float-sum loops (vectorized reductions and near misses) |
 | `memfz` | memory access and aliasing: union punning of every width, char and memcpy access, overlapping copies, aliasing pointers |
