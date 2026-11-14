@@ -37,6 +37,23 @@ PROJECTS = [
     {'name': 'blake3-neon', 'dir': 'blake3-*/c', 'driver': 'blake3', 'arch': 'arm64',
      'sources': ['blake3.c', 'blake3_dispatch.c', 'blake3_portable.c', 'blake3_neon.c'], 'inc': ['.'],
      'defines': ['BLAKE3_NO_SSE2', 'BLAKE3_NO_SSE41', 'BLAKE3_NO_AVX2', 'BLAKE3_NO_AVX512', 'BLAKE3_USE_NEON=1']},
+    # Oniguruma, with the config.h its crate's build script writes, and the
+    # files it compiles.
+    {'name': 'onig', 'dir': 'onig_sys-*/oniguruma/src',
+     'sources': ['regexec.c', 'regerror.c', 'regparse.c', 'regext.c', 'regcomp.c', 'reggnu.c', 'regenc.c',
+                 'regsyntax.c', 'regtrav.c', 'regversion.c', 'st.c', 'onig_init.c', 'unicode.c', 'ascii.c',
+                 'utf8.c', 'utf16_be.c', 'utf16_le.c', 'utf32_be.c', 'utf32_le.c', 'euc_jp.c', 'sjis.c',
+                 'iso8859_1.c', 'iso8859_2.c', 'iso8859_3.c', 'iso8859_4.c', 'iso8859_5.c', 'iso8859_6.c',
+                 'iso8859_7.c', 'iso8859_8.c', 'iso8859_9.c', 'iso8859_10.c', 'iso8859_11.c', 'iso8859_13.c',
+                 'iso8859_14.c', 'iso8859_15.c', 'iso8859_16.c', 'euc_tw.c', 'euc_kr.c', 'big5.c', 'gb18030.c',
+                 'koi8_r.c', 'cp1251.c', 'euc_jp_prop.c', 'sjis_prop.c', 'unicode_unfold_key.c',
+                 'unicode_fold1_key.c', 'unicode_fold2_key.c', 'unicode_fold3_key.c'],
+     'inc': ['.'],
+     'defines': ['HAVE_UNISTD_H=1', 'HAVE_SYS_TYPES_H=1', 'HAVE_SYS_TIME_H=1', 'HAVE_ALLOCA_H=1'],
+     'config_h': '#define HAVE_PROTOTYPES 1\n#define STDC_HEADERS 1\n#define HAVE_STRING_H 1\n'
+                 '#define HAVE_STDARG_H 1\n#define HAVE_STDLIB_H 1\n#define HAVE_LIMITS_H 1\n'
+                 '#define HAVE_INTTYPES_H 1\n#define SIZEOF_INT 4\n#define SIZEOF_SHORT 2\n'
+                 '#define SIZEOF_LONG 8\n#define SIZEOF_VOIDP 8\n#define SIZEOF_LONG_LONG 8\n'},
     {'name': 'sqlite', 'dir': 'libsqlite3-sys-*/sqlite3',
      'sources': ['sqlite3.c'], 'inc': ['.'],
      'defines': ['SQLITE_THREADSAFE=0', 'SQLITE_OMIT_LOAD_EXTENSION', 'SQLITE_ENABLE_FTS5',
@@ -77,7 +94,7 @@ def find_dir(root, pattern):
 
 def run(cmd, cwd=None, timeout=900):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, errors='backslashreplace', cwd=cwd, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return -1, '', 'timeout'
@@ -87,6 +104,13 @@ def build_and_run(cc, label, proj, src_dir, work, opt, pool):
     out = os.path.join(work, label)
     os.makedirs(out, exist_ok=True)
     flags = [opt, '-w'] + ['-I' + os.path.join(src_dir, i) for i in proj['inc']] + ['-D' + d for d in proj['defines']]
+    if 'config_h' in proj:
+        # A generated config header, as the project's own build writes one.
+        gen = os.path.join(work, 'generated')
+        os.makedirs(gen, exist_ok=True)
+        with open(os.path.join(gen, 'config.h'), 'w') as fh:
+            fh.write(proj['config_h'])
+        flags.insert(2, '-I' + gen)
     files = []
     for pat in proj['sources']:
         files += sorted(glob.glob(os.path.join(src_dir, pat)))
