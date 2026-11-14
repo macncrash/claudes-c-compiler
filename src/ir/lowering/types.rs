@@ -751,8 +751,10 @@ impl Lowerer {
                 // dims (`typeof(T[2])` for `typedef char T[3]` is [2, 3]),
                 // so the base element is the innermost one, not the typedef.
                 let all_dims = self.collect_type_array_dims(ts);
-                let base_elem_size = Self::ctype_innermost_elem_size(&resolved_ctype, &self.types.borrow_struct_layouts()).max(1);
-                let total: usize = all_dims.iter().product::<usize>() * base_elem_size;
+                let leaf_size = Self::ctype_innermost_elem_size(&resolved_ctype, &self.types.borrow_struct_layouts());
+                let base_elem_size = leaf_size.max(1);
+                // Zero-size elements make an empty array (see below).
+                let total: usize = if leaf_size == 0 { 0 } else { all_dims.iter().product::<usize>() * base_elem_size };
                 let strides = Self::compute_strides_from_dims(&all_dims, base_elem_size);
                 let elem_size = if strides.len() > 1 { strides[0] } else { base_elem_size };
                 return (total, elem_size, true, false, strides);
@@ -797,8 +799,14 @@ impl Lowerer {
                 .chain(type_dims.iter().copied())
                 .collect();
 
-            // Compute total size = product of all dims * base_elem_size
-            let total: usize = all_dims.iter().product::<usize>() * base_elem_size;
+            // Compute total size = product of all dims * base_elem_size. An
+            // array of zero-size elements (GNU empty structs, or only zero-width
+            // bit-fields) is empty: base_elem_size is kept at least 1 for
+            // the divisions done with it, not for the size.
+            let zero_size_elem = !has_func_ptr && type_dims.is_empty()
+                && resolved_ctype.size_ctx(&*self.types.borrow_struct_layouts()) == 0
+                && !derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+            let total: usize = if zero_size_elem { 0 } else { all_dims.iter().product::<usize>() * base_elem_size };
 
             // Compute strides: stride[i] = product of dims[i+1..] * base_elem_size
             let strides = Self::compute_strides_from_dims(&all_dims, base_elem_size);
