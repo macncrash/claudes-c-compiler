@@ -52,6 +52,7 @@ objects; a ccc-only build cannot show a calling-convention mismatch.
 | `cffuzz` | control flow: nested if/switch, GNU case ranges, bounded loops |
 | `loopfuzz` | loop nests over arrays and maybe-overlapping pointers |
 | `rdfuzz` | float-sum loops (vectorized reductions and near misses) |
+| `memfz` | memory access and aliasing: union punning of every width, char and memcpy access, overlapping copies, aliasing pointers |
 | `bffuzz` | bit-field layout, static initializers and access |
 | `bfrt` | bit-field runtime operations |
 | `pkfz` | bit-field layout under `#pragma pack` and attributes |
