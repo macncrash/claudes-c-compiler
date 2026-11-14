@@ -242,7 +242,7 @@ impl Lexer {
 
     /// Lex a hex float literal: 0x<int_hex>.<frac_hex>p<+/->exp
     fn lex_hex_float(&mut self, start: usize, hex_start: usize, has_dot: bool) -> Token {
-        let int_hex = std::str::from_utf8(&self.input[hex_start..self.pos]).unwrap_or("0");
+        let int_hex = std::str::from_utf8(&self.input[hex_start..self.pos]).unwrap_or("0").to_string();
 
         let frac_hex = if has_dot {
             self.pos += 1; // skip '.'
@@ -250,9 +250,9 @@ impl Lexer {
             while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
                 self.pos += 1;
             }
-            std::str::from_utf8(&self.input[frac_start..self.pos]).unwrap_or("")
+            std::str::from_utf8(&self.input[frac_start..self.pos]).unwrap_or("").to_string()
         } else {
-            ""
+            String::new()
         };
 
         // Parse 'p'/'P' exponent (mandatory for hex floats)
@@ -278,18 +278,15 @@ impl Lexer {
             0
         };
 
-        // Convert hex float to f64: value = (int_part + frac_part) * 2^exp
-        let int_val = u64::from_str_radix(int_hex, 16).unwrap_or(0) as f64;
-        let frac_val: f64 = if !frac_hex.is_empty() {
-            let frac_int = u64::from_str_radix(frac_hex, 16).unwrap_or(0) as f64;
-            frac_int / (16.0_f64).powi(frac_hex.len() as i32)
-        } else {
-            0.0
-        };
-        let value = (int_val + frac_val) * (2.0_f64).powi(exp as i32);
-
         // Check float suffix: f/F = float, l/L = long double
         let float_kind = self.parse_simple_float_suffix();
+        // Rounded once, to float for an f literal (a float literal rounded
+        // to double first could round twice).
+        let value = if float_kind == 1 {
+            hex_float_value(&int_hex, &frac_hex, exp, 24, -126, 128)
+        } else {
+            hex_float_value(&int_hex, &frac_hex, exp, 53, -1022, 1024)
+        };
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
         match float_kind {
             1 => Token::new(TokenKind::FloatLiteralF32(value), span),
@@ -1245,4 +1242,76 @@ fn hex_digit_val(c: u8) -> u8 {
         b'A'..=b'F' => c - b'A' + 10,
         _ => 0,
     }
+}
+
+/// The value of a hexadecimal floating constant `0x INT . FRAC p EXP`,
+/// rounded once (to nearest, ties to even) to a binary format with `prec`
+/// significand bits and normal exponents from `emin` to `emax - 1`,
+/// subnormals and overflow to infinity included. It was computed as
+/// (int + frac) * powi(2, exp), which gave 0 for 0x1p-1074 (powi went
+/// through 2^1074 = inf), lost digits past 16 and rounded twice.
+fn hex_float_value(int_hex: &str, frac_hex: &str, exp: i64, prec: i32, emin: i32, emax: i32) -> f64 {
+    // The digits as a 128-bit mantissa and a sticky bit for those past it,
+    // with a binary exponent: value = (m + sticky) * 2^e2.
+    let mut m: u128 = 0;
+    let mut sticky = false;
+    let mut e2: i64 = exp;
+    for (k, c) in int_hex.bytes().chain(frac_hex.bytes()).enumerate() {
+        let d = hex_digit_val(c) as u128;
+        let in_frac = k >= int_hex.len();
+        if m >> 120 == 0 {
+            m = (m << 4) | d;
+            if in_frac {
+                e2 -= 4;
+            }
+        } else {
+            // No room: the digit only sets sticky; an integer digit scales.
+            sticky |= d != 0;
+            if !in_frac {
+                e2 += 4;
+            }
+        }
+    }
+    if m == 0 {
+        return 0.0;
+    }
+    let len = 128 - m.leading_zeros() as i64;
+    // The exponent of the leading bit, and the bits the result can keep.
+    let top = e2 + len - 1;
+    if top >= emax as i64 {
+        return f64::INFINITY;
+    }
+    let keep = if top >= emin as i64 { prec as i64 } else { prec as i64 - (emin as i64 - top) };
+    let shift = len - keep;
+    let (kept, scale) = if shift <= 0 {
+        (m, e2)
+    } else {
+        let (q, half, below) = if shift > len {
+            (0u128, false, true)
+        } else if shift == len {
+            (0u128, (m >> (len - 1)) & 1 == 1, m & !(1u128 << (len - 1)) != 0)
+        } else {
+            let s = shift as u32;
+            (m >> s, (m >> (s - 1)) & 1 == 1, m & ((1u128 << (s - 1)) - 1) != 0)
+        };
+        let up = half && (below || sticky || q & 1 == 1);
+        (q + up as u128, e2 + shift)
+    };
+    if kept >> prec != 0 && top + 1 >= emax as i64 {
+        return f64::INFINITY;
+    }
+    // kept fits the format, so scaling it by 2^scale in steps that stay in
+    // the normal range is exact.
+    let mut v = kept as f64;
+    let mut s = scale;
+    let pow2 = |k: i64| f64::from_bits(((k + 1023) as u64) << 52);
+    while s > 1000 {
+        v *= pow2(1000);
+        s -= 1000;
+    }
+    while s < -1000 {
+        v *= pow2(-1000);
+        s += 1000;
+    }
+    v * pow2(s)
 }
