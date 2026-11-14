@@ -53,6 +53,7 @@ objects; a ccc-only build cannot show a calling-convention mismatch.
 | `swfz` | switches on every integer type: jump tables with holes, extreme and sparse values, case ranges, fallthrough; computed goto |
 | `cufz` | cleanup attribute: handler order and values on return, break, continue, goto out of and back within scopes; generated programs capped at 1 MB of output |
 | `ibfz` | integer builtins: add/sub/mul overflow over every mix of integer types to 128 bits, typed forms, clz/ctz/clrsb/popcount/parity/ffs/bswap, constant and run-time |
+| `cpfz` | struct copies: odd-sized, packed and over-aligned structs copied by assignment, chained, conditional, compound literal, return, member and wrapper copies, constant-size memcpy/memmove/memset at offsets; members hashed, never padding |
 | `loopfuzz` | loop nests over arrays and maybe-overlapping pointers |
 | `rdfuzz` | float-sum loops (vectorized reductions and near misses) |
 | `memfz` | memory access and aliasing: union punning of every width, char and memcpy access, overlapping copies, aliasing pointers |
