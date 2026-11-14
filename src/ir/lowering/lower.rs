@@ -490,26 +490,22 @@ impl Lowerer {
         }
     }
 
-    /// Collect all cleanup variables from all active scopes (for return statements).
-    /// Returns cleanup vars from innermost scope to outermost scope, each scope's
-    /// vars in reverse declaration order.
+    /// Collect all cleanup variables from all active scopes (for return statements),
+    /// in declaration order; see collect_scope_cleanup_vars_above_depth.
     pub(super) fn collect_all_scope_cleanup_vars(&self) -> Vec<(String, Value)> {
         self.collect_scope_cleanup_vars_above_depth(0)
     }
 
-    /// Collect cleanup variables from scopes above `target_depth` (for break/continue).
-    /// This collects from the innermost scope down to (but not including) the scope at
-    /// target_depth, with each scope's vars in reverse declaration order.
+    /// Collect cleanup variables from scopes above `target_depth` (for break/continue/goto),
+    /// in declaration order: outermost scope first, each scope's vars as declared.
+    /// emit_cleanup_calls runs them in reverse, innermost and latest first, as a scope's
+    /// own end does. (Returning them already reversed made every return, break,
+    /// continue and goto run its cleanups in declaration order.)
     pub(super) fn collect_scope_cleanup_vars_above_depth(&self, target_depth: usize) -> Vec<(String, Value)> {
-        let func = self.func();
-        let mut all_cleanups = Vec::new();
-        // Walk scopes from innermost to outermost, stopping at target_depth
-        for frame in func.scope_stack[target_depth..].iter().rev() {
-            for (func_name, alloca_val) in frame.cleanup_vars.iter().rev() {
-                all_cleanups.push((func_name.clone(), *alloca_val));
-            }
-        }
-        all_cleanups
+        self.func().scope_stack[target_depth..]
+            .iter()
+            .flat_map(|frame| frame.cleanup_vars.iter().cloned())
+            .collect()
     }
 
     /// Remove a local variable, tracking the removal in the current scope frame.

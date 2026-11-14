@@ -57,11 +57,15 @@ pub(super) struct FuncScopeFrame {
     /// Each entry is (cleanup_function_name, alloca_value) where alloca_value is the
     /// address of the variable to pass as &var to the cleanup function.
     pub cleanup_vars: Vec<(String, Value)>,
+    /// Identifies this scope among all the function's scopes (never reused), so a
+    /// label's recorded scope path can be compared with the scopes open at a goto.
+    pub serial: usize,
 }
 
 impl FuncScopeFrame {
-    fn new() -> Self {
+    fn new(serial: usize) -> Self {
         Self {
+            serial,
             locals_added: Vec::new(),
             locals_shadowed: Vec::new(),
             statics_added: Vec::new(),
@@ -122,6 +126,12 @@ pub(super) struct FunctionBuildState {
     /// Populated by a prescan of the function body before lowering, so that
     /// `goto` cleanup emission can determine which scopes are actually exited.
     pub user_label_depths: FxHashMap<String, usize>,
+    /// Defined user labels -> (serials of the scopes open at the label, how many
+    /// cleanup variables the innermost of them had then). A backward goto runs the
+    /// cleanups of variables declared after its label, not only of scopes it leaves.
+    pub user_label_scopes: FxHashMap<String, (Vec<usize>, usize)>,
+    /// The serial the next scope frame gets.
+    pub next_scope_serial: usize,
     /// Scope stack for function-local variable undo tracking
     pub scope_stack: Vec<FuncScopeFrame>,
     /// Static local variable name -> mangled global name
@@ -205,6 +215,8 @@ impl FunctionBuildState {
             computed_goto: None,
             defined_user_labels: FxHashSet::default(),
             user_label_depths: FxHashMap::default(),
+            user_label_scopes: FxHashMap::default(),
+            next_scope_serial: 0,
             scope_stack: Vec::new(),
             static_local_names: FxHashMap::default(),
             const_local_values: FxHashMap::default(),
@@ -229,7 +241,9 @@ impl FunctionBuildState {
 
     /// Push a new function-local scope frame.
     pub fn push_scope(&mut self) {
-        self.scope_stack.push(FuncScopeFrame::new());
+        let serial = self.next_scope_serial;
+        self.next_scope_serial += 1;
+        self.scope_stack.push(FuncScopeFrame::new(serial));
     }
 
     /// Pop the top function-local scope frame and undo changes to locals,

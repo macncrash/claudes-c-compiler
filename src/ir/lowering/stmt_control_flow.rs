@@ -227,8 +227,24 @@ impl Lowerer {
         // Clamp target_depth to the current scope depth. If the goto jumps into a
         // deeper or same-level scope (target_depth >= current_depth), no cleanup is
         // needed. If jumping out to a shallower scope, clean up the exited scopes.
-        let cleanup_depth = target_depth.min(current_depth);
-        let cleanups = self.collect_scope_cleanup_vars_above_depth(cleanup_depth);
+        let mut cleanup_depth = target_depth.min(current_depth);
+        let mut cleanups = Vec::new();
+        // A backward goto: the label's scopes are known. It leaves the open scopes past
+        // the ones it shares with the label, and, when the label's own scope is still
+        // open, it also ends the variables declared there after the label, as clang and
+        // gcc have it (their cleanups run on each jump back).
+        let resolved_name = self.resolve_local_label(label);
+        let key = format!("{}::{}", self.func().name, resolved_name);
+        if let Some((path, cleanups_before)) = self.func().user_label_scopes.get(&key).cloned() {
+            let open = &self.func().scope_stack;
+            let shared = path.iter().zip(open.iter()).take_while(|(s, f)| **s == f.serial).count();
+            if shared == path.len() && shared > 0 {
+                let frame = &open[shared - 1];
+                cleanups.extend(frame.cleanup_vars.iter().skip(cleanups_before).cloned());
+            }
+            cleanup_depth = shared;
+        }
+        cleanups.extend(self.collect_scope_cleanup_vars_above_depth(cleanup_depth));
         self.emit_cleanup_calls(&cleanups);
 
         // Restore the stack pointer for VLA deallocation when needed.
@@ -261,9 +277,9 @@ impl Lowerer {
     }
 
     pub(super) fn lower_goto_indirect_stmt(&mut self, expr: &Expr) {
-        // Emit cleanup calls for all active scopes before indirect jump (same as goto).
-        let all_cleanups = self.collect_all_scope_cleanup_vars();
-        self.emit_cleanup_calls(&all_cleanups);
+        // No cleanup calls: the target is not known here. gcc runs none for a computed
+        // goto, and clang rejects one that could leave a cleanup variable's scope.
+        // (Running every open scope's cleanups ran them on each jump within the scope.)
         // If the function has VLA declarations, restore the saved stack pointer before
         // indirect jumps too (computed gotos).
         if let Some(save_val) = self.func().vla_stack_save {
@@ -294,6 +310,9 @@ impl Lowerer {
         let resolved_name = self.resolve_local_label(name);
         let func_name = self.func().name.clone();
         let key = format!("{}::{}", func_name, resolved_name);
+        let path: Vec<usize> = self.func().scope_stack.iter().map(|f| f.serial).collect();
+        let cleanups_before = self.func().scope_stack.last().map_or(0, |f| f.cleanup_vars.len());
+        self.func_mut().user_label_scopes.insert(key.clone(), (path, cleanups_before));
         self.func_mut().defined_user_labels.insert(key);
         self.terminate(Terminator::Branch(label));
         self.start_block(label);
