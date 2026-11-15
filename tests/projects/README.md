@@ -17,12 +17,13 @@ python3 tests/projects/run.py --ccc target/release/ccc --only sqlite,zstd
 | `blake3-neon` | BLAKE3 with its NEON code (arm64) | the same |
 | `onig` | Oniguruma (48 files, with the `config.h` its crate's build writes) | ~40 patterns in Ruby, Perl and POSIX syntax over several subjects: backreferences, named groups, lookaround, lazy and possessive quantifiers, Unicode properties and case folding, Shift_JIS and ISO-8859-1; every match and group |
 | `ring` | ring's portable C (8 files, `OPENSSL_NO_ASM`) | X25519 (RFC 7748 vectors, the 1000-iteration chain, public keys), Poly1305 (RFC 8439), AES-128/256 without hardware instructions (FIPS-197) and in CTR mode, P-256 base and variable point multiplication, doubling, addition and Montgomery multiplication on random inputs |
+| `aws-lc` | aws-lc's libcrypto without assembly (251 files: the FIPS module, the rest of `crypto/`, the error table, jitterentropy at `-O0`) | SHA-256/512 ("abc", a million "a"), HMAC-SHA256 (RFC 4231), AES-128 (FIPS-197), the AES-128-GCM empty-message tag; SHA-2, HMAC and AES-GCM seal/open over random inputs, bignum modular exponentiation, inverses and products, P-256 point multiplication |
 | `sqlite` | the SQLite amalgamation, with FTS5 | tables, indexes, joins, aggregates, window functions, recursive CTEs (the Mandelbrot query), string, date, JSON and printf functions, floating point, full-text search |
 
 The library sources are not in this repository. Each project is looked up
 under `--src-root`, by default the cargo registry
 (`~/.cargo/registry/src/*`), where the `zstd-sys`, `lz4-sys`, `blake3`,
-`onig_sys`, `ring` and `libsqlite3-sys` crates keep the C they build; the newest
+`onig_sys`, `ring`, `aws-lc-sys` and `libsqlite3-sys` crates keep the C they build; the newest
 version found is
 used, and a project whose sources are missing is skipped. Both builds are
 linked by the reference compiler, so the comparison is of the code each
