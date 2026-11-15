@@ -2,7 +2,7 @@
  "meta": {
   "platform": "darwin-arm64",
   "date": "2026-11-14",
-  "ccc_rev": "6d1f3064",
+  "ccc_rev": "f57b41ea",
   "ccc_flags": [
    "-O2",
    "-w"
@@ -1141,6 +1141,9 @@
   "cases/nested_selects_with_own_tests": {
    "status": "pass"
   },
+  "cases/overaligned_struct_params": {
+   "status": "pass"
+  },
   "cases/overflow_builtins_exact_mixed_types": {
    "status": "pass"
   },
@@ -1277,6 +1280,9 @@
    "status": "pass"
   },
   "cases/strings_wide": {
+   "status": "pass"
+  },
+  "cases/struct_args_copied_by_caller": {
    "status": "pass"
   },
   "cases/struct_by_value_copied_in_a_loop": {
@@ -5802,7 +5808,7 @@
   },
   "gcc-torture/return-addr": {
    "status": "wrong_output",
-   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16b9eed8f 0x16b9eed8f 0x16b9eed8f 0x16b9eed8f'"
+   "detail": "line 1: expected '0x16f2970c1 0x16f2970c1 0x16f2970c1 0x16f2970c1', got '0x16fdbad8f 0x16fdbad8f 0x16fdbad8f 0x16fdbad8f'"
   },
   "gcc-torture/scal-to-vec1": {
    "status": "pass"
