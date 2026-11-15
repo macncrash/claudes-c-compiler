@@ -54,6 +54,15 @@ PROJECTS = [
                  '#define HAVE_STDARG_H 1\n#define HAVE_STDLIB_H 1\n#define HAVE_LIMITS_H 1\n'
                  '#define HAVE_INTTYPES_H 1\n#define SIZEOF_INT 4\n#define SIZEOF_SHORT 2\n'
                  '#define SIZEOF_LONG 8\n#define SIZEOF_VOIDP 8\n#define SIZEOF_LONG_LONG 8\n'},
+    # ring's portable C: X25519, Poly1305, AES without hardware instructions,
+    # P-256 point arithmetic (the nistz, P-384 and assembly paths are left out).
+    {'name': 'ring', 'dir': 'ring-*',
+     'sources': ['crypto/curve25519/curve25519.c', 'crypto/poly1305/poly1305.c',
+                 'crypto/fipsmodule/aes/aes_nohw.c', 'crypto/mem.c', 'crypto/crypto.c',
+                 'crypto/limbs/limbs.c',
+                 'crypto/fipsmodule/bn/montgomery_inv.c', 'crypto/fipsmodule/ec/p256.c',
+                 ],
+     'inc': ['include', 'pregenerated'], 'defines': ['OPENSSL_NO_ASM']},
     {'name': 'sqlite', 'dir': 'libsqlite3-sys-*/sqlite3',
      'sources': ['sqlite3.c'], 'inc': ['.'],
      'defines': ['SQLITE_THREADSAFE=0', 'SQLITE_OMIT_LOAD_EXTENSION', 'SQLITE_ENABLE_FTS5',

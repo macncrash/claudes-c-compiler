@@ -536,8 +536,17 @@ impl Lowerer {
             if dims.is_empty() {
                 return vec![];
             }
+            // The element may be a typedef'd array (typedef uint64_t fe[4];
+            // fe pre[][2]): its dimensions count too. Without them pre[i][j]
+            // was taken as the scalar it is not, and loaded, where it is an
+            // array that decays to its address.
+            let mut tail_ct = self.type_spec_to_ctype(current);
+            while let CType::Array(elem, size) = tail_ct {
+                dims.push(size.unwrap_or(1));
+                tail_ct = *elem;
+            }
             // Compute base element size (the innermost non-array type)
-            let base_elem_size = self.sizeof_type(current);
+            let base_elem_size = tail_ct.size_ctx(&*self.types.borrow_struct_layouts()).max(1);
             // Strides: [full_size, stride_for_dim_1, ..., base_elem_size]
             // full_size = product(all_dims) * base, then per-dim strides
             let full_size: usize = dims.iter().product::<usize>() * base_elem_size;
