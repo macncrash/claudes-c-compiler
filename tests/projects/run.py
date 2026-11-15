@@ -63,6 +63,18 @@ PROJECTS = [
                  'crypto/fipsmodule/bn/montgomery_inv.c', 'crypto/fipsmodule/ec/p256.c',
                  ],
      'inc': ['include', 'pregenerated'], 'defines': ['OPENSSL_NO_ASM']},
+    # aws-lc's libcrypto without assembly: the FIPS module (bcm.c, which
+    # includes most of fipsmodule/), cpucap.c, every C file outside
+    # fipsmodule/ but tests and other platforms', the generated error table
+    # and the bundled jitterentropy (which must be built without optimization).
+    {'name': 'aws-lc', 'dir': 'aws-lc-sys-*/aws-lc', 'driver': 'awslc', 'arch': 'arm64',
+     'sources': ['crypto/fipsmodule/bcm.c', 'crypto/fipsmodule/cpucap/cpucap.c', 'crypto/**/*.c',
+                 'generated-src/err_data.c', 'third_party/jitterentropy/jitterentropy-library/src/*.c'],
+     'exclude': ['crypto/fipsmodule/', '_test.c', 'test_util.c', '/test/', 'windows', 'fuchsia', 'openbsd', '_win.c',
+                 'ios', '_freebsd', 'android', '_linux.c', 'trusty', 'sysrand_getentropy'],
+     'inc': ['include', 'third_party/jitterentropy/jitterentropy-library'],
+     'defines': ['OPENSSL_NO_ASM', 'BORINGSSL_IMPLEMENTATION'],
+     'noopt': ['jitterentropy'], 'ldflags': ['-framework', 'CoreFoundation']},
     {'name': 'sqlite', 'dir': 'libsqlite3-sys-*/sqlite3',
      'sources': ['sqlite3.c'], 'inc': ['.'],
      'defines': ['SQLITE_THREADSAFE=0', 'SQLITE_OMIT_LOAD_EXTENSION', 'SQLITE_ENABLE_FTS5',
@@ -122,18 +134,28 @@ def build_and_run(cc, label, proj, src_dir, work, opt, pool):
         flags.insert(2, '-I' + gen)
     files = []
     for pat in proj['sources']:
-        files += sorted(glob.glob(os.path.join(src_dir, pat)))
+        found = sorted(glob.glob(os.path.join(src_dir, pat), recursive=True))
+        # exclude: path substrings a wildcard pattern leaves out (tests, other
+        # platforms); a file named outright is always built.
+        files += [f for f in found if f not in files
+                  and ('*' not in pat or not any(x in os.path.relpath(f, src_dir) for x in proj.get('exclude', [])))]
     driver = os.path.join(HERE, 'drivers', proj.get('driver', proj['name']) + '.c')
     files.append(driver)
     objs = [os.path.join(out, '%d_%s.o' % (k, os.path.basename(f)[:-2])) for k, f in enumerate(files)]
-    results = list(pool.map(lambda fo: run([cc] + flags + ['-c', fo[0], '-o', fo[1]]), zip(files, objs)))
+
+    def file_flags(f):
+        # noopt: files the project builds without optimization (as its own build does).
+        if any(x in f for x in proj.get('noopt', [])):
+            return ['-O0' if a == opt else a for a in flags]
+        return flags
+    results = list(pool.map(lambda fo: run([cc] + file_flags(fo[0]) + ['-c', fo[0], '-o', fo[1]]), zip(files, objs)))
     for f, (rc, _, err) in zip(files, results):
         if rc != 0:
             return 'compile failed: %s: %s' % (os.path.basename(f), err.strip()[:300]), None
     exe = os.path.join(out, 'run')
     # Link with the reference compiler driver for both: the comparison is of
     # the code each compiler generated, linked the same way.
-    rc, _, err = run([REF_LINK, '-o', exe] + objs + ['-lm'])
+    rc, _, err = run([REF_LINK, '-o', exe] + objs + ['-lm'] + proj.get('ldflags', []))
     if rc != 0:
         return 'link failed: %s' % err.strip()[:300], None
     rc, so, se = run([exe], cwd=out)
