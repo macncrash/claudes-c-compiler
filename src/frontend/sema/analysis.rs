@@ -1569,6 +1569,10 @@ impl SemanticAnalyzer {
                 self.collect_enum_constants_from_type_spec(ts);
                 self.analyze_expr(ap_expr);
             }
+            Expr::ConvertVector(src, ts, _) => {
+                self.collect_enum_constants_from_type_spec(ts);
+                self.analyze_expr(src);
+            }
             Expr::GenericSelection(controlling, associations, _) => {
                 self.analyze_expr(controlling);
                 for assoc in associations {

@@ -678,6 +678,19 @@ impl Parser {
                 self.expect_closing(&TokenKind::RParen, open);
                 Expr::VaArg(Box::new(ap_expr), type_spec, span)
             }
+            TokenKind::BuiltinConvertVector => {
+                // __builtin_convertvector(vector, vector type): each lane converted
+                // as by a cast, unlike a vector cast, which keeps the bits.
+                let span = self.peek_span();
+                self.advance();
+                let open = self.peek_span();
+                self.expect_context(&TokenKind::LParen, "after '__builtin_convertvector'");
+                let src = self.parse_assignment_expr();
+                self.expect_context(&TokenKind::Comma, "between '__builtin_convertvector' arguments");
+                let type_spec = self.parse_va_arg_type();
+                self.expect_closing(&TokenKind::RParen, open);
+                Expr::ConvertVector(Box::new(src), type_spec, span)
+            }
             TokenKind::BuiltinTypesCompatibleP => {
                 // __builtin_types_compatible_p(type1, type2)
                 // Compile-time: 1 if types are compatible (ignoring qualifiers), 0 otherwise.

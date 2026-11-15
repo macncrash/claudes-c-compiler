@@ -941,7 +941,7 @@ impl Lowerer {
                 }
                 self.get_call_return_type(func)
             }
-            Expr::VaArg(_, type_spec, _) => self.resolve_va_arg_type(type_spec),
+            Expr::VaArg(_, type_spec, _) | Expr::ConvertVector(_, type_spec, _) => self.resolve_va_arg_type(type_spec),
             Expr::Identifier(name, _) => {
                 if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
                     return IrType::Ptr;
@@ -1497,7 +1497,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::VaArg(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _, _) => {
+            Expr::VaArg(_, type_spec, _) | Expr::ConvertVector(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _, _) => {
                 Some(self.type_spec_to_ctype(type_spec))
             }
             Expr::GenericSelection(controlling, associations, _) => {

@@ -58,6 +58,7 @@ objects; a ccc-only build cannot show a calling-convention mismatch.
 | `binfz` | mixed-type binary expressions: / % >> << comparisons and ?: over every pair of integer types to 128 bits, folded, run time, in calls and conditions; undefined cases guarded in the source |
 | `wrapfz` | loops whose counter wraps: unsigned of every width and signed char/short near their limits, != ends, mixed-type bounds, i-- past 0; simulated first, guarded only when unbounded |
 | `aifz` | local aggregate initializers from runtime values: designators reordered and repeated, braced re-init of a member, brace elision, strings in char arrays, unions by any member, GNU ranges, loops re-zeroing |
+| `vecfz` | vector extensions, 8 to 64 bytes: / % shifts ~ compares, broadcasts, runtime element access, shufflevector, convertvector, reinterpreting casts, calls, struct members, unaligned loads |
 | `loopfuzz` | loop nests over arrays and maybe-overlapping pointers |
 | `rdfuzz` | float-sum loops (vectorized reductions and near misses) |
 | `memfz` | memory access and aliasing: union punning of every width, char and memcpy access, overlapping copies, aliasing pointers |

@@ -88,6 +88,7 @@ pub enum TokenKind {
     Builtin,         // __builtin_va_list (used as type name)
     BuiltinVaArg,    // __builtin_va_arg(expr, type) - special syntax
     BuiltinTypesCompatibleP, // __builtin_types_compatible_p(type, type) - special syntax
+    BuiltinConvertVector, // __builtin_convertvector(expr, vector type) - special syntax
     /// __int128 / __int128_t type keyword (GCC extension, signed)
     Int128,
     /// __uint128_t type keyword (GCC extension, unsigned)
@@ -283,6 +284,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Builtin => write!(f, "'__builtin_va_list'"),
             TokenKind::BuiltinVaArg => write!(f, "'__builtin_va_arg'"),
             TokenKind::BuiltinTypesCompatibleP => write!(f, "'__builtin_types_compatible_p'"),
+            TokenKind::BuiltinConvertVector => write!(f, "'__builtin_convertvector'"),
             TokenKind::Int128 => write!(f, "'__int128'"),
             TokenKind::UInt128 => write!(f, "'__uint128_t'"),
             TokenKind::RealPart => write!(f, "'__real__'"),
@@ -372,9 +374,10 @@ impl TokenKind {
     /// Most identifiers in typical C code are rejected by these filters
     /// without entering the match statement.
     pub fn from_keyword(s: &str, gnu_extensions: bool) -> Option<TokenKind> {
-        // Fast reject by length: C/GCC keywords have lengths 2-17 or 28.
+        // Fast reject by length: C/GCC keywords have lengths 2-17, 23
+        // (__builtin_convertvector) or 28 (__builtin_types_compatible_p).
         let len = s.len();
-        if len < 2 || (len > 17 && len != 28) {
+        if len < 2 || (len > 17 && len != 23 && len != 28) {
             return None;
         }
         // Fast reject by first character: keywords only start with these 16 chars.
@@ -443,6 +446,7 @@ impl TokenKind {
             "__builtin_va_list" => Some(TokenKind::Builtin),
             "__builtin_va_arg" => Some(TokenKind::BuiltinVaArg),
             "__builtin_types_compatible_p" => Some(TokenKind::BuiltinTypesCompatibleP),
+            "__builtin_convertvector" => Some(TokenKind::BuiltinConvertVector),
             "__int128" | "__int128_t" => Some(TokenKind::Int128),
             "__uint128_t" => Some(TokenKind::UInt128),
             "__real__" | "__real" => Some(TokenKind::RealPart),

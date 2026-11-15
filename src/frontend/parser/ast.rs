@@ -821,6 +821,9 @@ pub enum Expr {
     Sizeof(Box<SizeofArg>, Span),
     /// __builtin_va_arg(ap, type): extract next variadic argument of given type
     VaArg(Box<Expr>, TypeSpecifier, Span),
+    /// __builtin_convertvector(vec, type): the vector of `type` whose lanes are
+    /// vec's lanes converted as by a cast (lane counts are equal)
+    ConvertVector(Box<Expr>, TypeSpecifier, Span),
     /// _Alignof(type) - C11 standard, returns minimum ABI alignment
     Alignof(TypeSpecifier, Span),
     /// _Alignof(expr) - alignment of expression's type (via _Alignof macro path)
@@ -939,7 +942,7 @@ impl Expr {
             | Expr::FunctionCall(_, _, s) | Expr::ArraySubscript(_, _, s)
             | Expr::MemberAccess(_, _, s) | Expr::PointerMemberAccess(_, _, s)
             | Expr::Cast(_, _, s) | Expr::CompoundLiteral(_, _, s, _) | Expr::StmtExpr(_, s)
-            | Expr::Sizeof(_, s) | Expr::VaArg(_, _, s) | Expr::Alignof(_, s)
+            | Expr::Sizeof(_, s) | Expr::VaArg(_, _, s) | Expr::ConvertVector(_, _, s) | Expr::Alignof(_, s)
             | Expr::AlignofExpr(_, s) | Expr::GnuAlignof(_, s)
             | Expr::GnuAlignofExpr(_, s) | Expr::Comma(_, _, s)
             | Expr::AddressOf(_, s) | Expr::Deref(_, s)

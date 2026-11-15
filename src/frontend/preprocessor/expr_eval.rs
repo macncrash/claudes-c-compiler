@@ -331,6 +331,7 @@ impl Preprocessor {
         matches!(name,
             "__builtin_va_arg" |              // Special token (BuiltinVaArg)
             "__builtin_types_compatible_p" |  // Special AST node (BuiltinTypesCompatibleP)
+            "__builtin_convertvector" |       // Special AST node (ConvertVector)
             "__builtin_offsetof"              // Predefined macro
         )
     }

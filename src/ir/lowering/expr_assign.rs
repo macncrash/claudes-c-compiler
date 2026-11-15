@@ -1104,6 +1104,37 @@ impl Lowerer {
         Operand::Value(result_alloca)
     }
 
+    /// __builtin_convertvector(src, T): a new vector of type T whose lane i is
+    /// src's lane i converted as by a cast. (A vector cast keeps the bits.)
+    pub(super) fn lower_convert_vector(&mut self, src: &Expr, type_spec: &crate::frontend::parser::ast::TypeSpecifier) -> Operand {
+        let dst_ct = self.type_spec_to_ctype(type_spec);
+        let src_ct = self.expr_ctype(src);
+        let (Some((dst_elem, n)), Some((src_elem, src_n))) = (dst_ct.vector_info(), src_ct.vector_info()) else {
+            return self.lower_expr(src);
+        };
+        let (dst_elem, src_elem) = (dst_elem.clone(), src_elem.clone());
+        let n = n.min(src_n);
+        let src_val = self.lower_expr(src);
+        let src_ptr = self.operand_to_value(src_val);
+        let (src_ty, dst_ty) = (Self::vector_elem_ir_type(&src_elem), Self::vector_elem_ir_type(&dst_elem));
+        let (src_size, dst_size) = (src_elem.size(), dst_elem.size());
+        let total = dst_ct.size();
+        let result = self.emit_entry_alloca(IrType::Ptr, total, total, false);
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        for i in 0..n {
+            let at = |s: &mut Self, base: Value, off: usize| if off == 0 { base } else {
+                s.emit_binop_val(IrBinOp::Add, Operand::Value(base), Operand::Const(IrConst::ptr_int(off as i64)), ptr_int_ty)
+            };
+            let sp = at(self, src_ptr, i * src_size);
+            let dp = at(self, result, i * dst_size);
+            let lane = self.fresh_value();
+            self.emit(Instruction::Load { dest: lane, ptr: sp, ty: src_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+            let conv = if src_ty == dst_ty { Operand::Value(lane) } else { self.emit_implicit_cast(Operand::Value(lane), src_ty, dst_ty) };
+            self.emit(Instruction::Store { val: conv, ptr: dp, ty: dst_ty, seg_override: AddressSpace::Default, volatile: false, alias: AliasClass::ANY });
+        }
+        Operand::Value(result)
+    }
+
     /// Lower vector binary operation (a + b, a - b, etc.): element-wise, returns new alloca.
     /// Per GCC vector extensions, if one operand is a scalar and the other is a
     /// vector, the scalar is broadcast (splatted) to all elements of the vector.

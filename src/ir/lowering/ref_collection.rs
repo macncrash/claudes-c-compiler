@@ -299,7 +299,7 @@ impl Lowerer {
             Expr::UnaryOp(_, operand, _) | Expr::PostfixOp(_, operand, _) => {
                 self.collect_refs_from_expr(operand, refs);
             }
-            Expr::Cast(ts, operand, _) | Expr::VaArg(operand, ts, _) => {
+            Expr::Cast(ts, operand, _) | Expr::VaArg(operand, ts, _) | Expr::ConvertVector(operand, ts, _) => {
                 self.collect_refs_from_type(ts, refs);
                 self.collect_refs_from_expr(operand, refs);
             }
