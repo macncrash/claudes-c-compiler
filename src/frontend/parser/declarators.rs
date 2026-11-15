@@ -82,6 +82,30 @@ impl Parser {
             let n = n.clone();
             self.advance();
             (Some(n), Vec::new())
+        } else if matches!(self.peek(), TokenKind::LParen)
+            && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Caret))
+        {
+            // Block pointer (Apple blocks): R (^name)(params). Blocks themselves
+            // are not supported, but headers declare block types; a block pointer
+            // is one pointer in the ABI, so it is taken as an opaque pointer to
+            // R: it can be stored, passed and compared, and calling it is an
+            // error rather than code that would treat it as a function pointer.
+            self.advance(); // '('
+            self.advance(); // '^'
+            self.skip_cv_qualifiers();
+            self.skip_gcc_extensions();
+            let n = if let TokenKind::Identifier(ref n) = self.peek() {
+                let n = n.clone();
+                self.advance();
+                Some(n)
+            } else {
+                None
+            };
+            self.expect(&TokenKind::RParen);
+            if matches!(self.peek(), TokenKind::LParen) {
+                let _ = self.parse_param_list();
+            }
+            (n, vec![DerivedDeclarator::Pointer(AccessQuals::NONE)])
         } else if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
             let save = self.pos;
             self.advance(); // consume '('
@@ -640,7 +664,11 @@ impl Parser {
             }
             name
         } else if self.consume_if(&TokenKind::Caret) {
-            // Block pointer (Apple extension)
+            // Block pointer (Apple extension): an opaque pointer, as in
+            // parse_declarator_with_attrs.
+            self.skip_cv_qualifiers();
+            self.skip_gcc_extensions();
+            d.pointer_depth += 1;
             let name = if let TokenKind::Identifier(ref n) = self.peek() {
                 let n = n.clone();
                 self.advance();
