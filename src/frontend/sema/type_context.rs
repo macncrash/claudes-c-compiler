@@ -508,11 +508,13 @@ impl TypeContext {
     }
 
     /// Record the types of a completed enum's constants: int when the value
-    /// fits int, else the enum's type (EnumType::enumerator_type).
-    pub fn set_enumerator_types(&mut self, variants: &[(String, i64)], is_packed: bool) {
+    /// fits int, else the enum's type (EnumType::enumerator_type); or the fixed
+    /// underlying type, which all of them have.
+    pub fn set_enumerator_types(&mut self, variants: &[(String, i64)], is_packed: bool, fixed: Option<&CType>) {
         let et = crate::common::types::EnumType { name: None, variants: variants.to_vec(), is_packed };
         for (name, v) in variants {
-            let ty = et.enumerator_type(*v);
+            // With a fixed underlying type (enum E : T) every constant has type T.
+            let ty = fixed.cloned().unwrap_or_else(|| et.enumerator_type(*v));
             if ty == CType::Int {
                 self.enum_constant_types.remove(name);
             } else {

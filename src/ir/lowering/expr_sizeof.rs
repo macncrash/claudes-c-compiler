@@ -69,6 +69,11 @@ impl Lowerer {
         if self.known_functions.contains(name) {
             return 1;
         }
+        // An enumeration constant has its recorded type: int, the enum's type
+        // when int cannot hold it, or a fixed underlying type (enum E : T).
+        if let Some(ct) = self.types.enumerator_ctype(name) {
+            return self.ctype_size(&ct);
+        }
         // Unknown identifier - sema should have caught this, but fallback to int size
         4
     }

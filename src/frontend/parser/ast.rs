@@ -528,8 +528,8 @@ pub enum TypeSpecifier {
     Struct(Option<String>, Option<Vec<StructFieldDecl>>, bool, Option<usize>, Option<usize>),
     /// Union: (name, fields, is_packed, max_field_align from #pragma pack, struct-level aligned attribute)
     Union(Option<String>, Option<Vec<StructFieldDecl>>, bool, Option<usize>, Option<usize>),
-    /// Enum: (name, variants, is_packed)
-    Enum(Option<String>, Option<Vec<EnumVariant>>, bool),
+    /// Enum: (name, variants, is_packed, fixed underlying type: C23 enum E : T)
+    Enum(Option<String>, Option<Vec<EnumVariant>>, bool, Option<Box<TypeSpecifier>>),
     TypedefName(String),
     /// The qualifiers are the pointed-to type's.
     Pointer(Box<TypeSpecifier>, AccessQuals),

@@ -584,6 +584,9 @@ impl<'a> ExprTypeChecker<'a> {
     /// Resolve a TypeSpecifier to a CType using sema's type context.
     /// This delegates to the type_builder's shared conversion via TypeConvertContext.
     fn resolve_type_spec(&self, spec: &TypeSpecifier) -> CType {
+        if let TypeSpecifier::Enum(_, _, _, Some(fixed)) = spec {
+            return self.resolve_type_spec(fixed);
+        }
         // Use a simple inline resolution for common cases to avoid the trait dispatch
         match spec {
             TypeSpecifier::Void => CType::Void,
@@ -622,7 +625,7 @@ impl<'a> ExprTypeChecker<'a> {
                     CType::Int // fallback for unknown typedef
                 }
             }
-            TypeSpecifier::Enum(name, variants, _is_packed) => {
+            TypeSpecifier::Enum(name, variants, _is_packed, _) => {
                 // A reference to a defined enum keeps its identity, as in
                 // declarations (`(enum E)x` has type enum E).
                 if variants.is_none() {

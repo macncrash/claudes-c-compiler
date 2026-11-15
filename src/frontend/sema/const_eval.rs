@@ -838,6 +838,9 @@ impl<'a> SemaConstEval<'a> {
     /// Compute sizeof for a type specifier.
     /// Returns None if the type cannot be sized (e.g., typeof(expr) without expr type info).
     fn sizeof_type_spec(&self, spec: &TypeSpecifier) -> Option<usize> {
+        if let TypeSpecifier::Enum(_, _, _, Some(fixed)) = spec {
+            return self.sizeof_type_spec(fixed);
+        }
         use crate::common::types::target_ptr_size;
         let ptr_sz = target_ptr_size();
         match spec {
@@ -914,7 +917,7 @@ impl<'a> SemaConstEval<'a> {
                 }
                 Some(0)
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => {
+            TypeSpecifier::Enum(name, variants, is_packed, _) => {
                 // Check if this is a forward reference to a known packed enum
                 let effective_packed = *is_packed || name.as_ref()
                     .and_then(|n| self.types.packed_enum_types.get(n))
@@ -969,6 +972,9 @@ impl<'a> SemaConstEval<'a> {
 
     /// Compute alignof for a type specifier.
     fn alignof_type_spec(&self, spec: &TypeSpecifier) -> usize {
+        if let TypeSpecifier::Enum(_, _, _, Some(fixed)) = spec {
+            return self.alignof_type_spec(fixed);
+        }
         use crate::common::types::target_ptr_size;
         let ptr_sz = target_ptr_size();
         match spec {
@@ -1035,7 +1041,7 @@ impl<'a> SemaConstEval<'a> {
                 }
                 struct_aligned.unwrap_or(1)
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => {
+            TypeSpecifier::Enum(name, variants, is_packed, _) => {
                 let effective_packed = *is_packed || name.as_ref()
                     .and_then(|n| self.types.packed_enum_types.get(n))
                     .is_some();
@@ -1208,8 +1214,9 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
                 CType::Int // anonymous union without context
             }
         }
-        TypeSpecifier::Enum(_, _, false) => CType::Int, // non-packed enums are int-sized
-        TypeSpecifier::Enum(name, variants, true) => {
+        TypeSpecifier::Enum(_, _, _, Some(fixed)) => ctype_from_type_spec(fixed, types),
+        TypeSpecifier::Enum(_, _, false, None) => CType::Int, // non-packed enums are int-sized
+        TypeSpecifier::Enum(name, variants, true, None) => {
             // Packed enum: look up from type context or compute from variants
             if let Some(tag) = name {
                 if let Some(et) = types.packed_enum_types.get(tag) {

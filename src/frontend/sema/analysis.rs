@@ -748,7 +748,7 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn process_enum_variants(&mut self, variants: &[EnumVariant], is_packed: bool) {
+    fn process_enum_variants(&mut self, variants: &[EnumVariant], is_packed: bool, fixed: Option<CType>) {
         self.enum_counter = 0;
         let mut values = Vec::with_capacity(variants.len());
         for variant in variants {
@@ -780,7 +780,7 @@ impl SemanticAnalyzer {
             self.enum_counter += 1;
         }
         // Once the enum is complete, constants int cannot hold have its type.
-        self.result.type_context.set_enumerator_types(&values, is_packed);
+        self.result.type_context.set_enumerator_types(&values, is_packed, fixed.as_ref());
         for (name, _) in &values {
             if let Some(ty) = self.result.type_context.enumerator_ctype(name) {
                 self.symbol_table.declare(Symbol { name: name.clone(), ty, explicit_alignment: None });
@@ -794,8 +794,9 @@ impl SemanticAnalyzer {
     /// constants registered in the enclosing scope, matching GCC/Clang behavior.
     fn collect_enum_constants_from_type_spec(&mut self, ts: &TypeSpecifier) {
         match ts {
-            TypeSpecifier::Enum(name, Some(variants), is_packed) => {
-                self.process_enum_variants(variants, *is_packed);
+            TypeSpecifier::Enum(name, Some(variants), is_packed, fixed) => {
+                let fixed = fixed.as_ref().map(|t| self.type_spec_to_ctype(t));
+                self.process_enum_variants(variants, *is_packed, fixed);
                 // Store the definition for later `enum tag` references; packed
                 // enums also go in packed_enum_types for their size.
                 if let Some(tag) = name {

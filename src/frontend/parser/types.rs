@@ -515,6 +515,25 @@ impl Parser {
         };
         let (packed2, _, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed2;
+        // C23 (and a clang extension before it): enum E : T, a fixed underlying
+        // type. A ':' not followed by a type is an unnamed bit-field's width.
+        let mut fixed = None;
+        if matches!(self.peek(), TokenKind::Colon) {
+            let save = self.pos;
+            self.advance();
+            if self.is_type_specifier() {
+                let ts = self.parse_va_arg_type();
+                if let Some(ref n) = name {
+                    self.fixed_enum_tags.insert(n.clone(), ts.clone());
+                }
+                fixed = Some(Box::new(ts));
+            } else {
+                self.pos = save;
+            }
+        }
+        if fixed.is_none() {
+            fixed = name.as_ref().and_then(|n| self.fixed_enum_tags.get(n)).map(|ts| Box::new(ts.clone()));
+        }
         let variants = if matches!(self.peek(), TokenKind::LBrace) {
             let v = self.parse_enum_variants();
             // Register enum constant values so that later constant expressions
@@ -526,7 +545,7 @@ impl Parser {
         };
         let (packed3, _, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
-        TypeSpecifier::Enum(name, variants, is_packed)
+        TypeSpecifier::Enum(name, variants, is_packed, fixed)
     }
 
     /// Parse typeof(expr) or typeof(type-name).

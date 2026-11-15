@@ -177,13 +177,13 @@ impl Lowerer {
             TypeSpecifier::Pointer(_, _) => IrType::Ptr,
             TypeSpecifier::Array(_, _) => IrType::Ptr,
             TypeSpecifier::Struct(..) | TypeSpecifier::Union(..) => IrType::Ptr,
-            TypeSpecifier::Enum(_, _, false) => {
+            TypeSpecifier::Enum(_, _, false, _) => {
                 // Non-packed enum: resolve to CType to get correct size and signedness.
                 // Enums with values like `1U << 31` (0x80000000) are unsigned 32-bit.
                 let ctype = self.type_spec_to_ctype(ts);
                 IrType::from_ctype(&ctype)
             }
-            TypeSpecifier::Enum(_, _, true) => {
+            TypeSpecifier::Enum(_, _, true, _) => {
                 // Packed enum: resolve to CType to get the correct IR type
                 let ctype = self.type_spec_to_ctype(ts);
                 IrType::from_ctype(&ctype)
@@ -252,8 +252,10 @@ impl Lowerer {
                 if ptr_sz == 4 { Some((24, 4)) } else { Some((32, 16)) }
             }
             TypeSpecifier::Pointer(_, _) => Some((ptr_sz, ptr_sz)),
-            TypeSpecifier::Enum(_, _, false) => Some((4, 4)),
-            TypeSpecifier::Enum(_, _, true) => {
+            TypeSpecifier::Enum(_, _, false, None) => Some((4, 4)),
+            // A fixed underlying type, like a packed enum, is sized through its CType.
+            TypeSpecifier::Enum(_, _, _, Some(_)) => None,
+            TypeSpecifier::Enum(_, _, true, _) => {
                 // Packed enums need type context to resolve; let caller handle via CType path
                 None
             }

@@ -98,7 +98,7 @@ impl Lowerer {
                 }
             }
             CType::Enum(et) => {
-                TypeSpecifier::Enum(et.name.clone(), None, et.is_packed)
+                TypeSpecifier::Enum(et.name.clone(), None, et.is_packed, None)
             }
             CType::Function(ft) => {
                 // Bare function type — NOT a pointer. Use BareFunction so that

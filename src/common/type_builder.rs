@@ -128,7 +128,10 @@ pub trait TypeConvertContext {
             TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned) => {
                 self.resolve_struct_or_union(name, fields, true, *is_packed, *pragma_pack, *struct_aligned)
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => self.resolve_enum(name, variants, *is_packed),
+            // An enum with a fixed underlying type (C23 enum E : T) is T in size,
+            // alignment and signedness, and compatible with it.
+            TypeSpecifier::Enum(_, _, _, Some(fixed)) => self.resolve_type_spec_to_ctype(fixed),
+            TypeSpecifier::Enum(name, variants, is_packed, None) => self.resolve_enum(name, variants, *is_packed),
             TypeSpecifier::Typeof(expr) => self.resolve_typeof_expr(expr),
             TypeSpecifier::Vector(inner, total_bytes) => {
                 let elem_ctype = self.resolve_type_spec_to_ctype(inner);

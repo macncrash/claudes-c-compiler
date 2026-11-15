@@ -292,6 +292,9 @@ pub struct Parser {
     pub(super) volatile_typedefs: FxHashSet<String>,
     /// Typedef names shadowed by local variable declarations in the current scope.
     pub(super) shadowed_typedefs: FxHashSet<String>,
+    /// Enum tags declared with a fixed underlying type (enum E : T), so a later
+    /// `enum E` has it too.
+    pub(super) fixed_enum_tags: crate::common::fx_hash::FxHashMap<String, TypeSpecifier>,
     /// Accumulated declaration attributes from the current parse_type_specifier pass.
     /// Reset at the start of each top-level or local declaration.
     pub(super) attrs: ParsedDeclAttrs,
@@ -339,6 +342,7 @@ impl Parser {
             typedefs: Self::builtin_typedefs(),
             volatile_typedefs: FxHashSet::default(),
             shadowed_typedefs: FxHashSet::default(),
+            fixed_enum_tags: crate::common::fx_hash::FxHashMap::default(),
             attrs: ParsedDeclAttrs::default(),
             pragma_pack_stack: Vec::new(),
             pragma_pack_align: None,
@@ -1383,7 +1387,8 @@ impl Parser {
                 // Fallback for empty struct/union or tag-only (no fields available)
                 if align == 0 { ptr_sz } else { align }
             }
-            TypeSpecifier::Enum(_, _, _) => 4,
+            TypeSpecifier::Enum(_, _, _, Some(fixed)) => Self::alignof_type_spec(fixed, tag_aligns),
+            TypeSpecifier::Enum(_, _, _, None) => 4,
             TypeSpecifier::TypedefName(_) => ptr_sz, // conservative default
             _ => ptr_sz,
         }

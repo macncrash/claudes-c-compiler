@@ -1285,7 +1285,7 @@ impl Lowerer {
     /// Collect enum constants from a type specifier.
     fn collect_enum_constants_impl(&mut self, ts: &TypeSpecifier, scoped: bool) {
         match ts {
-            TypeSpecifier::Enum(name, Some(variants), is_packed) => {
+            TypeSpecifier::Enum(name, Some(variants), is_packed, fixed) => {
                 let mut next_val: i64 = 0;
                 let mut variant_values = Vec::new();
                 for variant in variants {
@@ -1311,7 +1311,8 @@ impl Lowerer {
                     variant_values.push((variant.name.clone(), next_val));
                     next_val += 1;
                 }
-                self.types.set_enumerator_types(&variant_values, *is_packed);
+                let fixed = fixed.as_ref().map(|t| self.type_spec_to_ctype(t));
+                self.types.set_enumerator_types(&variant_values, *is_packed, fixed.as_ref());
                 // Store packed enum info for forward-reference lookups
                 if *is_packed {
                     if let Some(tag) = name {
@@ -1351,6 +1352,9 @@ impl Lowerer {
     /// Check if a TypeSpecifier refers to an enum type (directly or via typedef).
     pub(super) fn is_enum_type_spec(&self, ts: &TypeSpecifier) -> bool {
         match ts {
+            // An enum with a fixed underlying type (enum E : T) is T, signedness
+            // included: it is not an enum for the unsigned enum bit-field rule.
+            TypeSpecifier::Enum(_, _, _, Some(_)) => false,
             TypeSpecifier::Enum(..) => true,
             TypeSpecifier::TypedefName(name) => self.types.enum_typedefs.contains(name),
             TypeSpecifier::TypeofType(inner) => self.is_enum_type_spec(inner),
