@@ -679,6 +679,13 @@ impl Preprocessor {
             ("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "140000"),
             ("__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__", "140000"),
             ("__arm64__", "1"), ("__arm64", "1"),
+            // Apple arm64 has NEON and the AES, SHA-1 and SHA-256 instructions
+            // on every CPU, and clang says so; include/arm_neon.h has their
+            // intrinsics. (aws-lc refuses to build without these.) The other
+            // __ARM_FEATURE_* macros clang defines here stay off until their
+            // intrinsics exist.
+            ("__ARM_NEON__", "1"), ("__ARM_NEON_FP", "0xE"),
+            ("__ARM_FEATURE_CRYPTO", "1"), ("__ARM_FEATURE_AES", "1"), ("__ARM_FEATURE_SHA2", "1"),
             ("__LITTLE_ENDIAN__", "1"), ("__DYNAMIC__", "1"),
             ("__USER_LABEL_PREFIX__", "_"),
             // int64_t is `long long` on Darwin (it is `long` on LP64 Linux).
@@ -751,6 +758,11 @@ impl Preprocessor {
             let s = p.to_string_lossy();
             !s.starts_with("/usr/include") && !s.starts_with("/usr/lib/gcc")
         });
+        // <Name/file.h> may be a framework header: SDK/System/Library/Frameworks
+        // (sdk_include is SDK/usr/include).
+        if let Some(sdk) = sdk_include.as_ref().and_then(|p| p.parent()).and_then(|p| p.parent()) {
+            self.framework_paths.push(sdk.join("System/Library/Frameworks"));
+        }
         let paths: Vec<PathBuf> = [clang_include, sdk_include].into_iter().flatten().collect();
         let paths: Vec<&str> = paths.iter().filter_map(|p| p.to_str()).collect();
         self.insert_arch_paths_after_bundled(&paths);

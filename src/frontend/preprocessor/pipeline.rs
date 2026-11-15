@@ -67,6 +67,10 @@ pub struct Preprocessor {
     pub(super) isystem_include_paths: Vec<PathBuf>,
     /// After include paths (from -idirafter flags), searched last
     pub(super) after_include_paths: Vec<PathBuf>,
+    /// Framework search paths: Name/file.h is looked up as Name.framework/Headers/file.h
+    pub(super) framework_paths: Vec<PathBuf>,
+    /// How many of framework_paths came from -F / -iframework (they come first).
+    pub(super) user_framework_paths: usize,
     /// System include paths (default search paths)
     pub(super) system_include_paths: Vec<PathBuf>,
     /// Files currently being processed (for recursion detection)
@@ -134,6 +138,8 @@ impl Preprocessor {
             quote_include_paths: Vec::new(),
             isystem_include_paths: Vec::new(),
             after_include_paths: Vec::new(),
+            framework_paths: Vec::new(),
+            user_framework_paths: 0,
             system_include_paths: Self::default_system_include_paths(),
             include_stack: Vec::new(),
             pragma_once_files: FxHashSet::default(),
@@ -725,6 +731,13 @@ impl Preprocessor {
     /// These paths are searched last, after all other include paths.
     pub fn add_after_include_path(&mut self, path: &str) {
         self.after_include_paths.push(PathBuf::from(path));
+    }
+
+    /// Add a framework search path (-F / -iframework flag, and the SDK's
+    /// System/Library/Frameworks on Darwin). Searched before the default ones.
+    pub fn add_framework_path(&mut self, path: &str) {
+        self.framework_paths.insert(self.user_framework_paths, PathBuf::from(path));
+        self.user_framework_paths += 1;
     }
 
     /// Process a force-included file (-include flag). This preprocesses the file content

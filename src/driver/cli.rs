@@ -395,6 +395,34 @@ impl Driver {
                     }
                 }
 
+                // Framework search paths (Darwin): -F dir, -Fdir, -iframework dir.
+                // -F also goes to the linker, as clang passes it.
+                "-F" | "-iframework" => {
+                    let flag = args[i].clone();
+                    i += 1;
+                    if i < args.len() {
+                        self.framework_paths.push(args[i].clone());
+                        if flag == "-F" {
+                            self.linker_ordered_items.push(format!("-Wl,-F{}", args[i]));
+                        }
+                    } else {
+                        return Err(format!("{} requires an argument", flag));
+                    }
+                }
+                arg if arg.starts_with("-F") && arg.len() > 2 => {
+                    self.framework_paths.push(arg[2..].to_string());
+                    self.linker_ordered_items.push(format!("-Wl,{}", arg));
+                }
+                // Link a framework: -framework Name.
+                "-framework" => {
+                    i += 1;
+                    if i < args.len() {
+                        self.linker_ordered_items.push(format!("-Wl,-framework,{}", args[i]));
+                    } else {
+                        return Err("-framework requires an argument".to_string());
+                    }
+                }
+
                 // After include paths (-idirafter)
                 "-idirafter" => {
                     i += 1;

@@ -717,7 +717,39 @@ impl Preprocessor {
             }
         }
 
-        None
+        // Step 7: Darwin frameworks: <Name/file.h> is Name.framework/Headers/file.h
+        // (or PrivateHeaders) in a framework directory, or, from inside an
+        // umbrella framework, in one of its own Frameworks/ (CoreServices.h
+        // includes <CarbonCore/CarbonCore.h>).
+        self.resolve_framework_include(include_path)
+    }
+
+    fn resolve_framework_include(&self, include_path: &str) -> Option<PathBuf> {
+        let (name, rest) = include_path.split_once('/')?;
+        if name.is_empty() || rest.is_empty() {
+            return None;
+        }
+        let in_framework = |fw: &Path| -> Option<PathBuf> {
+            ["Headers", "PrivateHeaders"].iter()
+                .map(|d| fw.join(d).join(rest))
+                .find(|c| c.is_file())
+                .map(|c| make_absolute(&c))
+        };
+        // Sub-frameworks of the framework the including file is in.
+        for file in self.include_stack.iter().rev() {
+            let mut dir = file.parent();
+            while let Some(d) = dir {
+                if d.extension().is_some_and(|e| e == "framework") {
+                    if let Some(found) = in_framework(&d.join("Frameworks").join(format!("{}.framework", name))) {
+                        return Some(found);
+                    }
+                    break;
+                }
+                dir = d.parent();
+            }
+        }
+        self.framework_paths.iter()
+            .find_map(|dir| in_framework(&dir.join(format!("{}.framework", name))))
     }
 
     /// Inject compiler-builtin macros for well-known standard headers.

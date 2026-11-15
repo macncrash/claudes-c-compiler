@@ -68,6 +68,8 @@ pub struct Driver {
     /// System include paths (from -isystem flags).
     /// Searched after -I paths, before default system paths.
     pub(super) isystem_include_paths: Vec<String>,
+    /// Framework search paths (from -F and -iframework flags).
+    pub(super) framework_paths: Vec<String>,
     /// After include paths (from -idirafter flags).
     /// Searched last, after all other include paths.
     pub(super) after_include_paths: Vec<String>,
@@ -268,6 +270,7 @@ impl Driver {
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
             isystem_include_paths: Vec::new(),
+            framework_paths: Vec::new(),
             after_include_paths: Vec::new(),
             linker_paths: Vec::new(),
             linker_ordered_items: Vec::new(),
@@ -895,6 +898,9 @@ impl Driver {
         }
         for path in &self.after_include_paths {
             preprocessor.add_after_include_path(path);
+        }
+        for path in &self.framework_paths {
+            preprocessor.add_framework_path(path);
         }
     }
 

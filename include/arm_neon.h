@@ -3959,6 +3959,28 @@ vmlaq_u32(uint32x4_t __a, uint32x4_t __b, uint32x4_t __c)
     return __a + __b * __c;
 }
 
+/* By-scalar multiply, multiply-accumulate and multiply-subtract:
+ * vmul[q]_n_T(a, s) = a * s, vmla[q]_n_T(a, b, s) = a + b * s,
+ * vmls[q]_n_T(a, b, s) = a - b * s, the scalar broadcast to every lane. */
+#define __CCC_BY_SCALAR(V, S, SUF)                                              \
+    static __inline__ V __attribute__((__always_inline__))                     \
+    vmul##SUF(V __a, S __s) { return __a * __s; }                              \
+    static __inline__ V __attribute__((__always_inline__))                     \
+    vmla##SUF(V __a, V __b, S __s) { return __a + __b * __s; }                 \
+    static __inline__ V __attribute__((__always_inline__))                     \
+    vmls##SUF(V __a, V __b, S __s) { return __a - __b * __s; }
+__CCC_BY_SCALAR(uint16x4_t, uint16_t, _n_u16)
+__CCC_BY_SCALAR(int16x4_t, int16_t, _n_s16)
+__CCC_BY_SCALAR(uint32x2_t, uint32_t, _n_u32)
+__CCC_BY_SCALAR(int32x2_t, int32_t, _n_s32)
+__CCC_BY_SCALAR(float32x2_t, float32_t, _n_f32)
+__CCC_BY_SCALAR(uint16x8_t, uint16_t, q_n_u16)
+__CCC_BY_SCALAR(int16x8_t, int16_t, q_n_s16)
+__CCC_BY_SCALAR(uint32x4_t, uint32_t, q_n_u32)
+__CCC_BY_SCALAR(int32x4_t, int32_t, q_n_s32)
+__CCC_BY_SCALAR(float32x4_t, float32_t, q_n_f32)
+#undef __CCC_BY_SCALAR
+
 static __inline__ uint32x4_t __attribute__((__always_inline__))
 vmlsq_u32(uint32x4_t __a, uint32x4_t __b, uint32x4_t __c)
 {
@@ -5962,6 +5984,76 @@ vuzpq_u32(uint32x4_t __a, uint32x4_t __b)
 
 /* === SHA-256 crypto intrinsics (software implementation) === */
 /* Used by mbedtls SHA-256 hardware acceleration. */
+
+/* SHA-1 (FEAT_SHA1), as the Arm architecture defines SHA1C/SHA1P/SHA1M:
+ * four rounds over hash_abcd (lanes a..d) and hash_e, with the choose,
+ * parity or majority function; each round rotates the 160-bit state. */
+#define __CCC_SHA1_ROUNDS(__abcd, __e, __wk, __F)                              \
+    do {                                                                     \
+        for (int __i = 0; __i < 4; __i++) {                                  \
+            unsigned int __b = __abcd[1], __c = __abcd[2], __d = __abcd[3];  \
+            unsigned int __t = (__F);                                        \
+            unsigned int __y = __e + ((__abcd[0] << 5) | (__abcd[0] >> 27)) + __t + __wk[__i]; \
+            unsigned int __b30 = (__b << 30) | (__b >> 2);                   \
+            __e = __d;                                                       \
+            __abcd[3] = __c;                                                 \
+            __abcd[2] = __b30;                                               \
+            __abcd[1] = __abcd[0];                                           \
+            __abcd[0] = __y;                                                 \
+        }                                                                    \
+    } while (0)
+
+/* vsha1cq_u32: SHA-1 hash update, choose function */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsha1cq_u32(uint32x4_t __hash_abcd, uint32_t __hash_e, uint32x4_t __wk)
+{
+    __CCC_SHA1_ROUNDS(__hash_abcd, __hash_e, __wk, (__b & __c) | (~__b & __d));
+    return __hash_abcd;
+}
+
+/* vsha1pq_u32: SHA-1 hash update, parity function */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsha1pq_u32(uint32x4_t __hash_abcd, uint32_t __hash_e, uint32x4_t __wk)
+{
+    __CCC_SHA1_ROUNDS(__hash_abcd, __hash_e, __wk, __b ^ __c ^ __d);
+    return __hash_abcd;
+}
+
+/* vsha1mq_u32: SHA-1 hash update, majority function */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsha1mq_u32(uint32x4_t __hash_abcd, uint32_t __hash_e, uint32x4_t __wk)
+{
+    __CCC_SHA1_ROUNDS(__hash_abcd, __hash_e, __wk, (__b & __c) | (__b & __d) | (__c & __d));
+    return __hash_abcd;
+}
+
+/* vsha1h_u32: SHA-1 fixed rotate (ROL 30) */
+static __inline__ uint32_t __attribute__((__always_inline__))
+vsha1h_u32(uint32_t __hash_e)
+{
+    return (__hash_e << 30) | (__hash_e >> 2);
+}
+
+/* vsha1su0q_u32: SHA-1 schedule update 0: {w2, w3, w4, w5} ^ w0_3 ^ w8_11 */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsha1su0q_u32(uint32x4_t __w0_3, uint32x4_t __w4_7, uint32x4_t __w8_11)
+{
+    uint32x4_t __t = { __w0_3[2], __w0_3[3], __w4_7[0], __w4_7[1] };
+    return __t ^ __w0_3 ^ __w8_11;
+}
+
+/* vsha1su1q_u32: SHA-1 schedule update 1 */
+static __inline__ uint32x4_t __attribute__((__always_inline__))
+vsha1su1q_u32(uint32x4_t __tw0_3, uint32x4_t __w12_15)
+{
+    uint32x4_t __t = { __tw0_3[0] ^ __w12_15[1], __tw0_3[1] ^ __w12_15[2],
+                       __tw0_3[2] ^ __w12_15[3], __tw0_3[3] };
+    uint32x4_t __ret;
+    for (int __i = 0; __i < 3; __i++)
+        __ret[__i] = (__t[__i] << 1) | (__t[__i] >> 31);
+    __ret[3] = ((__t[3] << 1) | (__t[3] >> 31)) ^ ((__t[0] << 2) | (__t[0] >> 30));
+    return __ret;
+}
 
 /* vsha256su0q_u32: SHA-256 schedule update 0 */
 static __inline__ uint32x4_t __attribute__((__always_inline__))
