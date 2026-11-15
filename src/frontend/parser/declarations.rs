@@ -191,6 +191,8 @@ impl Parser {
         decl_attrs.asm_register = first_asm_reg;
         decl_attrs.cleanup_fn = cleanup_fn;
         decl_attrs.symver = symver;
+        decl_attrs.ctor_priority = self.attrs.parsing_ctor_priority.take();
+        decl_attrs.dtor_priority = self.attrs.parsing_dtor_priority.take();
 
         // Apply __attribute__((mode(...))): transform type to specified bit-width
         let type_spec = if let Some(mk) = mode_kind {
@@ -297,6 +299,8 @@ impl Parser {
                 attrs.section = decl_attrs.section;
                 attrs.visibility = decl_attrs.visibility;
                 attrs.symver = decl_attrs.symver;
+                attrs.ctor_priority = decl_attrs.ctor_priority;
+                attrs.dtor_priority = decl_attrs.dtor_priority;
                 attrs
             },
             is_kr: is_kr_style,

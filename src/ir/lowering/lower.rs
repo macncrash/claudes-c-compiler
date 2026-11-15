@@ -660,6 +660,12 @@ impl Lowerer {
                     if func.attrs.is_destructor() && !self.module.destructors.contains(&func.name) {
                         self.module.destructors.push(func.name.clone());
                     }
+                    if let Some(p) = func.attrs.ctor_priority {
+                        self.module.ctor_priority.push((func.name.clone(), p));
+                    }
+                    if let Some(p) = func.attrs.dtor_priority {
+                        self.module.dtor_priority.push((func.name.clone(), p));
+                    }
                     if func.attrs.is_fastcall() {
                         self.fastcall_functions.insert(func.name.clone());
                     }
@@ -675,6 +681,14 @@ impl Lowerer {
                             && !self.module.destructors.contains(&declarator.name)
                         {
                             self.module.destructors.push(declarator.name.clone());
+                        }
+                        if !declarator.name.is_empty() {
+                            if let Some(p) = declarator.attrs.ctor_priority {
+                                self.module.ctor_priority.push((declarator.name.clone(), p));
+                            }
+                            if let Some(p) = declarator.attrs.dtor_priority {
+                                self.module.dtor_priority.push((declarator.name.clone(), p));
+                            }
                         }
                         // Collect __attribute__((alias("target"))) declarations
                         if let Some(ref target) = declarator.attrs.alias_target {

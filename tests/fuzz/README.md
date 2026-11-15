@@ -59,6 +59,7 @@ objects; a ccc-only build cannot show a calling-convention mismatch.
 | `wrapfz` | loops whose counter wraps: unsigned of every width and signed char/short near their limits, != ends, mixed-type bounds, i-- past 0; simulated first, guarded only when unbounded |
 | `aifz` | local aggregate initializers from runtime values: designators reordered and repeated, braced re-init of a member, brace elision, strings in char arrays, unions by any member, GNU ranges, loops re-zeroing |
 | `vecfz` | vector extensions, 8 to 64 bytes: / % shifts ~ compares, broadcasts, runtime element access, shufflevector, convertvector, reinterpreting casts, calls, struct members, unaligned loads |
+| `lkfz` | linkage across two files built in all four ccc/clang mixes: weak overrides, constructor/destructor priorities, pure/const around writes, C99 inline with extern inline, section/used statics |
 | `loopfuzz` | loop nests over arrays and maybe-overlapping pointers |
 | `rdfuzz` | float-sum loops (vectorized reductions and near misses) |
 | `memfz` | memory access and aliasing: union punning of every width, char and memcpy access, overlapping copies, aliasing pointers |

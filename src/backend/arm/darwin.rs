@@ -91,6 +91,12 @@ impl State {
             emit(out, ".p2align 3");
             emit(out, "    .quad Lccc_register_dtors");
         }
+        // Each symbol starts its own atom, as clang's output has it. Without
+        // this ld64 takes every section as one atom, so a weak definition could
+        // not be dropped for a strong one from another file (a weak variable
+        // overridden elsewhere was a duplicate symbol), and -dead_strip could
+        // not drop unused functions.
+        emit(out, ".subsections_via_symbols");
     }
 }
 

@@ -34,6 +34,9 @@ pub struct FunctionAttributes {
     pub visibility: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// __attribute__((constructor(N))) / destructor(N) priorities
+    pub ctor_priority: Option<u16>,
+    pub dtor_priority: Option<u16>,
 }
 
 /// Bit masks for boolean flags in `FunctionAttributes::flags`.
@@ -374,6 +377,9 @@ pub struct DeclAttributes {
     pub cleanup_fn: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// __attribute__((constructor(N))) / destructor(N) priorities
+    pub ctor_priority: Option<u16>,
+    pub dtor_priority: Option<u16>,
 }
 
 /// Bit masks for boolean flags in `DeclAttributes::flags`.

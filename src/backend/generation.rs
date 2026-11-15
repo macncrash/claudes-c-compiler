@@ -781,19 +781,33 @@ fn emit_symbol_attrs(cg: &mut dyn ArchCodegen, module: &IrModule, referenced_sym
 }
 
 /// Emit .init_array and .fini_array sections for constructor/destructor functions.
+///
+/// constructor(N) / destructor(N) priorities: constructors run from the lowest N,
+/// destructors to it, and those without one count as 65535. A prioritized entry
+/// goes in .init_array.NNNNN / .fini_array.NNNNN, which linkers sort; within this
+/// file the entries are in priority order too (the Mach-O translation takes the
+/// order as it is: __mod_init_func runs in order, destructors register with
+/// __cxa_atexit in order and so run in reverse).
 fn emit_init_fini_arrays(cg: &mut dyn ArchCodegen, module: &IrModule, ptr_dir: super::common::PtrDirective) {
     let align = crate::common::types::target_ptr_size();
-    for ctor in &module.constructors {
-        cg.state().emit("");
-        cg.state().emit(".section .init_array,\"aw\",@init_array");
-        cg.state().emit_fmt(format_args!(".align {}", ptr_dir.align_arg(align)));
-        cg.state().emit_fmt(format_args!("{} {}", ptr_dir.as_str(), ctor));
-    }
-    for dtor in &module.destructors {
-        cg.state().emit("");
-        cg.state().emit(".section .fini_array,\"aw\",@fini_array");
-        cg.state().emit_fmt(format_args!(".align {}", ptr_dir.align_arg(align)));
-        cg.state().emit_fmt(format_args!("{} {}", ptr_dir.as_str(), dtor));
+    let sorted = |names: &[String], prio: &[(String, u16)]| -> Vec<(String, Option<u16>)> {
+        let mut v: Vec<(String, Option<u16>)> = names.iter()
+            .map(|n| (n.clone(), prio.iter().rev().find(|(m, _)| m == n).map(|&(_, p)| p)))
+            .collect();
+        v.sort_by_key(|(_, p)| p.unwrap_or(65535));
+        v
+    };
+    for (kind, list) in [("init", sorted(&module.constructors, &module.ctor_priority)),
+                         ("fini", sorted(&module.destructors, &module.dtor_priority))] {
+        for (name, prio) in list {
+            cg.state().emit("");
+            match prio {
+                Some(p) => cg.state().emit_fmt(format_args!(".section .{}_array.{:05},\"aw\",@{}_array", kind, p, kind)),
+                None => cg.state().emit_fmt(format_args!(".section .{}_array,\"aw\",@{}_array", kind, kind)),
+            }
+            cg.state().emit_fmt(format_args!(".align {}", ptr_dir.align_arg(align)));
+            cg.state().emit_fmt(format_args!("{} {}", ptr_dir.as_str(), name));
+        }
     }
 }
 

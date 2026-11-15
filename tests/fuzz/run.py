@@ -27,7 +27,7 @@ FUZZERS = {
     'abifuzz': True, 'adfz': True, 'aifz': True, 'asmfz': True, 'atfz': True, 'bffuzz': True, 'bfrt': True, 'binfz': True,
     'cffuzz': True, 'cfuzz': False, 'clfz': True, 'cpfz': True, 'cqfz': True, 'cufz': True, 'cvfz': True, 'cxfz': True,
     'ffuzz': True, 'fpfuzz': True, 'gnfz': True, 'gnufz': True, 'i128fz': True, 'ibfz': True, 'ifuzz': True,
-    'inlfz': True, 'loopfuzz': True, 'lvfz': True, 'mathfz': True, 'memfz': True, 'pfuzz': True, 'pkfz': True, 'rdfuzz': True, 'rtfuzz': True, 'sfz': True,
+    'inlfz': True, 'lkfz': True, 'loopfuzz': True, 'lvfz': True, 'mathfz': True, 'memfz': True, 'pfuzz': True, 'pkfz': True, 'rdfuzz': True, 'rtfuzz': True, 'sfz': True,
     'sjfz': True, 'swfz': True, 'stfz': True, 'strfz': True, 'tlsfz': True, 'vafz': True, 'vafz2': True, 'vecfz': True,
     'vlafz': True, 'vlfz': True, 'vlfz2': True, 'vmfz': True, 'wrapfz': True, 'wsfz': True,
 }

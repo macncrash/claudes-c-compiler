@@ -131,6 +131,9 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_cleanup_fn: Option<String>,
     /// `__attribute__((symver("name@@VERSION")))` symbol version string.
     pub parsing_symver: Option<String>,
+    /// `__attribute__((constructor(N)))` / `destructor(N)` priorities.
+    pub parsing_ctor_priority: Option<u16>,
+    pub parsing_dtor_priority: Option<u16>,
     /// `__attribute__((vector_size(N)))` total vector size in bytes.
     pub parsing_vector_size: Option<usize>,
     /// `__attribute__((ext_vector_type(N)))` number of vector elements.
@@ -800,15 +803,21 @@ impl Parser {
                               aligned: &mut Option<usize>, mode_kind: &mut Option<ModeKind>,
                               is_common: &mut bool) {
         match name {
+            // An optional priority orders them (lower first for constructors,
+            // last for destructors); it was skipped, so they ran as declared.
             "constructor" | "__constructor__" => {
                 self.attrs.set_constructor(true);
                 self.advance();
-                if matches!(self.peek(), TokenKind::LParen) { self.skip_balanced_parens(); }
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.attrs.parsing_ctor_priority = self.parse_alignment_expr().map(|p| p.min(65535) as u16);
+                }
             }
             "destructor" | "__destructor__" => {
                 self.attrs.set_destructor(true);
                 self.advance();
-                if matches!(self.peek(), TokenKind::LParen) { self.skip_balanced_parens(); }
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.attrs.parsing_dtor_priority = self.parse_alignment_expr().map(|p| p.min(65535) as u16);
+                }
             }
             "packed" | "__packed__" => { *is_packed = true; self.advance(); }
             "aligned" | "__aligned__" => {

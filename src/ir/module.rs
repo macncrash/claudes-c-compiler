@@ -20,6 +20,9 @@ pub struct IrModule {
     pub char16_string_literals: Vec<(String, Vec<u16>)>,
     pub constructors: Vec<String>, // functions with __attribute__((constructor))
     pub destructors: Vec<String>,  // functions with __attribute__((destructor))
+    /// Priorities given as constructor(N) / destructor(N); the others count as 65535.
+    pub ctor_priority: Vec<(String, u16)>,
+    pub dtor_priority: Vec<(String, u16)>,
     /// Symbol aliases: (alias_name, target_name, is_weak)
     /// From __attribute__((alias("target"))) and __attribute__((weak))
     pub aliases: Vec<(String, String, bool)>,
@@ -265,6 +268,8 @@ impl IrModule {
             char16_string_literals: Vec::new(),
             constructors: Vec::new(),
             destructors: Vec::new(),
+            ctor_priority: Vec::new(),
+            dtor_priority: Vec::new(),
             aliases: Vec::new(),
             toplevel_asm: Vec::new(),
             symbol_attrs: Vec::new(),
