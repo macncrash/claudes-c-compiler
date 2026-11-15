@@ -61,6 +61,7 @@ objects; a ccc-only build cannot show a calling-convention mismatch.
 | `vecfz` | vector extensions, 8 to 64 bytes: / % shifts ~ compares, broadcasts, runtime element access, shufflevector, convertvector, reinterpreting casts, calls, struct members, unaligned loads |
 | `lkfz` | linkage across two files built in all four ccc/clang mixes: weak overrides, constructor/destructor priorities, pure/const around writes, C99 inline with extern inline, section/used statics |
 | `alfz` | over-aligned objects: locals and statics aligned to 4096, over-aligned structs by value, VLAs, alloca, stack and variadic arguments, recursion through realigned frames |
+| `abx` | call boundary in all four ccc/clang mixes: runtime narrow arguments and returns, callees that modify struct parameters (caller objects rechecked), FP aggregates on the stack, many mixed arguments, callbacks |
 | `loopfuzz` | loop nests over arrays and maybe-overlapping pointers |
 | `rdfuzz` | float-sum loops (vectorized reductions and near misses) |
 | `memfz` | memory access and aliasing: union punning of every width, char and memcpy access, overlapping copies, aliasing pointers |
