@@ -24,7 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # name -> whether it takes a CLANG argument (cfuzz compares ccc's constant
 # folding with its own run-time results only).
 FUZZERS = {
-    'abifuzz': True, 'adfz': True, 'aifz': True, 'asmfz': True, 'atfz': True, 'bffuzz': True, 'bfrt': True, 'binfz': True,
+    'abifuzz': True, 'adfz': True, 'aifz': True, 'alfz': True, 'asmfz': True, 'atfz': True, 'bffuzz': True, 'bfrt': True, 'binfz': True,
     'cffuzz': True, 'cfuzz': False, 'clfz': True, 'cpfz': True, 'cqfz': True, 'cufz': True, 'cvfz': True, 'cxfz': True,
     'ffuzz': True, 'fpfuzz': True, 'gnfz': True, 'gnufz': True, 'i128fz': True, 'ibfz': True, 'ifuzz': True,
     'inlfz': True, 'lkfz': True, 'loopfuzz': True, 'lvfz': True, 'mathfz': True, 'memfz': True, 'pfuzz': True, 'pkfz': True, 'rdfuzz': True, 'rtfuzz': True, 'sfz': True,

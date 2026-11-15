@@ -316,7 +316,21 @@ impl Lowerer {
                     self.register_normal_param(orig_param, &info.params[*ir_idx], ir_allocas[*ir_idx]);
                 }
                 ParamKind::Struct(ir_idx) => {
-                    self.register_struct_or_complex_param(orig_param, ir_allocas[*ir_idx]);
+                    // An over-aligned struct (aligned(64), _Alignas members) is
+                    // copied from its incoming slot, which the backend stores at
+                    // the default alignment, into a slot of its own alignment:
+                    // the parameter sat misaligned in the callee.
+                    let p = &info.params[*ir_idx];
+                    let slot = match (p.struct_align, p.struct_size) {
+                        // (Default slots are only 8-byte aligned.)
+                        (Some(align), Some(size)) if align > 8 => {
+                            let aligned = self.emit_entry_alloca(IrType::Ptr, size, align, false);
+                            self.emit(Instruction::Memcpy { dest: aligned, src: ir_allocas[*ir_idx], size });
+                            aligned
+                        }
+                        _ => ir_allocas[*ir_idx],
+                    };
+                    self.register_struct_or_complex_param(orig_param, slot);
                 }
                 ParamKind::ComplexFloatPacked(ir_idx) => {
                     self.register_packed_complex_float_param(orig_param, ir_allocas[*ir_idx]);

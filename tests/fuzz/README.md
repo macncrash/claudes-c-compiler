@@ -60,6 +60,7 @@ objects; a ccc-only build cannot show a calling-convention mismatch.
 | `aifz` | local aggregate initializers from runtime values: designators reordered and repeated, braced re-init of a member, brace elision, strings in char arrays, unions by any member, GNU ranges, loops re-zeroing |
 | `vecfz` | vector extensions, 8 to 64 bytes: / % shifts ~ compares, broadcasts, runtime element access, shufflevector, convertvector, reinterpreting casts, calls, struct members, unaligned loads |
 | `lkfz` | linkage across two files built in all four ccc/clang mixes: weak overrides, constructor/destructor priorities, pure/const around writes, C99 inline with extern inline, section/used statics |
+| `alfz` | over-aligned objects: locals and statics aligned to 4096, over-aligned structs by value, VLAs, alloca, stack and variadic arguments, recursion through realigned frames |
 | `loopfuzz` | loop nests over arrays and maybe-overlapping pointers |
 | `rdfuzz` | float-sum loops (vectorized reductions and near misses) |
 | `memfz` | memory access and aliasing: union punning of every width, char and memcpy access, overlapping copies, aliasing pointers |

@@ -496,7 +496,7 @@ impl Lowerer {
         // scalar type (e.g., complex-to-bool). These should NOT get a
         // struct_arg_size based on the original expression's CType.
         let mut complex_converted_to_scalar: Vec<bool> = vec![false; args.len()];
-        let arg_vals: Vec<Operand> = args.iter().enumerate().map(|(i, a)| {
+        let mut arg_vals: Vec<Operand> = args.iter().enumerate().map(|(i, a)| {
             let mut val = self.lower_expr(a);
             let arg_ty = self.get_expr_type(a);
 
@@ -735,6 +735,24 @@ impl Lowerer {
         } else {
             struct_arg_riscv_float_classes
         };
+
+        // AArch64 and RISC-V pass a composite larger than 16 bytes (not in FP
+        // registers) by reference to a copy the caller makes, which the callee
+        // may modify. The argument was the address of the object itself, so a
+        // callee built by another compiler wrote into the caller's variable.
+        if matches!(self.target, crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64) {
+            for (i, arg) in arg_vals.iter_mut().enumerate() {
+                let Some(size) = struct_arg_sizes.get(i).copied().flatten() else { continue };
+                if size <= 16 || struct_arg_riscv_float_classes.get(i).copied().flatten().is_some() {
+                    continue;
+                }
+                let align = struct_arg_aligns.get(i).copied().flatten().unwrap_or(8).max(8);
+                let src = self.operand_to_value(*arg);
+                let copy = self.emit_entry_alloca(IrType::Ptr, size, align, false);
+                self.emit(Instruction::Memcpy { dest: copy, src, size });
+                *arg = Operand::Value(copy);
+            }
+        }
 
         (arg_vals, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes)
     }
