@@ -58,6 +58,7 @@ impl Lowerer {
                             is_volatile: false,
                             vla_size_exprs: Vec::new(),
                             fptr_inner_ptr_depth: 0,
+                            fptr_variadic: false,
                         }
                     }).collect();
                     if quals.pointer_const {
@@ -114,6 +115,7 @@ impl Lowerer {
                         is_volatile: false,
                         vla_size_exprs: Vec::new(),
                         fptr_inner_ptr_depth: 0,
+                        fptr_variadic: false,
                     }
                 }).collect();
                 TypeSpecifier::BareFunction(Box::new(ret_ts), param_decls, ft.variadic)
@@ -174,7 +176,7 @@ impl Lowerer {
             let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
                 return_type: actual_return,
                 params: param_types,
-                variadic: false,
+                variadic: param.fptr_variadic,
             }));
             let mut result = CType::Pointer(Box::new(func_type), fptr_quals);
             for quals in extra_quals.into_iter().rev() {

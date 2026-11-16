@@ -46,9 +46,25 @@ pub(super) struct ParamDeclarator {
     pub ptr_to_array_dims: Vec<Option<Box<Expr>>>,
     pub fptr_params: Option<Vec<ParamDecl>>,
     pub fptr_inner_ptr_depth: u32,
+    /// Whether the pointed-to function takes `...`.
+    pub fptr_variadic: bool,
     /// Whether the `*` pointing to a function is itself const
     /// (`(*const fp)(int)`).
     pub func_ptr_const: bool,
+    /// `(*(*g)(params))(ret_params)`: a pointer to a function returning a
+    /// function pointer.
+    pub nested_fn: Option<NestedFnParam>,
+}
+
+/// A parameter declared `R (*(*g)(params))(ret_params)`, with `ret_ptrs` stars
+/// before the inner group and `g_ptrs` before g.
+pub(super) struct NestedFnParam {
+    pub ret_ptrs: u32,
+    pub ret_params: Vec<ParamDecl>,
+    pub ret_variadic: bool,
+    pub g_ptrs: u32,
+    pub g_params: Vec<ParamDecl>,
+    pub g_variadic: bool,
 }
 
 impl Parser {
@@ -411,7 +427,7 @@ impl Parser {
                 let ParamDeclarator {
                     name, pointer_depth, pointer_consts, array_dims, is_func_ptr,
                     ptr_to_array_dims, fptr_params: fptr_param_decls,
-                    fptr_inner_ptr_depth: inner_ptr_depth, func_ptr_const,
+                    fptr_inner_ptr_depth: inner_ptr_depth, fptr_variadic, func_ptr_const, nested_fn,
                 } = self.parse_param_declarator_full();
                 self.skip_gcc_extensions();
 
@@ -419,6 +435,20 @@ impl Parser {
                 for level in 0..pointer_depth {
                     let pointer_const = level < 32 && pointer_consts & (1 << level) != 0;
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AccessQuals { pointer_const, ..AccessQuals::NONE });
+                }
+
+                // R (*(*g)(params))(ret_params): g points to a function
+                // taking params and returning a pointer to a function taking
+                // ret_params and returning R.
+                if let Some(n) = nested_fn {
+                    let mut ret = TypeSpecifier::FunctionPointer(Box::new(type_spec), n.ret_params, n.ret_variadic);
+                    for _ in 1..n.ret_ptrs {
+                        ret = TypeSpecifier::Pointer(Box::new(ret), AccessQuals::NONE);
+                    }
+                    type_spec = TypeSpecifier::FunctionPointer(Box::new(ret), n.g_params, n.g_variadic);
+                    for _ in 1..n.g_ptrs {
+                        type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AccessQuals::NONE);
+                    }
                 }
 
                 // Pointer-to-array: int (*p)[N][M]
@@ -456,7 +486,7 @@ impl Parser {
                 self.attrs.set_const(saved_const);
                 self.attrs.restore_volatile(saved_volatile);
                 self.attrs.set_noreturn(saved_noreturn);
-                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, is_volatile: param_is_volatile, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
+                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, is_volatile: param_is_volatile, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth, fptr_variadic });
             } else {
                 self.attrs.set_const(saved_const);
                 self.attrs.restore_volatile(saved_volatile);
@@ -487,6 +517,7 @@ impl Parser {
                 is_volatile: false,
                 vla_size_exprs: Vec::new(),
                 fptr_inner_ptr_depth: 0,
+                fptr_variadic: false,
             });
             if !self.consume_if(&TokenKind::Comma) {
                 break;
@@ -547,8 +578,9 @@ impl Parser {
         // Also handles abstract declarators: `void (Dat *)` → function taking Dat*, returning void
         if matches!(self.peek(), TokenKind::LParen) {
             d.is_func_ptr = true;
-            let (fp_params, _variadic) = self.parse_param_list();
+            let (fp_params, fp_variadic) = self.parse_param_list();
             d.fptr_params = Some(fp_params);
+            d.fptr_variadic = fp_variadic;
         }
 
         d
@@ -604,6 +636,40 @@ impl Parser {
                 // E.g., `void (*__attribute__((unused)) fp)(int)` is valid GNU C.
                 self.skip_gcc_extensions();
             }
+            // Pointer to a function returning a function pointer:
+            // (*(*g)(params))(ret_params), g named or abstract.
+            if matches!(self.peek(), TokenKind::LParen)
+                && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Star))
+            {
+                let save_inner = self.pos;
+                self.advance();
+                let mut g_ptrs = 0u32;
+                while self.consume_if(&TokenKind::Star) {
+                    self.skip_cv_qualifiers();
+                    self.skip_gcc_extensions();
+                    g_ptrs += 1;
+                }
+                let name = if let TokenKind::Identifier(ref n) = self.peek() {
+                    let n = n.clone();
+                    self.advance();
+                    Some(n)
+                } else {
+                    None
+                };
+                if self.consume_if(&TokenKind::RParen) && matches!(self.peek(), TokenKind::LParen) {
+                    let (g_params, g_variadic) = self.parse_param_list();
+                    if self.consume_if(&TokenKind::RParen) && matches!(self.peek(), TokenKind::LParen) {
+                        let (ret_params, ret_variadic) = self.parse_param_list();
+                        d.nested_fn = Some(NestedFnParam {
+                            ret_ptrs: inner_ptr_depth,
+                            ret_params, ret_variadic,
+                            g_ptrs, g_params, g_variadic,
+                        });
+                        return name;
+                    }
+                }
+                self.pos = save_inner;
+            }
             let name = if let TokenKind::Identifier(ref n) = self.peek() {
                 let n = n.clone();
                 self.advance();
@@ -642,9 +708,21 @@ impl Parser {
             } else if matches!(self.peek(), TokenKind::LParen) {
                 // Function pointer: (*fp)(params) or (*fp[])(params)
                 d.is_func_ptr = true;
+                // An array of function pointers decays to a pointer to one,
+                // so (*fp[N])(params) is (**fp)(params). (A second dimension,
+                // (*fp[N][M]), would need a pointer to an array of function
+                // pointers, which this representation cannot express.)
+                if !inner_array_dims.is_empty() {
+                    if inner_array_dims.len() > 1 {
+                        self.emit_error("parameter of multi-dimensional array of function pointer type is not supported", self.peek_span());
+                    }
+                    inner_ptr_depth += 1;
+                    d.pointer_depth += 1;
+                }
                 d.fptr_inner_ptr_depth = inner_ptr_depth;
-                let (fp_params, _variadic) = self.parse_param_list();
+                let (fp_params, fp_variadic) = self.parse_param_list();
                 d.fptr_params = Some(fp_params);
+                d.fptr_variadic = fp_variadic;
             } else if matches!(self.peek(), TokenKind::LBracket) {
                 // Pointer-to-array: (*p)[N]
                 while matches!(self.peek(), TokenKind::LBracket) {
@@ -697,8 +775,9 @@ impl Parser {
             // pointer per C11 6.7.6.3p8.
             if matches!(self.peek(), TokenKind::LParen) {
                 d.is_func_ptr = true;
-                let (fp_params, _variadic) = self.parse_param_list();
+                let (fp_params, fp_variadic) = self.parse_param_list();
                 d.fptr_params = Some(fp_params);
+                d.fptr_variadic = fp_variadic;
             }
             self.expect(&TokenKind::RParen);
             self.skip_array_dimensions();
@@ -707,8 +786,9 @@ impl Parser {
             // Parse the param list to preserve function type information.
             if !d.is_func_ptr && matches!(self.peek(), TokenKind::LParen) {
                 d.is_func_ptr = true;
-                let (fp_params, _variadic) = self.parse_param_list();
+                let (fp_params, fp_variadic) = self.parse_param_list();
                 d.fptr_params = Some(fp_params);
+                d.fptr_variadic = fp_variadic;
             }
             name
         } else if matches!(self.peek(), TokenKind::LParen) {
@@ -724,8 +804,9 @@ impl Parser {
                 // Parse the param list to preserve function type information.
                 if matches!(self.peek(), TokenKind::LParen) {
                     d.is_func_ptr = true;
-                    let (fp_params, _variadic) = self.parse_param_list();
+                    let (fp_params, fp_variadic) = self.parse_param_list();
                     d.fptr_params = Some(fp_params);
+                    d.fptr_variadic = fp_variadic;
                 }
             } else {
                 // extract_paren_name failed (e.g. ((int)) where inner content
@@ -741,8 +822,9 @@ impl Parser {
             // Parse the param list to preserve function type information.
             if matches!(self.peek(), TokenKind::LParen) {
                 d.is_func_ptr = true;
-                let (fp_params, _variadic) = self.parse_param_list();
+                let (fp_params, fp_variadic) = self.parse_param_list();
                 d.fptr_params = Some(fp_params);
+                d.fptr_variadic = fp_variadic;
             }
             name
         } else {

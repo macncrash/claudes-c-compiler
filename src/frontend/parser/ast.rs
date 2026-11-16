@@ -177,6 +177,9 @@ pub struct ParamDecl {
     /// pointer. This distinguishes `int (**fpp)(int)` from `void *(*fp)(size_t)` which
     /// otherwise have identical CType representations.
     pub fptr_inner_ptr_depth: u32,
+    /// Whether a function pointer parameter's function takes `...`
+    /// (`int (*f)(const char *, ...)`).
+    pub fptr_variadic: bool,
 }
 
 /// Bit masks for boolean flags in `Declaration::flags`.

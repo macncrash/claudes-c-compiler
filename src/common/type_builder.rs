@@ -180,11 +180,38 @@ fn convert_param_decls_to_ctypes(
 ) -> Vec<(CType, Option<String>)> {
     params
         .iter()
-        .map(|p| {
-            let ty = ctx.resolve_type_spec_to_ctype(&p.type_spec);
-            (ty, p.name.clone())
-        })
+        .map(|p| (param_decl_ctype(ctx, p), p.name.clone()))
         .collect()
+}
+
+/// The CType of one parameter. A function pointer parameter written with
+/// its own declarator (`int (*f)(int)`) keeps the pointed-to function's
+/// parameters in `fptr_params`, and its `type_spec` holds only one pointer
+/// layer over the return type, so build the pointer to function here
+/// (the same rule as lowering's `param_ctype`).
+pub fn param_decl_ctype(ctx: &dyn TypeConvertContext, p: &ParamDecl) -> CType {
+    let ty = ctx.resolve_type_spec_to_ctype(&p.type_spec);
+    let Some(fptr_params) = &p.fptr_params else { return ty };
+    let (mut ret, fptr_quals) = match ty {
+        CType::Pointer(inner, quals) => (*inner, pointer_quals(&quals)),
+        other => (other, AccessQuals::NONE),
+    };
+    let mut extra_quals = Vec::new();
+    for _ in 1..p.fptr_inner_ptr_depth {
+        let CType::Pointer(inner, quals) = ret else { break };
+        extra_quals.push(pointer_quals(&quals));
+        ret = *inner;
+    }
+    let func = CType::Function(Box::new(FunctionType {
+        return_type: ret,
+        params: convert_param_decls_to_ctypes(ctx, fptr_params),
+        variadic: p.fptr_variadic,
+    }));
+    let mut result = CType::Pointer(Box::new(func), fptr_quals);
+    for quals in extra_quals.into_iter().rev() {
+        result = CType::Pointer(Box::new(result), quals);
+    }
+    result
 }
 
 /// The qualifiers a pointer declarator gives its CType: only whether the

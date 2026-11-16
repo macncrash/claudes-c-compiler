@@ -218,8 +218,7 @@ impl SemanticAnalyzer {
         self.collect_enum_constants_from_type_spec(&func.return_type);
 
         let params: Vec<(CType, Option<String>)> = func.params.iter().map(|p| {
-            let ty = self.type_spec_to_ctype(&p.type_spec);
-            (ty, p.name.clone())
+            (type_builder::param_decl_ctype(self, p), p.name.clone())
         }).collect();
 
         // Preserve noreturn from a prior declaration (e.g., the prototype may have
@@ -262,7 +261,7 @@ impl SemanticAnalyzer {
         // Declare parameters in function scope
         for param in &func.params {
             if let Some(name) = &param.name {
-                let ty = self.type_spec_to_ctype(&param.type_spec);
+                let ty = type_builder::param_decl_ctype(self, param);
                 self.symbol_table.declare(Symbol {
                     name: name.clone(),
                     ty,
@@ -1437,6 +1436,23 @@ impl SemanticAnalyzer {
                 self.analyze_expr(callee);
                 for arg in args {
                     self.analyze_expr(arg);
+                }
+                // The callee must have function or pointer-to-function type
+                // (C11 6.5.2.2p1). Checked only for a named object, whose
+                // declared type sema knows exactly.
+                if let Expr::Identifier(name, callee_span) = callee.as_ref() {
+                    if let Some(sym) = self.symbol_table.lookup(name) {
+                        let callable = match &sym.ty {
+                            CType::Function(_) => true,
+                            CType::Pointer(inner, _) => matches!(inner.as_ref(), CType::Function(_)),
+                            _ => false,
+                        };
+                        if !callable {
+                            let msg = format!(
+                                "called object '{}' is not a function or function pointer", name);
+                            self.diagnostics.borrow_mut().error(msg, *callee_span);
+                        }
+                    }
                 }
                 // Check for invalid pointer <-> float conversions in arguments
                 if let Expr::Identifier(name, _) = callee.as_ref() {

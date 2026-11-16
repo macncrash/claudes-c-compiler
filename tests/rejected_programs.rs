@@ -71,6 +71,19 @@ fn range_designator_too_big_to_expand() {
 }
 
 #[test]
+fn call_of_an_object_that_is_not_a_function() {
+    // Once compiled to a branch to the object's value (C11 6.5.2.2p1).
+    for (name, decl, call) in [("void_ptr", "void *p", "p(3)"), ("int_ptr", "int *p", "p(1)"),
+                               ("int", "int p", "p(2)"), ("double", "double p", "p()"),
+                               ("fptr_ptr", "int (**p)(int)", "p(1)")] {
+        let source = format!("void f({decl}) {{ {call}; }}\n{MAIN}");
+        assert_rejected(name, &source, "called object 'p' is not a function or function pointer");
+    }
+    let source = format!("struct S {{ int x; }} s;\nvoid f(void) {{ s(); }}\n{MAIN}");
+    assert_rejected("struct", &source, "called object 's' is not a function or function pointer");
+}
+
+#[test]
 fn integer_operator_on_a_float() {
     // Once a panic in the backend, which has no float `and`.
     for (name, expr) in [("and", "d & 1"), ("or", "1 | d"), ("xor", "d ^ d"), ("mod", "d % 2"), ("shl", "d << 1"), ("shr", "1 >> d")] {
