@@ -3,7 +3,9 @@
 outputs (=r), read-write (+r), early clobbers (=&r), tied inputs ("0"),
 %w/%x size modifiers, operands of every integer width (narrow values passed
 to %w), memory operands on locals, globals and array elements, clobber lists
-(registers, "cc", "memory"), asm in loops and with values live across it.
+(registers, "cc", "memory"), asm in loops and with values live across it;
+two outputs, clobbers of the registers ccc allocates, one variable as input
+and output, outputs stored through pointers, and the arm_acle.h intrinsics.
 Each asm does a simple add/eor/lsl/madd; results are hashed.
 usage: asmfz.py CCC CLANG WORK SEED COUNT   (env OPT, default -O2)"""
 import os
@@ -20,7 +22,7 @@ T32 = ['int', 'unsigned']
 
 
 def gen_stmt(r, k, vars64, vars32):
-    c = r.randint(0, 9)
+    c = r.randint(0, 14)
     a64, b64 = r.choice(vars64), r.choice(vars64)
     a32, b32 = r.choice(vars32), r.choice(vars32)
     if c == 0:
@@ -49,6 +51,30 @@ def gen_stmt(r, k, vars64, vars32):
         # narrow operands: sub-word values through %w
         t = r.choice(['signed char', 'unsigned char', 'short', 'unsigned short'])
         return '{ %s n = (%s)%s; asm("add %%w0, %%w0, #%d" : "+r"(n)); %s = n; }' % (t, t, a64, r.randint(0, 300), a32)
+    if c == 10:
+        # two plain outputs, written before the inputs are all read
+        return 'asm("add %%0, %%2, %%3\\n\\tsub %%1, %%2, %%3" : "=&r"(%s), "=&r"(%s) : "r"(%s), "r"(%s));' % (
+            a64, r.choice([v for v in vars64 if v != a64]), b64, r.choice(vars64))
+    if c == 11:
+        # clobbers of registers the allocator hands out, values live across
+        regs = r.sample(['x12', 'x13', 'x14', 'x15', 'x19', 'x20', 'x21', 'x22', 'x23', 'x24'], 2)
+        return 'asm volatile("mov %s, #3\\n\\tmov %s, #5\\n\\tadd %%0, %%1, %%2" : "=r"(%s) : "r"(%s), "r"(%s) : "%s", "%s");' % (
+            regs[0], regs[1], a64, b64, r.choice(vars64), regs[0], regs[1])
+    if c == 12:
+        # the same variable in and out (a CRC loop's shape), maybe in a loop
+        s = 'asm("eor %%w0, %%w1, %%w2" : "=r"(%s) : "r"(%s), "r"(%s));' % (a32, a32, b32)
+        if r.random() < 0.5:
+            return s
+        return 'for (int i = 0; i < %d; i++) { %s %s += i; }' % (r.randint(1, 6), s, b32)
+    if c == 13:
+        # the ACLE intrinsics (inline asm in ccc's arm_acle.h)
+        f = r.choice(['__crc32b', '__crc32h', '__crc32w', '__crc32cb', '__crc32ch', '__crc32cw'])
+        return '%s = %s((unsigned)%s, %s); %s = __crc32cd(%s, (unsigned long long)%s) + __rbit(%s) + __clz(%s);' % (
+            a32, f, a32, b64, b32, b32, a64, a32, b32)
+    if c == 14:
+        # an output stored through a pointer
+        return '{ long *pp = &arr[%d]; asm("add %%0, %%1, %%2" : "=r"(*pp) : "r"(%s), "r"(%s)); }' % (
+            r.randint(0, 7), a64, b64)
     # asm inside a loop with an induction variable
     return 'for (int i = 0; i < %d; i++) asm("add %%0, %%0, %%1" : "+r"(%s) : "r"((long)i));' % (r.randint(1, 5), a64)
 
@@ -73,7 +99,7 @@ def gen_func(r, fi):
 
 
 def gen_file(r):
-    top = ['#include <stdio.h>',
+    top = ['#include <stdio.h>', '#include <arm_acle.h>',
            '#define H(...) (h = h * 1000003u + (unsigned long long)(__VA_ARGS__))',
            'unsigned long long h;', 'long g0 = 5, g1 = -7, g2 = 99;', 'long arr[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };']
     nf = r.randint(1, 3)

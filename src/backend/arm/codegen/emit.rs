@@ -233,6 +233,12 @@ pub struct ArmCodegen {
     pub(super) asm_scratch_idx: usize,
     /// Scratch register index for inline asm FP register allocation
     pub(super) asm_fp_scratch_idx: usize,
+    /// The current inline asm's plain "r" operands used in their allocated
+    /// registers, by value (asm_emitter.rs).
+    pub(super) asm_direct: FxHashMap<u32, &'static str>,
+    /// The allocated registers of the current asm's operand values, which
+    /// its scratch registers must avoid.
+    pub(super) asm_operand_regs: Vec<String>,
     /// Register allocator: value ID -> physical callee-saved register.
     pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
     /// Values known to be below 256 (byte loads and their zero extensions,
@@ -358,6 +364,8 @@ impl ArmCodegen {
             hfa_ret: None,
             asm_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
+            asm_direct: FxHashMap::default(),
+            asm_operand_regs: Vec::new(),
             reg_assignments: FxHashMap::default(),
             byte_values: FxHashSet::default(),
             mul_highs: FxHashMap::default(),
@@ -2400,7 +2408,10 @@ impl ArchCodegen for ArmCodegen {
 
     // ---- Inline asm / intrinsics (kept inline - has extra logic) ----
     fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], clobbers: &[String], operand_types: &[IrType], goto_labels: &[(String, BlockId)], input_symbols: &[Option<String>]) {
+        self.plan_asm_direct_operands(outputs, inputs, clobbers, operand_types, goto_labels.is_empty());
         emit_inline_asm_common(self, template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols);
+        self.asm_direct.clear();
+        self.asm_operand_regs.clear();
     }
     fn emit_intrinsic(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
         self.emit_intrinsic_arm(dest, op, dest_ptr, args);

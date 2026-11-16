@@ -295,6 +295,28 @@ pub fn constraint_is_memory_only(constraint: &str, is_arm: bool) -> bool {
     !has_reg && !has_tied
 }
 
+/// Which inline asm operands the register allocator may keep in registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AsmOperandRegs {
+    /// None: every operand value lives in a stack slot.
+    None,
+    /// All of them: the asm emitter checks reg_assignments everywhere (RISC-V).
+    All,
+    /// Only plain general-register operands (`asm_operand_is_plain_gp`), which
+    /// the AArch64 emitter uses in place.
+    PlainGp,
+}
+
+/// Whether an asm operand is a plain general register of integer or pointer
+/// type: an `"r"` input, or an `"=r"` or `"=&r"` output. No read-write,
+/// tied, memory, immediate or multi-alternative constraint.
+pub fn asm_operand_is_plain_gp(constraint: &str, is_output: bool, ty: Option<&IrType>) -> bool {
+    let plain = if is_output { constraint == "=r" || constraint == "=&r" } else { constraint == "r" };
+    plain && ty.is_some_and(|t| matches!(t,
+        IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        | IrType::I64 | IrType::U64 | IrType::Ptr))
+}
+
 /// Check whether a constraint requires an address (lvalue) rather than a value (rvalue).
 /// This covers both memory-only constraints (m, o, V, Q) and address constraints.
 ///

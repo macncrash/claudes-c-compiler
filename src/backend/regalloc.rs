@@ -30,6 +30,7 @@ use crate::ir::reexports::{
     IrFunction,
     Operand,
 };
+use super::inline_asm::{AsmOperandRegs, asm_operand_is_plain_gp};
 use super::liveness::{LiveInterval, LivenessResult, compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator};
 
 /// A physical register assignment.
@@ -67,10 +68,9 @@ pub struct RegAllocConfig {
     /// registers x3-x8, written while setting up arguments): only for values
     /// live at no call at all, not even as its argument or result.
     pub call_free_regs: Vec<PhysReg>,
-    /// Whether to allow inline asm operands to be register-allocated.
-    /// Only enable this when the backend's asm emitter checks reg_assignments
-    /// before falling back to stack access. Currently only RISC-V does this.
-    pub allow_inline_asm_regalloc: bool,
+    /// Which inline asm operands may be register-allocated: only those the
+    /// backend's asm emitter reads from and writes to their registers.
+    pub inline_asm_regalloc: AsmOperandRegs,
     /// Whether a value may use a caller-saved register when a register-args-
     /// only call (`liveness::is_reg_args_only_call`) is only where its live
     /// range starts (it is the call's result) or ends (it is only read as an
@@ -240,6 +240,25 @@ pub fn allocate_registers(
         }
     }
 
+    // A plain general-register asm output that the asm defines (a promoted
+    // variable, not a pointer to store through: no other instruction
+    // defines it), when the asm emitter writes it to its register.
+    if config.inline_asm_regalloc == AsmOperandRegs::PlainGp {
+        let defined: FxHashSet<u32> = func.blocks.iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| inst.dest().map(|d| d.0))
+            .collect();
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            if let Instruction::InlineAsm { outputs, operand_types, .. } = inst {
+                for (i, (constraint, val, _)) in outputs.iter().enumerate() {
+                    if !defined.contains(&val.0) && asm_operand_is_plain_gp(constraint, true, operand_types.get(i)) {
+                        eligible.insert(val.0);
+                    }
+                }
+            }
+        }
+    }
+
     // Exclude values used as pointers in instructions whose codegen paths use
     // resolve_slot_addr() directly (not register-aware).
     remove_ineligible_operands(func, &mut eligible, config);
@@ -256,7 +275,7 @@ pub fn allocate_registers(
     // Intervals are inclusive, so a value used by the instruction that defines
     // another never shares its register, except at the instructions in
     // `reuse_points` (see RegAllocConfig::dest_reuses_operand_reg).
-    let reuse_points = if config.dest_reuses_operand_reg { dest_reuse_points(func) } else { FxHashMap::default() };
+    let reuse_points = if config.dest_reuses_operand_reg { dest_reuse_points(func, config.inline_asm_regalloc == AsmOperandRegs::PlainGp) } else { FxHashMap::default() };
     // Whether a piece of `a` ending at `p` and a piece of `b` starting there
     // may share a register: the instruction at `p` defines `b` and reads `a`.
     let handoff = |a: u32, b: u32, p: u32| {
@@ -712,7 +731,27 @@ fn drop_cold_callee_saved(
 /// Program points (numbered as in liveness: one per instruction, then one
 /// for the block's terminator) of the instructions whose dest may take the
 /// register of an operand that dies there: point -> (dest, operands).
-fn dest_reuse_points(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<u32>)> {
+/// For an inline asm with one plain "=r" output and only plain "r" inputs:
+/// the output and its input values (see dest_reuse_points).
+pub(crate) fn asm_output_reuse(inst: &Instruction) -> Option<(u32, Vec<u32>)> {
+    let Instruction::InlineAsm { outputs, inputs, operand_types, goto_labels, .. } = inst else { return None };
+    let [(constraint, out, _)] = outputs.as_slice() else { return None };
+    if constraint != "=r" || !goto_labels.is_empty() || !asm_operand_is_plain_gp(constraint, true, operand_types.first()) {
+        return None;
+    }
+    let mut ops = Vec::new();
+    for (j, (c, op, _)) in inputs.iter().enumerate() {
+        if !asm_operand_is_plain_gp(c, false, operand_types.get(1 + j)) {
+            return None;
+        }
+        if let Operand::Value(v) = op {
+            ops.push(v.0);
+        }
+    }
+    Some((out.0, ops))
+}
+
+fn dest_reuse_points(func: &IrFunction, asm_outputs: bool) -> FxHashMap<u32, (u32, Vec<u32>)> {
     let mut points = FxHashMap::default();
     let mut point = 0u32;
     for block in &func.blocks {
@@ -726,6 +765,16 @@ fn dest_reuse_points(func: &IrFunction) -> FxHashMap<u32, (u32, Vec<u32>)> {
                 // Operands.)
                 let ops = inst.used_values();
                 points.insert(point, (dest.0, ops));
+            }
+            // An inline asm whose one output is a plain "=r" (not early
+            // clobber) and whose inputs are all plain "r": the output may take
+            // an input's register, as GCC allows (the asm reads its inputs
+            // before it writes such an output). AArch64's asm emitter then
+            // uses the register in place (plan_asm_direct_operands).
+            if asm_outputs {
+                if let Some(ops) = asm_output_reuse(inst) {
+                    points.insert(point, ops);
+                }
             }
             point += 1;
         }
@@ -1232,6 +1281,13 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
 /// This includes CallIndirect func pointers, Memcpy pointers, va_arg pointers,
 /// atomic pointers, StackRestore, and InlineAsm operands.
 fn remove_ineligible_operands(func: &IrFunction, eligible: &mut FxHashSet<u32>, config: &RegAllocConfig) {
+    // Under PlainGp an output must be one the asm defines: a pointer that
+    // another instruction defines is stored through, from its stack slot.
+    let defined: FxHashSet<u32> = if config.inline_asm_regalloc == AsmOperandRegs::PlainGp {
+        func.blocks.iter().flat_map(|b| &b.instructions).filter_map(|inst| inst.dest().map(|d| d.0)).collect()
+    } else {
+        FxHashSet::default()
+    };
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
@@ -1274,23 +1330,28 @@ fn remove_ineligible_operands(func: &IrFunction, eligible: &mut FxHashSet<u32>, 
                 Instruction::StackRestore { ptr } => {
                     eligible.remove(&ptr.0);
                 }
-                Instruction::InlineAsm { outputs, inputs, .. } => {
-                    if !config.allow_inline_asm_regalloc {
-                        // Inline asm operands are accessed via stack slots
-                        // in codegen. Exclude them from register allocation
-                        // unless the backend's asm emitter checks reg_assignments.
-                        for (_, val, _) in outputs {
+                Instruction::InlineAsm { outputs, inputs, operand_types, .. } => {
+                    // Inline asm operands are accessed via stack slots in
+                    // codegen, except those the backend's asm emitter reads
+                    // from and writes to registers (all of them on RISC-V,
+                    // the plain general-register ones on AArch64).
+                    let keep = |constraint: &str, is_output: bool, idx: usize| match config.inline_asm_regalloc {
+                        AsmOperandRegs::All => true,
+                        AsmOperandRegs::None => false,
+                        AsmOperandRegs::PlainGp => asm_operand_is_plain_gp(constraint, is_output, operand_types.get(idx)),
+                    };
+                    for (i, (constraint, val, _)) in outputs.iter().enumerate() {
+                        if !keep(constraint, true, i) || defined.contains(&val.0) {
                             eligible.remove(&val.0);
                         }
-                        for (_, op, _) in inputs {
-                            if let Operand::Value(v) = op {
+                    }
+                    for (j, (constraint, op, _)) in inputs.iter().enumerate() {
+                        if let Operand::Value(v) = op {
+                            if !keep(constraint, false, outputs.len() + j) {
                                 eligible.remove(&v.0);
                             }
                         }
                     }
-                    // When allow_inline_asm_regalloc is true (RISC-V), the
-                    // asm emitter checks reg_assignments before falling back
-                    // to stack slot access.
                 }
                 _ => {}
             }
@@ -1527,7 +1588,7 @@ mod tests {
         ];
         let config = |save| RegAllocConfig {
             available_regs: Vec::new(), caller_saved_regs: vec![PhysReg(10), PhysReg(11)], call_free_regs: Vec::new(),
-            allow_inline_asm_regalloc: false, caller_saved_at_call_boundaries: true, allow_ptr_operand_regalloc: false,
+            inline_asm_regalloc: AsmOperandRegs::None, caller_saved_at_call_boundaries: true, allow_ptr_operand_regalloc: false,
             dest_reuses_operand_reg: false, save_around_calls: save, gpr_casts: FxHashSet::default(),
         };
         let r = allocate_registers(&func, &config(true));

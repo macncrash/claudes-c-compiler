@@ -81,7 +81,7 @@ impl X86Codegen {
         let (reg_assigned, cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, Vec::new(), &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
-            false,
+            crate::backend::inline_asm::AsmOperandRegs::None,
             false,
             false,
             false,

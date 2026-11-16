@@ -9,9 +9,9 @@ use crate::ir::reexports::{
 };
 use crate::common::types::IrType;
 use crate::backend::state::CodegenState;
-use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand};
+use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand, asm_operand_is_plain_gp};
 use crate::backend::regalloc::PhysReg;
-use super::emit::{ArmCodegen, is_arm_fp_reg};
+use super::emit::{ArmCodegen, is_arm_fp_reg, callee_saved_name};
 
 /// AArch64 scratch registers for inline asm (caller-saved temporaries).
 pub(super) const ARM_GP_SCRATCH: &[&str] = &["x9", "x10", "x11", "x12", "x13", "x14", "x15", "x19", "x20", "x21"];
@@ -99,6 +99,15 @@ impl InlineAsmEmitter for ArmCodegen {
     }
 
     fn setup_operand_metadata(&self, op: &mut AsmOperand, val: &Operand, _is_output: bool) {
+        // A plain "r" operand in its allocated register (plan_asm_direct_operands).
+        if matches!(op.kind, AsmOperandKind::GpReg) {
+            if let Operand::Value(v) = val {
+                if let Some(reg) = self.asm_direct.get(&v.0) {
+                    op.reg = reg.to_string();
+                    return;
+                }
+            }
+        }
         if matches!(op.kind, AsmOperandKind::Memory) {
             if let Operand::Value(v) = val {
                 if let Some(slot) = self.state.get_slot(v.0) {
@@ -172,7 +181,7 @@ impl InlineAsmEmitter for ArmCodegen {
                 } else {
                     format!("x{}", 9 + idx)
                 };
-                if !excluded.iter().any(|e| e == &reg) {
+                if !excluded.iter().any(|e| e == &reg) && !self.asm_operand_regs.contains(&reg) {
                     // If this is a callee-saved register (x19-x28), ensure it is
                     // saved/restored in the prologue/epilogue.
                     let reg_num = reg.strip_prefix('x')
@@ -228,6 +237,15 @@ impl InlineAsmEmitter for ArmCodegen {
                 }
             }
             Operand::Value(v) => {
+                // A value in an allocated register (a plain "r" operand, or
+                // the source of a tied one): used in place, or moved.
+                if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    let src = callee_saved_name(phys);
+                    if reg != src {
+                        self.state.emit_fmt(format_args!("    mov {}, {}", reg, src));
+                    }
+                    return;
+                }
                 if let Some(slot) = self.state.get_slot(v.0) {
                     if is_fp {
                         // Load FP value from stack: use ldr with d/s register form.
@@ -339,6 +357,17 @@ impl InlineAsmEmitter for ArmCodegen {
         }
         let reg = &op.reg;
         let is_fp = is_arm_fp_reg(reg);
+        // An output the asm defines, in an allocated register: written there
+        // in place, or moved (plan_asm_direct_operands).
+        if let Some(&phys) = self.reg_assignments.get(&ptr.0) {
+            if self.state.asm_output_values.contains(&ptr.0) {
+                let dst = callee_saved_name(phys);
+                if reg != dst {
+                    self.state.emit_fmt(format_args!("    mov {}, {}", dst, reg));
+                }
+                return;
+            }
+        }
         if let Some(slot) = self.state.get_slot(ptr.0) {
             if is_fp {
                 // Store FP/SIMD register output. fmov requires d/s form, not v.
@@ -423,6 +452,56 @@ impl InlineAsmEmitter for ArmCodegen {
 /// uses this convention extensively in inline assembly (e.g., `register unsigned long
 /// r0 asm("r0")` in arm-smccc.h). This function maps these aliases to canonical
 /// AArch64 register names so the assembler accepts them.
+/// The number of an AArch64 general register named `xN`, `wN` or `rN`.
+fn gp_reg_number(name: &str) -> Option<u8> {
+    let digits = name.strip_prefix('x').or_else(|| name.strip_prefix('w')).or_else(|| name.strip_prefix('r'))?;
+    digits.parse::<u8>().ok().filter(|&n| n <= 30)
+}
+
+impl ArmCodegen {
+    /// Before an inline asm: its plain "r" operands whose values the
+    /// register allocator kept in registers (AsmOperandRegs::PlainGp) use
+    /// those registers in place, with no move. An input in a register the
+    /// asm clobbers, and an output whose register another output or an input
+    /// is in, are instead moved through a scratch register: except that the
+    /// one plain "=r" output of an asm with only plain "r" inputs may share
+    /// an input's register, as GCC allows (regalloc::asm_output_reuse lets
+    /// the allocator give it one). No scratch register is one of these.
+    pub(super) fn plan_asm_direct_operands(&mut self, outputs: &[(String, Value, Option<String>)],
+                                           inputs: &[(String, Operand, Option<String>)], clobbers: &[String],
+                                           operand_types: &[IrType], no_goto: bool) {
+        self.asm_direct.clear();
+        let shares_input = no_goto && outputs.len() == 1 && outputs[0].0 == "=r"
+            && asm_operand_is_plain_gp(&outputs[0].0, true, operand_types.first())
+            && inputs.iter().enumerate().all(|(j, (c, _, _))| asm_operand_is_plain_gp(c, false, operand_types.get(1 + j)));
+        self.asm_operand_regs.clear();
+        let clobbered: Vec<u8> = clobbers.iter().filter_map(|c| gp_reg_number(c)).collect();
+        let mut input_regs: Vec<u8> = Vec::new();
+        for (_, op, _) in inputs {
+            let Operand::Value(v) = op else { continue };
+            let Some(&r) = self.reg_assignments.get(&v.0) else { continue };
+            input_regs.push(r.0);
+            if !clobbered.contains(&r.0) {
+                self.asm_direct.insert(v.0, callee_saved_name(r));
+            }
+        }
+        let mut output_regs: Vec<u8> = Vec::new();
+        for (_, v, _) in outputs {
+            let Some(&r) = self.reg_assignments.get(&v.0) else { continue };
+            if !self.state.asm_output_values.contains(&v.0) {
+                continue;
+            }
+            if !clobbered.contains(&r.0) && (shares_input || !input_regs.contains(&r.0)) && !output_regs.contains(&r.0) {
+                self.asm_direct.insert(v.0, callee_saved_name(r));
+            }
+            output_regs.push(r.0);
+        }
+        self.asm_operand_regs = input_regs.iter().chain(&output_regs)
+            .map(|&n| format!("x{}", n))
+            .collect();
+    }
+}
+
 pub(super) fn normalize_aarch64_register(name: &str) -> String {
     if let Some(suffix) = name.strip_prefix('r') {
         if let Ok(n) = suffix.parse::<u32>() {

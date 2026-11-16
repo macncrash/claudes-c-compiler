@@ -103,7 +103,7 @@ impl ArmCodegen {
         let (mut reg_assigned, mut cached_liveness) = crate::backend::generation::run_regalloc_and_merge_clobbers(
             func, available_regs, caller_saved_regs, call_free, &asm_clobbered_regs,
             &mut self.reg_assignments, &mut self.used_callee_saved,
-            false,
+            crate::backend::inline_asm::AsmOperandRegs::PlainGp, // plain "r" operands used in place (asm_emitter.rs)
             true, // argument setup leaves x10-x15 intact (calls.rs)
             true, // memcpy and indirect calls read register-assigned pointers
             true, // simple ops read their operands before writing the dest

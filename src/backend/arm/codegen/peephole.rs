@@ -2079,7 +2079,8 @@ fn classify_access(line: &str, kind: LineKind) -> Access {
         | "umull" | "smulh" | "umulh" | "sdiv" | "udiv" | "neg" | "mvn" | "sxtw" | "sxth"
         | "sxtb" | "uxtb" | "uxth" | "cset" | "csetm" | "csel" | "csinc" | "csinv"
         | "csneg" | "cinc" | "cneg" | "clz" | "rbit" | "rev" | "rev16" | "rev32" | "ubfx" | "sbfx"
-        | "ubfiz" | "sbfiz" | "smaddl" | "smsubl" | "fmov" | "fcvtzs" | "fcvtzu" | "umov" if !has_symbol => {
+        | "ubfiz" | "sbfiz" | "smaddl" | "smsubl" | "fmov" | "fcvtzs" | "fcvtzu" | "umov"
+        | "cls" | "crc32b" | "crc32h" | "crc32w" | "crc32x" | "crc32cb" | "crc32ch" | "crc32cw" | "crc32cx" if !has_symbol => {
             Access::Write { deletable: true }
         }
         // Flag-setting arithmetic writes its destination too; the flags may
@@ -5341,6 +5342,9 @@ fn eliminate_redundant_zero_extends(lines: &mut [String], kinds: &mut [LineKind]
             "and" => low_mask_bits(last_operand(srcs)).filter(|_| srcs.split(',').count() == 2),
             "uxtb" => Some(8),
             "uxth" => Some(16),
+            // `mov wN, wN` zero-extends xN: nothing after any w write of N
+            // (an inline asm's `crc32cx wN, ...` as much as an `add`).
+            "mov" if dest.starts_with('w') && dest == src && srcs.split(',').count() == 1 => Some(32),
             _ => None,
         };
         if let (Some(w), Some(d), Some(s)) = (width, gpr_operand(dest), gpr_operand(src)) {
@@ -9806,6 +9810,19 @@ f:
         let input = "    ldr x14, [x10]\n    and x0, x14, #0xff\n    str x0, [x9]\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("and x0, x14, #0xff"), "{}", result);
+    }
+
+    #[test]
+    fn test_w_self_move_after_w_write_removed() {
+        // A w write (here an inline asm's crc32cx, from arm_acle.h) already
+        // zero-extends: a CRC loop's `mov w22, w22` was on its critical path.
+        let input = "    crc32cx w22, w22, x23\n    mov w22, w22\n    str x22, [x9]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov w22, w22"), "{}", result);
+        // After a 64-bit write it zero-extends, and stays.
+        let input = "    lsr x22, x10, #3\n    mov w22, w22\n    str x22, [x9]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov w22, w22"), "{}", result);
     }
 
     #[test]

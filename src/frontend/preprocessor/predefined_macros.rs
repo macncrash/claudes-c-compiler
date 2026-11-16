@@ -453,6 +453,8 @@ impl Preprocessor {
                 self.define_simple_macro("__ARM_SIZEOF_MINIMAL_ENUM", "4");
                 self.define_simple_macro("__ARM_SIZEOF_WCHAR_T", "4");
                 // Features
+                // include/arm_acle.h has the ACLE scalar intrinsics.
+                self.define_simple_macro("__ARM_ACLE", "200");
                 self.define_simple_macro("__ARM_FEATURE_CLZ", "1");
                 self.define_simple_macro("__ARM_FEATURE_FMA", "1");
                 self.define_simple_macro("__ARM_FEATURE_IDIV", "1");
@@ -686,6 +688,9 @@ impl Preprocessor {
             // intrinsics exist.
             ("__ARM_NEON__", "1"), ("__ARM_NEON_FP", "0xE"),
             ("__ARM_FEATURE_CRYPTO", "1"), ("__ARM_FEATURE_AES", "1"), ("__ARM_FEATURE_SHA2", "1"),
+            // So are the CRC32 instructions (include/arm_acle.h); Linux arm64
+            // leaves them to the CPU (they are optional before Armv8.1).
+            ("__ARM_FEATURE_CRC32", "1"),
             ("__LITTLE_ENDIAN__", "1"), ("__DYNAMIC__", "1"),
             ("__USER_LABEL_PREFIX__", "_"),
             // int64_t is `long long` on Darwin (it is `long` on LP64 Linux).
