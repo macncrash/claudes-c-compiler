@@ -83,7 +83,7 @@ int main(void)
         for (int i = 0; i < 16; i++)
             sum += out[i];
     }
-    printf("table %.6f\n", sum);
+    printf("table %.4f\n", sum);   /* fma contraction moves the last digits */
 
     double ny, nx = rot(1.0, 2.0, 0.7, &ny);
     printf("rot %.9f %.9f\n", nx, ny);
