@@ -190,6 +190,13 @@ impl ModRef {
     pub(crate) fn compute(module: &IrModule) -> ModRef {
         let candidates: Vec<&IrFunction> = module.functions.iter().filter(|f| summarizable(f)).collect();
         let mut mr = ModRef::default();
+        // libgcc / compiler-rt complex multiply and divide (complex.rs):
+        // pure arithmetic, no errno, on every target.
+        for name in ["__muldc3", "__mulsc3", "__divdc3", "__divsc3"] {
+            if !module.functions.iter().any(|f| f.name == name && !f.is_declaration) {
+                mr.effects.insert(name.to_string(), (FnEffects::default(), 4));
+            }
+        }
         // Apple's libm never sets errno (math_errhandling is MATH_ERREXCEPT)
         // and these touch no memory, so a call to one writes nothing its
         // caller sees. Not where the module defines the name itself.

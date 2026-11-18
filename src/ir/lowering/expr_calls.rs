@@ -356,7 +356,7 @@ impl Lowerer {
     /// Returns Some(result) if the return was complex, None otherwise.
     /// Note: on i686, ComplexDouble and ComplexLongDouble use sret (handled before this),
     /// so this function only needs to handle ComplexFloat on i686.
-    fn handle_complex_return(&mut self, dest: Value, ret_ct: &CType) -> Option<Operand> {
+    pub(super) fn handle_complex_return(&mut self, dest: Value, ret_ct: &CType) -> Option<Operand> {
         match ret_ct {
             CType::ComplexFloat => {
                 if self.uses_packed_complex_float() {

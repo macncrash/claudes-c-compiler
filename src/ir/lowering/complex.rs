@@ -13,6 +13,7 @@
 use crate::common::types::AliasClass;
 use crate::frontend::parser::ast::{BinOp, Expr, UnaryOp};
 use crate::ir::reexports::{
+    CallInfo,
     GlobalInit,
     Instruction,
     IrBinOp,
@@ -20,6 +21,7 @@ use crate::ir::reexports::{
     IrConst,
     IrUnaryOp,
     Operand,
+    Terminator,
     Value,
 };
 use crate::common::types::{AddressSpace, IrType, CType};
@@ -331,10 +333,80 @@ impl Lowerer {
 
         let result = self.alloca_complex(ctype);
         self.store_complex_parts(result, Operand::Value(real), Operand::Value(imag), ctype);
+
+        // Annex G (G.5.1): when both parts are NaN, an infinite operand may
+        // still make the product infinite. __muldc3 / __mulsc3 work that
+        // out, as clang and gcc call them; only then, so the common case
+        // stays inline.
+        if let Some((name, helper_ct, ret_ty)) = self.complex_helper("mul", comp_ty) {
+            let (slow, check_imag, join) = (self.fresh_label(), self.fresh_label(), self.fresh_label());
+            let real_nan = self.emit_cmp_val(IrCmpOp::Ne, Operand::Value(real), Operand::Value(real), comp_ty);
+            self.terminate(Terminator::CondBranch { cond: Operand::Value(real_nan), true_label: check_imag, false_label: join });
+            self.start_block(check_imag);
+            let imag_nan = self.emit_cmp_val(IrCmpOp::Ne, Operand::Value(imag), Operand::Value(imag), comp_ty);
+            self.terminate(Terminator::CondBranch { cond: Operand::Value(imag_nan), true_label: slow, false_label: join });
+            self.start_block(slow);
+            let fixed = self.call_complex_helper(&name, &helper_ct, ret_ty, comp_ty, [a, b, c, d]);
+            let (re, im) = (self.load_complex_real(fixed, ctype), self.load_complex_imag(fixed, ctype));
+            self.store_complex_parts(result, re, im, ctype);
+            self.terminate(Terminator::Branch(join));
+            self.start_block(join);
+        }
         Operand::Value(result)
     }
 
-    /// Lower complex division: (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
+    /// The libgcc / compiler-rt routine for complex `op` ("mul" or "div")
+    /// on components of `comp_ty`, with the complex type whose return
+    /// handle_complex_return reads and the call's IR return type; None where
+    /// the result comes back in memory (i686 double) or for long double.
+    fn complex_helper(&self, op: &str, comp_ty: IrType) -> Option<(String, CType, IrType)> {
+        match comp_ty {
+            IrType::F64 if self.decomposes_complex_double() => Some((format!("__{}dc3", op), CType::ComplexDouble, IrType::F64)),
+            IrType::F32 => {
+                let ret = if self.uses_packed_complex_float() {
+                    IrType::F64 // x86-64: both parts packed in xmm0
+                } else if !self.decomposes_complex_float() {
+                    IrType::I64 // i686: in eax:edx
+                } else {
+                    IrType::F32 // s0/s1, fa0/fa1
+                };
+                Some((format!("__{}sc3", op), CType::ComplexFloat, ret))
+            }
+            _ => None,
+        }
+    }
+
+    /// Call `name(a, b, c, d)`, returning a pointer to its complex result.
+    fn call_complex_helper(&mut self, name: &str, ct: &CType, ret_ty: IrType, comp_ty: IrType, args: [Operand; 4]) -> Value {
+        let dest = self.fresh_value();
+        self.emit(Instruction::Call {
+            func: name.to_string(),
+            info: CallInfo {
+                dest: Some(dest),
+                args: args.to_vec(),
+                arg_types: vec![comp_ty; 4],
+                return_type: ret_ty,
+                is_variadic: false,
+                num_fixed_args: 4,
+                struct_arg_sizes: vec![None; 4],
+                struct_arg_aligns: vec![None; 4],
+                struct_arg_classes: vec![Vec::new(); 4],
+                struct_arg_riscv_float_classes: vec![None; 4],
+                is_sret: false,
+                is_fastcall: false,
+                ret_eightbyte_classes: Vec::new(),
+            },
+        });
+        match self.handle_complex_return(dest, ct) {
+            Some(Operand::Value(p)) => p,
+            _ => unreachable!("complex_helper only names types handle_complex_return stores"),
+        }
+    }
+
+    /// Lower complex division. Where the target has it, __divdc3 / __divsc3
+    /// as clang and gcc call: scaled so c² + d² neither overflows nor
+    /// underflows, and with Annex G's infinities and zeros (G.5.1).
+    /// Otherwise ((ac+bd) + (bc-ad)i) / (c²+d²).
     pub(super) fn lower_complex_div(&mut self, lhs_ptr: Value, rhs_ptr: Value, ctype: &CType) -> Operand {
         let comp_ty = Self::complex_component_ir_type(ctype);
 
@@ -342,6 +414,13 @@ impl Lowerer {
         let b = self.load_complex_imag(lhs_ptr, ctype);
         let c = self.load_complex_real(rhs_ptr, ctype);
         let d = self.load_complex_imag(rhs_ptr, ctype);
+        if let Some((name, helper_ct, ret_ty)) = self.complex_helper("div", comp_ty) {
+            let q = self.call_complex_helper(&name, &helper_ct, ret_ty, comp_ty, [a, b, c, d]);
+            let (re, im) = (self.load_complex_real(q, ctype), self.load_complex_imag(q, ctype));
+            let result = self.alloca_complex(ctype);
+            self.store_complex_parts(result, re, im, ctype);
+            return Operand::Value(result);
+        }
 
         // denom = c*c + d*d
         let cc = self.emit_binop_val(IrBinOp::Mul, c, c, comp_ty);
@@ -847,11 +926,30 @@ impl Lowerer {
                 let (a, ai) = self.eval_complex_parts(lhs)?;
                 let (b, bi) = self.eval_complex_parts(rhs)?;
                 Some(match (ai, bi) {
-                    // (a+xi)(b+yi) = (ab-xy) + (ay+xb)i
-                    (Some(x), Some(y)) => (a * b - x * y, Some(a * y + x * b)),
+                    // (a+xi)(b+yi), as __muldc3 computes it at run time.
+                    (Some(x), Some(y)) => {
+                        let (re, im) = annex_g_mul(a, x, b, y);
+                        (re, Some(im))
+                    }
                     (Some(x), None) => (a * b, Some(x * b)),
                     (None, Some(y)) => (a * b, Some(a * y)),
                     (None, None) => (a * b, None),
+                })
+            }
+            // Once fell through to the real evaluator, which gave 0: a
+            // static (2+3i)/(4-1i) was 0 + 0i.
+            Expr::BinaryOp(BinOp::Div, lhs, rhs, _) => {
+                let (a, ai) = self.eval_complex_parts(lhs)?;
+                let (b, bi) = self.eval_complex_parts(rhs)?;
+                Some(match (ai, bi) {
+                    // Both real: the real evaluator's division (3 / 2 is 1).
+                    (None, None) => (self.eval_const_expr(expr)?.to_f64()?, None),
+                    // A real divisor divides each part (Annex G).
+                    (Some(x), None) => (a / b, Some(x / b)),
+                    (ai, Some(y)) => {
+                        let (re, im) = annex_g_div(a, ai.unwrap_or(0.0), b, y);
+                        (re, Some(im))
+                    }
                 })
             }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
@@ -859,6 +957,36 @@ impl Lowerer {
                 Some((-a, ai.map(|x| -x)))
             }
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_complex_parts(inner),
+            // These too fell through to the real evaluator and gave 0.
+            // ~ on a complex value is its conjugate (GNU); on an integer, ~.
+            Expr::UnaryOp(UnaryOp::BitNot, inner, _) => match self.eval_complex_parts(inner)? {
+                (a, Some(x)) => Some((a, Some(-x))),
+                (_, None) => Some((self.eval_const_expr(expr)?.to_f64()?, None)),
+            },
+            Expr::Conditional(cond, then_e, else_e, _) => {
+                let taken = if self.eval_const_expr(cond)?.is_nonzero() { then_e } else { else_e };
+                self.eval_complex_parts(taken)
+            }
+            Expr::GnuConditional(cond, else_e, _) => {
+                let (a, ai) = self.eval_complex_parts(cond)?;
+                if a != 0.0 || ai.is_some_and(|x| x != 0.0) { Some((a, ai)) } else { self.eval_complex_parts(else_e) }
+            }
+            Expr::FunctionCall(func, args, _)
+                if matches!(func.as_ref(), Expr::Identifier(n, _) if n == "__builtin_complex") && args.len() == 2 =>
+            {
+                let re = self.eval_const_expr(&args[0])?.to_f64()?;
+                let im = self.eval_const_expr(&args[1])?.to_f64()?;
+                Some((re, Some(im)))
+            }
+            // == and != compare both parts; the result is an int.
+            Expr::BinaryOp(op @ (BinOp::Eq | BinOp::Ne), lhs, rhs, _)
+                if self.expr_ctype(lhs).is_complex() || self.expr_ctype(rhs).is_complex() =>
+            {
+                let (a, ai) = self.eval_complex_parts(lhs)?;
+                let (b, bi) = self.eval_complex_parts(rhs)?;
+                let eq = a == b && ai.unwrap_or(0.0) == bi.unwrap_or(0.0);
+                Some((if eq == (*op == BinOp::Eq) { 1.0 } else { 0.0 }, None))
+            }
             // A cast to a complex type gives a real value a +0 imaginary
             // part; one to a real type drops the imaginary part.
             Expr::Cast(ts, inner, _) => {
@@ -1048,5 +1176,155 @@ impl Lowerer {
         *struct_arg_sizes = new_struct_sizes;
         *struct_arg_aligns = new_struct_aligns;
         *struct_arg_classes = new_struct_classes;
+    }
+}
+
+// Compile-time complex multiply and divide, ported from compiler-rt's
+// __muldc3 and __divdc3 (C11 Annex G G.5.1), so a constant folds to the
+// value the run-time call gives.
+
+/// `copysign(if inf { 1 } else { 0 }, v)`: Annex G's "box" of an infinite part.
+fn inf_box(v: f64) -> f64 {
+    (if v.is_infinite() { 1.0f64 } else { 0.0 }).copysign(v)
+}
+
+/// A NaN part replaced by a zero of its sign.
+fn nan_to_zero(v: f64) -> f64 {
+    if v.is_nan() { 0.0f64.copysign(v) } else { v }
+}
+
+/// (a + bi)(c + di).
+pub(crate) fn annex_g_mul(mut a: f64, mut b: f64, mut c: f64, mut d: f64) -> (f64, f64) {
+    let (ac, bd, ad, bc) = (a * c, b * d, a * d, b * c);
+    let (mut re, mut im) = (ac - bd, ad + bc);
+    if re.is_nan() && im.is_nan() {
+        let mut recalc = false;
+        if a.is_infinite() || b.is_infinite() {
+            a = inf_box(a);
+            b = inf_box(b);
+            c = nan_to_zero(c);
+            d = nan_to_zero(d);
+            recalc = true;
+        }
+        if c.is_infinite() || d.is_infinite() {
+            c = inf_box(c);
+            d = inf_box(d);
+            a = nan_to_zero(a);
+            b = nan_to_zero(b);
+            recalc = true;
+        }
+        if !recalc && (ac.is_infinite() || bd.is_infinite() || ad.is_infinite() || bc.is_infinite()) {
+            a = nan_to_zero(a);
+            b = nan_to_zero(b);
+            c = nan_to_zero(c);
+            d = nan_to_zero(d);
+            recalc = true;
+        }
+        if recalc {
+            re = f64::INFINITY * (a * c - b * d);
+            im = f64::INFINITY * (a * d + b * c);
+        }
+    }
+    (re, im)
+}
+
+/// (a + bi) / (c + di), scaled by a power of two so c² + d² stays in range.
+pub(crate) fn annex_g_div(a: f64, b: f64, mut c: f64, mut d: f64) -> (f64, f64) {
+    let logbw = logb(c.abs().max(d.abs()));
+    let mut ilogbw = 0;
+    if logbw.is_finite() {
+        ilogbw = logbw as i32;
+        c = scalbn(c, -ilogbw);
+        d = scalbn(d, -ilogbw);
+    }
+    let denom = c * c + d * d;
+    let mut re = scalbn((a * c + b * d) / denom, -ilogbw);
+    let mut im = scalbn((b * c - a * d) / denom, -ilogbw);
+    if re.is_nan() && im.is_nan() {
+        if denom == 0.0 && (!a.is_nan() || !b.is_nan()) {
+            re = f64::INFINITY.copysign(c) * a;
+            im = f64::INFINITY.copysign(c) * b;
+        } else if (a.is_infinite() || b.is_infinite()) && c.is_finite() && d.is_finite() {
+            let (a, b) = (inf_box(a), inf_box(b));
+            re = f64::INFINITY * (a * c + b * d);
+            im = f64::INFINITY * (b * c - a * d);
+        } else if logbw.is_infinite() && logbw > 0.0 && a.is_finite() && b.is_finite() {
+            let (c, d) = (inf_box(c), inf_box(d));
+            re = 0.0 * (a * c + b * d);
+            im = 0.0 * (b * c - a * d);
+        }
+    }
+    (re, im)
+}
+
+/// C's logb: the unbiased exponent, subnormals included; -inf for zero.
+fn logb(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x.is_infinite() {
+        return f64::INFINITY;
+    }
+    if x == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    let bits = x.abs().to_bits();
+    let exp = (bits >> 52) as i64;
+    if exp == 0 {
+        // Subnormal: the top set bit of the fraction gives the exponent.
+        return (-1011 - bits.leading_zeros() as i64) as f64;
+    }
+    (exp - 1023) as f64
+}
+
+/// C's scalbn, as musl computes it: x * 2^n with one rounding.
+fn scalbn(mut x: f64, mut n: i32) -> f64 {
+    let p1023 = f64::from_bits(0x7fe0_0000_0000_0000);
+    let pm969 = f64::from_bits(0x0010_0000_0000_0000) * f64::from_bits(0x4340_0000_0000_0000);
+    if n > 1023 {
+        x *= p1023;
+        n -= 1023;
+        if n > 1023 {
+            x *= p1023;
+            n -= 1023;
+            n = n.min(1023);
+        }
+    } else if n < -1022 {
+        x *= pm969;
+        n += 1022 - 53;
+        if n < -1022 {
+            x *= pm969;
+            n += 1022 - 53;
+            n = n.max(-1022);
+        }
+    }
+    x * f64::from_bits(((0x3ff + n) as u64) << 52)
+}
+
+#[cfg(test)]
+mod annex_g_tests {
+    use super::*;
+
+    #[test]
+    fn logb_and_scalbn_match_c() {
+        assert_eq!(logb(1.0), 0.0);
+        assert_eq!(logb(0.75), -1.0);
+        assert_eq!(logb(1e300), 996.0);
+        assert_eq!(logb(f64::from_bits(1)), -1074.0);
+        assert_eq!(logb(f64::from_bits(0x000f_ffff_ffff_ffff)), -1023.0);
+        assert_eq!(logb(0.0), f64::NEG_INFINITY);
+        assert_eq!(scalbn(1.0, -1074), f64::from_bits(1));
+        assert_eq!(scalbn(f64::from_bits(1), 1074), 1.0);
+        assert_eq!(scalbn(3.0, 1023), f64::INFINITY);
+        assert_eq!(scalbn(1.5, 10), 1536.0);
+    }
+
+    #[test]
+    fn infinities_survive() {
+        assert_eq!(annex_g_mul(f64::INFINITY, f64::NAN, 1.0, 1.0).0, f64::INFINITY);
+        let (re, im) = annex_g_div(1.0, 1.0, 0.0, 0.0);
+        assert_eq!((re, im), (f64::INFINITY, f64::INFINITY));
+        assert_eq!(annex_g_div(1e300, 1e300, 1e300, 1e300), (1.0, 0.0));
+        assert_eq!(annex_g_div(1.0, 1.0, f64::INFINITY, 0.0), (0.0, 0.0));
     }
 }
