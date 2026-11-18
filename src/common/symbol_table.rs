@@ -9,6 +9,9 @@ pub struct Symbol {
     /// Explicit alignment from _Alignas or __attribute__((aligned(N))).
     /// Used by _Alignof(var) to return the correct alignment per C11 6.2.8p3.
     pub explicit_alignment: Option<usize>,
+    /// The object itself is const-qualified (`const int x`, not `const char
+    /// *p`), so it may not be assigned, incremented or decremented.
+    pub readonly: bool,
 }
 
 /// A scope in the symbol table.

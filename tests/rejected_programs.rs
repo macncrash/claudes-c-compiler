@@ -84,6 +84,41 @@ fn call_of_an_object_that_is_not_a_function() {
 }
 
 #[test]
+fn modification_of_what_is_not_a_modifiable_lvalue() {
+    // Once accepted silently: `--2` compiled, `f() = 1` and `c = 2` for a
+    // const c too (C11 6.5.16p2, 6.5.2.4p1, 6.5.3.1p1, 6.5.3.2p1).
+    let pre = "int g, a[3]; struct S { int m; } s; struct C { const int m; } cs; int f(void);\n\
+               const int c = 1; enum { E = 1 }; typedef const int CI; typedef int *IP;\n";
+    let not_lvalue = "lvalue required as left operand of assignment";
+    for (name, body, expected) in [
+        ("dec_constant", "--2", "lvalue required as decrement operand"),
+        ("inc_rvalue", "(x + 1)++", "lvalue required as increment operand"),
+        ("assign_constant", "3 = x", not_lvalue),
+        ("assign_call", "f() = 1", not_lvalue),
+        ("assign_cast", "(int)x = 1", not_lvalue),
+        ("assign_conditional", "(x ? x : g) = 1", not_lvalue),
+        ("assign_comma", "(x, g) = 1", not_lvalue),
+        ("assign_assignment", "(x = 1) = 2", not_lvalue),
+        ("assign_preinc", "++x = 3", not_lvalue),
+        ("compound_rvalue", "(x + 0) *= 2", not_lvalue),
+        ("assign_function", "f = 0", not_lvalue),
+        ("assign_enum_constant", "E = 2", not_lvalue),
+        ("assign_array", "a = 0", "assignment to expression with array type"),
+        ("inc_array", "a++", "lvalue required as increment operand"),
+        ("assign_const", "c = 2", "assignment of read-only variable 'c'"),
+        ("inc_const_param", "k++", "increment of read-only variable 'k'"),
+        ("assign_const_typedef", "CI v = 1; v = 2", "assignment of read-only variable 'v'"),
+        ("assign_const_pointer", "char *const q = 0; q = 0", "assignment of read-only variable 'q'"),
+        ("assign_const_typedef_pointer", "const IP w = 0; w = 0", "assignment of read-only variable 'w'"),
+        ("assign_const_member", "cs.m = 1", "assignment of read-only member 'm'"),
+        ("address_of_rvalue", "int *p = &(x + 1)", "lvalue required as unary '&' operand"),
+    ] {
+        let source = format!("{pre}void h(int x, const int k) {{ {body}; }}\n{MAIN}");
+        assert_rejected(name, &source, expected);
+    }
+}
+
+#[test]
 fn integer_operator_on_a_float() {
     // Once a panic in the backend, which has no float `and`.
     for (name, expr) in [("and", "d & 1"), ("or", "1 | d"), ("xor", "d ^ d"), ("mod", "d % 2"), ("shl", "d << 1"), ("shr", "1 >> d")] {

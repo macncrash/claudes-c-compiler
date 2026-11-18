@@ -48,6 +48,16 @@ use std::cell::RefCell;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Outcome of a case segment in a switch statement for -Wreturn-type analysis.
+/// An operand of assignment, ++/-- or unary & (see lvalue_kind).
+enum LvalueKind {
+    Modifiable,
+    NotLvalue,
+    Array,
+    Function,
+    /// A const object or member, named for the message.
+    ReadOnly(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SwitchSegmentOutcome {
     /// Segment returns or otherwise diverges (goto, continue to outer loop, infinite loop)
@@ -246,6 +256,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+            readonly: false,
         });
 
         // Push scope for function body (both symbol table and type context,
@@ -262,10 +273,12 @@ impl SemanticAnalyzer {
         for param in &func.params {
             if let Some(name) = &param.name {
                 let ty = type_builder::param_decl_ctype(self, param);
+                let readonly = self.object_is_const(param.is_const, &param.type_spec, &ty, false);
                 self.symbol_table.declare(Symbol {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+                    readonly,
                 });
             }
         }
@@ -529,10 +542,18 @@ impl SemanticAnalyzer {
                 decl.alignment
             };
 
+            let has_ptr = init_decl.derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+            let readonly = self.object_is_const(decl.is_const(), &decl.type_spec, &full_type, has_ptr);
+
             self.symbol_table.declare(Symbol {
+
                 name: init_decl.name.clone(),
+
                 ty: full_type,
+
                 explicit_alignment,
+
+                readonly,
             });
 
             // Analyze array size expressions in derived declarators
@@ -774,6 +795,7 @@ impl SemanticAnalyzer {
                 name: variant.name.clone(),
                 ty: sym_ty,
                 explicit_alignment: None,
+                readonly: false,
             });
             values.push((variant.name.clone(), self.enum_counter));
             self.enum_counter += 1;
@@ -782,7 +804,7 @@ impl SemanticAnalyzer {
         self.result.type_context.set_enumerator_types(&values, is_packed, fixed.as_ref());
         for (name, _) in &values {
             if let Some(ty) = self.result.type_context.enumerator_ctype(name) {
-                self.symbol_table.declare(Symbol { name: name.clone(), ty, explicit_alignment: None });
+                self.symbol_table.declare(Symbol { name: name.clone(), ty, explicit_alignment: None, readonly: false });
             }
         }
     }
@@ -1490,16 +1512,24 @@ impl SemanticAnalyzer {
             }
             Expr::UnaryOp(op, operand, span) => {
                 self.analyze_expr(operand);
+                match op {
+                    crate::frontend::parser::ast::UnaryOp::PreInc => self.check_modifiable_lvalue(operand, "increment", *span),
+                    crate::frontend::parser::ast::UnaryOp::PreDec => self.check_modifiable_lvalue(operand, "decrement", *span),
+                    _ => {}
+                }
                 if *op == crate::frontend::parser::ast::UnaryOp::BitNot && self.is_floating_expr(operand) {
                     self.diagnostics.borrow_mut().error("invalid operand to unary ~", *span);
                 }
             }
-            Expr::PostfixOp(_, operand, _) => {
+            Expr::PostfixOp(op, operand, span) => {
                 self.analyze_expr(operand);
+                let what = if *op == crate::frontend::parser::ast::PostfixOp::PostInc { "increment" } else { "decrement" };
+                self.check_modifiable_lvalue(operand, what, *span);
             }
             Expr::Assign(lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
+                self.check_modifiable_lvalue(lhs, "assignment", *span);
                 // Check for invalid pointer <-> float conversions in assignment
                 let checker = super::type_checker::ExprTypeChecker {
                     symbols: &self.symbol_table,
@@ -1517,6 +1547,7 @@ impl SemanticAnalyzer {
             Expr::CompoundAssign(op, lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
+                self.check_modifiable_lvalue(lhs, "assignment", *span);
                 self.check_integer_operands(op, lhs, rhs, *span);
             }
             Expr::Conditional(cond, then_expr, else_expr, _) => {
@@ -1565,8 +1596,11 @@ impl SemanticAnalyzer {
             Expr::AlignofExpr(inner, _) | Expr::GnuAlignofExpr(inner, _) => {
                 self.analyze_expr(inner);
             }
-            Expr::AddressOf(inner, _) => {
+            Expr::AddressOf(inner, span) => {
                 self.analyze_expr(inner);
+                if matches!(self.lvalue_kind(inner), LvalueKind::NotLvalue) {
+                    self.diagnostics.borrow_mut().error("lvalue required as unary '&' operand", *span);
+                }
             }
             Expr::Deref(inner, _) => {
                 self.analyze_expr(inner);
@@ -1685,6 +1719,120 @@ impl SemanticAnalyzer {
         } else if matches!(expr, Expr::BinaryOp(..)) {
             self.not_const_binops.insert(expr.id());
         }
+    }
+
+    /// Whether a declared object is itself const. `written_const` is a
+    /// `const` in its specifiers, which for a pointer declarator (or a
+    /// pointer in `type_spec`) is the pointee's; the pointer's own is
+    /// `pointer_const`. A typedef'd pointer takes a written `const` itself
+    /// (`const P p`), and a typedef of a const non-pointer makes it const.
+    fn object_is_const(&self, written_const: bool, type_spec: &TypeSpecifier, ty: &CType, ptr_declarator: bool) -> bool {
+        match ty {
+            CType::Pointer(_, quals) => {
+                quals.pointer_const
+                    || (written_const && !ptr_declarator && matches!(type_spec, TypeSpecifier::TypedefName(_)))
+            }
+            CType::Array(..) | CType::Function(..) => false,
+            _ => self.result.type_context.type_spec_base_const(type_spec, written_const),
+        }
+    }
+
+    /// What kind of operand `e` is for assignment, ++/-- and unary & (C11
+    /// 6.3.2.1). Anything this cannot tell (a _Generic selection, say) is
+    /// `Modifiable`, so no valid program is rejected.
+    fn lvalue_kind(&self, e: &Expr) -> LvalueKind {
+        use crate::frontend::parser::ast::UnaryOp as U;
+        match e {
+            Expr::Identifier(name, _) => {
+                let tc = &self.result.type_context;
+                if tc.enum_constants.contains_key(name) && !tc.enum_constant_shadowed(name, &self.symbol_table) {
+                    return LvalueKind::NotLvalue;
+                }
+                match self.symbol_table.lookup(name) {
+                    Some(sym) if matches!(sym.ty, CType::Function(..)) => LvalueKind::Function,
+                    Some(sym) if matches!(sym.ty, CType::Array(..)) => LvalueKind::Array,
+                    Some(sym) if sym.readonly => LvalueKind::ReadOnly(format!("variable '{}'", name)),
+                    _ => LvalueKind::Modifiable,
+                }
+            }
+            Expr::StringLiteral(..) | Expr::WideStringLiteral(..) => LvalueKind::Array,
+            Expr::MemberAccess(obj, field, _) => match self.lvalue_kind(obj) {
+                LvalueKind::NotLvalue => LvalueKind::NotLvalue,
+                LvalueKind::ReadOnly(what) => LvalueKind::ReadOnly(what),
+                _ => self.member_lvalue_kind(obj, field, false),
+            },
+            Expr::PointerMemberAccess(obj, field, _) => self.member_lvalue_kind(obj, field, true),
+            // An element of a multidimensional array is an array.
+            Expr::ArraySubscript(..) | Expr::Deref(..) => {
+                let checker = super::type_checker::ExprTypeChecker {
+                    symbols: &self.symbol_table,
+                    types: &self.result.type_context,
+                    functions: &self.result.functions,
+                    expr_types: Some(&self.result.expr_types),
+                };
+                match checker.infer_expr_ctype(e) {
+                    Some(CType::Array(..)) => LvalueKind::Array,
+                    _ => LvalueKind::Modifiable,
+                }
+            }
+            Expr::UnaryOp(U::RealPart | U::ImagPart, inner, _) => self.lvalue_kind(inner),
+            Expr::IntLiteral(..) | Expr::UIntLiteral(..) | Expr::LongLiteral(..) | Expr::ULongLiteral(..)
+            | Expr::LongLongLiteral(..) | Expr::ULongLongLiteral(..) | Expr::FloatLiteral(..)
+            | Expr::FloatLiteralLongDouble(..) | Expr::ImaginaryLiteral(..)
+            | Expr::ImaginaryLiteralLongDouble(..) | Expr::CharLiteral(..)
+            | Expr::BinaryOp(..) | Expr::UnaryOp(..) | Expr::PostfixOp(..) | Expr::Assign(..)
+            | Expr::CompoundAssign(..) | Expr::Conditional(..) | Expr::GnuConditional(..)
+            | Expr::FunctionCall(..) | Expr::Cast(..) | Expr::StmtExpr(..) | Expr::Sizeof(..)
+            | Expr::Alignof(..) | Expr::AlignofExpr(..) | Expr::GnuAlignof(..) | Expr::GnuAlignofExpr(..)
+            | Expr::Comma(..) | Expr::AddressOf(..) | Expr::LabelAddr(..) | Expr::VaArg(..) => LvalueKind::NotLvalue,
+            _ => LvalueKind::Modifiable,
+        }
+    }
+
+    /// A member of an lvalue struct (or of `*obj` for `->`): read-only if
+    /// the field is const and not a pointer (whose const is its pointee's).
+    fn member_lvalue_kind(&self, obj: &Expr, field: &str, is_pointer: bool) -> LvalueKind {
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+        };
+        let base = match checker.infer_expr_ctype(obj) {
+            Some(CType::Pointer(inner, _)) | Some(CType::Array(inner, _)) if is_pointer => *inner,
+            Some(t) if !is_pointer => t,
+            _ => return LvalueKind::Modifiable,
+        };
+        let (CType::Struct(key) | CType::Union(key)) = &base else { return LvalueKind::Modifiable };
+        if self.result.type_context.is_struct_key_shadowed(key.as_ref()) {
+            return LvalueKind::Modifiable;
+        }
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let Some(layout) = layouts.get(key.as_ref()) else { return LvalueKind::Modifiable };
+        match layout.field_offset(field, &*layouts) {
+            Some((_, CType::Array(..))) => LvalueKind::Array,
+            Some((_, ty)) if !matches!(ty, CType::Pointer(..) | CType::Function(..))
+                && layout.field_is_const(field, &*layouts) => LvalueKind::ReadOnly(format!("member '{}'", field)),
+            _ => LvalueKind::Modifiable,
+        }
+    }
+
+    /// Report an operand that `op` ("assignment", "increment", ...) cannot
+    /// modify, worded as GCC does.
+    fn check_modifiable_lvalue(&self, e: &Expr, op: &str, span: Span) {
+        let msg = match self.lvalue_kind(e) {
+            LvalueKind::Modifiable => return,
+            LvalueKind::NotLvalue | LvalueKind::Function => match op {
+                "assignment" => "lvalue required as left operand of assignment".to_string(),
+                _ => format!("lvalue required as {} operand", op),
+            },
+            LvalueKind::Array => match op {
+                "assignment" => "assignment to expression with array type".to_string(),
+                _ => format!("lvalue required as {} operand", op),
+            },
+            LvalueKind::ReadOnly(what) => format!("{} of read-only {}", op, what),
+        };
+        self.diagnostics.borrow_mut().error(msg, span);
     }
 
     /// Check that a struct/union member access refers to an existing field.
