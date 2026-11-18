@@ -12,6 +12,7 @@ usage: cxfz.py CCC CLANG WORKDIR SEED COUNT
 env: OPT (default -O2)
 """
 import os
+import re
 import random
 import subprocess
 import sys
@@ -44,7 +45,7 @@ def cx(r, d):
     if op == '/':
         return '(%s / %s)' % (a, r.choice(NICE + ['x', '(double _Complex)f']))
     if op == 'neg':
-        return '(-%s)' % a
+        return '(-(%s))' % a
     if op == 'conj':
         return '(~(double _Complex)%s)' % a
     if op == 'fcast':
@@ -67,7 +68,7 @@ static void pf(const char *n, float _Complex v) { printf("%s %.6g %.6g\n", n, (d
 
 VALS_C = ['0', '1.0', '(1.0 + 2.0i)', '(-0.5 + 3.0i)', '(4.0 - 1.0i)', '2.0i', '(-2.0 - 2.0i)', '(0.25 + 0.75i)']
 VALS_F = ['0', '(1.5f + 0.5if)', '(-2.0f + 1.0if)', '3.0if', '(0.5f - 4.0if)']
-VALS_R = ['0', '1.0', '-2.5', '0.5', '3.0']
+VALS_R = ['0.0', '1.0', '-2.5', '0.5', '3.0']
 
 
 def gen_file(r):
@@ -77,8 +78,12 @@ def gen_file(r):
     for i in range(nf):
         ret = r.choice(['double _Complex', 'float _Complex', 'double'])
         body = ['__attribute__((noinline)) %s f%d(double _Complex a, double _Complex b, float _Complex f, double x, float y, int k)' % (ret, i), '{']
-        body.append('    double _Complex c = %s;' % cx(r, 2))
+        # g before c, and c's initializer must not read c itself.
         body.append('    float _Complex g = f;')
+        init = cx(r, 2)
+        while re.search(r'\bc\b', init):
+            init = cx(r, 2)
+        body.append('    double _Complex c = %s;' % init)
         for _ in range(r.randint(1, 4)):
             t = r.random()
             if t < 0.4:

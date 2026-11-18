@@ -34,6 +34,7 @@ pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
 pub(crate) mod lftr;
 mod mem_inline;
+mod sincos;
 mod sroa;
 mod vec_split;
 pub(crate) mod index_base;
@@ -904,6 +905,16 @@ pub(crate) fn run_passes(module: &mut IrModule, _opt_level: u32, target: crate::
     if target == crate::backend::Target::Aarch64 && !disabled.contains("gep_reassoc") {
         for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
             gep_reassoc::chain_large_offsets(func);
+        }
+    }
+
+    // Phase 10l: sin(x) and cos(x) of one x in one call (Apple's
+    // __sincos_stret; AArch64, where ccc returns its HFA in registers).
+    if target == crate::backend::Target::Aarch64 && crate::common::types::target_is_darwin()
+        && !disabled.contains("sincos")
+    {
+        for func in module.functions.iter_mut().filter(|f| !f.is_declaration) {
+            sincos::fuse_function(func);
         }
     }
 

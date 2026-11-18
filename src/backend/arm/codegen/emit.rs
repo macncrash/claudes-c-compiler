@@ -1606,10 +1606,24 @@ impl ArmCodegen {
 
     // ── Call register arg helpers ───────────────────────────────────────────
 
+    /// A float operand in an allocated FP register: move its bits to GP
+    /// register `dest` (an `x` register; an F32 fills the low half and
+    /// zeroes the rest, as its stack slot load would). False otherwise.
+    pub(super) fn fp_value_to_gp(&mut self, arg: &Operand, dest: &str) -> bool {
+        let Operand::Value(v) = arg else { return false };
+        let Some(&(reg, f32)) = self.fp_reg_assignments.get(&v.0) else { return false };
+        let gp = if f32 { format!("w{}", &dest[1..]) } else { dest.to_string() };
+        self.state.emit_fmt(format_args!("    fmov {}, {}", gp, fp_reg_name(reg, f32)));
+        true
+    }
+
     /// Load an operand into the given destination register, accounting for SP adjustment.
     /// When `needs_adjusted_load` is true, values must be loaded from adjusted stack offsets
     /// or callee-saved registers (since SP has been modified for stack args).
     pub(super) fn emit_load_arg_to_reg(&mut self, arg: &Operand, dest: &str, slot_adjust: i64, extra_sp_adj: i64, needs_adjusted_load: bool) {
+        if self.fp_value_to_gp(arg, dest) {
+            return;
+        }
         if needs_adjusted_load || extra_sp_adj > 0 {
             match arg {
                 Operand::Value(v) => {
@@ -1714,6 +1728,17 @@ impl ArmCodegen {
         for &(arg_i, reg_i) in &fp_reg_assignments {
             if matches!(arg_classes[arg_i], CallArgClass::F128Reg { .. }) { continue; }
             let arg_ty = if arg_i < arg_types.len() { Some(arg_types[arg_i]) } else { None };
+            // Allocated FP registers (d8-d15, v16-v31) are never s0-s7.
+            if let Some(&(reg, f32)) = match &args[arg_i] {
+                Operand::Value(v) => self.fp_reg_assignments.get(&v.0),
+                _ => None,
+            } {
+                if f32 == (arg_ty == Some(IrType::F32)) {
+                    let p = if f32 { 's' } else { 'd' };
+                    self.state.emit_fmt(format_args!("    fmov {}{}, {}", p, reg_i, fp_reg_name(reg, f32)));
+                    continue;
+                }
+            }
             self.emit_load_arg_to_reg(&args[arg_i], "x0", slot_adjust, 0, needs_adjusted_load);
             if arg_ty == Some(IrType::F32) {
                 self.state.emit_fmt(format_args!("    fmov s{}, w0", reg_i));
@@ -2342,6 +2367,25 @@ impl ArchCodegen for ArmCodegen {
     // ---- Standard trait methods (kept inline - arch-specific) ----
     fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_x0(op); }
     fn emit_store_result(&mut self, dest: &Value) { self.store_x0_to(dest); }
+    fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) {
+        if crate::backend::generation::is_i128_type(return_type) {
+            self.emit_call_store_i128_result(dest);
+        } else if return_type.is_long_double() {
+            self.emit_call_store_f128_result(dest);
+        } else if return_type.is_float() {
+            let f32 = return_type == IrType::F32;
+            if let Some(reg) = self.dest_fp_reg(dest) {
+                // Straight from s0/d0, not through x0.
+                self.state.emit_fmt(format_args!("    fmov {}, {}", reg, if f32 { "s0" } else { "d0" }));
+                self.state.reg_cache.invalidate_acc();
+            } else {
+                self.state.emit(if f32 { "    fmov w0, s0" } else { "    fmov x0, d0" });
+                self.store_x0_to(dest);
+            }
+        } else {
+            self.store_x0_to(dest);
+        }
+    }
     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if !self.mul_high_parts.contains(&dest.0) {
             crate::backend::traits::emit_binop_default(self, dest, op, lhs, rhs, ty);

@@ -157,6 +157,25 @@ impl FnEffects {
     }
 }
 
+/// libm functions (double names; the `f` forms too) that read and write no
+/// memory when errno is not set, with their parameter counts. Not lgamma
+/// (writes signgam), frexp/modf/remquo/sincos (write through a pointer), or
+/// nan (reads a string).
+const MEMORY_FREE_LIBM: &[(&str, usize)] = &[
+    ("sin", 1), ("cos", 1), ("tan", 1), ("asin", 1), ("acos", 1), ("atan", 1),
+    ("sinh", 1), ("cosh", 1), ("tanh", 1), ("asinh", 1), ("acosh", 1), ("atanh", 1),
+    ("exp", 1), ("exp2", 1), ("expm1", 1), ("log", 1), ("log2", 1), ("log10", 1), ("log1p", 1),
+    ("sqrt", 1), ("cbrt", 1), ("fabs", 1), ("floor", 1), ("ceil", 1), ("trunc", 1),
+    ("round", 1), ("rint", 1), ("nearbyint", 1), ("erf", 1), ("erfc", 1), ("tgamma", 1),
+    ("logb", 1),
+    ("atan2", 2), ("pow", 2), ("hypot", 2), ("fmod", 2), ("fmin", 2), ("fmax", 2),
+    ("fdim", 2), ("copysign", 2), ("remainder", 2), ("nextafter", 2),
+    ("fma", 3),
+];
+
+/// Apple libm functions returning an HFA, called with an sret buffer.
+const SRET_LIBM: &[&str] = &["__sincos_stret", "__sincosf_stret"];
+
 /// Rounds of the call-graph fixpoint before giving up on every summary.
 const MAX_ROUNDS: usize = 64;
 
@@ -171,6 +190,24 @@ impl ModRef {
     pub(crate) fn compute(module: &IrModule) -> ModRef {
         let candidates: Vec<&IrFunction> = module.functions.iter().filter(|f| summarizable(f)).collect();
         let mut mr = ModRef::default();
+        // Apple's libm never sets errno (math_errhandling is MATH_ERREXCEPT)
+        // and these touch no memory, so a call to one writes nothing its
+        // caller sees. Not where the module defines the name itself.
+        if crate::common::types::target_is_darwin() {
+            for &(base, nparams) in MEMORY_FREE_LIBM {
+                for name in [base.to_string(), format!("{}f", base)] {
+                    if !module.functions.iter().any(|f| f.name == name && !f.is_declaration) {
+                        mr.effects.insert(name, (FnEffects::default(), nparams));
+                    }
+                }
+            }
+            // sincos.rs's calls: (sret buffer, x), writing only the buffer.
+            for name in SRET_LIBM {
+                if !module.functions.iter().any(|f| f.name == *name && !f.is_declaration) {
+                    mr.effects.insert(name.to_string(), (FnEffects { writes_params: 1, ..FnEffects::default() }, 2));
+                }
+            }
+        }
         for f in &candidates {
             mr.effects.insert(f.name.clone(), (FnEffects::default(), f.params.len()));
         }
@@ -198,7 +235,7 @@ impl ModRef {
     /// parameters one per argument.
     pub(crate) fn call_effects(&self, name: &str, info: &CallInfo) -> Option<FnEffects> {
         let &(e, nparams) = self.effects.get(name)?;
-        let plain = !info.is_variadic && !info.is_sret && info.args.len() == nparams
+        let plain = !info.is_variadic && (!info.is_sret || SRET_LIBM.contains(&name)) && info.args.len() == nparams
             && info.struct_arg_sizes.iter().all(|s| s.is_none());
         plain.then_some(e)
     }

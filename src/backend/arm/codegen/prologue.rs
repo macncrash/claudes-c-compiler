@@ -639,6 +639,12 @@ impl ArmCodegen {
                 self.store_x0_to(dest);
             }
             ParamClass::FloatReg { reg_idx } => {
+                if let Some(reg) = self.dest_fp_reg(dest) {
+                    let p = if ty == IrType::F32 { 's' } else { 'd' };
+                    self.state.emit_fmt(format_args!("    fmov {}, {}{}", reg, p, reg_idx));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
                 if ty == IrType::F32 {
                     self.state.emit_fmt(format_args!("    fmov w0, s{}", reg_idx));
                 } else {

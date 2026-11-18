@@ -232,6 +232,7 @@ impl ArmCodegen {
                     }
                     CallArgClass::Stack | CallArgClass::StackPacked { .. } => {
                         match arg {
+                            Operand::Value(_) if self.fp_value_to_gp(arg, "x0") => {}
                             Operand::Value(v) => {
                                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                                     let reg_name = callee_saved_name(reg);

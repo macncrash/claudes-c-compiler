@@ -1029,6 +1029,10 @@ pub fn allocate_fp_registers(
                     Some((*dest, if *f64 { IrType::F64 } else { IrType::F32 })),
                 Instruction::Intrinsic { dest: Some(dest), op: IntrinsicOp::SqrtF32 | IntrinsicOp::FabsF32, .. } => Some((*dest, IrType::F32)),
                 Instruction::Intrinsic { dest: Some(dest), op: IntrinsicOp::SqrtF64 | IntrinsicOp::FabsF64, .. } => Some((*dest, IrType::F64)),
+                // Stored through store_x0_to (emit_param_ref, emit_call_store_result).
+                Instruction::ParamRef { dest, ty, .. } if is_fp(ty) => Some((*dest, *ty)),
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
+                    if is_fp(&info.return_type) => info.dest.map(|d| (d, info.return_type)),
                 _ => None,
             };
             match (float_def, inst) {
@@ -1058,6 +1062,12 @@ pub fn allocate_fp_registers(
                 // (Only AArch64 emits it, through float_operand_to_fp_reg.)
                 Instruction::Intrinsic { op: IntrinsicOp::Fma { .. } | IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64
                     | IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64, .. } => true,
+                // Arguments are read through emit_load_arg_to_reg and
+                // emit_call_fp_reg_args, which know FP registers. A value
+                // used by a call spans it here (no boundary), so it gets a
+                // callee-saved register: an F128 argument's conversion calls
+                // out before the other arguments are read.
+                Instruction::Call { .. } | Instruction::CallIndirect { .. } => true,
                 _ => false,
             };
             if !safe_use {
