@@ -426,20 +426,14 @@ impl ArmCodegen {
         let align = self.state.alloca_over_align(val_id)
             .expect("alloca must have over-alignment for aligned addr emission");
         self.emit_add_sp_offset("x9", slot.0);
-        self.load_large_imm("x17", (align - 1) as i64);
-        self.state.emit("    add x9, x9, x17");
-        self.load_large_imm("x17", -(align as i64));
-        self.state.emit("    and x9, x9, x17");
+        self.emit_align_up("x9", align);
     }
 
     pub(super) fn emit_alloca_aligned_addr_to_acc_impl(&mut self, slot: StackSlot, val_id: u32) {
         let align = self.state.alloca_over_align(val_id)
             .expect("alloca must have over-alignment for aligned addr emission");
         self.emit_add_sp_offset("x0", slot.0);
-        self.load_large_imm("x17", (align - 1) as i64);
-        self.state.emit("    add x0, x0, x17");
-        self.load_large_imm("x17", -(align as i64));
-        self.state.emit("    and x0, x0, x17");
+        self.emit_align_up("x0", align);
         self.state.reg_cache.invalidate_acc();
     }
 

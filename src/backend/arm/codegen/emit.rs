@@ -1172,15 +1172,27 @@ impl ArmCodegen {
     /// For over-aligned allocas: `dest = (sp + offset + align-1) & -align`.
     /// `offset` is the raw stack slot offset (already adjusted for call setup if needed).
     pub(super) fn emit_alloca_addr(&mut self, dest: &str, val_id: u32, offset: i64) {
+        self.emit_add_sp_offset(dest, offset);
         if let Some(align) = self.state.alloca_over_align(val_id) {
-            self.emit_add_sp_offset(dest, offset);
-            self.load_large_imm("x17", (align - 1) as i64);
-            self.state.emit_fmt(format_args!("    add {}, {}, x17", dest, dest));
-            self.load_large_imm("x17", -(align as i64));
-            self.state.emit_fmt(format_args!("    and {}, {}, x17", dest, dest));
-        } else {
-            self.emit_add_sp_offset(dest, offset);
+            self.emit_align_up(dest, align);
         }
+    }
+
+    /// Round the address in `reg` up to `align` (a power of two):
+    /// `reg = (reg + align-1) & -align`. -align is always a logical
+    /// immediate and align-1 an add immediate up to 4096, so no scratch is
+    /// needed there; that matters because callers compute struct-argument
+    /// addresses into x17 itself. Larger alignments go through x16 or x17,
+    /// whichever `reg` is not.
+    pub(super) fn emit_align_up(&mut self, reg: &str, align: usize) {
+        if align <= 4096 {
+            self.state.emit_fmt(format_args!("    add {}, {}, #{}", reg, reg, align - 1));
+        } else {
+            let scratch = if reg == "x17" { "x16" } else { "x17" };
+            self.load_large_imm(scratch, (align - 1) as i64);
+            self.state.emit_fmt(format_args!("    add {}, {}, {}", reg, reg, scratch));
+        }
+        self.state.emit_fmt(format_args!("    and {}, {}, #{}", reg, reg, -(align as i64)));
     }
 
     /// Emit `add dest, x29, #offset` handling large offsets.
