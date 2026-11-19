@@ -364,7 +364,7 @@ impl Lowerer {
         if let CType::Vector(_, size @ (8 | 16)) = ret_ct {
             return Some(crate::common::types::RiscvFloatClass::Hfa { count: 1, elem_size: *size });
         }
-        let CType::Struct(key) = ret_ct else { return None };
+        let (CType::Struct(key) | CType::Union(key)) = ret_ct else { return None };
         let layouts = self.types.borrow_struct_layouts();
         let layout = layouts.get_struct_layout(key)?;
         layout.classify_hfa(&*layouts)

@@ -1175,25 +1175,72 @@ impl StructLayout {
     /// AAPCS64 homogeneous floating-point aggregate classification: a struct
     /// whose flattened members are 1-4 values of one float type (all float or
     /// all double) and nothing else. Returns `RiscvFloatClass::Hfa`.
+    ///
+    /// A union is homogeneous when every member is, with one base type, and
+    /// counts as many members as its largest (AAPCS64 5.9.5, as clang's
+    /// isHomogeneousAggregate): union { float a[2]; float b; } is an HFA of
+    /// two floats, and so is a struct holding it. Packing does not matter,
+    /// only that the size is exactly count * base (no padding).
     pub fn classify_hfa(&self, ctx: &dyn StructLayoutProvider) -> Option<RiscvFloatClass> {
-        if self.is_union || self.size == 0 {
+        if self.size == 0 {
             return None;
         }
-        let mut float_fields: Vec<(usize, usize)> = Vec::new();
-        let mut int_fields: Vec<(usize, usize)> = Vec::new();
-        // A complex member counts as two members of its part type (AAPCS64 4.3.5).
-        if !Self::collect_riscv_fields(&self.fields, 0, &mut float_fields, &mut int_fields, 4, true, ctx) {
+        let mut base = 0usize;
+        let count = Self::hfa_members(&self.fields, self.is_union, &mut base, ctx)?;
+        if !(1..=4).contains(&count) || self.size != count * base {
             return None;
         }
-        let count = float_fields.len();
-        if !int_fields.is_empty() || !(1..=4).contains(&count) {
-            return None;
+        Some(RiscvFloatClass::Hfa { count, elem_size: base })
+    }
+
+    /// The number of base-type members in a struct's or union's fields for
+    /// the AAPCS64 homogeneous-aggregate rule, setting `base` to the base
+    /// type's size the first time one is seen; None if not homogeneous.
+    fn hfa_members(fields: &[StructFieldLayout], is_union: bool, base: &mut usize, ctx: &dyn StructLayoutProvider) -> Option<usize> {
+        let mut total = 0usize;
+        for field in fields {
+            // Zero-width bitfields are padding only; any other is an integer.
+            match field.bit_width {
+                Some(0) => continue,
+                Some(_) => return None,
+                None => {}
+            }
+            let n = Self::hfa_type_members(&field.ty, base, ctx)?;
+            total = if is_union { total.max(n) } else { total + n };
+            if total > 4 {
+                return None;
+            }
         }
-        let elem_size = float_fields[0].1;
-        if float_fields.iter().any(|&(_, size)| size != elem_size) || self.size != count * elem_size {
-            return None;
+        Some(total)
+    }
+
+    fn hfa_type_members(ty: &CType, base: &mut usize, ctx: &dyn StructLayoutProvider) -> Option<usize> {
+        let mut scalar = |size: usize, n: usize| {
+            if *base == 0 {
+                *base = size;
+            }
+            (*base == size).then_some(n)
+        };
+        match ty {
+            CType::Float => scalar(4, 1),
+            CType::Double => scalar(8, 1),
+            CType::LongDouble if long_double_is_f64() => scalar(8, 1),
+            // A complex member counts as two members of its part type (AAPCS64 4.3.5).
+            CType::ComplexFloat => scalar(4, 2),
+            CType::ComplexDouble => scalar(8, 2),
+            CType::ComplexLongDouble if long_double_is_f64() => scalar(8, 2),
+            CType::Struct(key) | CType::Union(key) => {
+                let layout = ctx.get_struct_layout(key)?;
+                Self::hfa_members(&layout.fields, layout.is_union, base, ctx)
+            }
+            // Zero-length arrays (FAMs) are ignored.
+            CType::Array(_, Some(0)) => Some(0),
+            CType::Array(elem, Some(n)) => {
+                let per = Self::hfa_type_members(elem, base, ctx)?;
+                per.checked_mul(*n).filter(|&t| t <= 4)
+            }
+            _ => None,
         }
-        Some(RiscvFloatClass::Hfa { count, elem_size })
     }
 
     /// Recursively collect scalar float and int fields from a struct.
