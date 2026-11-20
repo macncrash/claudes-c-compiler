@@ -338,6 +338,65 @@ impl Lowerer {
                 let selected = self.resolve_generic_selection_expr(controlling, associations)?;
                 self.eval_const_expr(selected)
             }
+            Expr::ArraySubscript(..) | Expr::Deref(..) => self.eval_string_element(expr),
+            _ => None,
+        }
+    }
+
+    /// A character of a string literal at a constant index: "abc"[1],
+    /// 1["abc"], *"abc", *("abc" + 2), L"wide"[3], u"h16"[0]. gcc and clang
+    /// fold these in static initializers; without this they became 0.
+    /// The index may name the terminating NUL; past it, nothing is folded.
+    fn eval_string_element(&self, expr: &Expr) -> Option<IrConst> {
+        let (lit, idx) = match expr {
+            Expr::ArraySubscript(a, b, _) => {
+                if Self::string_literal_units(a).is_some() {
+                    (a.as_ref(), self.eval_const_expr(b)?.to_i64()?)
+                } else if Self::string_literal_units(b).is_some() {
+                    (b.as_ref(), self.eval_const_expr(a)?.to_i64()?)
+                } else {
+                    return None;
+                }
+            }
+            Expr::Deref(inner, _) => self.string_literal_plus_offset(inner)?,
+            _ => return None,
+        };
+        let units = Self::string_literal_units(lit)?;
+        let idx = usize::try_from(idx).ok().filter(|&i| i <= units.len())?;
+        let unit = units.get(idx).copied().unwrap_or(0);
+        // The element type is the target's: plain char may be signed or not.
+        self.cast_bits_to_ir_const(unit as u64, false, self.get_expr_type(expr))
+    }
+
+    /// `"abc"` plus or minus constant offsets (`"abc" + 3 - 1`, `n + "abc"`):
+    /// the literal and the offset.
+    fn string_literal_plus_offset<'e>(&self, expr: &'e Expr) -> Option<(&'e Expr, i64)> {
+        match expr {
+            e if Self::string_literal_units(e).is_some() => Some((e, 0)),
+            Expr::BinaryOp(BinOp::Add, a, b, _) => {
+                if let Some((lit, off)) = self.string_literal_plus_offset(a) {
+                    Some((lit, off.checked_add(self.eval_const_expr(b)?.to_i64()?)?))
+                } else {
+                    let (lit, off) = self.string_literal_plus_offset(b)?;
+                    Some((lit, off.checked_add(self.eval_const_expr(a)?.to_i64()?)?))
+                }
+            }
+            Expr::BinaryOp(BinOp::Sub, a, b, _) => {
+                let (lit, off) = self.string_literal_plus_offset(a)?;
+                Some((lit, off.checked_sub(self.eval_const_expr(b)?.to_i64()?)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The code units of a string literal, without the terminating NUL.
+    fn string_literal_units(expr: &Expr) -> Option<Vec<u32>> {
+        match expr {
+            Expr::StringLiteral(s, _) => Some(s.chars().map(|c| c as u8 as u32).collect()),
+            Expr::WideStringLiteral(s, _) => Some(s.chars().map(|c| c as u32).collect()),
+            Expr::Char16StringLiteral(s, _) => {
+                Some(s.chars().map(|c| crate::common::encoding::char16_unit(c) as u32).collect())
+            }
             _ => None,
         }
     }
