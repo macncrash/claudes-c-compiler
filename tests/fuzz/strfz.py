@@ -82,8 +82,6 @@ def gen(r):
         st = r.random() < 0.5
         where = lines_g if st else lines_f
         c = r.randint(0, 6)
-        if c in (3, 4) and kind not in ('c', 'u8') and not os.environ.get('WIDEAGG'):
-            c = 0  # open in ccc: wide strings in struct members and arrays of strings
         if c == 0:
             where.append('%s%s %s[] = %s;' % ('' if st else '', t, name, lit))
             lines_f.append('H(sizeof %s);' % name)

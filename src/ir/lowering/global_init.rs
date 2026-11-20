@@ -1878,7 +1878,7 @@ impl Lowerer {
                     values.push(self.zero_const(base_ty));
                 }
                 // Check for braced string literal initializing a char sub-array
-                if sub_items.len() == 1 {
+                if sub_items.len() == 1 && sub_items[0].designators.is_empty() {
                     if let Initializer::Expr(e) = &sub_items[0].init {
                         let mut row = Vec::with_capacity(sub_elem_count);
                         if self.inline_string_to_values(e, sub_elem_count, base_ty, &mut row) {

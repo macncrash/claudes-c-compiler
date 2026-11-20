@@ -810,6 +810,33 @@ impl Lowerer {
             .unwrap_or(strides.len().saturating_sub(1))
     }
 
+    /// Whether any item of an initializer list, at any depth, has a designator.
+    fn init_has_designator(items: &[InitializerItem]) -> bool {
+        items.iter().any(|item| {
+            !item.designators.is_empty()
+                || matches!(&item.init, Initializer::List(sub) if Self::init_has_designator(sub))
+        })
+    }
+
+    /// A string row of a multi-dimensional character array. The whole row is
+    /// what the string initializes, so where a designator may have come back
+    /// to a row an earlier string filled ({ "abcd", [0] = "x" }) the bytes
+    /// after a shorter string's NUL are zeroed; the wide paths store the
+    /// whole row already, and without designators the array was zeroed first.
+    fn emit_init_string_row(&mut self, alloca: Value, e: &Expr, base_ty: IrType, offset: usize, max_bytes: usize, may_override: bool) -> bool {
+        if may_override {
+            if let Expr::StringLiteral(s, _) = e {
+                if matches!(base_ty, IrType::I8 | IrType::U8) {
+                    let end = s.chars().count() + 1;
+                    if end < max_bytes {
+                        self.zero_init_region(alloca, offset + end, max_bytes - end);
+                    }
+                }
+            }
+        }
+        self.emit_string_row_to_alloca(alloca, e, base_ty, offset, max_bytes)
+    }
+
     /// Lower a multi-dimensional array initializer list.
     /// Handles nested braces like `{{1,2,3},{4,5,6}}` for `int a[2][3]`.
     pub(super) fn lower_array_init_list(
@@ -820,7 +847,10 @@ impl Lowerer {
         array_dim_strides: &[usize],
     ) {
         let mut flat_index = 0usize;
-        self.lower_array_init_recursive(items, alloca, base_ty, array_dim_strides, &mut flat_index);
+        // A designator can move back over a row a string already filled; only
+        // then must a shorter string zero the rest of it.
+        let may_override = Self::init_has_designator(items);
+        self.lower_array_init_recursive(items, alloca, base_ty, array_dim_strides, &mut flat_index, may_override);
     }
 
     /// Recursive helper for multi-dimensional array initialization.
@@ -833,6 +863,7 @@ impl Lowerer {
         base_ty: IrType,
         array_dim_strides: &[usize],
         flat_index: &mut usize,
+        may_override: bool,
     ) {
         let elem_size = *array_dim_strides.last().unwrap_or(&1);
         let base_type_size = base_ty.size().max(1);
@@ -842,6 +873,10 @@ impl Lowerer {
             1
         };
 
+        // Designators in this list index the braced aggregate it initializes,
+        // which starts where the list does: in { {1}, { [1] = 3 } } for
+        // int[2][3][2], [1] is a[1][1], not a[0][1].
+        let list_base = *flat_index;
         for item in items {
             // Check for multi-dimensional index designators: [i][j]...
             let index_designators: Vec<usize> = item.designators.iter().filter_map(|d| {
@@ -854,7 +889,7 @@ impl Lowerer {
 
             if !index_designators.is_empty() {
                 // Compute flat scalar index from multi-dimensional indices
-                let mut target_flat = 0usize;
+                let mut target_flat = list_base;
                 for (i, &idx) in index_designators.iter().enumerate() {
                     let elems_per_entry = if i < array_dim_strides.len() && base_type_size > 0 {
                         array_dim_strides[i] / base_type_size
@@ -876,7 +911,12 @@ impl Lowerer {
                             // is zeroed ({ {1, 2, 3}, [0] = {7} } gives {7, 0, 0}).
                             let whole = array_dim_strides[index_designators.len() - 1];
                             self.zero_init_region(alloca, target_flat * elem_size, whole);
-                            self.lower_array_init_recursive(sub_items, alloca, base_ty, sub_strides, flat_index);
+                            self.lower_array_init_recursive(sub_items, alloca, base_ty, sub_strides, flat_index, may_override);
+                            // What follows starts at the next subobject: in
+                            // { 1, 2, [1] = { 5 }, 6 } for int[2][3], 6 is a[2] (excess).
+                            if let Some(n) = whole.checked_div(elem_size) {
+                                *flat_index = target_flat + n;
+                            }
                         } else {
                             for sub_item in sub_items {
                                 if let Initializer::Expr(e) = &sub_item.init {
@@ -888,7 +928,7 @@ impl Lowerer {
                         }
                     }
                     Initializer::Expr(e) => {
-                        if self.emit_string_row_to_alloca(alloca, e, base_ty, target_flat * elem_size, sub_elem_count * elem_size) {
+                        if self.emit_init_string_row(alloca, e, base_ty, target_flat * elem_size, sub_elem_count * elem_size, may_override) {
                             *flat_index = target_flat + sub_elem_count;
                             continue;
                         }
@@ -919,11 +959,11 @@ impl Lowerer {
                         // {"cd"} for a char (or wide character) row: a whole row, or one
                         // inside an elided element.
                         let level_count = array_dim_strides[level] / elem_size;
-                        self.emit_string_row_to_alloca(alloca, e, base_ty, *flat_index * elem_size, level_count * elem_size);
+                        self.emit_init_string_row(alloca, e, base_ty, *flat_index * elem_size, level_count * elem_size, may_override);
                         *flat_index = start_index + level_count;
                     } else if level > 0 && level + 1 < array_dim_strides.len() {
                         let level_count = array_dim_strides[level] / elem_size;
-                        self.lower_array_init_recursive(sub_items, alloca, base_ty, &array_dim_strides[level + 1..], flat_index);
+                        self.lower_array_init_recursive(sub_items, alloca, base_ty, &array_dim_strides[level + 1..], flat_index, may_override);
                         let boundary = start_index + level_count;
                         if *flat_index < boundary {
                             *flat_index = boundary;
@@ -936,7 +976,7 @@ impl Lowerer {
                         }
                         *flat_index = start_index + 1;
                     } else if array_dim_strides.len() > 1 {
-                        self.lower_array_init_recursive(sub_items, alloca, base_ty, &array_dim_strides[1..], flat_index);
+                        self.lower_array_init_recursive(sub_items, alloca, base_ty, &array_dim_strides[1..], flat_index, may_override);
                     } else {
                         // Bottom level: treat as flat elements
                         for sub_item in sub_items {
@@ -960,7 +1000,7 @@ impl Lowerer {
                 Initializer::Expr(e) => {
                     // String literal fills a sub-array (a row) in char (or wide character) arrays
                     let max_str_bytes = sub_elem_count * elem_size;
-                    if self.emit_string_row_to_alloca(alloca, e, base_ty, *flat_index * elem_size, max_str_bytes) {
+                    if self.emit_init_string_row(alloca, e, base_ty, *flat_index * elem_size, max_str_bytes, may_override) {
                         let string_stride = if array_dim_strides.len() >= 2 {
                             array_dim_strides[array_dim_strides.len() - 2] / elem_size
                         } else {
