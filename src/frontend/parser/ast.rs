@@ -613,6 +613,17 @@ impl TypeSpecifier {
         }
     }
 
+    /// The `typeof(expr)` this type name is built on, beneath pointers,
+    /// arrays and `typeof(type)`: its base type's const comes from `expr`.
+    pub fn typeof_expr_base(&self) -> Option<&Expr> {
+        match self {
+            TypeSpecifier::Typeof(e) => Some(e),
+            TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _)
+            | TypeSpecifier::TypeofType(inner) => inner.typeof_expr_base(),
+            _ => None,
+        }
+    }
+
     /// Whether mark_const_base marked this type.
     pub fn has_const_base(&self) -> bool {
         match self {

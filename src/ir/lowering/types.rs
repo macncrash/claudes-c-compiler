@@ -147,7 +147,8 @@ impl Lowerer {
         let ctype1 = self.type_spec_to_ctype(type1);
         let ctype2 = self.type_spec_to_ctype(type2);
         let compatible = builtin_types_compatible(&ctype1, &ctype2)
-            && (base_const[0] == base_const[1] || !has_pointer_level(&ctype1));
+            && (!has_pointer_level(&ctype1)
+                || self.type_name_pointee_const(type1, base_const[0]) == self.type_name_pointee_const(type2, base_const[1]));
         if compatible { 1 } else { 0 }
     }
 
@@ -357,7 +358,7 @@ impl Lowerer {
         }
         // Handle typeof(expr) by resolving the expression's type
         if let TypeSpecifier::Typeof(expr) = ts {
-            if let Some(ctype) = self.get_expr_ctype(expr) {
+            if let Some(ctype) = self.qualified_expr_ctype(expr) {
                 return ctype.size_ctx(&*self.types.borrow_struct_layouts());
             }
             return crate::common::types::target_ptr_size(); // fallback

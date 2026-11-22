@@ -1696,13 +1696,22 @@ impl SemanticAnalyzer {
     fn annotate_const_value(&mut self, expr: &Expr) {
         // Resolve the operands with enum identity intact (SemaConstEval and
         // the lowerer see enums as int); the lowerer uses this value.
+        // Whether a pointer's base type is const: written, or from a const
+        // typedef (`CI *`). Under a typeof(expr) it is the expression's,
+        // which the lowerer works out.
         if let Expr::BuiltinTypesCompatibleP(type1, type2, base_const, _) = expr {
             use type_builder::TypeConvertContext;
             let ctype1 = self.resolve_type_spec_to_ctype(type1);
             let ctype2 = self.resolve_type_spec_to_ctype(type2);
-            let compatible = crate::common::types::builtin_types_compatible(&ctype1, &ctype2)
-                && (base_const[0] == base_const[1]
-                    || !crate::common::types::has_pointer_level(&ctype1));
+            let structural = crate::common::types::builtin_types_compatible(&ctype1, &ctype2);
+            let pointer = crate::common::types::has_pointer_level(&ctype1);
+            if structural && pointer && (type1.typeof_expr_base().is_some() || type2.typeof_expr_base().is_some()) {
+                return;
+            }
+            let tc = &self.result.type_context;
+            let compatible = structural
+                && (!pointer
+                    || tc.type_spec_base_const(type1, base_const[0]) == tc.type_spec_base_const(type2, base_const[1]));
             self.result.const_values.insert(expr.id(), crate::ir::reexports::IrConst::I64(compatible as i64));
             return;
         }
@@ -2326,7 +2335,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
         };
-        checker.infer_expr_ctype(expr).unwrap_or(CType::Int)
+        super::type_checker::string_literal_array_ctype(expr).or_else(|| checker.infer_expr_ctype(expr)).unwrap_or(CType::Int)
     }
 
     fn eval_const_expr_as_usize(&self, expr: &Expr) -> Option<usize> {

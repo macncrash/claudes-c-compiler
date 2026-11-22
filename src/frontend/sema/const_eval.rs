@@ -414,8 +414,17 @@ impl<'a> SemaConstEval<'a> {
             Expr::BuiltinTypesCompatibleP(ref type1, ref type2, base_const, _) => {
                 let ctype1 = self.type_spec_to_ctype(type1);
                 let ctype2 = self.type_spec_to_ctype(type2);
-                let compatible = builtin_types_compatible(&ctype1, &ctype2)
-                    && (base_const[0] == base_const[1] || !has_pointer_level(&ctype1));
+                // As in SemanticAnalyzer::annotate_const_value: a typeof(expr)
+                // base is left to the lowerer.
+                let structural = builtin_types_compatible(&ctype1, &ctype2);
+                let pointer = has_pointer_level(&ctype1);
+                if structural && pointer && (type1.typeof_expr_base().is_some() || type2.typeof_expr_base().is_some()) {
+                    return None;
+                }
+                let compatible = structural
+                    && (!pointer
+                        || self.types.type_spec_base_const(type1, base_const[0])
+                            == self.types.type_spec_base_const(type2, base_const[1]));
                 Some(IrConst::I64(compatible as i64))
             }
 
@@ -573,10 +582,16 @@ impl<'a> SemaConstEval<'a> {
         // standalone ctype_from_type_spec function can't handle this because it
         // lacks access to the symbol table and expression type checker.
         if let TypeSpecifier::Typeof(expr) = spec {
-            return self.infer_expr_ctype(expr).unwrap_or(CType::Int);
+            return self.typeof_expr_ctype(expr).unwrap_or(CType::Int);
         }
         // Delegate to a simple inline conversion for all other cases.
         ctype_from_type_spec(spec, self.types)
+    }
+
+    /// The type typeof(expr) names: the expression's, but a string literal is
+    /// its array.
+    fn typeof_expr_ctype(&self, expr: &Expr) -> Option<CType> {
+        super::type_checker::string_literal_array_ctype(expr).or_else(|| self.infer_expr_ctype(expr))
     }
 
     /// Infer the CType of an expression using ExprTypeChecker.
@@ -941,7 +956,7 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::TypeofType(inner) => self.sizeof_type_spec(inner),
             TypeSpecifier::Typeof(expr) => {
-                let ctype = self.infer_expr_ctype(expr)?;
+                let ctype = self.typeof_expr_ctype(expr)?;
                 Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
             }
             TypeSpecifier::Vector(_, total_bytes) => Some(*total_bytes),
@@ -1062,7 +1077,7 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::TypeofType(inner) => self.alignof_type_spec(inner),
             TypeSpecifier::Typeof(expr) => {
-                if let Some(ctype) = self.infer_expr_ctype(expr) {
+                if let Some(ctype) = self.typeof_expr_ctype(expr) {
                     ctype.align_ctx(&*self.types.borrow_struct_layouts())
                 } else {
                     crate::common::types::target_ptr_size() // fallback
@@ -1097,7 +1112,7 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::TypeofType(inner) => self.preferred_alignof_type_spec(inner),
             TypeSpecifier::Typeof(expr) => {
-                if let Some(ctype) = self.infer_expr_ctype(expr) {
+                if let Some(ctype) = self.typeof_expr_ctype(expr) {
                     ctype.preferred_align_ctx(&*self.types.borrow_struct_layouts())
                 } else {
                     target_ptr_size()

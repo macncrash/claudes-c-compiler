@@ -33,6 +33,18 @@ use crate::frontend::parser::ast::{
 use super::type_context::TypeContext;
 use super::analysis::FunctionInfo;
 
+/// The array type of a string literal (`"ab"` is char[3]), which expression
+/// types give decayed; typeof, sizeof and _Generic operands need the array.
+pub fn string_literal_array_ctype(expr: &Expr) -> Option<CType> {
+    let (elem, len) = match expr {
+        Expr::StringLiteral(s, _) => (CType::Char, s.chars().count()),
+        Expr::WideStringLiteral(s, _) => (CType::Int, s.chars().count()),
+        Expr::Char16StringLiteral(s, _) => (CType::UShort, s.chars().count()),
+        _ => return None,
+    };
+    Some(CType::Array(Box::new(elem), Some(len + 1)))
+}
+
 /// Determine the C type of an enum constant value, following GCC's promotion rules.
 /// GCC uses the progression: int -> unsigned int -> long long -> unsigned long long.
 /// (On LP64 targets, long == long long, so we skip long/unsigned long.)
@@ -697,7 +709,7 @@ impl<'a> ExprTypeChecker<'a> {
             TypeSpecifier::TypeofType(inner) => self.resolve_type_spec(inner),
             TypeSpecifier::Typeof(expr) => {
                 // typeof(expr): try to infer the expression's type
-                self.infer_expr_ctype(expr).unwrap_or(CType::Int)
+                string_literal_array_ctype(expr).or_else(|| self.infer_expr_ctype(expr)).unwrap_or(CType::Int)
             }
             TypeSpecifier::FunctionPointer(ret, params, variadic) => {
                 let ret_ct = self.resolve_type_spec(ret);
@@ -945,7 +957,7 @@ impl<'a> ExprTypeChecker<'a> {
         match ts {
             TypeSpecifier::Typeof(expr) => {
                 // Try normal resolution first
-                if let Some(ctype) = self.infer_expr_ctype(expr) {
+                if let Some(ctype) = string_literal_array_ctype(expr).or_else(|| self.infer_expr_ctype(expr)) {
                     return ctype;
                 }
                 // Try resolving using the local scope

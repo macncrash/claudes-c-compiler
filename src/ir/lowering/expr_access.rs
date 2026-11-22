@@ -895,6 +895,18 @@ impl Lowerer {
         ts.has_const_base() || self.base_is_const(leaf, false)
     }
 
+    /// Whether the base type beneath a type name's pointers is const, for
+    /// `__builtin_types_compatible_p`: written (`written_const`), from a const
+    /// typedef (`CI *`), or under typeof(expr) the expression's
+    /// (`typeof(&c)` for `const int c`).
+    pub(super) fn type_name_pointee_const(&self, ts: &TypeSpecifier, written_const: bool) -> bool {
+        let mut leaf = ts;
+        while let TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) | TypeSpecifier::TypeofType(inner) = leaf {
+            leaf = inner;
+        }
+        self.base_is_const(leaf, written_const)
+    }
+
     /// Record that a function's return type has a const base type (see
     /// FunctionMeta::const_returns).
     pub(super) fn note_const_return(&mut self, name: &str, ret_type_spec: &TypeSpecifier, written_const: bool) {
@@ -910,14 +922,8 @@ impl Lowerer {
     pub(super) fn qualified_expr_ctype(&self, expr: &Expr) -> Option<CType> {
         // A string literal is an array (`typeof("ab")` is char[3]), which
         // get_expr_ctype gives already decayed.
-        let literal = match expr {
-            Expr::StringLiteral(s, _) => Some((CType::Char, s.chars().count())),
-            Expr::WideStringLiteral(s, _) => Some((CType::Int, s.chars().count())),
-            Expr::Char16StringLiteral(s, _) => Some((CType::UShort, s.chars().count())),
-            _ => None,
-        };
-        if let Some((elem, len)) = literal {
-            return Some(CType::Array(Box::new(elem), Some(len + 1)));
+        if let Some(array) = crate::frontend::sema::type_checker::string_literal_array_ctype(expr) {
+            return Some(array);
         }
         self.get_expr_ctype(expr).map(|ctype| self.with_member_const(expr, ctype))
     }
